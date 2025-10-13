@@ -1,4 +1,4 @@
-import { FileOperations } from "../tools/file-operations.js";
+import { FileOperations } from "../file-operations.js";
 import { MemorySystem } from "./memory-system.js";
 import { GraphIndex } from "../graph/graph-index.js";
 

@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { FileOperations } from "../tools/file-operations.js";
+import { FileOperations } from "../file-operations.js";
 
 /**
  * Access log entry for note usage tracking

@@ -8,16 +8,21 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { FileOperations } from "./tools/file-operations.js";
+import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ConsolidationManager } from "./memory/consolidation.js";
-import {
-  normalizeNoteReference,
-  extractNoteName,
-  generateSearchPaths,
-  resolveNotePath,
-} from "@obsidian-memory/utils";
+import { resolveNotePath } from "@obsidian-memory/utils";
+import { allTools, ToolContext } from "./tools/index.js";
+import { readNoteTool } from "./tools/read-note.js";
+import { getFrontmatterTool } from "./tools/get-frontmatter.js";
+import { updateFrontmatterTool } from "./tools/update-frontmatter.js";
+import { getBacklinksTool } from "./tools/get-backlinks.js";
+import { getGraphNeighborhoodTool } from "./tools/get-graph-neighborhood.js";
+import { getNoteUsageTool } from "./tools/get-note-usage.js";
+import { loadPrivateMemoryTool } from "./tools/load-private-memory.js";
+import { consolidateMemoryTool } from "./tools/consolidate-memory.js";
+import { completeConsolidationTool } from "./tools/complete-consolidation.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -59,6 +64,16 @@ function resolveNoteNameToPath(
   return resolveNotePath(availablePaths, { includePrivate });
 }
 
+// Build tool context with all dependencies
+const toolContext = {
+  vaultPath,
+  fileOps,
+  graphIndex,
+  memorySystem,
+  consolidationManager,
+  resolveNoteNameToPath,
+} satisfies ToolContext;
+
 // Create server instance
 const server = new Server(
   {
@@ -78,156 +93,7 @@ const server = new Server(
 // List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
-    tools: [
-      {
-        name: "read_note",
-        description: "Read the content of a note from the vault",
-        inputSchema: {
-          type: "object",
-          properties: {
-            note: {
-              type: "string",
-              description:
-                "Note name or path. Supports: 'Note Name', 'Note Name.md', 'knowledge/Note Name', 'memory://knowledge/Note Name'",
-            },
-          },
-          required: ["note"],
-        },
-      },
-      {
-        name: "get_frontmatter",
-        description: "Get the frontmatter metadata from a note",
-        inputSchema: {
-          type: "object",
-          properties: {
-            path: {
-              type: "string",
-              description: "Path to the note relative to vault root",
-            },
-          },
-          required: ["path"],
-        },
-      },
-      {
-        name: "update_frontmatter",
-        description: "Update frontmatter metadata in a note",
-        inputSchema: {
-          type: "object",
-          properties: {
-            path: {
-              type: "string",
-              description: "Path to the note relative to vault root",
-            },
-            updates: {
-              type: "object",
-              description: "Frontmatter fields to update",
-            },
-          },
-          required: ["path", "updates"],
-        },
-      },
-      {
-        name: "get_backlinks",
-        description: "Find all notes that link to a given note",
-        inputSchema: {
-          type: "object",
-          properties: {
-            noteName: {
-              type: "string",
-              description: "The note name (without .md extension)",
-            },
-            includePrivate: {
-              type: "boolean",
-              description: "Include links from private folder (default: false)",
-            },
-          },
-          required: ["noteName"],
-        },
-      },
-      {
-        name: "get_graph_neighborhood",
-        description:
-          "Explore notes connected to a note via wiki links (primary discovery tool)",
-        inputSchema: {
-          type: "object",
-          properties: {
-            noteName: {
-              type: "string",
-              description: "The note name to explore from",
-            },
-            depth: {
-              type: "number",
-              description:
-                "How many hops to explore (1-3 recommended, default: 2)",
-            },
-            includePrivate: {
-              type: "boolean",
-              description: "Include private folder notes (default: false)",
-            },
-          },
-          required: ["noteName"],
-        },
-      },
-      {
-        name: "get_note_usage",
-        description: "Get usage statistics for notes (for consolidation)",
-        inputSchema: {
-          type: "object",
-          properties: {
-            notes: {
-              type: "array",
-              items: { type: "string" },
-              description: "List of note names to get statistics for",
-            },
-            period: {
-              type: "string",
-              enum: ["24h", "7d", "30d", "all"],
-              description: "Time period for statistics (default: all)",
-            },
-          },
-          required: ["notes"],
-        },
-      },
-      {
-        name: "load_private_memory",
-        description:
-          "Load private memory indexes (requires explicit user consent)",
-        inputSchema: {
-          type: "object",
-          properties: {
-            reason: {
-              type: "string",
-              description: "Reason for loading private memory",
-            },
-          },
-          required: ["reason"],
-        },
-      },
-      {
-        name: "consolidate_memory",
-        description:
-          "Trigger memory consolidation (consolidate WorkingMemory.md into Index.md)",
-        inputSchema: {
-          type: "object",
-          properties: {
-            includePrivate: {
-              type: "boolean",
-              description:
-                "Include private notes in consolidation (default: false)",
-            },
-          },
-        },
-      },
-      {
-        name: "complete_consolidation",
-        description:
-          "Mark consolidation as complete (deletes WorkingMemory.md, releases lock)",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-    ],
+    tools: allTools.map((tool) => tool.definition),
   };
 });
 
@@ -335,335 +201,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    // Dispatch to tool handlers (using switch for type narrowing)
     switch (name) {
-      case "read_note": {
-        const { note } = args as { note: string };
+      case readNoteTool.name:
+        return await readNoteTool.handler(args, toolContext);
 
-        // Normalize the note reference
-        const notePath = normalizeNoteReference(note);
-        const noteNameOnly = extractNoteName(notePath);
+      case getFrontmatterTool.name:
+        return await getFrontmatterTool.handler(args, toolContext);
 
-        // Determine final path using smart lookup
-        let finalPath: string = notePath; // Default to provided path
+      case updateFrontmatterTool.name:
+        return await updateFrontmatterTool.handler(args, toolContext);
 
-        // If path includes a folder, use it directly
-        if (notePath.includes("/")) {
-          finalPath = notePath;
-        } else {
-          // Smart lookup: try common locations in priority order
-          const searchPaths = generateSearchPaths(noteNameOnly, false);
+      case getBacklinksTool.name:
+        return await getBacklinksTool.handler(args, toolContext);
 
-          let found = false;
-          // Try each path until we find one that exists
-          for (const searchPath of searchPaths) {
-            try {
-              await fileOps.readNote(searchPath);
-              finalPath = searchPath;
-              found = true;
-              break;
-            } catch {
-              // Continue to next path
-            }
-          }
+      case getGraphNeighborhoodTool.name:
+        return await getGraphNeighborhoodTool.handler(args, toolContext);
 
-          // Fall back to graph index if not found in standard paths
-          if (!found) {
-            const indexPath = graphIndex.getNotePath(noteNameOnly);
-            if (indexPath) {
-              finalPath = indexPath;
-            }
-          }
-        }
+      case getNoteUsageTool.name:
+        return await getNoteUsageTool.handler(args, toolContext);
 
-        // Read the note
-        const result = await fileOps.readNote(finalPath);
+      case loadPrivateMemoryTool.name:
+        return await loadPrivateMemoryTool.handler(args, toolContext);
 
-        // Log note access for usage statistics
-        memorySystem.logAccess(noteNameOnly, "read_note");
+      case consolidateMemoryTool.name:
+        return await consolidateMemoryTool.handler(args, toolContext);
 
-        // Build metadata
-        const metadata = {
-          noteName: noteNameOnly,
-          memoryUri: `memory://${finalPath}`,
-          filePath: `${vaultPath}/${finalPath}.md`,
-        };
-
-        // Build response with metadata first, then content
-        let response = `\`\`\`json\n${JSON.stringify(
-          metadata,
-          null,
-          2
-        )}\n\`\`\`\n\n`;
-
-        if (result.frontmatter) {
-          response += `---\nFrontmatter:\n${JSON.stringify(
-            result.frontmatter,
-            null,
-            2
-          )}\n---\n\n`;
-        }
-
-        response += result.content;
-
-        return {
-          content: [{ type: "text", text: response }],
-        };
-      }
-
-      case "get_frontmatter": {
-        const { path } = args as { path: string };
-        const frontmatter = await fileOps.getFrontmatter(path);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: frontmatter
-                ? JSON.stringify(frontmatter, null, 2)
-                : "No frontmatter found",
-            },
-          ],
-        };
-      }
-
-      case "update_frontmatter": {
-        const { path, updates } = args as {
-          path: string;
-          updates: Record<string, any>;
-        };
-
-        await fileOps.updateFrontmatter(path, updates);
-
-        return {
-          content: [{ type: "text", text: `Frontmatter updated: ${path}` }],
-        };
-      }
-
-      case "get_backlinks": {
-        const { noteName, includePrivate = false } = args as {
-          noteName: string;
-          includePrivate?: boolean;
-        };
-
-        // Resolve note name to actual path (handles duplicates)
-        const resolvedPath = resolveNoteNameToPath(noteName, includePrivate);
-        if (!resolvedPath) {
-          return {
-            content: [
-              { type: "text", text: `Note not found in graph: ${noteName}` },
-            ],
-          };
-        }
-
-        // Use the note name from the resolved path
-        const resolvedNoteName = extractNoteName(resolvedPath);
-        const backlinks = graphIndex.getBacklinks(resolvedNoteName, includePrivate);
-
-        if (backlinks.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No backlinks found for: ${resolvedNoteName} (${resolvedPath})`,
-              },
-            ],
-          };
-        }
-
-        // Build ResourceLinks for each backlink
-        const resourceLinks = backlinks.map((note) => {
-          const notePath = graphIndex.getNotePath(note) || note;
-          return {
-            type: "resource" as const,
-            resource: {
-              uri: `memory://${notePath}`,
-              name: note,
-              mimeType: "text/markdown",
-              description: `Links to [[${noteName}]]`,
-            },
-          };
-        });
-
-        // Also include a text summary
-        const summary = {
-          type: "text" as const,
-          text: `Found ${backlinks.length} backlink${
-            backlinks.length === 1 ? "" : "s"
-          } to "${noteName}"`,
-        };
-
-        return {
-          content: [summary, ...resourceLinks],
-        };
-      }
-
-      case "get_graph_neighborhood": {
-        const {
-          noteName,
-          depth = 2,
-          includePrivate = false,
-        } = args as {
-          noteName: string;
-          depth?: number;
-          includePrivate?: boolean;
-        };
-
-        // Resolve note name to actual path (handles duplicates)
-        const resolvedPath = resolveNoteNameToPath(noteName, includePrivate);
-        if (!resolvedPath) {
-          return {
-            content: [
-              { type: "text", text: `Note not found in graph: ${noteName}` },
-            ],
-          };
-        }
-
-        // Use the note name from the resolved path
-        const resolvedNoteName = extractNoteName(resolvedPath);
-        const neighborhood = graphIndex.getNeighborhood(
-          resolvedNoteName,
-          depth,
-          includePrivate
-        );
-
-        if (neighborhood.size === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No connected notes found for: ${resolvedNoteName} (${resolvedPath})`,
-              },
-            ],
-          };
-        }
-
-        // Build text summary
-        let summary = `Graph neighborhood for "${resolvedNoteName}" at ${resolvedPath} (depth: ${depth}):\n\n`;
-
-        // Build ResourceLinks grouped by distance
-        const resourceLinks: any[] = [];
-
-        for (let d = 1; d <= depth; d++) {
-          const notesAtDistance = Array.from(neighborhood.entries()).filter(
-            ([_, info]) => info.distance === d
-          );
-
-          if (notesAtDistance.length > 0) {
-            summary += `Distance ${d}: ${notesAtDistance.length} note${
-              notesAtDistance.length === 1 ? "" : "s"
-            }\n`;
-
-            for (const [note, info] of notesAtDistance) {
-              const notePath = graphIndex.getNotePath(note) || note;
-
-              // Build description with link information
-              let description = `${info.linkType} (distance ${d})`;
-              if (info.directLinks.length > 0) {
-                description += ` - Links to: ${info.directLinks.join(", ")}`;
-              }
-              if (info.backlinks.length > 0) {
-                description += ` - Linked from: ${info.backlinks.join(", ")}`;
-              }
-
-              resourceLinks.push({
-                type: "resource" as const,
-                resource: {
-                  uri: `memory://${notePath}`,
-                  name: note,
-                  mimeType: "text/markdown",
-                  description,
-                },
-              });
-            }
-          }
-        }
-
-        return {
-          content: [{ type: "text" as const, text: summary }, ...resourceLinks],
-        };
-      }
-
-      case "get_note_usage": {
-        const { notes, period = "all" } = args as {
-          notes: string[];
-          period?: "24h" | "7d" | "30d" | "all";
-        };
-
-        const stats = await memorySystem.getNoteUsage(notes, period);
-
-        // Add backlink counts from graph index
-        for (const note of notes) {
-          const backlinks = graphIndex.getBacklinks(note, false);
-          stats[note].backlinks = backlinks.length;
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(stats, null, 2),
-            },
-          ],
-        };
-      }
-
-      case "load_private_memory": {
-        const { reason } = args as { reason: string };
-
-        console.error(`[MemorySystem] Loading private memory: ${reason}`);
-
-        const { longTermIndex, workingMemory } =
-          await memorySystem.loadPrivateMemory();
-
-        let response = `# Private Memory Loaded\n\nReason: ${reason}\n\n`;
-
-        if (longTermIndex) {
-          response += `## Private Index.md\n\n${longTermIndex}\n\n`;
-        } else {
-          response += `## Private Index.md\n\nNo private Index.md found\n\n`;
-        }
-
-        if (workingMemory) {
-          response += `## Private WorkingMemory.md\n\n${workingMemory}\n\n`;
-        } else {
-          response += `## Private WorkingMemory.md\n\nNo private WorkingMemory.md found\n\n`;
-        }
-
-        return {
-          content: [{ type: "text", text: response }],
-        };
-      }
-
-      case "consolidate_memory": {
-        const { includePrivate = false } = args as { includePrivate?: boolean };
-
-        console.error(
-          `[Consolidation] Triggering consolidation (includePrivate: ${includePrivate})`
-        );
-
-        const prompt = await consolidationManager.triggerConsolidation(
-          includePrivate
-        );
-
-        return {
-          content: [{ type: "text", text: prompt }],
-        };
-      }
-
-      case "complete_consolidation": {
-        console.error("[Consolidation] Completing consolidation");
-
-        await consolidationManager.completeConsolidation();
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Consolidation complete! WorkingMemory.md deleted, Index.md reloaded.",
-            },
-          ],
-        };
-      }
+      case completeConsolidationTool.name:
+        return await completeConsolidationTool.handler(args, toolContext);
 
       default:
         throw new Error(`Unknown tool: ${name}`);
