@@ -1,0 +1,40 @@
+{
+  "name": "@obsidian-memory/mcp-server",
+  "version": "0.1.0",
+  "description": "Custom MCP server for Obsidian with graph-aware memory system",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "obsidian-memory-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "obsidian",
+    "model-context-protocol",
+    "knowledge-management"
+  ],
+  "author": "Michael Mullins",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@obsidian-memory/utils": "*",
+    "chokidar": "^4.0.3",
+    "gray-matter": "^4.0.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "obsidian-memory",
+  "version": "0.1.0",
+  "description": "Collection of tools for Obsidian integration including MCP server, utilities, and Claude Code plugin",
+  "type": "module",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build:utils && npm run build:mcp",
+    "dev": "npm run dev --workspaces --if-present",
+    "build:mcp": "npm run build --workspace=packages/mcp-server",
+    "build:utils": "npm run build --workspace=packages/utils",
+    "test": "npm run test --workspaces --if-present",
+    "clean": "rm -rf packages/*/dist"
+  },
+  "keywords": [
+    "obsidian",
+    "mcp",
+    "model-context-protocol",
+    "knowledge-management",
+    "claude-code"
+  ],
+  "author": "Michael Mullins",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
