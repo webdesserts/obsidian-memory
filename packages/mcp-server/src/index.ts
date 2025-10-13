@@ -8,17 +8,24 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
 import { FileOperations } from "./tools/file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ConsolidationManager } from "./memory/consolidation.js";
+import {
+  normalizeNoteReference,
+  extractNoteName,
+  generateSearchPaths,
+  resolveNotePath,
+} from "@obsidian-memory/utils";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
 const vaultPathIndex = args.indexOf("--vault-path");
 const vaultPath =
-  vaultPathIndex !== -1 ? args[vaultPathIndex + 1] : process.env.OBSIDIAN_VAULT_PATH;
+  vaultPathIndex !== -1
+    ? args[vaultPathIndex + 1]
+    : process.env.OBSIDIAN_VAULT_PATH;
 
 if (!vaultPath) {
   console.error("Error: Vault path is required.");
@@ -34,7 +41,23 @@ console.error(`[Server] Vault path: ${vaultPath}`);
 const fileOps = new FileOperations({ vaultPath });
 const graphIndex = new GraphIndex(vaultPath);
 const memorySystem = new MemorySystem(vaultPath, fileOps);
-const consolidationManager = new ConsolidationManager(memorySystem, fileOps, graphIndex);
+const consolidationManager = new ConsolidationManager(
+  memorySystem,
+  fileOps,
+  graphIndex
+);
+
+/**
+ * Resolve a note name to a specific path using the graph index
+ * Handles duplicate note names using priority-based resolution
+ */
+function resolveNoteNameToPath(
+  noteName: string,
+  includePrivate: boolean = false
+): string | undefined {
+  const availablePaths = graphIndex.getAllNotePaths(noteName);
+  return resolveNotePath(availablePaths, { includePrivate });
+}
 
 // Create server instance
 const server = new Server(
@@ -64,7 +87,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             note: {
               type: "string",
-              description: "Note name or path. Supports: 'Note Name', 'Note Name.md', 'knowledge/Note Name', 'memory://knowledge/Note Name'",
+              description:
+                "Note name or path. Supports: 'Note Name', 'Note Name.md', 'knowledge/Note Name', 'memory://knowledge/Note Name'",
             },
           },
           required: ["note"],
@@ -133,7 +157,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             depth: {
               type: "number",
-              description: "How many hops to explore (1-3 recommended, default: 2)",
+              description:
+                "How many hops to explore (1-3 recommended, default: 2)",
             },
             includePrivate: {
               type: "boolean",
@@ -187,7 +212,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             includePrivate: {
               type: "boolean",
-              description: "Include private notes in consolidation (default: false)",
+              description:
+                "Include private notes in consolidation (default: false)",
             },
           },
         },
@@ -212,25 +238,29 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
       {
         uri: "memory://Index",
         name: "Long-term Memory Index",
-        description: "Public long-term memory - stable entry points organized by domain",
+        description:
+          "Public long-term memory - stable entry points organized by domain",
         mimeType: "text/markdown",
       },
       {
         uri: "memory://WorkingMemory",
         name: "Working Memory",
-        description: "Public short-term memory - notes and discoveries from recent sessions",
+        description:
+          "Public short-term memory - notes and discoveries from recent sessions",
         mimeType: "text/markdown",
       },
       {
         uri: "memory://private/Index",
         name: "Private Long-term Memory Index",
-        description: "Personal and sensitive long-term memory. Contains private notes and information. Always ask for explicit user consent before reading this resource.",
+        description:
+          "Personal and sensitive long-term memory. Contains private notes and information. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
       },
       {
         uri: "memory://private/WorkingMemory",
         name: "Private Working Memory",
-        description: "Personal and sensitive short-term memory. Contains private notes from recent sessions. Always ask for explicit user consent before reading this resource.",
+        description:
+          "Personal and sensitive short-term memory. Contains private notes from recent sessions. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
       },
     ],
@@ -309,49 +339,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "read_note": {
         const { note } = args as { note: string };
 
-        // Normalize the note reference to a relative path
-        let notePath = note;
-
-        // Strip memory:// prefix if present
-        if (notePath.startsWith("memory://")) {
-          notePath = notePath.slice(9);
-        }
-
-        // Strip .md extension if present (we'll add it back)
-        if (notePath.endsWith(".md")) {
-          notePath = notePath.slice(0, -3);
-        }
+        // Normalize the note reference
+        const notePath = normalizeNoteReference(note);
+        const noteNameOnly = extractNoteName(notePath);
 
         // Determine final path using smart lookup
         let finalPath: string = notePath; // Default to provided path
-        const noteNameOnly = notePath.split("/").pop() || notePath;
 
         // If path includes a folder, use it directly
         if (notePath.includes("/")) {
           finalPath = notePath;
         } else {
-          // Try to find in graph index first
-          const indexPath = graphIndex.getNotePath(noteNameOnly);
+          // Smart lookup: try common locations in priority order
+          const searchPaths = generateSearchPaths(noteNameOnly, false);
 
-          if (indexPath) {
-            finalPath = indexPath;
-          } else {
-            // Smart lookup: try common folders in order
-            const searchPaths = [
-              `knowledge/${notePath}`,
-              `journal/${notePath}`,
-              notePath, // root
-            ];
+          let found = false;
+          // Try each path until we find one that exists
+          for (const searchPath of searchPaths) {
+            try {
+              await fileOps.readNote(searchPath);
+              finalPath = searchPath;
+              found = true;
+              break;
+            } catch {
+              // Continue to next path
+            }
+          }
 
-            // Try each path until we find one that exists
-            for (const searchPath of searchPaths) {
-              try {
-                await fileOps.readNote(searchPath);
-                finalPath = searchPath;
-                break;
-              } catch {
-                // Continue to next path
-              }
+          // Fall back to graph index if not found in standard paths
+          if (!found) {
+            const indexPath = graphIndex.getNotePath(noteNameOnly);
+            if (indexPath) {
+              finalPath = indexPath;
             }
           }
         }
@@ -370,10 +389,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         // Build response with metadata first, then content
-        let response = `\`\`\`json\n${JSON.stringify(metadata, null, 2)}\n\`\`\`\n\n`;
+        let response = `\`\`\`json\n${JSON.stringify(
+          metadata,
+          null,
+          2
+        )}\n\`\`\`\n\n`;
 
         if (result.frontmatter) {
-          response += `---\nFrontmatter:\n${JSON.stringify(result.frontmatter, null, 2)}\n---\n\n`;
+          response += `---\nFrontmatter:\n${JSON.stringify(
+            result.frontmatter,
+            null,
+            2
+          )}\n---\n\n`;
         }
 
         response += result.content;
@@ -418,11 +445,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           includePrivate?: boolean;
         };
 
-        const backlinks = graphIndex.getBacklinks(noteName, includePrivate);
+        // Resolve note name to actual path (handles duplicates)
+        const resolvedPath = resolveNoteNameToPath(noteName, includePrivate);
+        if (!resolvedPath) {
+          return {
+            content: [
+              { type: "text", text: `Note not found in graph: ${noteName}` },
+            ],
+          };
+        }
+
+        // Use the note name from the resolved path
+        const resolvedNoteName = extractNoteName(resolvedPath);
+        const backlinks = graphIndex.getBacklinks(resolvedNoteName, includePrivate);
 
         if (backlinks.length === 0) {
           return {
-            content: [{ type: "text", text: `No backlinks found for: ${noteName}` }],
+            content: [
+              {
+                type: "text",
+                text: `No backlinks found for: ${resolvedNoteName} (${resolvedPath})`,
+              },
+            ],
           };
         }
 
@@ -443,7 +487,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Also include a text summary
         const summary = {
           type: "text" as const,
-          text: `Found ${backlinks.length} backlink${backlinks.length === 1 ? "" : "s"} to "${noteName}"`,
+          text: `Found ${backlinks.length} backlink${
+            backlinks.length === 1 ? "" : "s"
+          } to "${noteName}"`,
         };
 
         return {
@@ -452,22 +498,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_graph_neighborhood": {
-        const { noteName, depth = 2, includePrivate = false } = args as {
+        const {
+          noteName,
+          depth = 2,
+          includePrivate = false,
+        } = args as {
           noteName: string;
           depth?: number;
           includePrivate?: boolean;
         };
 
-        const neighborhood = graphIndex.getNeighborhood(noteName, depth, includePrivate);
+        // Resolve note name to actual path (handles duplicates)
+        const resolvedPath = resolveNoteNameToPath(noteName, includePrivate);
+        if (!resolvedPath) {
+          return {
+            content: [
+              { type: "text", text: `Note not found in graph: ${noteName}` },
+            ],
+          };
+        }
+
+        // Use the note name from the resolved path
+        const resolvedNoteName = extractNoteName(resolvedPath);
+        const neighborhood = graphIndex.getNeighborhood(
+          resolvedNoteName,
+          depth,
+          includePrivate
+        );
 
         if (neighborhood.size === 0) {
           return {
-            content: [{ type: "text", text: `No connected notes found for: ${noteName}` }],
+            content: [
+              {
+                type: "text",
+                text: `No connected notes found for: ${resolvedNoteName} (${resolvedPath})`,
+              },
+            ],
           };
         }
 
         // Build text summary
-        let summary = `Graph neighborhood for "${noteName}" (depth: ${depth}):\n\n`;
+        let summary = `Graph neighborhood for "${resolvedNoteName}" at ${resolvedPath} (depth: ${depth}):\n\n`;
 
         // Build ResourceLinks grouped by distance
         const resourceLinks: any[] = [];
@@ -478,7 +549,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           );
 
           if (notesAtDistance.length > 0) {
-            summary += `Distance ${d}: ${notesAtDistance.length} note${notesAtDistance.length === 1 ? "" : "s"}\n`;
+            summary += `Distance ${d}: ${notesAtDistance.length} note${
+              notesAtDistance.length === 1 ? "" : "s"
+            }\n`;
 
             for (const [note, info] of notesAtDistance) {
               const notePath = graphIndex.getNotePath(note) || note;
@@ -506,10 +579,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         return {
-          content: [
-            { type: "text" as const, text: summary },
-            ...resourceLinks,
-          ],
+          content: [{ type: "text" as const, text: summary }, ...resourceLinks],
         };
       }
 
@@ -542,7 +612,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         console.error(`[MemorySystem] Loading private memory: ${reason}`);
 
-        const { longTermIndex, workingMemory } = await memorySystem.loadPrivateMemory();
+        const { longTermIndex, workingMemory } =
+          await memorySystem.loadPrivateMemory();
 
         let response = `# Private Memory Loaded\n\nReason: ${reason}\n\n`;
 
@@ -566,9 +637,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "consolidate_memory": {
         const { includePrivate = false } = args as { includePrivate?: boolean };
 
-        console.error(`[Consolidation] Triggering consolidation (includePrivate: ${includePrivate})`);
+        console.error(
+          `[Consolidation] Triggering consolidation (includePrivate: ${includePrivate})`
+        );
 
-        const prompt = await consolidationManager.triggerConsolidation(includePrivate);
+        const prompt = await consolidationManager.triggerConsolidation(
+          includePrivate
+        );
 
         return {
           content: [{ type: "text", text: prompt }],
@@ -581,7 +656,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         await consolidationManager.completeConsolidation();
 
         return {
-          content: [{ type: "text", text: "Consolidation complete! WorkingMemory.md deleted, Index.md reloaded." }],
+          content: [
+            {
+              type: "text",
+              text: "Consolidation complete! WorkingMemory.md deleted, Index.md reloaded.",
+            },
+          ],
         };
       }
 

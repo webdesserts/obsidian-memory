@@ -14,3 +14,14 @@ export { parseWikiLinks, extractLinkedNotes } from "./wiki-links.js";
 
 // Path utility exports
 export { validatePath, fileExists, ensureMarkdownExtension } from "./path.js";
+
+// Path resolution exports
+export type { PathResolutionOptions } from "./path-resolver.js";
+export {
+  resolveNotePath,
+  generateSearchPaths,
+  normalizeNoteReference,
+  extractNoteName,
+  DEFAULT_PRIORITY_ORDER,
+  COMMON_SEARCH_PATHS,
+} from "./path-resolver.js";

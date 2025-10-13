@@ -13,8 +13,8 @@ export class GraphIndex {
   // Map of note name -> list of notes that link to it
   private backlinks = new Map<string, Set<string>>();
 
-  // Map of note name -> relative file path (for ResourceLinks)
-  private notePaths = new Map<string, string>();
+  // Map of note name -> array of relative file paths (handles duplicate note names)
+  private notePaths = new Map<string, string[]>();
 
   // File watcher
   private watcher?: FSWatcher;
@@ -84,8 +84,12 @@ export class GraphIndex {
 
     const linkedNotes = extractLinkedNotes(content);
 
-    // Store note path (for ResourceLinks)
-    this.notePaths.set(noteName, relativePath.replace(/\.md$/, ""));
+    // Store note path (for ResourceLinks) - append to array to handle duplicates
+    const pathWithoutExt = relativePath.replace(/\.md$/, "");
+    const existingPaths = this.notePaths.get(noteName) || [];
+    if (!existingPaths.includes(pathWithoutExt)) {
+      this.notePaths.set(noteName, [...existingPaths, pathWithoutExt]);
+    }
 
     // Clear existing forward links for this note
     const oldLinks = this.forwardLinks.get(noteName);
@@ -163,10 +167,38 @@ export class GraphIndex {
   }
 
   /**
+   * Get all relative paths for a note (without .md extension)
+   * Returns all paths if there are duplicates
+   */
+  getAllNotePaths(noteName: string): string[] {
+    return this.notePaths.get(noteName) || [];
+  }
+
+  /**
    * Get relative path for a note (without .md extension)
+   * Uses priority order: root → knowledge/ → journal/ → others → private/
    */
   getNotePath(noteName: string): string | undefined {
-    return this.notePaths.get(noteName);
+    const paths = this.notePaths.get(noteName);
+    if (!paths || paths.length === 0) return undefined;
+    if (paths.length === 1) return paths[0];
+
+    // Priority order for disambiguation
+    const priorityOrder = [
+      (p: string) => !p.includes("/"), // Root level first
+      (p: string) => p.startsWith("knowledge/"),
+      (p: string) => p.startsWith("journal/"),
+      (p: string) => !p.startsWith("private/"), // Non-private before private
+      () => true, // Any remaining (including private)
+    ];
+
+    for (const predicate of priorityOrder) {
+      const match = paths.find(predicate);
+      if (match) return match;
+    }
+
+    // Fallback to first path (shouldn't reach here)
+    return paths[0];
   }
 
   /**
