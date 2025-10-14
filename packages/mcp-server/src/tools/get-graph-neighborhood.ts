@@ -1,54 +1,30 @@
-import { MCPTool, ToolContext, ToolResponseContent } from "./types.js";
+import { z } from "zod";
+import { ToolContext, ToolResponseContent, MCPTool } from "./types.js";
 import { extractNoteName } from "@obsidian-memory/utils";
 
-/**
- * Type guard for get_graph_neighborhood args
- */
-function isGetGraphNeighborhoodArgs(
-  args: unknown
-): args is { noteName: string; depth?: number; includePrivate?: boolean } {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "noteName" in args &&
-    typeof (args as { noteName: unknown }).noteName === "string"
-  );
-}
+const Args = z.object({
+  noteName: z.string().describe("The note name to explore from"),
+  depth: z
+    .number()
+    .optional()
+    .describe("How many hops to explore (1-3 recommended, default: 2)"),
+  includePrivate: z
+    .boolean()
+    .optional()
+    .describe("Include private folder notes (default: false)"),
+});
+type Args = z.infer<typeof Args>;
 
-export const getGraphNeighborhoodTool = {
-  name: "get_graph_neighborhood",
-
+export const getGraphNeighborhood = {
   definition: {
     name: "get_graph_neighborhood",
     description:
       "Explore notes connected to a note via wiki links (primary discovery tool)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        noteName: {
-          type: "string",
-          description: "The note name to explore from",
-        },
-        depth: {
-          type: "number",
-          description:
-            "How many hops to explore (1-3 recommended, default: 2)",
-        },
-        includePrivate: {
-          type: "boolean",
-          description: "Include private folder notes (default: false)",
-        },
-      },
-      required: ["noteName"],
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isGetGraphNeighborhoodArgs(args)) {
-      throw new Error("Invalid arguments: noteName is required");
-    }
-
-    const { noteName, depth = 2, includePrivate = false } = args;
+    const { noteName, depth = 2, includePrivate = false } = Args.parse(args);
     const { graphIndex, resolveNoteNameToPath } = context;
 
     // Resolve note name to actual path (handles duplicates)

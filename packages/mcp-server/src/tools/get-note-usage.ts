@@ -1,52 +1,24 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 
-/**
- * Type guard for get_note_usage args
- */
-function isGetNoteUsageArgs(
-  args: unknown
-): args is { notes: string[]; period?: "24h" | "7d" | "30d" | "all" } {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "notes" in args &&
-    Array.isArray((args as { notes: unknown }).notes) &&
-    (args as { notes: unknown[] }).notes.every(
-      (note) => typeof note === "string"
-    )
-  );
-}
+const Args = z.object({
+  notes: z.array(z.string()).describe("List of note names to get statistics for"),
+  period: z
+    .enum(["24h", "7d", "30d", "all"])
+    .optional()
+    .describe("Time period for statistics (default: all)"),
+});
+type Args = z.infer<typeof Args>;
 
-export const getNoteUsageTool = {
-  name: "get_note_usage",
-
+export const getNoteUsage = {
   definition: {
     name: "get_note_usage",
     description: "Get usage statistics for notes (for consolidation)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        notes: {
-          type: "array",
-          items: { type: "string" },
-          description: "List of note names to get statistics for",
-        },
-        period: {
-          type: "string",
-          enum: ["24h", "7d", "30d", "all"],
-          description: "Time period for statistics (default: all)",
-        },
-      },
-      required: ["notes"],
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isGetNoteUsageArgs(args)) {
-      throw new Error("Invalid arguments: notes array is required");
-    }
-
-    const { notes, period = "all" } = args;
+    const { notes, period = "all" } = Args.parse(args);
     const { memorySystem, graphIndex } = context;
 
     const stats = await memorySystem.getNoteUsage(notes, period);

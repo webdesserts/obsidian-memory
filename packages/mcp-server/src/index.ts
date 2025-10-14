@@ -13,16 +13,8 @@ import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ConsolidationManager } from "./memory/consolidation.js";
 import { resolveNotePath } from "@obsidian-memory/utils";
-import { allTools, ToolContext } from "./tools/index.js";
-import { readNoteTool } from "./tools/read-note.js";
-import { getFrontmatterTool } from "./tools/get-frontmatter.js";
-import { updateFrontmatterTool } from "./tools/update-frontmatter.js";
-import { getBacklinksTool } from "./tools/get-backlinks.js";
-import { getGraphNeighborhoodTool } from "./tools/get-graph-neighborhood.js";
-import { getNoteUsageTool } from "./tools/get-note-usage.js";
-import { loadPrivateMemoryTool } from "./tools/load-private-memory.js";
-import { consolidateMemoryTool } from "./tools/consolidate-memory.js";
-import { completeConsolidationTool } from "./tools/complete-consolidation.js";
+import { allTools } from "./tools/index.js";
+import { ToolContext } from "./tools/types.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -198,41 +190,14 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: args = {} } = request.params;
 
   try {
-    // Dispatch to tool handlers (using switch for type narrowing)
-    switch (name) {
-      case readNoteTool.name:
-        return await readNoteTool.handler(args, toolContext);
+    const tool = allTools.find((tool) => tool.definition.name === name);
 
-      case getFrontmatterTool.name:
-        return await getFrontmatterTool.handler(args, toolContext);
+    if (!tool) throw new Error(`Tool not found: ${name}`);
 
-      case updateFrontmatterTool.name:
-        return await updateFrontmatterTool.handler(args, toolContext);
-
-      case getBacklinksTool.name:
-        return await getBacklinksTool.handler(args, toolContext);
-
-      case getGraphNeighborhoodTool.name:
-        return await getGraphNeighborhoodTool.handler(args, toolContext);
-
-      case getNoteUsageTool.name:
-        return await getNoteUsageTool.handler(args, toolContext);
-
-      case loadPrivateMemoryTool.name:
-        return await loadPrivateMemoryTool.handler(args, toolContext);
-
-      case consolidateMemoryTool.name:
-        return await consolidateMemoryTool.handler(args, toolContext);
-
-      case completeConsolidationTool.name:
-        return await completeConsolidationTool.handler(args, toolContext);
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
-    }
+    return tool.handler(args, toolContext);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     return {

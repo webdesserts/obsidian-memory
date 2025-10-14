@@ -1,45 +1,24 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 
-/**
- * Type guard for consolidate_memory args
- */
-function isConsolidateMemoryArgs(
-  args: unknown
-): args is { includePrivate?: boolean } {
-  // includePrivate is optional, so we just need to check if args is an object
-  return typeof args === "object" && args !== null;
-}
+const Args = z.object({
+  includePrivate: z
+    .boolean()
+    .optional()
+    .describe("Include private notes in consolidation (default: false)"),
+});
+type Args = z.infer<typeof Args>;
 
-export const consolidateMemoryTool = {
-  name: "consolidate_memory",
-
+export const consolidateMemory = {
   definition: {
     name: "consolidate_memory",
     description:
       "Trigger memory consolidation (consolidate WorkingMemory.md into Index.md)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        includePrivate: {
-          type: "boolean",
-          description:
-            "Include private notes in consolidation (default: false)",
-        },
-      },
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isConsolidateMemoryArgs(args)) {
-      throw new Error("Invalid arguments");
-    }
-
-    const includePrivate =
-      "includePrivate" in args &&
-      typeof args.includePrivate === "boolean"
-        ? args.includePrivate
-        : false;
-
+    const { includePrivate = false } = Args.parse(args);
     const { consolidationManager } = context;
 
     console.error(

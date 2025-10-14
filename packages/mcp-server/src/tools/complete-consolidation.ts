@@ -1,16 +1,15 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 
-export const completeConsolidationTool = {
-  name: "complete_consolidation",
+const Args = z.object({});
+type Args = z.infer<typeof Args>;
 
+export const completeConsolidation = {
   definition: {
     name: "complete_consolidation",
     description:
       "Mark consolidation as complete (deletes WorkingMemory.md, releases lock)",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(_args: unknown, context: ToolContext) {

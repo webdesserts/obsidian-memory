@@ -1,42 +1,20 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 
-/**
- * Type guard for load_private_memory args
- */
-function isLoadPrivateMemoryArgs(args: unknown): args is { reason: string } {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "reason" in args &&
-    typeof (args as { reason: unknown }).reason === "string"
-  );
-}
+const Args = z.object({
+  reason: z.string().describe("Reason for loading private memory"),
+});
+type Args = z.infer<typeof Args>;
 
-export const loadPrivateMemoryTool = {
-  name: "load_private_memory",
-
+export const loadPrivateMemory = {
   definition: {
     name: "load_private_memory",
-    description:
-      "Load private memory indexes (requires explicit user consent)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        reason: {
-          type: "string",
-          description: "Reason for loading private memory",
-        },
-      },
-      required: ["reason"],
-    },
+    description: "Load private memory indexes (requires explicit user consent)",
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isLoadPrivateMemoryArgs(args)) {
-      throw new Error("Invalid arguments: reason is required");
-    }
-
-    const { reason } = args;
+    const { reason } = Args.parse(args);
     const { memorySystem } = context;
 
     console.error(`[MemorySystem] Loading private memory: ${reason}`);

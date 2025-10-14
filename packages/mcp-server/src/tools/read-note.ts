@@ -1,47 +1,27 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 import {
   normalizeNoteReference,
   extractNoteName,
   generateSearchPaths,
 } from "@obsidian-memory/utils";
 
-/**
- * Type guard for read_note args
- */
-function isReadNoteArgs(args: unknown): args is { note: string } {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "note" in args &&
-    typeof (args as { note: unknown }).note === "string"
-  );
-}
+const Args = z.object({
+  note: z.string().describe(
+    "Note name or path. Supports: 'Note Name', 'Note Name.md', 'knowledge/Note Name', 'memory://knowledge/Note Name'"
+  ),
+});
+type Args = z.infer<typeof Args>;
 
-export const readNoteTool = {
-  name: "read_note",
-
+export const readNote = {
   definition: {
     name: "read_note",
     description: "Read the content of a note from the vault",
-    inputSchema: {
-      type: "object",
-      properties: {
-        note: {
-          type: "string",
-          description:
-            "Note name or path. Supports: 'Note Name', 'Note Name.md', 'knowledge/Note Name', 'memory://knowledge/Note Name'",
-        },
-      },
-      required: ["note"],
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isReadNoteArgs(args)) {
-      throw new Error("Invalid arguments: note is required");
-    }
-
-    const { note } = args;
+    const { note } = Args.parse(args);
     const { fileOps, graphIndex, memorySystem, vaultPath } = context;
 
     // Normalize the note reference

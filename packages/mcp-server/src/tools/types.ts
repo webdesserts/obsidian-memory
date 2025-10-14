@@ -2,10 +2,13 @@
  * Type definitions for MCP tools
  */
 
+import { z, ZodJSONSchema } from "zod";
 import { FileOperations } from "../file-operations.js";
 import { GraphIndex } from "../graph/graph-index.js";
 import { MemorySystem } from "../memory/memory-system.js";
 import { ConsolidationManager } from "../memory/consolidation.js";
+import { JSONSchema } from "zod/v4/core";
+import { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 
 /**
  * Context passed to all tool handlers
@@ -25,10 +28,10 @@ export interface ToolContext {
 
 /**
  * Tool handler function signature
- * Args are unknown and must be validated with type guards
+ * Args are validated by Zod schema and typed accordingly
  */
-export type ToolHandler = (
-  args: unknown,
+export type ToolHandler<TArgs extends z.ZodTypeAny> = (
+  args: z.infer<TArgs>,
   context: ToolContext
 ) => Promise<ToolResponse>;
 
@@ -63,18 +66,13 @@ export interface ResourceLink {
 export interface ToolDefinition {
   name: string;
   description: string;
-  inputSchema: {
-    type: "object";
-    properties: Record<string, unknown>;
-    required?: string[];
-  };
+  inputSchema: JSONSchema.BaseSchema;
 }
 
 /**
- * Complete MCP tool specification
+ * Complete MCP tool specification with Zod schema
  */
 export interface MCPTool {
-  name: string;
   definition: ToolDefinition;
-  handler: ToolHandler;
+  handler: (args: unknown, context: ToolContext) => Promise<ToolResponse>;
 }

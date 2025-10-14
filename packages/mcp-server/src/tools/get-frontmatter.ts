@@ -1,41 +1,20 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 
-/**
- * Type guard for get_frontmatter args
- */
-function isGetFrontmatterArgs(args: unknown): args is { path: string } {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "path" in args &&
-    typeof (args as { path: unknown }).path === "string"
-  );
-}
+const Args = z.object({
+  path: z.string().describe("Path to the note relative to vault root"),
+});
+type Args = z.infer<typeof Args>;
 
-export const getFrontmatterTool = {
-  name: "get_frontmatter",
-
+export const getFrontmatter = {
   definition: {
     name: "get_frontmatter",
     description: "Get the frontmatter metadata from a note",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "Path to the note relative to vault root",
-        },
-      },
-      required: ["path"],
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isGetFrontmatterArgs(args)) {
-      throw new Error("Invalid arguments: path is required");
-    }
-
-    const { path } = args;
+    const { path } = Args.parse(args);
     const { fileOps } = context;
 
     const frontmatter = await fileOps.getFrontmatter(path);

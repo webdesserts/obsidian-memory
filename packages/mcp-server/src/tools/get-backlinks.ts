@@ -1,48 +1,25 @@
-import { MCPTool, ToolContext } from "./types.js";
+import { z } from "zod";
+import { ToolContext, MCPTool } from "./types.js";
 import { extractNoteName } from "@obsidian-memory/utils";
 
-/**
- * Type guard for get_backlinks args
- */
-function isGetBacklinksArgs(
-  args: unknown
-): args is { noteName: string; includePrivate?: boolean } {
-  return (
-    typeof args === "object" &&
-    args !== null &&
-    "noteName" in args &&
-    typeof (args as { noteName: unknown }).noteName === "string"
-  );
-}
+const Args = z.object({
+  noteName: z.string().describe("The note name (without .md extension)"),
+  includePrivate: z
+    .boolean()
+    .optional()
+    .describe("Include links from private folder (default: false)"),
+});
+type Args = z.infer<typeof Args>;
 
-export const getBacklinksTool = {
-  name: "get_backlinks",
-
+export const getBacklinks = {
   definition: {
     name: "get_backlinks",
     description: "Find all notes that link to a given note",
-    inputSchema: {
-      type: "object",
-      properties: {
-        noteName: {
-          type: "string",
-          description: "The note name (without .md extension)",
-        },
-        includePrivate: {
-          type: "boolean",
-          description: "Include links from private folder (default: false)",
-        },
-      },
-      required: ["noteName"],
-    },
+    inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    if (!isGetBacklinksArgs(args)) {
-      throw new Error("Invalid arguments: noteName is required");
-    }
-
-    const { noteName, includePrivate = false } = args;
+    const { noteName, includePrivate = false } = Args.parse(args);
     const { graphIndex, resolveNoteNameToPath } = context;
 
     // Resolve note name to actual path (handles duplicates)
