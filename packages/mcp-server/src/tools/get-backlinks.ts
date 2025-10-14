@@ -51,13 +51,11 @@ export const getBacklinks = {
     const resourceLinks = backlinks.map((note) => {
       const notePath = graphIndex.getNotePath(note) || note;
       return {
-        type: "resource" as const,
-        resource: {
-          uri: `memory://${notePath}`,
-          name: note,
-          mimeType: "text/markdown",
-          description: `Links to [[${noteName}]]`,
-        },
+        type: "resource_link" as const,
+        uri: `memory://${notePath}`,
+        name: note,
+        mimeType: "text/markdown",
+        description: `Links to [[${noteName}]]`,
       };
     });
 

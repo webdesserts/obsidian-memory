@@ -85,13 +85,11 @@ export const getGraphNeighborhood = {
           }
 
           resourceLinks.push({
-            type: "resource",
-            resource: {
-              uri: `memory://${notePath}`,
-              name: note,
-              mimeType: "text/markdown",
-              description,
-            },
+            type: "resource_link",
+            uri: `memory://${notePath}`,
+            name: note,
+            mimeType: "text/markdown",
+            description,
           });
         }
       }

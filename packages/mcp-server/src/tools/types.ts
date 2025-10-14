@@ -48,7 +48,13 @@ export interface ToolResponse {
  */
 export type ToolResponseContent =
   | { type: "text"; text: string }
-  | { type: "resource"; resource: ResourceLink };
+  | {
+      type: "resource_link";
+      uri: string;
+      name: string;
+      mimeType: string;
+      description?: string;
+    };
 
 /**
  * Resource link for MCP
