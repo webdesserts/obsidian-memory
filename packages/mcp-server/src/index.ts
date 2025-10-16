@@ -8,6 +8,7 @@ import {
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
+  ListRootsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
@@ -84,9 +85,24 @@ const server = new Server(
       resources: {
         subscribe: true,
       },
+      roots: {
+        listChanged: false,
+      },
     },
   }
 );
+
+// List roots
+server.setRequestHandler(ListRootsRequestSchema, async () => {
+  return {
+    roots: [
+      {
+        uri: `file://${vaultPath}`,
+        name: vaultName,
+      },
+    ],
+  };
+});
 
 // List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
