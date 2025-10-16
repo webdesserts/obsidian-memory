@@ -12,7 +12,11 @@ export class FileOperations {
   /**
    * Read note content with optional frontmatter parsing
    */
-  async readNote(relativePath: string): Promise<{ content: string; frontmatter?: any }> {
+  async readNote(relativePath: string): Promise<{
+    content: string;
+    rawContent: string;
+    frontmatter?: any;
+  }> {
     const notePath = ensureMarkdownExtension(relativePath);
     const absolutePath = validatePath(this.config.vaultPath, notePath);
 
@@ -25,6 +29,7 @@ export class FileOperations {
 
     return {
       content: parsed.content,
+      rawContent: fileContent,
       frontmatter: Object.keys(parsed.data).length > 0 ? parsed.data : undefined,
     };
   }

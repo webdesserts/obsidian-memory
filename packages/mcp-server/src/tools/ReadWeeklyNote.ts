@@ -17,18 +17,15 @@ export const ReadWeeklyNote = {
 
   async handler(args: unknown, context: ToolContext) {
     Args.parse(args);
-    const { fileOps, vaultPath, vaultName, memorySystem } = context;
 
-    // Get current weekly note path
-    const weeklyNotePath = getCurrentWeeklyNotePath();
+    // Get current weekly note URI and current day
+    const weeklyNoteRef = getCurrentWeeklyNotePath();
     const currentDay = getCurrentDayOfWeek();
 
     // Read note and build resource response
     const response = await readNoteResource({
-      notePath: weeklyNotePath,
-      vaultName,
-      vaultPath,
-      fileOps,
+      noteRef: weeklyNoteRef,
+      context,
       annotations: {
         priority: 1.0, // High priority - user's active work hub
       },
@@ -36,7 +33,9 @@ export const ReadWeeklyNote = {
 
     // Log access for usage statistics (if it exists)
     if (response.structuredContent?.exists) {
-      memorySystem.logAccess(weeklyNotePath, "ReadWeeklyNote");
+      // Extract path from memory: URI for logging
+      const url = new URL(weeklyNoteRef);
+      context.memorySystem.logAccess(url.pathname, "ReadWeeklyNote");
     }
 
     // Add current day to structured content

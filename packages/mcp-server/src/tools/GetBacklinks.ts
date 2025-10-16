@@ -52,7 +52,7 @@ export const GetBacklinks = {
       const notePath = graphIndex.getNotePath(note) || note;
       return {
         type: "resource_link" as const,
-        uri: `memory://${notePath}`,
+        uri: `memory:${notePath}`,
         name: note,
         mimeType: "text/markdown",
         description: `Links to [[${noteName}]]`,

@@ -100,7 +100,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   return {
     resources: [
       {
-        uri: "memory://Index",
+        uri: "memory:Index",
         name: "Long-term Memory Index",
         description:
           "Public long-term memory - stable entry points organized by domain",
@@ -111,7 +111,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
       },
       {
-        uri: "memory://WorkingMemory",
+        uri: "memory:WorkingMemory",
         name: "Working Memory",
         description:
           "Public short-term memory - notes and discoveries from recent sessions",
@@ -122,7 +122,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
       },
       {
-        uri: "memory://private/Index",
+        uri: "memory:private/Index",
         name: "Private Long-term Memory Index",
         description:
           "Personal and sensitive long-term memory. Contains private notes and information. Always ask for explicit user consent before reading this resource.",
@@ -133,7 +133,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
       },
       {
-        uri: "memory://private/WorkingMemory",
+        uri: "memory:private/WorkingMemory",
         name: "Private Working Memory",
         description:
           "Personal and sensitive short-term memory. Contains private notes from recent sessions. Always ask for explicit user consent before reading this resource.",
@@ -152,12 +152,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri;
 
   try {
-    // Parse memory:// URI
-    if (!uri.startsWith("memory://")) {
+    // Parse memory: URI
+    if (!uri.startsWith("memory:")) {
       throw new Error(`Unsupported URI scheme: ${uri}`);
     }
 
-    const resourcePath = uri.slice(9); // Remove "memory://"
+    const url = new URL(uri);
+    const resourcePath = url.pathname;
 
     let content: string;
     let exists = true;

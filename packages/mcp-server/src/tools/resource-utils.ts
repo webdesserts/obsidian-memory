@@ -2,9 +2,16 @@
  * Utilities for building MCP resource responses from note data
  */
 
-import { ToolResponse } from "./types.js";
+import { ToolResponse, ToolContext } from "./types.js";
 import { FileOperations } from "../file-operations.js";
-import { extractNoteName } from "@obsidian-memory/utils";
+import {
+  extractNoteName,
+  normalizeNoteReference,
+  generateSearchPaths,
+  validatePath,
+  fileExists,
+  ensureMarkdownExtension,
+} from "@obsidian-memory/utils";
 
 export interface ResourceAnnotations {
   /** Intended audience for the resource */
@@ -13,45 +20,92 @@ export interface ResourceAnnotations {
   priority?: number;
 }
 
+export interface ResolveNotePathOptions {
+  /** Note reference (supports: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]") */
+  noteRef: string;
+  /** Tool context for vault access */
+  context: Pick<ToolContext, "vaultPath" | "graphIndex">;
+}
+
 export interface ReadNoteResourceOptions {
-  /** Relative path within vault (e.g., "knowledge/Note Name") */
-  notePath: string;
-  /** Vault name for obsidian:// URI */
-  vaultName: string;
-  /** Absolute vault path */
-  vaultPath: string;
-  /** File operations instance */
-  fileOps: FileOperations;
+  /** Note reference (supports: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]") */
+  noteRef: string;
+  /** Tool context for vault access */
+  context: ToolContext;
   /** Custom annotations (default: audience both, priority 0.5) */
   annotations?: ResourceAnnotations;
 }
 
 /**
+ * Resolve a note reference to a vault-relative path
+ * Handles smart lookup across common locations and graph index
+ */
+export async function resolveNotePath(
+  options: ResolveNotePathOptions
+): Promise<string> {
+  const { noteRef, context } = options;
+  const { vaultPath, graphIndex } = context;
+
+  // If it's a memory: URI, extract the pathname
+  if (noteRef.startsWith("memory:")) {
+    const url = new URL(noteRef);
+    return url.pathname;
+  }
+
+  // Normalize the note reference (handles [[Note]], paths, etc.)
+  const notePath = normalizeNoteReference(noteRef);
+  const noteNameOnly = extractNoteName(notePath);
+
+  // If path includes a folder, use it directly
+  if (notePath.includes("/")) {
+    return notePath;
+  }
+
+  // Smart lookup: try common locations in priority order
+  const searchPaths = generateSearchPaths(noteNameOnly, false);
+
+  for (const searchPath of searchPaths) {
+    const notePathWithExt = ensureMarkdownExtension(searchPath);
+    const absolutePath = validatePath(vaultPath, notePathWithExt);
+
+    if (await fileExists(absolutePath)) {
+      return searchPath;
+    }
+  }
+
+  // Fall back to graph index if not found in standard paths
+  const indexPath = graphIndex.getNotePath(noteNameOnly);
+  if (indexPath) {
+    return indexPath;
+  }
+
+  // Return the original path if nothing found (will handle as non-existent)
+  return notePath;
+}
+
+/**
  * Read a note and build a standardized MCP tool response with embedded resource
- * Handles the complete flow: read file -> parse -> build response
+ * Handles the complete flow: resolve path -> read file -> parse -> build response
  */
 export async function readNoteResource(
   options: ReadNoteResourceOptions
 ): Promise<ToolResponse> {
-  const {
-    notePath,
-    vaultName,
-    vaultPath,
-    fileOps,
-    annotations = {},
-  } = options;
+  const { noteRef, context, annotations = {} } = options;
+  const { vaultName, vaultPath, fileOps } = context;
 
+  // Resolve the note reference to a vault-relative path
+  const notePath = await resolveNotePath({ noteRef, context });
   const noteName = extractNoteName(notePath);
 
   // Try to read the note
   let exists = false;
-  let content = "";
+  let rawContent = "";
   let frontmatter: Record<string, unknown> | undefined;
 
   try {
     const result = await fileOps.readNote(notePath);
     exists = true;
-    content = result.content;
+    rawContent = result.rawContent;
     frontmatter = result.frontmatter;
   } catch (error) {
     // Note doesn't exist - leave exists as false
@@ -80,10 +134,10 @@ export async function readNoteResource(
       {
         type: "resource",
         resource: {
-          uri: `memory://${notePath}`,
+          uri: `memory:${notePath}`,
           title: noteName,
           mimeType: "text/markdown",
-          text: exists ? content : null,
+          text: exists ? rawContent : null,
           annotations: {
             audience: annotations.audience ?? ["user", "assistant"],
             priority: annotations.priority ?? 0.5,

@@ -86,7 +86,7 @@ export const GetGraphNeighborhood = {
 
           resourceLinks.push({
             type: "resource_link",
-            uri: `memory://${notePath}`,
+            uri: `memory:${notePath}`,
             name: note,
             mimeType: "text/markdown",
             description,

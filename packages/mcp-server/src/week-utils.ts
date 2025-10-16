@@ -30,14 +30,14 @@ function getISOWeekYear(date: Date): number {
 }
 
 /**
- * Get the current weekly note path
- * Format: journal/YYYY-wWW.md (e.g., journal/2025-w42.md)
+ * Get the current weekly note URI
+ * Format: memory:journal/YYYY-wWW (e.g., memory:journal/2025-w42)
  */
 export function getCurrentWeeklyNotePath(): string {
   const now = new Date();
   const year = getISOWeekYear(now);
   const week = getISOWeek(now);
-  return `journal/${year}-w${String(week).padStart(2, '0')}`;
+  return `memory:journal/${year}-w${String(week).padStart(2, '0')}`;
 }
 
 /**
