@@ -9,9 +9,9 @@ const Args = z.object({
 });
 type Args = z.infer<typeof Args>;
 
-export const consolidateMemory = {
+export const ConsolidateMemory = {
   definition: {
-    name: "consolidate_memory",
+    name: "ConsolidateMemory",
     description:
       "Trigger memory consolidation (consolidate WorkingMemory.md into Index.md)",
     inputSchema: z.toJSONSchema(Args),

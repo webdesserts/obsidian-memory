@@ -15,9 +15,9 @@ const Args = z.object({
 });
 type Args = z.infer<typeof Args>;
 
-export const getGraphNeighborhood = {
+export const GetGraphNeighborhood = {
   definition: {
-    name: "get_graph_neighborhood",
+    name: "GetGraphNeighborhood",
     description:
       "Explore notes connected to a note via wiki links (primary discovery tool)",
     inputSchema: z.toJSONSchema(Args),

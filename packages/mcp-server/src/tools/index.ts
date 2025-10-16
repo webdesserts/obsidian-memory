@@ -3,15 +3,15 @@
  */
 
 import { MCPTool } from "./types.js";
-import { readNote } from "./read-note.js";
-import { getFrontmatter } from "./get-frontmatter.js";
-import { updateFrontmatter } from "./update-frontmatter.js";
-import { getBacklinks } from "./get-backlinks.js";
-import { getGraphNeighborhood } from "./get-graph-neighborhood.js";
-import { getNoteUsage } from "./get-note-usage.js";
-import { loadPrivateMemory } from "./load-private-memory.js";
-import { consolidateMemory } from "./consolidate-memory.js";
-import { completeConsolidation } from "./complete-consolidation.js";
+import { ReadNote } from "./ReadNote.js";
+import { GetFrontmatter } from "./GetFrontmatter.js";
+import { UpdateFrontmatter } from "./UpdateFrontmatter.js";
+import { GetBacklinks } from "./GetBacklinks.js";
+import { GetGraphNeighborhood } from "./GetGraphNeighborhood.js";
+import { GetNoteUsage } from "./GetNoteUsage.js";
+import { LoadPrivateMemory } from "./LoadPrivateMemory.js";
+import { ConsolidateMemory } from "./ConsolidateMemory.js";
+import { CompleteConsolidation } from "./CompleteConsolidation.js";
 import type { JSONSchema } from "zod/v4/core";
 
 /**
@@ -19,13 +19,13 @@ import type { JSONSchema } from "zod/v4/core";
  * Add new tools here to register them with the MCP server
  */
 export const allTools = [
-  readNote,
-  getFrontmatter,
-  updateFrontmatter,
-  getBacklinks,
-  getGraphNeighborhood,
-  getNoteUsage,
-  loadPrivateMemory,
-  consolidateMemory,
-  completeConsolidation,
+  ReadNote,
+  GetFrontmatter,
+  UpdateFrontmatter,
+  GetBacklinks,
+  GetGraphNeighborhood,
+  GetNoteUsage,
+  LoadPrivateMemory,
+  ConsolidateMemory,
+  CompleteConsolidation,
 ] as const;

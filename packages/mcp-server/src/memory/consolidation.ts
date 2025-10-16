@@ -109,11 +109,11 @@ ${workingMemoryMd || "*(No WorkingMemory.md exists yet)*"}
 
 ## Tools Available
 
-- \`get_note_usage(notes, period)\` - Query access statistics
-- \`get_backlinks(note)\` - Find what links to a note
-- \`get_graph_neighborhood(note, depth)\` - Explore connections
-- \`write_note()\` - Write the new Index.md
-- \`update_frontmatter()\` - Update Index.md frontmatter
+- \`GetNoteUsage(notes, period)\` - Query access statistics
+- \`GetBacklinks(note)\` - Find what links to a note
+- \`GetGraphNeighborhood(note, depth)\` - Explore connections
+- \`Write()\` - Write the new Index.md
+- \`UpdateFrontmatter()\` - Update Index.md frontmatter
 
 ## Output Format
 

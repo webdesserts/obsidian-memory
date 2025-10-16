@@ -6,9 +6,9 @@ const Args = z.object({
 });
 type Args = z.infer<typeof Args>;
 
-export const loadPrivateMemory = {
+export const LoadPrivateMemory = {
   definition: {
-    name: "load_private_memory",
+    name: "LoadPrivateMemory",
     description: "Load private memory indexes (requires explicit user consent)",
     inputSchema: z.toJSONSchema(Args),
   },

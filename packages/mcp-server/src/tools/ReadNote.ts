@@ -13,9 +13,9 @@ const Args = z.object({
 });
 type Args = z.infer<typeof Args>;
 
-export const readNote = {
+export const ReadNote = {
   definition: {
-    name: "read_note",
+    name: "ReadNote",
     description: "Read the content of a note from the vault",
     inputSchema: z.toJSONSchema(Args),
   },
@@ -64,7 +64,7 @@ export const readNote = {
     const result = await fileOps.readNote(finalPath);
 
     // Log note access for usage statistics
-    memorySystem.logAccess(noteNameOnly, "read_note");
+    memorySystem.logAccess(noteNameOnly, "ReadNote");
 
     // Build metadata
     const metadata = {

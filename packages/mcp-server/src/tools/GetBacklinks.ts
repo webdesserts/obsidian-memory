@@ -11,9 +11,9 @@ const Args = z.object({
 });
 type Args = z.infer<typeof Args>;
 
-export const getBacklinks = {
+export const GetBacklinks = {
   definition: {
-    name: "get_backlinks",
+    name: "GetBacklinks",
     description: "Find all notes that link to a given note",
     inputSchema: z.toJSONSchema(Args),
   },

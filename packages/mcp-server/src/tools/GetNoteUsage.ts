@@ -10,9 +10,9 @@ const Args = z.object({
 });
 type Args = z.infer<typeof Args>;
 
-export const getNoteUsage = {
+export const GetNoteUsage = {
   definition: {
-    name: "get_note_usage",
+    name: "GetNoteUsage",
     description: "Get usage statistics for notes (for consolidation)",
     inputSchema: z.toJSONSchema(Args),
   },

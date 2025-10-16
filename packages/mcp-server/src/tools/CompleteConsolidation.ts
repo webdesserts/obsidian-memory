@@ -4,9 +4,9 @@ import { ToolContext, MCPTool } from "./types.js";
 const Args = z.object({});
 type Args = z.infer<typeof Args>;
 
-export const completeConsolidation = {
+export const CompleteConsolidation = {
   definition: {
-    name: "complete_consolidation",
+    name: "CompleteConsolidation",
     description:
       "Mark consolidation as complete (deletes WorkingMemory.md, releases lock)",
     inputSchema: z.toJSONSchema(Args),

@@ -10,7 +10,8 @@
       "Bash(npm run build:mcp:utils:*)",
       "Bash(npm run build:*)",
       "WebFetch(domain:zod.dev)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(npm run build:mcp:server:*)"
     ],
     "deny": [],
     "ask": []

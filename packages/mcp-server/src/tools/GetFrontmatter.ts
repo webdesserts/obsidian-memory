@@ -3,25 +3,31 @@ import { ToolContext, MCPTool } from "./types.js";
 
 const Args = z.object({
   path: z.string().describe("Path to the note relative to vault root"),
-  updates: z.record(z.string(), z.any()).describe("Frontmatter fields to update"),
 });
 type Args = z.infer<typeof Args>;
 
-export const updateFrontmatter = {
+export const GetFrontmatter = {
   definition: {
-    name: "update_frontmatter",
-    description: "Update frontmatter metadata in a note",
+    name: "GetFrontmatter",
+    description: "Get the frontmatter metadata from a note",
     inputSchema: z.toJSONSchema(Args),
   },
 
   async handler(args: unknown, context: ToolContext) {
-    const { path, updates } = Args.parse(args);
+    const { path } = Args.parse(args);
     const { fileOps } = context;
 
-    await fileOps.updateFrontmatter(path, updates);
+    const frontmatter = await fileOps.getFrontmatter(path);
 
     return {
-      content: [{ type: "text", text: `Frontmatter updated: ${path}` }],
+      content: [
+        {
+          type: "text",
+          text: frontmatter
+            ? JSON.stringify(frontmatter, null, 2)
+            : "No frontmatter found",
+        },
+      ],
     };
   },
 } satisfies MCPTool;
