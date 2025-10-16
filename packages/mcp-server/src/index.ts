@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { basename } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -31,8 +32,12 @@ if (!vaultPath) {
   process.exit(1);
 }
 
+// Derive vault name from path (basename of the vault directory)
+const vaultName = basename(vaultPath);
+
 console.error(`[Server] Starting Obsidian Memory MCP Server`);
 console.error(`[Server] Vault path: ${vaultPath}`);
+console.error(`[Server] Vault name: ${vaultName}`);
 
 // Initialize file operations, graph index, memory system, and consolidation
 const fileOps = new FileOperations({ vaultPath });
@@ -59,6 +64,7 @@ function resolveNoteNameToPath(
 // Build tool context with all dependencies
 const toolContext = {
   vaultPath,
+  vaultName,
   fileOps,
   graphIndex,
   memorySystem,
@@ -99,6 +105,10 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         description:
           "Public long-term memory - stable entry points organized by domain",
         mimeType: "text/markdown",
+        annotations: {
+          audience: ["user", "assistant"],
+          priority: 1.0,
+        },
       },
       {
         uri: "memory://WorkingMemory",
@@ -106,6 +116,10 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         description:
           "Public short-term memory - notes and discoveries from recent sessions",
         mimeType: "text/markdown",
+        annotations: {
+          audience: ["user", "assistant"],
+          priority: 1.0,
+        },
       },
       {
         uri: "memory://private/Index",
@@ -113,6 +127,10 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         description:
           "Personal and sensitive long-term memory. Contains private notes and information. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
+        annotations: {
+          audience: ["user", "assistant"],
+          priority: 0.5,
+        },
       },
       {
         uri: "memory://private/WorkingMemory",
@@ -120,6 +138,10 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         description:
           "Personal and sensitive short-term memory. Contains private notes from recent sessions. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
+        annotations: {
+          audience: ["user", "assistant"],
+          priority: 0.5,
+        },
       },
     ],
   };

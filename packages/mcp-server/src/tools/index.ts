@@ -4,7 +4,6 @@
 
 import { MCPTool } from "./types.js";
 import { ReadNote } from "./ReadNote.js";
-import { GetFrontmatter } from "./GetFrontmatter.js";
 import { UpdateFrontmatter } from "./UpdateFrontmatter.js";
 import { GetBacklinks } from "./GetBacklinks.js";
 import { GetGraphNeighborhood } from "./GetGraphNeighborhood.js";
@@ -20,7 +19,6 @@ import type { JSONSchema } from "zod/v4/core";
  */
 export const allTools = [
   ReadNote,
-  GetFrontmatter,
   UpdateFrontmatter,
   GetBacklinks,
   GetGraphNeighborhood,

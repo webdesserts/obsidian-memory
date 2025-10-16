@@ -11,7 +11,8 @@
       "Bash(npm run build:*)",
       "WebFetch(domain:zod.dev)",
       "WebFetch(domain:github.com)",
-      "Bash(npm run build:mcp:server:*)"
+      "Bash(npm run build:mcp:server:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []

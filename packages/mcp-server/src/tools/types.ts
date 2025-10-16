@@ -16,6 +16,7 @@ import { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
  */
 export interface ToolContext {
   vaultPath: string;
+  vaultName: string;
   fileOps: FileOperations;
   graphIndex: GraphIndex;
   memorySystem: MemorySystem;
@@ -40,11 +41,12 @@ export type ToolHandler<TArgs extends z.ZodTypeAny> = (
  */
 export interface ToolResponse {
   content: ToolResponseContent[];
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }
 
 /**
- * Tool response content can be text or resource links
+ * Tool response content can be text, resource links, or embedded resources
  */
 export type ToolResponseContent =
   | { type: "text"; text: string }
@@ -54,6 +56,16 @@ export type ToolResponseContent =
       name: string;
       mimeType: string;
       description?: string;
+    }
+  | {
+      type: "resource";
+      resource: {
+        uri: string;
+        title: string;
+        mimeType: string;
+        text?: string | null;
+        annotations?: Record<string, unknown>;
+      };
     };
 
 /**

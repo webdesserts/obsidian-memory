@@ -5,6 +5,7 @@ import {
   extractNoteName,
   generateSearchPaths,
 } from "@obsidian-memory/utils";
+import { readNoteResource } from "./resource-utils.js";
 
 const Args = z.object({
   note: z.string().describe(
@@ -22,7 +23,7 @@ export const ReadNote = {
 
   async handler(args: unknown, context: ToolContext) {
     const { note } = Args.parse(args);
-    const { fileOps, graphIndex, memorySystem, vaultPath } = context;
+    const { fileOps, graphIndex, memorySystem, vaultPath, vaultName } = context;
 
     // Normalize the note reference
     const notePath = normalizeNoteReference(note);
@@ -60,34 +61,19 @@ export const ReadNote = {
       }
     }
 
-    // Read the note
-    const result = await fileOps.readNote(finalPath);
+    // Read note and build resource response
+    const response = await readNoteResource({
+      notePath: finalPath,
+      vaultName,
+      vaultPath,
+      fileOps,
+    });
 
-    // Log note access for usage statistics
-    memorySystem.logAccess(noteNameOnly, "ReadNote");
-
-    // Build metadata
-    const metadata = {
-      noteName: noteNameOnly,
-      memoryUri: `memory://${finalPath}`,
-      filePath: `${vaultPath}/${finalPath}.md`,
-    };
-
-    // Build response with metadata first, then content
-    let response = `\`\`\`json\n${JSON.stringify(metadata, null, 2)}\n\`\`\`\n\n`;
-
-    if (result.frontmatter) {
-      response += `---\nFrontmatter:\n${JSON.stringify(
-        result.frontmatter,
-        null,
-        2
-      )}\n---\n\n`;
+    // Log note access for usage statistics (if it exists)
+    if (response.structuredContent?.exists) {
+      memorySystem.logAccess(noteNameOnly, "ReadNote");
     }
 
-    response += result.content;
-
-    return {
-      content: [{ type: "text", text: response }],
-    };
+    return response;
   },
 } satisfies MCPTool;
