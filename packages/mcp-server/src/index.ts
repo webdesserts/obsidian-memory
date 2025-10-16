@@ -106,7 +106,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
           "Public long-term memory - stable entry points organized by domain",
         mimeType: "text/markdown",
         annotations: {
-          audience: ["user", "assistant"],
+          audience: ["assistant"],
           priority: 1.0,
         },
       },
@@ -117,7 +117,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
           "Public short-term memory - notes and discoveries from recent sessions",
         mimeType: "text/markdown",
         annotations: {
-          audience: ["user", "assistant"],
+          audience: ["assistant"],
           priority: 1.0,
         },
       },
@@ -128,7 +128,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
           "Personal and sensitive long-term memory. Contains private notes and information. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
         annotations: {
-          audience: ["user", "assistant"],
+          audience: ["assistant"],
           priority: 0.5,
         },
       },
@@ -139,7 +139,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
           "Personal and sensitive short-term memory. Contains private notes from recent sessions. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
         annotations: {
-          audience: ["user", "assistant"],
+          audience: ["assistant"],
           priority: 0.5,
         },
       },
