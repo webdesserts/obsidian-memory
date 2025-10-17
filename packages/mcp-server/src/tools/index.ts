@@ -2,7 +2,7 @@
  * All available MCP tools for the Obsidian Memory server
  */
 
-import { MCPTool } from "./types.js";
+import { MCPTool } from "../types.js";
 import { ReadNote } from "./ReadNote.js";
 import { ReadWeeklyNote } from "./ReadWeeklyNote.js";
 import { UpdateFrontmatter } from "./UpdateFrontmatter.js";

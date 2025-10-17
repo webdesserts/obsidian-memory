@@ -3,7 +3,8 @@
  */
 
 import { ToolResponse, ToolContext } from "./types.js";
-import { FileOperations } from "../file-operations.js";
+import { FileOperations } from "./file-operations.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import {
   extractNoteName,
   normalizeNoteReference,
@@ -97,26 +98,36 @@ export async function readNoteResource(
   const notePath = await resolveNotePath({ noteRef, context });
   const noteName = extractNoteName(notePath);
 
+  // Build obsidian:// URI
+  const obsidianUri = `obsidian://open?vault=${encodeURIComponent(
+    vaultName
+  )}&file=${encodeURIComponent(notePath)}`;
+
   // Try to read the note
-  let exists = false;
-  let rawContent = "";
+  let rawContent: string;
   let frontmatter: Record<string, unknown> | undefined;
 
   try {
     const result = await fileOps.readNote(notePath);
-    exists = true;
     rawContent = result.rawContent;
     frontmatter = result.frontmatter;
   } catch (error) {
-    // Note doesn't exist - leave exists as false
-  }
+    // Note doesn't exist - throw error with resolution metadata
 
-  // Build obsidian:// URI
-  const obsidianUri = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(notePath)}`;
+    // (Custom codes must be above -32000 per JSON-RPC spec)
+    throw new McpError(-32002, `Resource Not Found`, {
+      noteName,
+      resolvedPath: notePath,
+      memoryUri: `memory:${notePath}`,
+      filePath: `${vaultPath}/${notePath}.md`,
+      obsidianUri,
+      suggestion:
+        "You can create this note using the Write tool with the filePath.",
+    });
+  }
 
   // Build structured content with machine-readable metadata
   const structuredContent: Record<string, unknown> = {
-    exists,
     noteName,
     path: notePath,
     filePath: `${vaultPath}/${notePath}.md`,
@@ -137,7 +148,7 @@ export async function readNoteResource(
           uri: `memory:${notePath}`,
           title: noteName,
           mimeType: "text/markdown",
-          text: exists ? rawContent : null,
+          text: rawContent,
           annotations: {
             audience: annotations.audience ?? ["user", "assistant"],
             priority: annotations.priority ?? 0.5,

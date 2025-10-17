@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "./types.js";
+import { ToolContext, MCPTool } from "../types.js";
 
 const Args = z.object({
   path: z.string().describe("Path to the note relative to vault root"),

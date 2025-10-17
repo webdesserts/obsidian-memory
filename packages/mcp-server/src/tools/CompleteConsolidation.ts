@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "./types.js";
+import { ToolContext, MCPTool } from "../types.js";
 
 const Args = z.object({});
 type Args = z.infer<typeof Args>;

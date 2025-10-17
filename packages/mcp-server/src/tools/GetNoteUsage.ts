@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "./types.js";
+import { ToolContext, MCPTool } from "../types.js";
 
 const Args = z.object({
   notes: z.array(z.string()).describe("List of note names to get statistics for"),

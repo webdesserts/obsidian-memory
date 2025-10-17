@@ -16,7 +16,7 @@ import { MemorySystem } from "./memory/memory-system.js";
 import { ConsolidationManager } from "./memory/consolidation.js";
 import { resolveNotePath } from "@obsidian-memory/utils";
 import { allTools } from "./tools/index.js";
-import { ToolContext } from "./tools/types.js";
+import { ToolContext } from "./types.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -116,21 +116,10 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   return {
     resources: [
       {
-        uri: "memory:Index",
-        name: "Long-term Memory Index",
-        description:
-          "Public long-term memory - stable entry points organized by domain",
-        mimeType: "text/markdown",
-        annotations: {
-          audience: ["assistant"],
-          priority: 1.0,
-        },
-      },
-      {
         uri: "memory:WorkingMemory",
         name: "Working Memory",
         description:
-          "Public short-term memory - notes and discoveries from recent sessions",
+          "Scratchpad for temporary notes and research. Update freely. Notes here may periodically be moved over to permanent notes or removed when appropriate.",
         mimeType: "text/markdown",
         annotations: {
           audience: ["assistant"],
@@ -138,10 +127,21 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
       },
       {
-        uri: "memory:private/Index",
-        name: "Private Long-term Memory Index",
+        uri: "memory:Index",
+        name: "Long-term Memory Index",
         description:
-          "Personal and sensitive long-term memory. Contains private notes and information. Always ask for explicit user consent before reading this resource.",
+          "List of commonly accessed notes and journal entries. Refreshed in longer intervals. Used as an entry point for exploring the knowledge graph",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["assistant"],
+          priority: 9,
+        },
+      },
+      {
+        uri: "memory:private/WorkingMemory",
+        name: "Private Working Memory",
+        description:
+          "Scratchpad for temporary notes and research that may contain sensitive or personal information. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
         annotations: {
           audience: ["assistant"],
@@ -149,10 +149,10 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
       },
       {
-        uri: "memory:private/WorkingMemory",
-        name: "Private Working Memory",
+        uri: "memory:private/Index",
+        name: "Private Long-term Memory Index",
         description:
-          "Personal and sensitive short-term memory. Contains private notes from recent sessions. Always ask for explicit user consent before reading this resource.",
+          "List of commonly accessed notes and journal entries that may contain sensitive or personal information. Always ask for explicit user consent before reading this resource.",
         mimeType: "text/markdown",
         annotations: {
           audience: ["assistant"],
@@ -177,38 +177,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const resourcePath = url.pathname;
 
     let content: string;
-    let exists = true;
 
-    switch (resourcePath) {
-      case "Index":
-        content = memorySystem.getIndex() || "";
-        exists = !!memorySystem.getIndex();
-        break;
-
-      case "WorkingMemory":
-        content = memorySystem.getWorkingMemory() || "";
-        exists = !!memorySystem.getWorkingMemory();
-        break;
-
-      case "private/Index": {
-        const { longTermIndex } = await memorySystem.loadPrivateMemory();
-        content = longTermIndex || "";
-        exists = !!longTermIndex;
-        break;
-      }
-
-      case "private/WorkingMemory": {
-        const { workingMemory } = await memorySystem.loadPrivateMemory();
-        content = workingMemory || "";
-        exists = !!workingMemory;
-        break;
-      }
-
-      default:
-        throw new Error(`Unknown resource: ${uri}`);
-    }
-
-    if (!exists) {
+    // Read note using FileOperations
+    try {
+      const result = await fileOps.readNote(resourcePath);
+      content = result.rawContent;
+    } catch (error) {
+      // File doesn't exist - provide helpful placeholder
       content = `# ${resourcePath}\n\n*This file does not exist yet. Create it to start using this memory space.*`;
     }
 

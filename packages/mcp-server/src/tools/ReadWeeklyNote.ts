@@ -1,7 +1,10 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "./types.js";
-import { getCurrentWeeklyNotePath, getCurrentDayOfWeek } from "../week-utils.js";
-import { readNoteResource } from "./resource-utils.js";
+import { ToolContext, MCPTool } from "../types.js";
+import {
+  getCurrentWeeklyNotePath,
+  getCurrentDayOfWeek,
+} from "../week-utils.js";
+import { readNoteResource } from "../resource-utils.js";
 
 const Args = z.object({
   // No arguments - always returns current week's note
@@ -11,7 +14,8 @@ type Args = z.infer<typeof Args>;
 export const ReadWeeklyNote = {
   definition: {
     name: "ReadWeeklyNote",
-    description: "Read the current week's journal note. Returns the full note content with metadata including the current day of the week.",
+    description:
+      "Read the current week's journal note. Returns the full note content with metadata including the current day of the week.",
     inputSchema: z.toJSONSchema(Args),
   },
 
@@ -22,7 +26,7 @@ export const ReadWeeklyNote = {
     const weeklyNoteRef = getCurrentWeeklyNotePath();
     const currentDay = getCurrentDayOfWeek();
 
-    // Read note and build resource response
+    // Read note and build resource response (throws if note doesn't exist)
     const response = await readNoteResource({
       noteRef: weeklyNoteRef,
       context,
@@ -31,12 +35,9 @@ export const ReadWeeklyNote = {
       },
     });
 
-    // Log access for usage statistics (if it exists)
-    if (response.structuredContent?.exists) {
-      // Extract path from memory: URI for logging
-      const url = new URL(weeklyNoteRef);
-      context.memorySystem.logAccess(url.pathname, "ReadWeeklyNote");
-    }
+    // Log access for usage statistics
+    const url = new URL(weeklyNoteRef);
+    context.memorySystem.logAccess(url.pathname, "ReadWeeklyNote");
 
     // Add current day to structured content
     if (response.structuredContent) {

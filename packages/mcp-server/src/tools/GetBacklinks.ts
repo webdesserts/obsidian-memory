@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "./types.js";
+import { ToolContext, MCPTool } from "../types.js";
 import { extractNoteName } from "@obsidian-memory/utils";
 
 const Args = z.object({
