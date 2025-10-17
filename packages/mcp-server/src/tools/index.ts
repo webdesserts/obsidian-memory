@@ -3,8 +3,7 @@
  */
 
 import { MCPTool } from "../types.js";
-import { ReadNote } from "./ReadNote.js";
-import { ReadWeeklyNote } from "./ReadWeeklyNote.js";
+import { GetWeeklyNote } from "./GetWeeklyNote.js";
 import { UpdateFrontmatter } from "./UpdateFrontmatter.js";
 import { GetBacklinks } from "./GetBacklinks.js";
 import { GetGraphNeighborhood } from "./GetGraphNeighborhood.js";
@@ -19,8 +18,7 @@ import type { JSONSchema } from "zod/v4/core";
  * Add new tools here to register them with the MCP server
  */
 export const allTools = [
-  ReadNote,
-  ReadWeeklyNote,
+  GetWeeklyNote,
   UpdateFrontmatter,
   GetBacklinks,
   GetGraphNeighborhood,

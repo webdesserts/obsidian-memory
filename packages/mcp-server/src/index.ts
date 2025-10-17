@@ -9,6 +9,7 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
   ListRootsRequestSchema,
+  ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
@@ -17,6 +18,7 @@ import { ConsolidationManager } from "./memory/consolidation.js";
 import { resolveNotePath } from "@obsidian-memory/utils";
 import { allTools } from "./tools/index.js";
 import { ToolContext } from "./types.js";
+import { readNoteResource } from "./resource-utils.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -111,6 +113,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+// List resource templates
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+  return {
+    resourceTemplates: [
+      {
+        uriTemplate: "memory:{path}",
+        name: "Vault Note",
+        description: "Access any note in the vault by path (e.g., memory:knowledge/CSS or memory:journal/2025-w42)",
+        mimeType: "text/markdown",
+      },
+    ],
+  };
+});
+
 // List available resources
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
   return {
@@ -173,29 +189,42 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       throw new Error(`Unsupported URI scheme: ${uri}`);
     }
 
-    const url = new URL(uri);
-    const resourcePath = url.pathname;
+    // Use readNoteResource for all note reading
+    // This handles path resolution, frontmatter, and error cases
+    const result = await readNoteResource({
+      noteRef: uri,
+      context: toolContext,
+    });
 
-    let content: string;
-
-    // Read note using FileOperations
-    try {
-      const result = await fileOps.readNote(resourcePath);
-      content = result.rawContent;
-    } catch (error) {
-      // File doesn't exist - provide helpful placeholder
-      content = `# ${resourcePath}\n\n*This file does not exist yet. Create it to start using this memory space.*`;
+    // If the result is an error (note doesn't exist), return helpful message
+    if (result.isError && result.content[0].type === "text") {
+      const url = new URL(uri);
+      const resourcePath = url.pathname;
+      return {
+        contents: [
+          {
+            uri,
+            mimeType: "text/markdown",
+            text: `# ${resourcePath}\n\n*This file does not exist yet. Create it to start using this memory space.*`,
+          },
+        ],
+      };
     }
 
-    return {
-      contents: [
-        {
-          uri,
-          mimeType: "text/markdown",
-          text: content,
-        },
-      ],
-    };
+    // Extract the resource content from the tool response
+    if (result.content[0].type === "resource") {
+      return {
+        contents: [
+          {
+            uri: result.content[0].resource.uri,
+            mimeType: result.content[0].resource.mimeType,
+            text: result.content[0].resource.text || "",
+          },
+        ],
+      };
+    }
+
+    throw new Error(`Unexpected response format from readNoteResource`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read resource ${uri}: ${errorMessage}`);
