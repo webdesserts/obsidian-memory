@@ -4,7 +4,6 @@
 
 import { ToolResponse, ToolContext } from "./types.js";
 import { FileOperations } from "./file-operations.js";
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import {
   extractNoteName,
   normalizeNoteReference,
@@ -112,18 +111,33 @@ export async function readNoteResource(
     rawContent = result.rawContent;
     frontmatter = result.frontmatter;
   } catch (error) {
-    // Note doesn't exist - throw error with resolution metadata
+    // Note doesn't exist - return error response with resolution metadata
+    const filePath = `${vaultPath}/${notePath}.md`;
+    const memoryUri = `memory:${notePath}`;
 
-    // (Custom codes must be above -32000 per JSON-RPC spec)
-    throw new McpError(-32002, `Resource Not Found`, {
-      noteName,
-      resolvedPath: notePath,
-      memoryUri: `memory:${notePath}`,
-      filePath: `${vaultPath}/${notePath}.md`,
-      obsidianUri,
-      suggestion:
-        "You can create this note using the Write tool with the filePath.",
-    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Note not found: ${noteName}
+
+This note doesn't exist yet. You can create it at:
+- File path: ${filePath}
+- Memory URI: ${memoryUri}
+- Obsidian URI: ${obsidianUri}
+
+Use the Write tool with the file path to create this note.`,
+        },
+      ],
+      structuredContent: {
+        noteName,
+        resolvedPath: notePath,
+        filePath,
+        memoryUri,
+        obsidianUri,
+      },
+      isError: true,
+    };
   }
 
   // Build structured content with machine-readable metadata
