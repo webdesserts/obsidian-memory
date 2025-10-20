@@ -72,14 +72,14 @@ export class MemorySystem {
   /**
    * Get Working Memory.md content
    */
-  getWorking Memory(): string | null {
+  getWorkingMemory(): string | null {
     return this.workingMemoryContent;
   }
 
   /**
    * Update Working Memory.md in memory (called after writes)
    */
-  async refreshWorking Memory(): Promise<void> {
+  async refreshWorkingMemory(): Promise<void> {
     try {
       const result = await this.fileOps.readNote("Working Memory.md");
       this.workingMemoryContent = result.content;

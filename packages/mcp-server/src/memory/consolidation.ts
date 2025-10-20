@@ -47,7 +47,7 @@ export class ConsolidationManager {
 
       // Get current memory state
       const indexMd = this.memorySystem.getIndex() || "";
-      const workingMemoryMd = this.memorySystem.getWorking Memory() || "";
+      const workingMemoryMd = this.memorySystem.getWorkingMemory() || "";
 
       // Get current timestamp for frontmatter
       const timestamp = new Date().toISOString();
