@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { ToolContext, MCPTool } from "../types.js";
 import { extractNoteName } from "@obsidian-memory/utils";
-import { resolveNotePath } from "../resource-utils.js";
+import { resolveNotePath } from "../path-utils.js";
 
 const Args = z.object({
   note: z

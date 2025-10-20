@@ -6,10 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
   ListRootsRequestSchema,
-  ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
@@ -18,7 +15,6 @@ import { ConsolidationManager } from "./memory/consolidation.js";
 import { resolveNotePath } from "@obsidian-memory/utils";
 import { allTools } from "./tools/index.js";
 import { ToolContext } from "./types.js";
-import { readNoteResource } from "./resource-utils.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -113,131 +109,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// List resource templates
-server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-  // No resource templates - use GetNote tool for note discovery
-  return {
-    resourceTemplates: [],
-  };
-});
-
-// List available resources
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  return {
-    resources: [
-      {
-        uri: "memory:Working Memory",
-        name: "Working Memory",
-        description:
-          "Scratchpad for temporary notes and research. Update freely. Notes here may periodically be moved over to permanent notes or removed when appropriate.",
-        mimeType: "text/markdown",
-        annotations: {
-          audience: ["assistant"],
-          priority: 1.0,
-        },
-      },
-      {
-        uri: "memory:Index",
-        name: "Long-term Memory Index",
-        description:
-          "List of commonly accessed notes and journal entries. Refreshed in longer intervals. Used as an entry point for exploring the knowledge graph",
-        mimeType: "text/markdown",
-        annotations: {
-          audience: ["assistant"],
-          priority: 9,
-        },
-      },
-      {
-        uri: "memory:private/Working Memory",
-        name: "Private Working Memory",
-        description:
-          "Scratchpad for temporary notes and research that may contain sensitive or personal information. Always ask for explicit user consent before reading this resource.",
-        mimeType: "text/markdown",
-        annotations: {
-          audience: ["assistant"],
-          priority: 0.5,
-        },
-      },
-      {
-        uri: "memory:private/Index",
-        name: "Private Long-term Memory Index",
-        description:
-          "List of commonly accessed notes and journal entries that may contain sensitive or personal information. Always ask for explicit user consent before reading this resource.",
-        mimeType: "text/markdown",
-        annotations: {
-          audience: ["assistant"],
-          priority: 0.5,
-        },
-      },
-    ],
-  };
-});
-
-// Handle resource reads (static resources only)
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const uri = request.params.uri;
-
-  try {
-    // Parse memory: URI
-    if (!uri.startsWith("memory:")) {
-      throw new Error(`Unsupported URI scheme: ${uri}`);
-    }
-
-    // Extract path from URI
-    const notePath = uri.replace("memory:", "");
-
-    // Only support static resources (Index, Working Memory, private variants)
-    const staticResources = [
-      "Index",
-      "Working Memory",
-      "private/Index",
-      "private/Working Memory",
-    ];
-
-    if (!staticResources.includes(notePath)) {
-      throw new Error(
-        `Only static resources are supported. Use GetNote tool for other notes: ${notePath}`
-      );
-    }
-
-    // Read the static resource
-    const result = await readNoteResource({
-      noteRef: uri,
-      context: toolContext,
-    });
-
-    // If the result is an error (note doesn't exist), return helpful message
-    if (result.isError && result.content[0].type === "text") {
-      return {
-        contents: [
-          {
-            uri,
-            mimeType: "text/markdown",
-            text: `# ${notePath}\n\n*This file does not exist yet. Create it to start using this memory space.*`,
-          },
-        ],
-      };
-    }
-
-    // Extract the resource content from the tool response
-    if (result.content[0].type === "resource") {
-      return {
-        contents: [
-          {
-            uri: result.content[0].resource.uri,
-            mimeType: result.content[0].resource.mimeType,
-            text: result.content[0].resource.text || "",
-          },
-        ],
-      };
-    }
-
-    throw new Error(`Unexpected response format from readNoteResource`);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to read resource ${uri}: ${errorMessage}`);
-  }
-});
+// No resources - use GetNote tool for all note discovery and access
 
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
