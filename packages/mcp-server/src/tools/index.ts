@@ -3,9 +3,9 @@
  */
 
 import { MCPTool } from "../types.js";
+import { GetNote } from "./GetNote.js";
 import { GetWeeklyNote } from "./GetWeeklyNote.js";
 import { UpdateFrontmatter } from "./UpdateFrontmatter.js";
-import { GetBacklinks } from "./GetBacklinks.js";
 import { GetGraphNeighborhood } from "./GetGraphNeighborhood.js";
 import { GetNoteUsage } from "./GetNoteUsage.js";
 import { LoadPrivateMemory } from "./LoadPrivateMemory.js";
@@ -18,9 +18,9 @@ import type { JSONSchema } from "zod/v4/core";
  * Add new tools here to register them with the MCP server
  */
 export const allTools = [
+  GetNote,
   GetWeeklyNote,
   UpdateFrontmatter,
-  GetBacklinks,
   GetGraphNeighborhood,
   GetNoteUsage,
   LoadPrivateMemory,

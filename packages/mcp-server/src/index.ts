@@ -115,15 +115,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // List resource templates
 server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+  // No resource templates - use GetNote tool for note discovery
   return {
-    resourceTemplates: [
-      {
-        uriTemplate: "memory:{path}",
-        name: "Vault Note",
-        description: "Access any note in the vault by path (e.g., memory:knowledge/CSS or memory:journal/2025-w42)",
-        mimeType: "text/markdown",
-      },
-    ],
+    resourceTemplates: [],
   };
 });
 
@@ -179,7 +173,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   };
 });
 
-// Handle resource reads
+// Handle resource reads (static resources only)
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri;
 
@@ -189,8 +183,24 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       throw new Error(`Unsupported URI scheme: ${uri}`);
     }
 
-    // Use readNoteResource for all note reading
-    // This handles path resolution, frontmatter, and error cases
+    // Extract path from URI
+    const notePath = uri.replace("memory:", "");
+
+    // Only support static resources (Index, Working Memory, private variants)
+    const staticResources = [
+      "Index",
+      "Working Memory",
+      "private/Index",
+      "private/Working Memory",
+    ];
+
+    if (!staticResources.includes(notePath)) {
+      throw new Error(
+        `Only static resources are supported. Use GetNote tool for other notes: ${notePath}`
+      );
+    }
+
+    // Read the static resource
     const result = await readNoteResource({
       noteRef: uri,
       context: toolContext,
@@ -198,14 +208,12 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
     // If the result is an error (note doesn't exist), return helpful message
     if (result.isError && result.content[0].type === "text") {
-      const url = new URL(uri);
-      const resourcePath = url.pathname;
       return {
         contents: [
           {
             uri,
             mimeType: "text/markdown",
-            text: `# ${resourcePath}\n\n*This file does not exist yet. Create it to start using this memory space.*`,
+            text: `# ${notePath}\n\n*This file does not exist yet. Create it to start using this memory space.*`,
           },
         ],
       };

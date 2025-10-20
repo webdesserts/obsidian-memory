@@ -6,28 +6,29 @@
 
 ---
 
-## Reading Notes - IMPORTANT
+## Working with Notes - IMPORTANT
 
-**ALWAYS use MCP resources for reading notes**, NOT the Read tool:
+**Use GetNote tool for note discovery, then Read/Write tools for content:**
 
-✅ **Correct:**
+✅ **Correct workflow:**
 ```
-ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:knowledge/CSS")
-ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:journal/2025-w42")
+1. GetNote(noteRef: "CSS") - Get metadata, links, file path
+2. Read(file_path: "/Users/michael/notes/knowledge/CSS.md") - View content
+3. Write(file_path: "/Users/michael/notes/knowledge/CSS.md") - Edit content
 ```
 
 ❌ **Incorrect:**
 ```
-Read(file_path: "/Users/michael/notes/knowledge/CSS.md")
+ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:knowledge/CSS")
 ```
 
-**Why resources?**
-- Smart path resolution (finds notes even without exact path)
-- Graph index lookup (searches across knowledge/, journal/, root)
-- Structured metadata (filePath, obsidianUri, frontmatter)
-- Consistent with resource-based architecture
+**Why this workflow?**
+- GetNote provides metadata (frontmatter, links, backlinks, paths) without loading full content
+- Read tool satisfies Write tool's requirement (avoids "File has not been read yet" error)
+- GetNote's `memory:` URIs are for reference only - use `filePath` for Read/Write
+- Clean integration with Claude Code's built-in diff and edit tools
 
-**When to use Read:** Only for non-note files (config files, source code, etc.)
+**Note reference formats:** GetNote accepts "Note Name", "knowledge/Note", "memory:Note", or "[[Note]]"
 
 ---
 
@@ -36,7 +37,7 @@ Read(file_path: "/Users/michael/notes/knowledge/CSS.md")
 A Model Context Protocol (MCP) server that gives Claude Code deep integration with Obsidian vaults:
 
 - **Graph navigation** - Explore notes via wiki links and backlinks
-- **Resource-based note access** - Read notes via `memory:{path}` template
+- **Note discovery** - GetNote tool provides metadata, links, and file paths
 - **Memory system** - Auto-loaded Index.md for long-term memory
 - **Resources** - Index/Working Memory exposed as MCP resources
 - **Private memory** - Consent-based access to private notes
@@ -97,16 +98,21 @@ A Model Context Protocol (MCP) server that gives Claude Code deep integration wi
 
 ## Available Tools
 
+### Note Discovery
+- **`GetNote(noteRef)`** - Get metadata and graph connections for a note
+  - Returns: frontmatter, file paths, forward links, backlinks
+  - Note reference formats: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]"
+  - Use returned `filePath` for Read/Write operations
+  - Links returned as `memory:` URIs for reference
+
 ### Weekly Journal
 - **`GetWeeklyNote()`** - Get ResourceLink to current week's journal note
   - Returns URI like `memory:journal/2025-w42`
-  - Use ReadMcpResourceTool to read the note content
 
 ### Graph Navigation
-- **`GetBacklinks(noteName, includePrivate)`** - Find notes linking here
-  - Returns ResourceLinks for each backlink
-- **`GetGraphNeighborhood(noteName, depth, includePrivate)`** - Explore connections
+- **`GetGraphNeighborhood(noteName, depth, includePrivate)`** - Explore multi-hop connections
   - Returns ResourceLinks grouped by distance
+  - Use for deep graph exploration (2+ hops)
 
 ### Metadata
 - **`UpdateFrontmatter(path, updates)`** - Update YAML frontmatter fields
@@ -132,14 +138,9 @@ Auto-loaded on startup (auto-discoverable by Claude):
 - **`memory:private/Index`** - Private long-term (consent required)
 - **`memory:private/Working Memory`** - Private short-term (consent required)
 
-### Resource Template
-
-- **`memory:{path}`** - Read any note in the vault
-  - Examples: `memory:knowledge/CSS`, `memory:journal/2025-w42`
-  - Smart path resolution with auto-search
-  - Returns embedded resource with structured metadata
-
 Resources support subscriptions for live updates.
+
+**Note:** For reading arbitrary notes, use GetNote tool instead of resources. Resources are only for auto-loaded memory files.
 
 ---
 
@@ -194,17 +195,17 @@ memory:private/Personal Note      # Private notes
 - Supports subscriptions for live updates
 - Natural consent flow for private resources
 
-**Why resource template instead of ReadNote tool?**
-- More semantic - notes are data, not actions
-- Better architecture - aligns with MCP resource model
-- Discoverable - Claude Code can browse available resources
-- Consistent - graph tools return ResourceLinks that work with template
+**Why GetNote tool instead of resource template?**
+- Works with Claude Code's Write tool requirement (Read must be called first)
+- Returns metadata without loading full content (more efficient)
+- Provides both discovery (links/backlinks) and paths for Read/Write
+- Clean integration with built-in diff and edit tools
 
-**Why ResourceLinks in graph tools?**
-- Avoids loading full note content
-- Client decides what to actually read
-- Better performance with large graphs
-- Provides rich metadata (relationships, descriptions)
+**Why memory: URIs in GetNote responses?**
+- Consistent reference format across tools
+- Human-readable (easier to understand than file paths)
+- Compatible with other tools that accept note references
+- Note: Use `filePath` from response for Read/Write, not the memory: URI
 
 **Why return error responses instead of throwing?**
 - Missing notes aren't protocol errors

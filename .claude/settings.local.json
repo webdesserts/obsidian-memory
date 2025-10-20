@@ -11,7 +11,8 @@
       "WebFetch(domain:github.com)",
       "Bash(npm run build:mcp:server:*)",
       "Bash(cat:*)",
-      "WebFetch(domain:help.obsidian.md)"
+      "WebFetch(domain:help.obsidian.md)",
+      "WebFetch(domain:spec.modelcontextprotocol.io)"
     ],
     "deny": [],
     "ask": []

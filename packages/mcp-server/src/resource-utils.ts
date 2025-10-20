@@ -22,7 +22,7 @@ export interface ResourceAnnotations {
 
 export interface ResolveNotePathOptions {
   /** Note reference (supports: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]") */
-  noteRef: string;
+  note: string;
   /** Tool context for vault access */
   context: Pick<ToolContext, "vaultPath">;
 }
@@ -43,11 +43,11 @@ export interface ReadNoteResourceOptions {
 export async function resolveNotePath(
   options: ResolveNotePathOptions
 ): Promise<string> {
-  const { noteRef, context } = options;
+  const { note, context } = options;
   const { vaultPath } = context;
 
   // Normalize the reference (handles memory: URIs, [[links]], .md extensions)
-  let notePath = normalizeNoteReference(noteRef);
+  let notePath = normalizeNoteReference(note);
 
   // Extract just the note name and any parent path
   const noteNameOnly = extractNoteName(notePath);
@@ -103,15 +103,21 @@ async function searchInFolder(
   // Then search subfolders alphabetically
   try {
     const folderAbsolutePath = validatePath(vaultPath, folderPath);
-    const entries = await fs.readdir(folderAbsolutePath, { withFileTypes: true });
+    const entries = await fs.readdir(folderAbsolutePath, {
+      withFileTypes: true,
+    });
     const subfolders = entries
-      .filter(entry => entry.isDirectory())
-      .map(entry => entry.name)
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
       .sort(); // Alphabetical order
 
     for (const subfolder of subfolders) {
       const subfolderPath = `${folderPath}/${subfolder}`;
-      const foundPath = await searchInFolder(vaultPath, subfolderPath, noteName);
+      const foundPath = await searchInFolder(
+        vaultPath,
+        subfolderPath,
+        noteName
+      );
       if (foundPath) return foundPath;
     }
   } catch {
@@ -132,7 +138,7 @@ export async function readNoteResource(
   const { vaultName, vaultPath, fileOps } = context;
 
   // Resolve the note reference to a vault-relative path
-  const notePath = await resolveNotePath({ noteRef, context });
+  const notePath = await resolveNotePath({ note: noteRef, context });
   const noteName = extractNoteName(notePath);
 
   // Build obsidian:// URI
