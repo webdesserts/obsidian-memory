@@ -13,7 +13,7 @@ export const ConsolidateMemory = {
   definition: {
     name: "ConsolidateMemory",
     description:
-      "Trigger memory consolidation (consolidate WorkingMemory.md into Index.md)",
+      "Trigger memory consolidation (consolidate Working Memory.md into Index.md)",
     inputSchema: z.toJSONSchema(Args),
   },
 

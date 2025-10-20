@@ -24,7 +24,7 @@ export interface ResolveNotePathOptions {
   /** Note reference (supports: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]") */
   noteRef: string;
   /** Tool context for vault access */
-  context: Pick<ToolContext, "vaultPath" | "graphIndex">;
+  context: Pick<ToolContext, "vaultPath">;
 }
 
 export interface ReadNoteResourceOptions {
@@ -38,30 +38,33 @@ export interface ReadNoteResourceOptions {
 
 /**
  * Resolve a note reference to a vault-relative path
- * Handles smart lookup across common locations and graph index
+ * Implements Obsidian wiki-link resolution behavior from vault root
  */
 export async function resolveNotePath(
   options: ResolveNotePathOptions
 ): Promise<string> {
   const { noteRef, context } = options;
-  const { vaultPath, graphIndex } = context;
+  const { vaultPath } = context;
 
-  // If it's a memory: URI, extract the pathname
-  if (noteRef.startsWith("memory:")) {
-    const url = new URL(noteRef);
-    return url.pathname;
-  }
+  // Normalize the reference (handles memory: URIs, [[links]], .md extensions)
+  let notePath = normalizeNoteReference(noteRef);
 
-  // Normalize the note reference (handles [[Note]], paths, etc.)
-  const notePath = normalizeNoteReference(noteRef);
+  // Extract just the note name and any parent path
   const noteNameOnly = extractNoteName(notePath);
+  const parentPath = notePath.includes("/")
+    ? notePath.substring(0, notePath.lastIndexOf("/"))
+    : "";
 
-  // If path includes a folder, use it directly
-  if (notePath.includes("/")) {
+  // If we have a parent path, do hierarchical lookup within that folder
+  if (parentPath) {
+    const foundPath = await searchInFolder(vaultPath, parentPath, noteNameOnly);
+    if (foundPath) return foundPath;
+    // Not found - return original path (will be handled as non-existent)
     return notePath;
   }
 
-  // Smart lookup: try common locations in priority order
+  // No parent path - search from vault root using Obsidian's resolution rules
+  // Priority: root first, then subdirectories alphabetically
   const searchPaths = generateSearchPaths(noteNameOnly, false);
 
   for (const searchPath of searchPaths) {
@@ -73,14 +76,49 @@ export async function resolveNotePath(
     }
   }
 
-  // Fall back to graph index if not found in standard paths
-  const indexPath = graphIndex.getNotePath(noteNameOnly);
-  if (indexPath) {
-    return indexPath;
-  }
-
   // Return the original path if nothing found (will handle as non-existent)
   return notePath;
+}
+
+/**
+ * Search for a note within a specific folder and its subfolders
+ * Returns the first match found, searching alphabetically by subfolder
+ */
+async function searchInFolder(
+  vaultPath: string,
+  folderPath: string,
+  noteName: string
+): Promise<string | undefined> {
+  const fs = await import("fs/promises");
+
+  // First try the folder itself
+  const directPath = `${folderPath}/${noteName}`;
+  const directPathWithExt = ensureMarkdownExtension(directPath);
+  const directAbsolutePath = validatePath(vaultPath, directPathWithExt);
+
+  if (await fileExists(directAbsolutePath)) {
+    return directPath;
+  }
+
+  // Then search subfolders alphabetically
+  try {
+    const folderAbsolutePath = validatePath(vaultPath, folderPath);
+    const entries = await fs.readdir(folderAbsolutePath, { withFileTypes: true });
+    const subfolders = entries
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name)
+      .sort(); // Alphabetical order
+
+    for (const subfolder of subfolders) {
+      const subfolderPath = `${folderPath}/${subfolder}`;
+      const foundPath = await searchInFolder(vaultPath, subfolderPath, noteName);
+      if (foundPath) return foundPath;
+    }
+  } catch {
+    // Folder doesn't exist or can't be read
+  }
+
+  return undefined;
 }
 
 /**

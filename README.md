@@ -13,7 +13,7 @@ Model Context Protocol (MCP) server providing graph-aware memory system for Obsi
 **Features:**
 - Graph navigation (wiki links, backlinks, neighborhoods)
 - Smart note lookup with auto-search
-- Memory system with Index.md and WorkingMemory.md
+- Memory system with Index.md and Working Memory.md
 - Private memory with consent-based access
 - MCP resources for auto-loaded memory files
 

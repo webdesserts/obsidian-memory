@@ -132,7 +132,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   return {
     resources: [
       {
-        uri: "memory:WorkingMemory",
+        uri: "memory:Working Memory",
         name: "Working Memory",
         description:
           "Scratchpad for temporary notes and research. Update freely. Notes here may periodically be moved over to permanent notes or removed when appropriate.",
@@ -154,7 +154,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
         },
       },
       {
-        uri: "memory:private/WorkingMemory",
+        uri: "memory:private/Working Memory",
         name: "Private Working Memory",
         description:
           "Scratchpad for temporary notes and research that may contain sensitive or personal information. Always ask for explicit user consent before reading this resource.",

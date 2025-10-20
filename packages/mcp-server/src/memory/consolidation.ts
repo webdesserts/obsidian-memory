@@ -47,7 +47,7 @@ export class ConsolidationManager {
 
       // Get current memory state
       const indexMd = this.memorySystem.getIndex() || "";
-      const workingMemoryMd = this.memorySystem.getWorkingMemory() || "";
+      const workingMemoryMd = this.memorySystem.getWorking Memory() || "";
 
       // Get current timestamp for frontmatter
       const timestamp = new Date().toISOString();
@@ -88,24 +88,24 @@ You are consolidating short-term working memory into long-term indexed memory.
 
 ## Instructions
 
-1. **Review** the current Index.md and WorkingMemory.md
-2. **Analyze** which notes from WorkingMemory.md should be promoted to Index.md
+1. **Review** the current Index.md and Working Memory.md
+2. **Analyze** which notes from Working Memory.md should be promoted to Index.md
 3. **Use get_note_usage()** to check access statistics for notes you're considering
 4. **Rewrite** Index.md with:
    - Updated entry points organized by domain
-   - Important discoveries from WorkingMemory.md
+   - Important discoveries from Working Memory.md
    - Remove stale or low-value entries
    - Add consolidation notes explaining your decisions
 5. **Update frontmatter** with lastConsolidation timestamp
-6. **Delete** WorkingMemory.md after consolidation
+6. **Delete** Working Memory.md after consolidation
 
 ## Current Index.md
 
 ${indexMd || "*(No Index.md exists yet - create initial structure)*"}
 
-## Current WorkingMemory.md
+## Current Working Memory.md
 
-${workingMemoryMd || "*(No WorkingMemory.md exists yet)*"}
+${workingMemoryMd || "*(No Working Memory.md exists yet)*"}
 
 ## Tools Available
 
@@ -139,7 +139,7 @@ lastConsolidation: ${timestamp}
 - Each link should have only a short description of why you'd use it
 - Group links by headers (domains, projects, meta) but otherwise keep flat
 - Remove links that are no longer relevant or low-value
-- Add new important links discovered in WorkingMemory.md
+- Add new important links discovered in Working Memory.md
 
 **Use ultrathink to plan your consolidation strategy before writing.**
 `;
@@ -156,14 +156,14 @@ lastConsolidation: ${timestamp}
    */
   async completeConsolidation(): Promise<void> {
     try {
-      // Delete WorkingMemory.md
-      const workingMemoryPath = this.fileOps["config"].vaultPath + "/WorkingMemory.md";
+      // Delete Working Memory.md
+      const workingMemoryPath = this.fileOps["config"].vaultPath + "/Working Memory.md";
       try {
         const fs = await import("fs/promises");
         await fs.unlink(workingMemoryPath);
-        console.error("[Consolidation] Deleted WorkingMemory.md");
+        console.error("[Consolidation] Deleted Working Memory.md");
       } catch (error) {
-        console.error("[Consolidation] No WorkingMemory.md to delete");
+        console.error("[Consolidation] No Working Memory.md to delete");
       }
 
       // Reload Index.md

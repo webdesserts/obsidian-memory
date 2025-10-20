@@ -83,8 +83,13 @@ describe("generateSearchPaths()", () => {
 });
 
 describe("normalizeNoteReference()", () => {
-  it("should strip memory:// prefix", () => {
-    const result = normalizeNoteReference("memory://knowledge/Note");
+  it("should strip memory: prefix", () => {
+    const result = normalizeNoteReference("memory:knowledge/Note");
+    expect(result).toBe("knowledge/Note");
+  });
+
+  it("should strip [[wiki link]] brackets", () => {
+    const result = normalizeNoteReference("[[knowledge/Note]]");
     expect(result).toBe("knowledge/Note");
   });
 
@@ -94,7 +99,12 @@ describe("normalizeNoteReference()", () => {
   });
 
   it("should strip both prefix and extension", () => {
-    const result = normalizeNoteReference("memory://knowledge/Note.md");
+    const result = normalizeNoteReference("memory:knowledge/Note.md");
+    expect(result).toBe("knowledge/Note");
+  });
+
+  it("should handle [[wiki links]] with memory: URIs", () => {
+    const result = normalizeNoteReference("[[memory:knowledge/Note]]");
     expect(result).toBe("knowledge/Note");
   });
 
@@ -115,8 +125,8 @@ describe("extractNoteName()", () => {
     expect(result).toBe("Note");
   });
 
-  it("should handle memory:// URIs", () => {
-    const result = extractNoteName("memory://knowledge/Note");
+  it("should handle memory: URIs", () => {
+    const result = extractNoteName("memory:knowledge/Note");
     expect(result).toBe("Note");
   });
 

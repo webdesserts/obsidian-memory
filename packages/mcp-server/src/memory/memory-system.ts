@@ -24,7 +24,7 @@ export interface NoteUsageStats {
 }
 
 /**
- * Memory system managing Index.md, WorkingMemory.md, and consolidation
+ * Memory system managing Index.md, Working Memory.md, and consolidation
  */
 export class MemorySystem {
   private accessLog: AccessLogEntry[] = [];
@@ -52,13 +52,13 @@ export class MemorySystem {
       console.error("[MemorySystem] No Index.md found (will be created on first consolidation)");
     }
 
-    // Try to load WorkingMemory.md
+    // Try to load Working Memory.md
     try {
-      const result = await this.fileOps.readNote("WorkingMemory.md");
+      const result = await this.fileOps.readNote("Working Memory.md");
       this.workingMemoryContent = result.content;
-      console.error("[MemorySystem] Loaded WorkingMemory.md");
+      console.error("[MemorySystem] Loaded Working Memory.md");
     } catch (error) {
-      console.error("[MemorySystem] No WorkingMemory.md found (will be created when needed)");
+      console.error("[MemorySystem] No Working Memory.md found (will be created when needed)");
     }
   }
 
@@ -70,18 +70,18 @@ export class MemorySystem {
   }
 
   /**
-   * Get WorkingMemory.md content
+   * Get Working Memory.md content
    */
-  getWorkingMemory(): string | null {
+  getWorking Memory(): string | null {
     return this.workingMemoryContent;
   }
 
   /**
-   * Update WorkingMemory.md in memory (called after writes)
+   * Update Working Memory.md in memory (called after writes)
    */
-  async refreshWorkingMemory(): Promise<void> {
+  async refreshWorking Memory(): Promise<void> {
     try {
-      const result = await this.fileOps.readNote("WorkingMemory.md");
+      const result = await this.fileOps.readNote("Working Memory.md");
       this.workingMemoryContent = result.content;
     } catch (error) {
       this.workingMemoryContent = null;
@@ -186,10 +186,10 @@ export class MemorySystem {
     }
 
     try {
-      const result = await this.fileOps.readNote("private/WorkingMemory.md");
+      const result = await this.fileOps.readNote("private/Working Memory.md");
       workingMemory = result.content;
     } catch (error) {
-      console.error("[MemorySystem] No private/WorkingMemory.md found");
+      console.error("[MemorySystem] No private/Working Memory.md found");
     }
 
     return { longTermIndex, workingMemory };

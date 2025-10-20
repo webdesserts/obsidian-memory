@@ -31,9 +31,9 @@ export const LoadPrivateMemory = {
     }
 
     if (workingMemory) {
-      response += `## Private WorkingMemory.md\n\n${workingMemory}\n\n`;
+      response += `## Private Working Memory.md\n\n${workingMemory}\n\n`;
     } else {
-      response += `## Private WorkingMemory.md\n\nNo private WorkingMemory.md found\n\n`;
+      response += `## Private Working Memory.md\n\nNo private Working Memory.md found\n\n`;
     }
 
     return {

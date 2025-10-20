@@ -6,14 +6,39 @@
 
 ---
 
+## Reading Notes - IMPORTANT
+
+**ALWAYS use MCP resources for reading notes**, NOT the Read tool:
+
+✅ **Correct:**
+```
+ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:knowledge/CSS")
+ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:journal/2025-w42")
+```
+
+❌ **Incorrect:**
+```
+Read(file_path: "/Users/michael/notes/knowledge/CSS.md")
+```
+
+**Why resources?**
+- Smart path resolution (finds notes even without exact path)
+- Graph index lookup (searches across knowledge/, journal/, root)
+- Structured metadata (filePath, obsidianUri, frontmatter)
+- Consistent with resource-based architecture
+
+**When to use Read:** Only for non-note files (config files, source code, etc.)
+
+---
+
 ## What This Is
 
 A Model Context Protocol (MCP) server that gives Claude Code deep integration with Obsidian vaults:
 
 - **Graph navigation** - Explore notes via wiki links and backlinks
-- **Smart note reading** - Flexible path resolution with auto-search
+- **Resource-based note access** - Read notes via `memory:{path}` template
 - **Memory system** - Auto-loaded Index.md for long-term memory
-- **Resources** - Index/WorkingMemory exposed as MCP resources
+- **Resources** - Index/Working Memory exposed as MCP resources
 - **Private memory** - Consent-based access to private notes
 
 ---
@@ -53,7 +78,7 @@ A Model Context Protocol (MCP) server that gives Claude Code deep integration wi
 
 **Consolidation** (`packages/mcp-server/src/memory/consolidation.ts`)
 - Lock-based workflow for Index.md updates
-- Generates prompt for Claude to consolidate WorkingMemory → Index
+- Generates prompt for Claude to consolidate Working Memory → Index
 - Partially implemented - see GitHub issues
 
 ### Shared Utilities (`packages/utils/src/`)
@@ -72,40 +97,47 @@ A Model Context Protocol (MCP) server that gives Claude Code deep integration wi
 
 ## Available Tools
 
-### Note Access
-- **`read_note(note)`** - Read note content with smart lookup
-  - Supports: `"Note Name"`, `"Note Name.md"`, `"knowledge/Note"`, `"memory://knowledge/Note"`
-  - Auto-searches: graph index → `knowledge/` → `journal/` → root
-  - Returns JSON metadata + frontmatter + content
+### Weekly Journal
+- **`GetWeeklyNote()`** - Get ResourceLink to current week's journal note
+  - Returns URI like `memory:journal/2025-w42`
+  - Use ReadMcpResourceTool to read the note content
 
 ### Graph Navigation
-- **`get_backlinks(noteName, includePrivate)`** - Find notes linking here
+- **`GetBacklinks(noteName, includePrivate)`** - Find notes linking here
   - Returns ResourceLinks for each backlink
-- **`get_graph_neighborhood(noteName, depth, includePrivate)`** - Explore connections
+- **`GetGraphNeighborhood(noteName, depth, includePrivate)`** - Explore connections
   - Returns ResourceLinks grouped by distance
 
 ### Metadata
-- **`get_frontmatter(path)`** - Get YAML frontmatter
-- **`update_frontmatter(path, updates)`** - Update frontmatter fields
+- **`UpdateFrontmatter(path, updates)`** - Update YAML frontmatter fields
 
 ### Statistics
-- **`get_note_usage(notes, period)`** - Query access stats for consolidation
+- **`GetNoteUsage(notes, period)`** - Query access stats for consolidation
 
 ### Memory Management
-- **`load_private_memory(reason)`** - Load private Index/WorkingMemory (requires consent)
-- **`consolidate_memory(includePrivate)`** - Trigger consolidation workflow
-- **`complete_consolidation()`** - Mark consolidation done, delete WorkingMemory
+- **`LoadPrivateMemory(reason)`** - Load private Index/Working Memory (requires consent)
+- **`ConsolidateMemory(includePrivate)`** - Trigger consolidation workflow
+- **`CompleteConsolidation()`** - Mark consolidation done, delete Working Memory
 
 ---
 
 ## Available Resources
 
-Exposed via MCP resources (auto-discoverable by Claude):
+### Static Resources
 
-- **`memory://Index`** - Public long-term memory
-- **`memory://WorkingMemory`** - Public short-term memory
-- **`memory://private/Index`** - Private long-term (consent required)
-- **`memory://private/WorkingMemory`** - Private short-term (consent required)
+Auto-loaded on startup (auto-discoverable by Claude):
+
+- **`memory:Index`** - Public long-term memory
+- **`memory:Working Memory`** - Public short-term memory
+- **`memory:private/Index`** - Private long-term (consent required)
+- **`memory:private/Working Memory`** - Private short-term (consent required)
+
+### Resource Template
+
+- **`memory:{path}`** - Read any note in the vault
+  - Examples: `memory:knowledge/CSS`, `memory:journal/2025-w42`
+  - Smart path resolution with auto-search
+  - Returns embedded resource with structured metadata
 
 Resources support subscriptions for live updates.
 
@@ -113,13 +145,13 @@ Resources support subscriptions for live updates.
 
 ## URI Scheme
 
-All resources and ResourceLinks use `memory://` scheme:
+All resources and ResourceLinks use `memory:` scheme (opaque URLs):
 
 ```
-memory://Index                      # Root-level files
-memory://knowledge/MCP Servers      # Knowledge base notes
-memory://journal/2024-w42           # Journal entries
-memory://private/Personal Note      # Private notes
+memory:Index                      # Root-level files
+memory:knowledge/MCP Servers      # Knowledge base notes
+memory:journal/2024-w42           # Journal entries
+memory:private/Personal Note      # Private notes
 ```
 
 ---
@@ -128,7 +160,7 @@ memory://private/Personal Note      # Private notes
 
 ### Global Settings (`~/.claude/CLAUDE.md`)
 - Documents memory priority rules
-- Auto-imports Index.md and WorkingMemory.md
+- Auto-imports Index.md and Working Memory.md
 - Instructs Claude to search memory before answering
 
 ### Permissions (`~/.claude/settings.json`)
@@ -162,13 +194,19 @@ memory://private/Personal Note      # Private notes
 - Supports subscriptions for live updates
 - Natural consent flow for private resources
 
-**Why remove `write_note`?**
-- Inconsistent with Claude Code's normal file editing
-- Users should use standard Edit/Write tools
-- `read_note` provides file path in metadata
+**Why resource template instead of ReadNote tool?**
+- More semantic - notes are data, not actions
+- Better architecture - aligns with MCP resource model
+- Discoverable - Claude Code can browse available resources
+- Consistent - graph tools return ResourceLinks that work with template
 
 **Why ResourceLinks in graph tools?**
 - Avoids loading full note content
 - Client decides what to actually read
 - Better performance with large graphs
 - Provides rich metadata (relationships, descriptions)
+
+**Why return error responses instead of throwing?**
+- Missing notes aren't protocol errors
+- Error responses provide helpful guidance (where to create the note)
+- Tool succeeds with useful information rather than failing

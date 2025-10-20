@@ -96,17 +96,22 @@ export function generateSearchPaths(
 }
 
 /**
- * Normalize a note reference (strip memory:// prefix and .md extension)
+ * Normalize a note reference (strip memory: URI scheme and .md extension)
  *
- * @param noteRef - Note reference (can be name, path, or memory:// URI)
+ * @param noteRef - Note reference (can be name, path, memory: URI, or [[wiki link]])
  * @returns Normalized path without extension
  */
 export function normalizeNoteReference(noteRef: string): string {
   let normalized = noteRef;
 
-  // Strip memory:// prefix if present
-  if (normalized.startsWith("memory://")) {
-    normalized = normalized.slice(9);
+  // Strip [[wiki link]] brackets if present
+  if (normalized.startsWith("[[") && normalized.endsWith("]]")) {
+    normalized = normalized.slice(2, -2);
+  }
+
+  // Strip memory: URI scheme (opaque URL format)
+  if (normalized.startsWith("memory:")) {
+    normalized = normalized.slice(7); // "memory:" is 7 chars
   }
 
   // Strip .md extension if present

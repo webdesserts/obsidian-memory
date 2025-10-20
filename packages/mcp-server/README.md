@@ -5,7 +5,7 @@ Custom MCP server for Obsidian with graph-aware memory system and intelligent co
 ## Features
 
 - **Graph-based navigation**: Follow wiki links, explore backlinks, discover neighborhoods
-- **Memory system**: Two-tier memory (WorkingMemory.md + Index.md) with automatic consolidation
+- **Memory system**: Two-tier memory (Working Memory.md + Index.md) with automatic consolidation
 - **Multi-device coordination**: Lock files and file watching for seamless sync across laptops
 - **Private memory**: Separate private folder with explicit consent required
 

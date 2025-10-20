@@ -8,7 +8,7 @@ export const CompleteConsolidation = {
   definition: {
     name: "CompleteConsolidation",
     description:
-      "Mark consolidation as complete (deletes WorkingMemory.md, releases lock)",
+      "Mark consolidation as complete (deletes Working Memory.md, releases lock)",
     inputSchema: z.toJSONSchema(Args),
   },
 
@@ -23,7 +23,7 @@ export const CompleteConsolidation = {
       content: [
         {
           type: "text",
-          text: "Consolidation complete! WorkingMemory.md deleted, Index.md reloaded.",
+          text: "Consolidation complete! Working Memory.md deleted, Index.md reloaded.",
         },
       ],
     };
