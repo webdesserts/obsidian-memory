@@ -1,36 +1,43 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "../types.js";
+import type { McpServer } from "../server.js";
+import type { ToolContext } from "../types.js";
 
-const Args = z.object({
-  includePrivate: z
-    .boolean()
-    .optional()
-    .describe("Include private notes in consolidation (default: false)"),
-});
-type Args = z.infer<typeof Args>;
+/**
+ * ConsolidateMemory Tool
+ *
+ * Trigger memory consolidation (consolidate Working Memory.md into Index.md).
+ */
+export function registerConsolidateMemory(
+  server: McpServer,
+  context: ToolContext
+) {
+  server.registerTool(
+    "consolidate_memory",
+    {
+      title: "Consolidate Memory",
+      description:
+        "Trigger memory consolidation (consolidate Working Memory.md into Index.md)",
+      inputSchema: {
+        includePrivate: z
+          .boolean()
+          .optional()
+          .describe("Include private notes in consolidation (default: false)"),
+      },
+    },
+    async ({ includePrivate = false }) => {
+      const { consolidationManager } = context;
 
-export const ConsolidateMemory = {
-  definition: {
-    name: "ConsolidateMemory",
-    description:
-      "Trigger memory consolidation (consolidate Working Memory.md into Index.md)",
-    inputSchema: z.toJSONSchema(Args),
-  },
+      console.error(
+        `[Consolidation] Triggering consolidation (includePrivate: ${includePrivate})`
+      );
 
-  async handler(args: unknown, context: ToolContext) {
-    const { includePrivate = false } = Args.parse(args);
-    const { consolidationManager } = context;
+      const prompt = await consolidationManager.triggerConsolidation(
+        includePrivate
+      );
 
-    console.error(
-      `[Consolidation] Triggering consolidation (includePrivate: ${includePrivate})`
-    );
-
-    const prompt = await consolidationManager.triggerConsolidation(
-      includePrivate
-    );
-
-    return {
-      content: [{ type: "text", text: prompt }],
-    };
-  },
-} satisfies MCPTool;
+      return {
+        content: [{ type: "text", text: prompt }],
+      };
+    }
+  );
+}

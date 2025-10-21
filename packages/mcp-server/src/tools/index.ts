@@ -1,29 +1,30 @@
 /**
  * All available MCP tools for the Obsidian Memory server
+ *
+ * Tools use server.registerTool() API for clean, type-safe registration
  */
 
-import { MCPTool } from "../types.js";
-import { GetNote } from "./GetNote.js";
-import { GetWeeklyNote } from "./GetWeeklyNote.js";
-import { UpdateFrontmatter } from "./UpdateFrontmatter.js";
-import { GetGraphNeighborhood } from "./GetGraphNeighborhood.js";
-import { GetNoteUsage } from "./GetNoteUsage.js";
-import { LoadPrivateMemory } from "./LoadPrivateMemory.js";
-import { ConsolidateMemory } from "./ConsolidateMemory.js";
-import { CompleteConsolidation } from "./CompleteConsolidation.js";
-import type { JSONSchema } from "zod/v4/core";
+import type { McpServer } from "../server.js";
+import type { ToolContext } from "../types.js";
+import { registerGetNote } from "./GetNote.js";
+import { registerGetWeeklyNote } from "./GetWeeklyNote.js";
+import { registerUpdateFrontmatter } from "./UpdateFrontmatter.js";
+import { registerGetGraphNeighborhood } from "./GetGraphNeighborhood.js";
+import { registerGetNoteUsage } from "./GetNoteUsage.js";
+import { registerLoadPrivateMemory } from "./LoadPrivateMemory.js";
+import { registerConsolidateMemory } from "./ConsolidateMemory.js";
+import { registerCompleteConsolidation } from "./CompleteConsolidation.js";
 
 /**
- * Array of all available tools
- * Add new tools here to register them with the MCP server
+ * Register all tools with the MCP server
  */
-export const allTools = [
-  GetNote,
-  GetWeeklyNote,
-  UpdateFrontmatter,
-  GetGraphNeighborhood,
-  GetNoteUsage,
-  LoadPrivateMemory,
-  ConsolidateMemory,
-  CompleteConsolidation,
-] as const;
+export function registerAllTools(server: McpServer, context: ToolContext) {
+  registerGetNote(server, context);
+  registerGetWeeklyNote(server, context);
+  registerUpdateFrontmatter(server, context);
+  registerGetGraphNeighborhood(server, context);
+  registerGetNoteUsage(server, context);
+  registerLoadPrivateMemory(server, context);
+  registerConsolidateMemory(server, context);
+  registerCompleteConsolidation(server, context);
+}

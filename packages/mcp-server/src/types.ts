@@ -80,9 +80,11 @@ export interface ResourceLink {
 
 /**
  * Tool definition for MCP server
+ * Matches McpServer.registerTool() config structure
  */
 export interface ToolDefinition {
   name: string;
+  title?: string;
   description: string;
   inputSchema: JSONSchema.BaseSchema;
 }

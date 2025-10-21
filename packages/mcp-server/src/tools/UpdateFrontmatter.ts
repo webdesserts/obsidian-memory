@@ -1,27 +1,36 @@
 import { z } from "zod";
-import { ToolContext, MCPTool } from "../types.js";
+import type { McpServer } from "../server.js";
+import type { ToolContext } from "../types.js";
 
-const Args = z.object({
-  path: z.string().describe("Path to the note relative to vault root"),
-  updates: z.record(z.string(), z.any()).describe("Frontmatter fields to update"),
-});
-type Args = z.infer<typeof Args>;
+/**
+ * UpdateFrontmatter Tool
+ *
+ * Update frontmatter metadata in a note.
+ */
+export function registerUpdateFrontmatter(
+  server: McpServer,
+  context: ToolContext
+) {
+  server.registerTool(
+    "update_frontmatter",
+    {
+      title: "Update Frontmatter",
+      description: "Update frontmatter metadata in a note",
+      inputSchema: {
+        path: z.string().describe("Path to the note relative to vault root"),
+        updates: z
+          .record(z.string(), z.any())
+          .describe("Frontmatter fields to update"),
+      },
+    },
+    async ({ path, updates }) => {
+      const { fileOps } = context;
 
-export const UpdateFrontmatter = {
-  definition: {
-    name: "UpdateFrontmatter",
-    description: "Update frontmatter metadata in a note",
-    inputSchema: z.toJSONSchema(Args),
-  },
+      await fileOps.updateFrontmatter(path, updates);
 
-  async handler(args: unknown, context: ToolContext) {
-    const { path, updates } = Args.parse(args);
-    const { fileOps } = context;
-
-    await fileOps.updateFrontmatter(path, updates);
-
-    return {
-      content: [{ type: "text", text: `Frontmatter updated: ${path}` }],
-    };
-  },
-} satisfies MCPTool;
+      return {
+        content: [{ type: "text", text: `Frontmatter updated: ${path}` }],
+      };
+    }
+  );
+}

@@ -1,19 +1,15 @@
 #!/usr/bin/env node
 
 import { basename } from "node:path";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "./server.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListRootsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ConsolidationManager } from "./memory/consolidation.js";
 import { resolveNotePath } from "@obsidian-memory/utils";
-import { allTools } from "./tools/index.js";
+import { registerAllTools } from "./tools/index.js";
 import { ToolContext } from "./types.js";
 
 // Parse command line arguments
@@ -72,26 +68,13 @@ const toolContext = {
 } satisfies ToolContext;
 
 // Create server instance
-const server = new Server(
-  {
-    name: "obsidian-memory-mcp",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-      resources: {
-        subscribe: true,
-      },
-      roots: {
-        listChanged: false,
-      },
-    },
-  }
-);
+const server = new McpServer({
+  name: "obsidian-memory-mcp",
+  version: "0.1.0",
+});
 
-// List roots
-server.setRequestHandler(ListRootsRequestSchema, async () => {
+// List roots - still using low-level API
+server.server.setRequestHandler(ListRootsRequestSchema, async () => {
   return {
     roots: [
       {
@@ -102,33 +85,8 @@ server.setRequestHandler(ListRootsRequestSchema, async () => {
   };
 });
 
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: allTools.map((tool) => tool.definition),
-  };
-});
-
-// No resources - use GetNote tool for all note discovery and access
-
-// Handle tool calls
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args = {} } = request.params;
-
-  try {
-    const tool = allTools.find((tool) => tool.definition.name === name);
-
-    if (!tool) throw new Error(`Tool not found: ${name}`);
-
-    return tool.handler(args, toolContext);
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: "text", text: `Error: ${errorMessage}` }],
-      isError: true,
-    };
-  }
-});
+// Register all tools using high-level API
+registerAllTools(server, toolContext);
 
 // Start the server
 async function main() {
@@ -137,7 +95,7 @@ async function main() {
   await memorySystem.initialize();
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await server.server.connect(transport);
   console.error("[Server] Obsidian Memory MCP Server running");
 
   // Clean up on exit
