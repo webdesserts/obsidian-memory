@@ -1,5 +1,5 @@
 {
-  "name": "@obsidian-memory/utils",
+  "name": "@webdesserts/obsidian-memory-utils",
   "version": "0.1.0",
   "description": "Shared utilities for working with Obsidian vaults",
   "type": "module",

@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import chokidar, { FSWatcher } from "chokidar";
-import { parseWikiLinks, extractLinkedNotes } from "@obsidian-memory/utils";
+import { parseWikiLinks, extractLinkedNotes } from "@webdesserts/obsidian-memory-utils";
 
 /**
  * In-memory graph index tracking forward links and backlinks

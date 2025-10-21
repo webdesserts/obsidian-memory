@@ -10,7 +10,7 @@ import {
   validatePath,
   fileExists,
   ensureMarkdownExtension,
-} from "@obsidian-memory/utils";
+} from "@webdesserts/obsidian-memory-utils";
 
 export interface ResolveNotePathOptions {
   /** Note reference (supports: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]") */

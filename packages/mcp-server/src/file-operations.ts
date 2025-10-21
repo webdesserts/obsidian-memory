@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import matter from "gray-matter";
-import { validatePath, fileExists, ensureMarkdownExtension } from "@obsidian-memory/utils";
+import { validatePath, fileExists, ensureMarkdownExtension } from "@webdesserts/obsidian-memory-utils";
 
 export interface FileOperationsConfig {
   vaultPath: string;

@@ -1,5 +1,5 @@
 {
-  "name": "@obsidian-memory/mcp-server",
+  "name": "@webdesserts/obsidian-memory-mcp-server",
   "version": "0.1.0",
   "description": "Custom MCP server for Obsidian with graph-aware memory system",
   "type": "module",
@@ -24,7 +24,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
-    "@obsidian-memory/utils": "*",
+    "@webdesserts/obsidian-memory-utils": "*",
     "chokidar": "^4.0.3",
     "gray-matter": "^4.0.3",
     "zod": "^4.1.12"

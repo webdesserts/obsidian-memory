@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext, ToolResponseContent } from "../types.js";
-import { extractNoteName } from "@obsidian-memory/utils";
+import { extractNoteName } from "@webdesserts/obsidian-memory-utils";
 
 /**
  * GetGraphNeighborhood Tool

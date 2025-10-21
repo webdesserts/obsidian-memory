@@ -13,7 +13,9 @@
       "Bash(cat:*)",
       "WebFetch(domain:help.obsidian.md)",
       "WebFetch(domain:spec.modelcontextprotocol.io)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(npm install)",
+      "mcp__plugin_obsidian-memory_obsidian-memory__get_note"
     ],
     "deny": [],
     "ask": []

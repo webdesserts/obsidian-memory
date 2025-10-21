@@ -32,7 +32,14 @@ Shared utilities for working with Obsidian vaults in Node.js.
 
 ### @obsidian-memory/claude-plugin
 
-*(Coming soon)* Claude Code plugin with notetaker agent and session hooks.
+Claude Code plugin with MCP server integration and notetaker skill.
+
+**Features:**
+- Automatic MCP server startup
+- Notetaker skill for automatic Working Memory updates
+- Future: Session hooks and `/reflect` command
+
+**Installation:** See [Plugin Installation](#plugin-installation) below.
 
 ## Development
 
@@ -94,6 +101,80 @@ obsidian-memory/
 - **ES Modules:** All packages use ES module format with tree-shaking support
 - **Project References:** Packages reference each other for type-safe development
 - **Composite Mode:** Enabled for incremental builds
+
+## Plugin Installation
+
+The Claude Code plugin boots the MCP server and provides the notetaker skill.
+
+### Setup
+
+1. **Clone and build this repository:**
+   ```bash
+   cd ~/code/webdesserts
+   git clone https://github.com/webdesserts/obsidian-memory.git
+   cd obsidian-memory
+   npm install && npm run build
+   ```
+
+2. **Link the MCP server globally** (so npx can find it):
+   ```bash
+   cd packages/mcp-server
+   npm link
+   ```
+
+3. **Copy plugin to your dotfiles:**
+   ```bash
+   # Copy plugin files to dotfiles marketplace
+   mkdir -p ~/.dots/<your-dotfiles>/claude/plugins/obsidian-memory
+   cp -r packages/claude-plugin/* ~/.dots/<your-dotfiles>/claude/plugins/obsidian-memory/
+   ```
+
+4. **Create marketplace metadata** (one-time setup):
+
+   Create `~/.dots/<your-dotfiles>/claude/plugins/.claude-plugin/marketplace.json`:
+   ```json
+   {
+     "name": "plugins",
+     "owner": {
+       "name": "Your Name",
+       "email": "your@email.com"
+     },
+     "plugins": [
+       {
+         "name": "obsidian-memory",
+         "source": "./obsidian-memory",
+         "description": "Obsidian Memory integration",
+         "version": "1.0.0"
+       }
+     ]
+   }
+   ```
+
+5. **Install the plugin in Claude Code:**
+   ```bash
+   # Add your dotfiles marketplace
+   /plugin marketplace add ~/.dots/<your-dotfiles>/claude/plugins
+
+   # Install the plugin
+   /plugin install obsidian-memory@plugins
+
+   # Restart Claude Code
+   ```
+
+### Configuration
+
+The plugin uses `npx` to run the MCP server, so it works regardless of repository location. You only need to configure:
+
+- **Vault location**: Default is `~/notes`. To change, edit `VAULT_PATH` in `~/.dots/<your-dotfiles>/claude/plugins/obsidian-memory/.claude-plugin/plugin.json`
+
+### Updating
+
+After making changes to the MCP server:
+```bash
+cd ~/code/webdesserts/obsidian-memory
+npm run build
+# MCP server will use updated code on next Claude Code restart
+```
 
 ## License
 

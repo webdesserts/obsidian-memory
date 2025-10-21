@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { basename } from "node:path";
+import { homedir } from "node:os";
 import { McpServer } from "./server.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -8,14 +9,14 @@ import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ConsolidationManager } from "./memory/consolidation.js";
-import { resolveNotePath } from "@obsidian-memory/utils";
+import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
 import { registerAllTools } from "./tools/index.js";
 import { ToolContext } from "./types.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
 const vaultPathIndex = args.indexOf("--vault-path");
-const vaultPath =
+let vaultPath =
   vaultPathIndex !== -1
     ? args[vaultPathIndex + 1]
     : process.env.OBSIDIAN_VAULT_PATH;
@@ -25,6 +26,11 @@ if (!vaultPath) {
   console.error("Usage: obsidian-memory-mcp --vault-path <path>");
   console.error("   or: Set OBSIDIAN_VAULT_PATH environment variable");
   process.exit(1);
+}
+
+// Expand ~ to home directory
+if (vaultPath.startsWith("~/")) {
+  vaultPath = vaultPath.replace("~", homedir());
 }
 
 // Derive vault name from path (basename of the vault directory)
