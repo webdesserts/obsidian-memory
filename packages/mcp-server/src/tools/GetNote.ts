@@ -26,11 +26,14 @@ export function registerGetNote(server: McpServer, context: ToolContext) {
       },
     },
     async ({ note }) => {
-      const { graphIndex, vaultPath, vaultName, fileOps } = context;
+      const { graphIndex, vaultPath, vaultName, fileOps, memorySystem } = context;
 
       // Resolve note reference to vault-relative path
       const notePath = await resolveNotePath({ note, context: { vaultPath } });
       const noteName = extractNoteName(notePath);
+
+      // Log access for usage statistics
+      memorySystem.logAccess(noteName, "get_note");
 
       // Check if note exists in graph
       const resolvedPath = graphIndex.getNotePath(noteName);

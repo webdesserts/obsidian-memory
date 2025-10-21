@@ -26,7 +26,7 @@ export function registerGetNoteUsage(server: McpServer, context: ToolContext) {
     async ({ notes, period = "all" }) => {
       const { memorySystem, graphIndex } = context;
 
-      const stats = await memorySystem.getNoteUsage(notes, period);
+      const stats = await memorySystem.getNoteUsage(notes, period, graphIndex);
 
       // Add backlink counts from graph index
       for (const note of notes) {

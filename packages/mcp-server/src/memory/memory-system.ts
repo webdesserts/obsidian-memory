@@ -31,11 +31,14 @@ export class MemorySystem {
   private indexContent: string | null = null;
   private workingMemoryContent: string | null = null;
   private consolidationInProgress = false;
+  private readonly accessLogPath: string;
 
   constructor(
     private vaultPath: string,
     private fileOps: FileOperations
-  ) {}
+  ) {
+    this.accessLogPath = path.join(vaultPath, ".obsidian", "memory-access-log.json");
+  }
 
   /**
    * Initialize memory system - load Index.md if it exists
@@ -60,6 +63,9 @@ export class MemorySystem {
     } catch (error) {
       console.error("[MemorySystem] No Working Memory.md found (will be created when needed)");
     }
+
+    // Load access log from disk
+    await this.loadAccessLog();
   }
 
   /**
@@ -105,6 +111,11 @@ export class MemorySystem {
     this.accessLog = this.accessLog.filter(
       (entry) => entry.timestamp >= thirtyDaysAgo
     );
+
+    // Persist to disk (fire-and-forget)
+    this.saveAccessLog().catch((err) =>
+      console.error("[MemorySystem] Failed to save access log:", err)
+    );
   }
 
   /**
@@ -112,7 +123,8 @@ export class MemorySystem {
    */
   async getNoteUsage(
     notes: string[],
-    period: "24h" | "7d" | "30d" | "all" = "all"
+    period: "24h" | "7d" | "30d" | "all" = "all",
+    graphIndex?: { getNotePath(noteName: string): string | undefined }
   ): Promise<Record<string, NoteUsageStats>> {
     const now = new Date();
     const cutoffTimes = {
@@ -148,9 +160,11 @@ export class MemorySystem {
       // Get file creation date
       let createdDate: Date | null = null;
       try {
-        const notePath = path.join(this.vaultPath, `${note}.md`);
-        const stats = await fs.stat(notePath);
-        createdDate = stats.birthtime;
+        // Resolve note name to path using graph index if available
+        const resolvedPath = graphIndex?.getNotePath(note) || note;
+        const notePath = path.join(this.vaultPath, `${resolvedPath}.md`);
+        const fileStats = await fs.stat(notePath);
+        createdDate = fileStats.birthtime;
       } catch (error) {
         // File doesn't exist or error reading stats
       }
@@ -320,5 +334,45 @@ export class MemorySystem {
     } catch (error) {
       console.error("[MemorySystem] Failed to reload Index.md");
     }
+  }
+
+  /**
+   * Load access log from disk
+   */
+  private async loadAccessLog(): Promise<void> {
+    try {
+      const content = await fs.readFile(this.accessLogPath, "utf-8");
+      const entries = JSON.parse(content);
+
+      // Convert timestamp strings back to Date objects
+      this.accessLog = entries.map((e: any) => ({
+        ...e,
+        timestamp: new Date(e.timestamp),
+      }));
+
+      console.error(
+        `[MemorySystem] Loaded ${this.accessLog.length} access log entries`
+      );
+    } catch (error) {
+      // File doesn't exist yet, start fresh
+      this.accessLog = [];
+      console.error("[MemorySystem] No access log found, starting fresh");
+    }
+  }
+
+  /**
+   * Save access log to disk
+   */
+  private async saveAccessLog(): Promise<void> {
+    // Ensure .obsidian directory exists
+    const obsidianDir = path.join(this.vaultPath, ".obsidian");
+    await fs.mkdir(obsidianDir, { recursive: true });
+
+    // Write log file
+    await fs.writeFile(
+      this.accessLogPath,
+      JSON.stringify(this.accessLog, null, 2),
+      "utf-8"
+    );
   }
 }
