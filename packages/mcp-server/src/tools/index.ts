@@ -12,8 +12,10 @@ import { registerUpdateFrontmatter } from "./UpdateFrontmatter.js";
 import { registerGetGraphNeighborhood } from "./GetGraphNeighborhood.js";
 import { registerGetNoteUsage } from "./GetNoteUsage.js";
 import { registerLoadPrivateMemory } from "./LoadPrivateMemory.js";
-import { registerConsolidateMemory } from "./ConsolidateMemory.js";
-import { registerCompleteConsolidation } from "./CompleteConsolidation.js";
+import { registerReindex } from "./Reindex.js";
+import { registerCompleteReindex } from "./CompleteReindex.js";
+import { registerReflect } from "./Reflect.js";
+import { registerCompleteReflect } from "./CompleteReflect.js";
 
 /**
  * Register all tools with the MCP server
@@ -25,6 +27,8 @@ export function registerAllTools(server: McpServer, context: ToolContext) {
   registerGetGraphNeighborhood(server, context);
   registerGetNoteUsage(server, context);
   registerLoadPrivateMemory(server, context);
-  registerConsolidateMemory(server, context);
-  registerCompleteConsolidation(server, context);
+  registerReindex(server, context);
+  registerCompleteReindex(server, context);
+  registerReflect(server, context);
+  registerCompleteReflect(server, context);
 }

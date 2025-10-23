@@ -6,7 +6,7 @@ import { z, ZodJSONSchema } from "zod";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
-import { ConsolidationManager } from "./memory/consolidation.js";
+import { ReindexManager } from "./memory/reindex.js";
 import { JSONSchema } from "zod/v4/core";
 import { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 
@@ -20,7 +20,7 @@ export interface ToolContext {
   fileOps: FileOperations;
   graphIndex: GraphIndex;
   memorySystem: MemorySystem;
-  consolidationManager: ConsolidationManager;
+  reindexManager: ReindexManager;
   resolveNoteNameToPath: (
     noteName: string,
     includePrivate?: boolean

@@ -8,9 +8,10 @@ import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
-import { ConsolidationManager } from "./memory/consolidation.js";
+import { ReindexManager } from "./memory/reindex.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
 import { registerAllTools } from "./tools/index.js";
+import { registerAllPrompts } from "./prompts/index.js";
 import { ToolContext } from "./types.js";
 
 // Parse command line arguments
@@ -40,11 +41,11 @@ console.error(`[Server] Starting Obsidian Memory MCP Server`);
 console.error(`[Server] Vault path: ${vaultPath}`);
 console.error(`[Server] Vault name: ${vaultName}`);
 
-// Initialize file operations, graph index, memory system, and consolidation
+// Initialize file operations, graph index, memory system, and reindex manager
 const fileOps = new FileOperations({ vaultPath });
 const graphIndex = new GraphIndex(vaultPath);
 const memorySystem = new MemorySystem(vaultPath, fileOps);
-const consolidationManager = new ConsolidationManager(
+const reindexManager = new ReindexManager(
   memorySystem,
   fileOps,
   graphIndex
@@ -69,7 +70,7 @@ const toolContext = {
   fileOps,
   graphIndex,
   memorySystem,
-  consolidationManager,
+  reindexManager,
   resolveNoteNameToPath,
 } satisfies ToolContext;
 
@@ -91,8 +92,9 @@ server.server.setRequestHandler(ListRootsRequestSchema, async () => {
   };
 });
 
-// Register all tools using high-level API
+// Register all tools and prompts using high-level API
 registerAllTools(server, toolContext);
+registerAllPrompts(server, toolContext);
 
 // Start the server
 async function main() {
