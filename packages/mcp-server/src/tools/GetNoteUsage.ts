@@ -16,7 +16,8 @@ export function registerGetNoteUsage(server: McpServer, context: ToolContext) {
       inputSchema: {
         notes: z
           .array(z.string())
-          .describe("List of note names to get statistics for"),
+          .optional()
+          .describe("List of note names to get statistics for (omit to get all notes from access log)"),
         period: z
           .enum(["24h", "7d", "30d", "all"])
           .optional()
@@ -29,9 +30,12 @@ export function registerGetNoteUsage(server: McpServer, context: ToolContext) {
       const stats = await memorySystem.getNoteUsage(notes, period, graphIndex);
 
       // Add backlink counts from graph index
-      for (const note of notes) {
-        const backlinks = graphIndex.getBacklinks(note, false);
-        stats[note].backlinks = backlinks.length;
+      const noteNames = notes ?? Object.keys(stats);
+      for (const note of noteNames) {
+        if (stats[note]) {
+          const backlinks = graphIndex.getBacklinks(note, false);
+          stats[note].backlinks = backlinks.length;
+        }
       }
 
       return {

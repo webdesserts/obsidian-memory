@@ -90,8 +90,10 @@ Update Index.md based on knowledge graph changes and access patterns.
 
 1. **Review** the current Index.md and Working Memory.md for context
 2. **Use get_note_usage()** to check access statistics from the access log
+   - **Call without arguments** to get usage for ALL notes in the access log
    - Identify frequently accessed notes that should be promoted to entry points
    - Find stale entries that are rarely accessed
+   - Discover notes with high access counts not currently in Index.md
 3. **Analyze** the knowledge graph structure
    - Use get_graph_neighborhood() to explore connections
    - Identify new entry points based on graph topology
@@ -111,13 +113,6 @@ ${indexMd || "*(No Index.md exists yet - create initial structure)*"}
 ## Current Working Memory.md (for context)
 
 ${workingMemoryMd || "*(No Working Memory.md exists yet)*"}
-
-## Tools Available
-
-- \`get_note_usage(notes, period)\` - **Query access log statistics** (use this!)
-- \`get_graph_neighborhood(note, depth)\` - Explore connections
-- \`Write()\` - Write the new Index.md
-- \`update_frontmatter()\` - Update Index.md frontmatter
 
 ## Output Format
 

@@ -120,9 +120,10 @@ export class MemorySystem {
 
   /**
    * Get usage statistics for notes
+   * If notes is undefined, returns stats for all notes in the access log
    */
   async getNoteUsage(
-    notes: string[],
+    notes: string[] | undefined,
     period: "24h" | "7d" | "30d" | "all" = "all",
     graphIndex?: { getNotePath(noteName: string): string | undefined }
   ): Promise<Record<string, NoteUsageStats>> {
@@ -137,7 +138,10 @@ export class MemorySystem {
     const cutoff = cutoffTimes[period];
     const stats: Record<string, NoteUsageStats> = {};
 
-    for (const note of notes) {
+    // If notes is undefined, get all unique notes from access log
+    const notesToQuery = notes ?? Array.from(new Set(this.accessLog.map((entry) => entry.note)));
+
+    for (const note of notesToQuery) {
       const accesses = this.accessLog.filter((entry) => entry.note === note);
 
       const accessCount24h = accesses.filter(
