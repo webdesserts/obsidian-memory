@@ -1,5 +1,7 @@
 /**
- * All available MCP prompts for the Obsidian Memory server
+ * Reflect Prompt
+ *
+ * MCP prompt for reflecting on Working Memory and consolidating content.
  */
 
 import type { McpServer } from "../server.js";
@@ -8,9 +10,9 @@ import { z } from "zod";
 import { generateReflectPrompt } from "./generateReflectPrompt.js";
 
 /**
- * Register all prompts with the MCP server
+ * Register reflect prompt with the MCP server
  */
-export function registerAllPrompts(server: McpServer, context: ToolContext) {
+export function registerReflectPrompt(server: McpServer, context: ToolContext) {
   // Register reflect prompt
   server.registerPrompt(
     "reflect",

@@ -10,9 +10,22 @@ import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ReindexManager } from "./memory/reindex.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
-import { registerAllTools } from "./tools/index.js";
-import { registerAllPrompts } from "./prompts/index.js";
 import { ToolContext } from "./types.js";
+
+// Tool registrations
+import { registerGetNote } from "./tools/GetNote.js";
+import { registerGetWeeklyNote } from "./tools/GetWeeklyNote.js";
+import { registerUpdateFrontmatter } from "./tools/UpdateFrontmatter.js";
+import { registerGetGraphNeighborhood } from "./tools/GetGraphNeighborhood.js";
+import { registerGetNoteUsage } from "./tools/GetNoteUsage.js";
+import { registerLoadPrivateMemory } from "./tools/LoadPrivateMemory.js";
+import { registerReindex } from "./tools/Reindex.js";
+import { registerCompleteReindex } from "./tools/CompleteReindex.js";
+import { registerReflect } from "./tools/Reflect.js";
+import { registerCompleteReflect } from "./tools/CompleteReflect.js";
+
+// Prompt registrations
+import { registerReflectPrompt } from "./prompts/Reflect.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -92,9 +105,20 @@ server.server.setRequestHandler(ListRootsRequestSchema, async () => {
   };
 });
 
-// Register all tools and prompts using high-level API
-registerAllTools(server, toolContext);
-registerAllPrompts(server, toolContext);
+// Register all tools
+registerGetNote(server, toolContext);
+registerGetWeeklyNote(server, toolContext);
+registerUpdateFrontmatter(server, toolContext);
+registerGetGraphNeighborhood(server, toolContext);
+registerGetNoteUsage(server, toolContext);
+registerLoadPrivateMemory(server, toolContext);
+registerReindex(server, toolContext);
+registerCompleteReindex(server, toolContext);
+registerReflect(server, toolContext);
+registerCompleteReflect(server, toolContext);
+
+// Register all prompts
+registerReflectPrompt(server, toolContext);
 
 // Start the server
 async function main() {
