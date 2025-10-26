@@ -15,7 +15,9 @@
       "WebFetch(domain:spec.modelcontextprotocol.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(npm install)",
-      "mcp__plugin_obsidian-memory_obsidian-memory__get_note"
+      "mcp__plugin_obsidian-memory_obsidian-memory__get_note",
+      "Bash(pkill:*)",
+      "Read(//tmp/**)"
     ],
     "deny": [],
     "ask": []

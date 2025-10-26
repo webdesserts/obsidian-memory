@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
-import chokidar, { FSWatcher } from "chokidar";
-import { parseWikiLinks, extractLinkedNotes } from "@webdesserts/obsidian-memory-utils";
+import chokidar, { type FSWatcher } from "chokidar";
+import { extractLinkedNotes } from "@webdesserts/obsidian-memory-utils";
 
 /**
  * In-memory graph index tracking forward links and backlinks
@@ -19,6 +19,9 @@ export class GraphIndex {
   // File watcher
   private watcher?: FSWatcher;
 
+  // Track pending async operations (used by tests to wait for file watcher events)
+  private operationCount = 0;
+
   constructor(private vaultPath: string) {}
 
   /**
@@ -30,11 +33,21 @@ export class GraphIndex {
     await this.scanVault();
 
     console.error(
-      `[GraphIndex] Indexed ${this.forwardLinks.size} notes with ${this.getTotalLinks()} links`
+      `[GraphIndex] Indexed ${
+        this.forwardLinks.size
+      } notes with ${this.getTotalLinks()} links`
     );
 
-    // Set up file watcher for incremental updates
-    this.setupFileWatcher();
+    // Set up file watcher for incremental updates (wait for it to be ready)
+    await this.setupFileWatcher();
+  }
+
+  /**
+   * Check if file watcher has pending operations
+   * Used by tests to wait for async operations to complete
+   */
+  hasPendingOperations(): boolean {
+    return this.operationCount > 0;
   }
 
   /**
@@ -78,67 +91,103 @@ export class GraphIndex {
    * Index a single file (extract links and update graph)
    */
   private async indexFile(filePath: string): Promise<void> {
-    const noteName = this.getNoteName(filePath);
-    const relativePath = path.relative(this.vaultPath, filePath);
-    const content = await fs.readFile(filePath, "utf-8");
+    this.operationCount++;
+    try {
+      const noteName = this.getNoteName(filePath);
+      const relativePath = path.relative(this.vaultPath, filePath);
+      const content = await fs.readFile(filePath, "utf-8");
 
-    const linkedNotes = extractLinkedNotes(content);
+      const linkedNotes = extractLinkedNotes(content);
 
-    // Store note path (for ResourceLinks) - append to array to handle duplicates
-    const pathWithoutExt = relativePath.replace(/\.md$/, "");
-    const existingPaths = this.notePaths.get(noteName) || [];
-    if (!existingPaths.includes(pathWithoutExt)) {
-      this.notePaths.set(noteName, [...existingPaths, pathWithoutExt]);
-    }
-
-    // Clear existing forward links for this note
-    const oldLinks = this.forwardLinks.get(noteName);
-    if (oldLinks) {
-      // Remove backlinks from previously linked notes
-      for (const target of oldLinks) {
-        this.backlinks.get(target)?.delete(noteName);
+      // Store note path (for ResourceLinks) - append to array to handle duplicates
+      const pathWithoutExt = relativePath.replace(/\.md$/, "");
+      const existingPaths = this.notePaths.get(noteName) || [];
+      if (!existingPaths.includes(pathWithoutExt)) {
+        this.notePaths.set(noteName, [...existingPaths, pathWithoutExt]);
       }
-    }
 
-    // Update forward links
-    this.forwardLinks.set(noteName, new Set(linkedNotes));
-
-    // Update backlinks
-    for (const target of linkedNotes) {
-      if (!this.backlinks.has(target)) {
-        this.backlinks.set(target, new Set());
+      // Clear existing forward links for this note
+      const oldLinks = this.forwardLinks.get(noteName);
+      if (oldLinks) {
+        // Remove backlinks from previously linked notes
+        for (const target of oldLinks) {
+          this.backlinks.get(target)?.delete(noteName);
+        }
       }
-      this.backlinks.get(target)!.add(noteName);
+
+      // Update forward links
+      this.forwardLinks.set(noteName, new Set(linkedNotes));
+
+      // Update backlinks
+      for (const target of linkedNotes) {
+        const links = new Set(this.backlinks.get(target));
+        this.backlinks.set(target, links.add(noteName));
+      }
+    } finally {
+      this.operationCount--;
     }
   }
 
   /**
    * Set up file watcher for incremental updates
+   * Returns a promise that resolves when the watcher is ready
    */
-  private setupFileWatcher(): void {
-    this.watcher = chokidar.watch("**/*.md", {
-      cwd: this.vaultPath,
-      ignored: ".obsidian/**",
-      ignoreInitial: true,
-      persistent: true,
-    });
+  private setupFileWatcher(): Promise<void> {
+    return new Promise((resolve) => {
+      // Watch the directory directly instead of using glob with cwd
+      this.watcher = chokidar.watch(this.vaultPath, {
+        ignored: ".obsidian/**",
+        ignoreInitial: true,
+        persistent: true,
+        atomic: true,
+      });
 
-    this.watcher.on("add", (relativePath: string) => {
-      const filePath = path.join(this.vaultPath, relativePath);
-      console.error(`[GraphIndex] File added: ${relativePath}`);
-      this.indexFile(filePath);
-    });
+      this.watcher.on("error", (error) => {
+        console.error(`[GraphIndex] Watcher error:`, error);
+      });
 
-    this.watcher.on("change", (relativePath: string) => {
-      const filePath = path.join(this.vaultPath, relativePath);
-      console.error(`[GraphIndex] File changed: ${relativePath}`);
-      this.indexFile(filePath);
-    });
+      this.watcher.on("add", (filePath: string) => {
+        // Filter for .md files only
+        if (!filePath.endsWith(".md")) return;
 
-    this.watcher.on("unlink", (relativePath: string) => {
-      const noteName = path.basename(relativePath, ".md");
-      console.error(`[GraphIndex] File deleted: ${relativePath}`);
-      this.removeNote(noteName);
+        const relativePath = path.relative(this.vaultPath, filePath);
+        this.indexFile(filePath).catch((err) => {
+          console.error(
+            `[GraphIndex] Error indexing added file ${relativePath}:`,
+            err
+          );
+        });
+      });
+
+      this.watcher.on("change", (filePath: string) => {
+        // Filter for .md files only
+        if (!filePath.endsWith(".md")) return;
+
+        const relativePath = path.relative(this.vaultPath, filePath);
+        console.error(`[GraphIndex] File changed: ${relativePath}`);
+        this.indexFile(filePath).catch((err) => {
+          console.error(
+            `[GraphIndex] Error indexing changed file ${relativePath}:`,
+            err
+          );
+        });
+      });
+
+      this.watcher.on("unlink", (filePath: string) => {
+        // Filter for .md files only
+        if (!filePath.endsWith(".md")) return;
+
+        const relativePath = path.relative(this.vaultPath, filePath);
+        const noteName = path.basename(filePath, ".md");
+        console.error(`[GraphIndex] File deleted: ${relativePath}`);
+        this.removeNote(noteName);
+      });
+
+      // Wait for watcher to be ready before resolving
+      this.watcher.on("ready", () => {
+        console.error("[GraphIndex] File watcher ready");
+        resolve();
+      });
     });
   }
 
@@ -157,6 +206,9 @@ export class GraphIndex {
 
     // Remove backlinks
     this.backlinks.delete(noteName);
+
+    // Remove note paths
+    this.notePaths.delete(noteName);
   }
 
   /**
@@ -248,7 +300,9 @@ export class GraphIndex {
   > {
     const neighborhood = new Map();
     const visited = new Set<string>();
-    const queue: Array<{ note: string; distance: number }> = [{ note: noteName, distance: 0 }];
+    const queue: Array<{ note: string; distance: number }> = [
+      { note: noteName, distance: 0 },
+    ];
 
     while (queue.length > 0) {
       const { note, distance } = queue.shift()!;
@@ -283,7 +337,9 @@ export class GraphIndex {
       // Determine link type
       let linkType: "forward" | "backward" | "both" = "forward";
       const isLinkedFrom = this.getForwardLinks(noteName).includes(note);
-      const isLinkingTo = this.getBacklinks(noteName, includePrivate).includes(note);
+      const isLinkingTo = this.getBacklinks(noteName, includePrivate).includes(
+        note
+      );
 
       if (isLinkedFrom && isLinkingTo) {
         linkType = "both";
