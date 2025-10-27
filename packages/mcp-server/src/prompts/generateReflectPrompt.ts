@@ -6,7 +6,6 @@
  */
 
 export interface ReflectPromptOptions {
-  workingMemoryContent: string;
   weeklyNotePath: string;
   currentWeekNumber: number;
   currentDayOfWeek: string;
@@ -24,15 +23,16 @@ export interface PromptMessage {
 export async function generateReflectPrompt(
   options: ReflectPromptOptions
 ): Promise<{ messages: PromptMessage[] }> {
-  const { workingMemoryContent, weeklyNotePath, currentWeekNumber, currentDayOfWeek, includePrivate } = options;
+  const { weeklyNotePath, currentWeekNumber, currentDayOfWeek, includePrivate } = options;
 
   const promptText = `# Memory Reflection
 
-Review Working Memory and consolidate into permanent notes.
+Review Log.md and Working Memory.md and consolidate into permanent notes.
 
-## Working Memory
+## Files to Review
 
-${workingMemoryContent || "*(Working Memory is empty)*"}
+1. **Read Log.md** - Chronological record of session activity with ISO 8601 timestamps
+2. **Read Working Memory.md** - Draft notes (may already be in your context if you've been writing to it)
 
 ## Current Week's Journal
 
@@ -41,9 +41,9 @@ Path: ${weeklyNotePath}
 
 ## Consolidation Workflow
 
-### Phase 1: Categorize
+### Phase 1: Read & Categorize
 
-Review the **Timeline** and **Notes** sections in Working Memory. Categorize each piece of content by its destination:
+Read Log.md and Working Memory.md. Categorize each piece of content by its destination:
 
 1. **Knowledge notes** - Technical facts, APIs, patterns, how things work
    - Term-based, small, focused (dictionary-style)
@@ -55,13 +55,14 @@ Review the **Timeline** and **Notes** sections in Working Memory. Categorize eac
    - Example: \`knowledge/Obsidian Memory Project.md\`
    - Can be longer and more detailed than knowledge notes
 
-3. **Weekly journal Log** - Work summaries
+3. **Weekly journal Log** - Work summaries from Log.md
    - Add under **"## Log"** header in current week's journal
-   - **Review timeline entries and backfill logs for the appropriate days**
-   - If Working Memory has entries from previous days, add them under their respective weekday sub-headers
-   - Today is **${currentDayOfWeek}**, so current entries go under \`### ${currentDayOfWeek}\`
+   - **Map timestamped Log.md entries to appropriate weekdays**
+   - Use ISO 8601 timestamps to determine which day each entry belongs to
+   - Today is **${currentDayOfWeek}**, so entries from today go under \`### ${currentDayOfWeek}\`
    - Previous days' entries go under \`### Monday\`, \`### Tuesday\`, etc.
-   - Consolidate timeline entries into readable summary (not verbatim copy)
+   - Consolidate log entries into readable summary (not verbatim copy)
+   - **Preserve work ticket tags** ([LOR-4883], etc.) from log entries
    - Link to relevant [[Project]] and [[Knowledge]] notes
    - Keep entries concise with bullet points
 
@@ -124,16 +125,17 @@ Once approved, apply the changes:
 2. Use \`Read()\` to load existing note content
 3. Use \`Write()\` to save updated notes
 4. Use \`get_weekly_note()\` to get the current week's journal path
-5. Call \`complete_reflect()\` when done to clear Working Memory
+5. Call \`complete_reflect()\` when done to clear Log.md and Working Memory.md
 
 ## Guidelines
 
-- **Be selective**: Not everything in Working Memory needs to be saved permanently
+- **Be selective**: Not everything in Log or Working Memory needs to be saved permanently
 - **Knowledge notes**: Keep small and focused, dictionary-style, term-based
-- **Timeline consolidation**: Transform timeline entries into readable journal summaries, don't just copy verbatim
-- **Backfill previous days**: Review timeline dates and add entries under the correct weekday sub-headers (not just today's)
+- **Log consolidation**: Transform timestamped log entries into readable journal summaries, don't just copy verbatim
+- **Map timestamps to weekdays**: Use ISO 8601 timestamps from Log.md to determine correct weekday sub-headers
+- **Preserve work tags**: Keep work ticket tags ([LOR-4883], etc.) from log entries in weekly journal
 - **Show clear diffs**: User needs to see what's changing before approving
-- **Weekly Log structure**: All timeline/work entries go under \`## Log\` header with weekday sub-headers
+- **Weekly Log structure**: All work entries go under \`## Log\` header with weekday sub-headers
 - **Wait for approval**: Never write files without explicit user approval${
     includePrivate
       ? "\n\n## Private Memory\n\nInclude private notes in this reflection."

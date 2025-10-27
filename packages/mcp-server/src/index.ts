@@ -15,6 +15,8 @@ import { ToolContext } from "./types.js";
 // Tool registrations
 import { registerGetNote } from "./tools/GetNote.js";
 import { registerGetWeeklyNote } from "./tools/GetWeeklyNote.js";
+import { registerGetCurrentDatetime } from "./tools/GetCurrentDatetime.js";
+import { registerLog } from "./tools/Log.js";
 import { registerUpdateFrontmatter } from "./tools/UpdateFrontmatter.js";
 import { registerGetGraphNeighborhood } from "./tools/GetGraphNeighborhood.js";
 import { registerGetNoteUsage } from "./tools/GetNoteUsage.js";
@@ -108,6 +110,8 @@ server.server.setRequestHandler(ListRootsRequestSchema, async () => {
 // Register all tools
 registerGetNote(server, toolContext);
 registerGetWeeklyNote(server, toolContext);
+registerGetCurrentDatetime(server, toolContext);
+registerLog(server, toolContext);
 registerUpdateFrontmatter(server, toolContext);
 registerGetGraphNeighborhood(server, toolContext);
 registerGetNoteUsage(server, toolContext);

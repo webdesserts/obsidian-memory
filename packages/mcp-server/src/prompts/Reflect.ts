@@ -1,7 +1,7 @@
 /**
  * Reflect Prompt
  *
- * MCP prompt for reflecting on Working Memory and consolidating content.
+ * MCP prompt for reflecting on Log.md and Working Memory.md and consolidating content.
  */
 
 import type { McpServer } from "../server.js";
@@ -17,9 +17,9 @@ export function registerReflectPrompt(server: McpServer, context: ToolContext) {
   server.registerPrompt(
     "reflect",
     {
-      title: "Reflect on Working Memory",
+      title: "Reflect on Log and Working Memory",
       description:
-        "Review Working Memory and consolidate content into permanent notes (knowledge notes, project notes, weekly journal)",
+        "Review Log.md and Working Memory.md and consolidate content into permanent notes (knowledge notes, project notes, weekly journal)",
       argsSchema: {
         includePrivate: z
           .boolean()
@@ -28,11 +28,6 @@ export function registerReflectPrompt(server: McpServer, context: ToolContext) {
       },
     },
     async ({ includePrivate = false }) => {
-      const { memorySystem, fileOps } = context;
-
-      // Get Working Memory content
-      const workingMemory = memorySystem.getWorkingMemory() || "";
-
       // Get current date info
       const now = new Date();
       const weekNumber = getWeekNumber(now);
@@ -40,9 +35,8 @@ export function registerReflectPrompt(server: McpServer, context: ToolContext) {
       const dayOfWeek = getDayOfWeek(now);
       const weeklyNotePath = `journal/${year}-w${weekNumber.toString().padStart(2, "0")}.md`;
 
-      // Generate the prompt
+      // Generate the prompt (Claude will read files directly)
       return generateReflectPrompt({
-        workingMemoryContent: workingMemory,
         weeklyNotePath,
         currentWeekNumber: weekNumber,
         currentDayOfWeek: dayOfWeek,

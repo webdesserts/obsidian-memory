@@ -5,8 +5,8 @@ import type { ToolContext } from "../types.js";
 /**
  * CompleteReflect Tool
  *
- * Mark reflection as complete (deletes Working Memory.md, releases lock).
- * This is called after reflect workflow successfully consolidates Working Memory.
+ * Mark reflection as complete (deletes Log.md and Working Memory.md, releases lock).
+ * This is called after reflect workflow successfully consolidates Log and Working Memory.
  */
 export function registerCompleteReflect(
   server: McpServer,
@@ -17,7 +17,7 @@ export function registerCompleteReflect(
     {
       title: "Complete Reflect",
       description:
-        "Mark reflection as complete (deletes Working Memory.md, releases lock)",
+        "Mark reflection as complete (deletes Log.md and Working Memory.md, releases lock)",
       inputSchema: {},
     },
     async () => {
@@ -26,10 +26,20 @@ export function registerCompleteReflect(
       console.error("[Reflect] Completing reflection");
 
       try {
+        const fs = await import("fs/promises");
+
+        // Delete Log.md
+        const logPath = fileOps["config"].vaultPath + "/Log.md";
+        try {
+          await fs.unlink(logPath);
+          console.error("[Reflect] Deleted Log.md");
+        } catch (error) {
+          console.error("[Reflect] No Log.md to delete");
+        }
+
         // Delete Working Memory.md
         const workingMemoryPath = fileOps["config"].vaultPath + "/Working Memory.md";
         try {
-          const fs = await import("fs/promises");
           await fs.unlink(workingMemoryPath);
           console.error("[Reflect] Deleted Working Memory.md");
         } catch (error) {
@@ -48,7 +58,7 @@ export function registerCompleteReflect(
           content: [
             {
               type: "text",
-              text: "Reflection complete! Working Memory.md cleared.",
+              text: "Reflection complete! Log.md and Working Memory.md cleared.",
             },
           ],
         };

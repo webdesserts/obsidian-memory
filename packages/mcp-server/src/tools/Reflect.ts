@@ -6,7 +6,7 @@ import { generateReflectPrompt } from "../prompts/generateReflectPrompt.js";
 /**
  * Reflect Tool
  *
- * Review Working Memory and consolidate content into permanent notes.
+ * Review Log.md and Working Memory.md and consolidate content into permanent notes.
  * Returns consolidation instructions that Claude should follow.
  */
 export function registerReflect(
@@ -16,9 +16,9 @@ export function registerReflect(
   server.registerTool(
     "reflect",
     {
-      title: "Reflect on Working Memory",
+      title: "Reflect on Log and Working Memory",
       description:
-        "Review Working Memory and consolidate content into permanent notes (knowledge notes, project notes, weekly journal). Returns detailed consolidation instructions.",
+        "Review Log.md and Working Memory.md and consolidate content into permanent notes (knowledge notes, project notes, weekly journal). Returns detailed consolidation instructions.",
       inputSchema: {
         includePrivate: z
           .boolean()
@@ -27,14 +27,9 @@ export function registerReflect(
       },
     },
     async ({ includePrivate = false }) => {
-      const { memorySystem } = context;
-
       console.error(
         `[Reflect] Triggering reflection (includePrivate: ${includePrivate})`
       );
-
-      // Get Working Memory content
-      const workingMemory = memorySystem.getWorkingMemory() || "";
 
       // Get current date info
       const now = new Date();
@@ -43,9 +38,8 @@ export function registerReflect(
       const year = now.getFullYear();
       const weeklyNotePath = `journal/${year}-w${weekNumber.toString().padStart(2, "0")}.md`;
 
-      // Generate the reflection prompt
+      // Generate the reflection prompt (Claude will read files directly)
       const { messages } = await generateReflectPrompt({
-        workingMemoryContent: workingMemory,
         weeklyNotePath,
         currentWeekNumber: weekNumber,
         currentDayOfWeek: dayOfWeek,
