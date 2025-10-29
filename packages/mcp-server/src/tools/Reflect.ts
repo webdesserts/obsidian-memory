@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
-import { generateReflectPrompt } from "../prompts/generateReflectPrompt.js";
 
 /**
  * Reflect Tool
@@ -38,16 +37,123 @@ export function registerReflect(
       const year = now.getFullYear();
       const weeklyNotePath = `journal/${year}-w${weekNumber.toString().padStart(2, "0")}.md`;
 
-      // Generate the reflection prompt (Claude will read files directly)
-      const { messages } = await generateReflectPrompt({
-        weeklyNotePath,
-        currentWeekNumber: weekNumber,
-        currentDayOfWeek: dayOfWeek,
-        includePrivate,
-      });
+      // Generate the reflection instructions inline
+      const promptText = `# Memory Reflection
 
-      // Extract the text from the first message
-      const promptText = messages[0]?.content.text || "";
+Review Log.md and Working Memory.md and consolidate into permanent notes.
+
+## Files to Review
+
+1. **Read Log.md** - Chronological record of session activity with ISO 8601 timestamps
+2. **Read Working Memory.md** - Draft notes (may already be in your context if you've been writing to it)
+
+## Current Week's Journal
+
+Path: ${weeklyNotePath}
+**Today is ${dayOfWeek}, week ${weekNumber}**
+
+## Consolidation Workflow
+
+### Phase 1: Read & Categorize
+
+Read Log.md and Working Memory.md. Categorize each piece of content by its destination:
+
+1. **Knowledge notes** - Technical facts, APIs, patterns, how things work
+   - Term-based, small, focused (dictionary-style)
+   - Example: \`knowledge/React Server Components.md\`, \`knowledge/MCP Prompts.md\`
+   - Keep these concise - think encyclopedia entries, not articles
+
+2. **Project notes** - Design decisions, architecture, project context
+   - Deep dives on specific projects
+   - Example: \`knowledge/Obsidian Memory Project.md\`
+   - Can be longer and more detailed than knowledge notes
+
+3. **Weekly journal Log** - Work summaries from Log.md
+   - Add under **"## Log"** header in current week's journal
+   - **Map timestamped Log.md entries to appropriate weekdays**
+   - Use ISO 8601 timestamps to determine which day each entry belongs to
+   - Today is **${dayOfWeek}**, so entries from today go under \`### ${dayOfWeek}\`
+   - Previous days' entries go under \`### Monday\`, \`### Tuesday\`, etc.
+   - Consolidate log entries into readable summary (not verbatim copy)
+   - **Preserve work ticket tags** ([LOR-4883], etc.) from log entries
+   - Link to relevant [[Project]] and [[Knowledge]] notes
+   - Keep entries concise with bullet points
+
+4. **Discard** - Not valuable long-term
+   - Routine fixes, temporary notes, already-documented info
+
+### Phase 2: Propose Changes
+
+For each piece of content you're keeping, show a clear proposal with enough context for review.
+
+**Format:**
+
+\`\`\`
+## Weekly Journal: ${weeklyNotePath}
+**Action:** Update existing
+
+**Section:** Log → Monday (backfill from previous session)
+**Add:**
+- Started work on [[Obsidian Memory Project]]
+  - Researched MCP prompts vs commands
+
+**Section:** Log → ${dayOfWeek} (today's entries)
+**Add:**
+- Worked on [[Obsidian Memory Project]]
+  - Renamed consolidation to reindex
+  - Implemented reflect prompt for memory cleanup
+- Reviewed [[MCP Servers]] documentation
+  - Added section on prompts vs tools
+
+## Knowledge Note: MCP Prompts
+**Action:** Create new
+**Path:** knowledge/MCP Prompts.md
+**Content preview:**
+> Reusable prompt templates that MCP servers expose to clients...
+> (show enough content for user to review)
+
+## Project Note: Obsidian Memory Project
+**Action:** Update existing
+**Section:** Implementation Status
+**Add:**
+- Implemented reflect prompt workflow
+- Separated reindex and reflect concerns
+\`\`\`
+
+Show clear, reviewable proposals. Include enough content that the user can see what's being added.
+
+### Phase 3: Get Approval
+
+After showing all proposed changes, ask:
+
+**"Review the proposed changes above. Should I proceed with applying them? You can edit any proposals before approving."**
+
+Wait for explicit approval. Don't proceed without it.
+
+### Phase 4: Apply Changes (after approval)
+
+Once approved, apply the changes:
+
+1. Use \`get_note()\` to check if notes exist
+2. Use \`Read()\` to load existing note content
+3. Use \`Write()\` to save updated notes
+4. Use \`get_weekly_note()\` to get the current week's journal path
+5. Call \`complete_reflect()\` when done to clear Log.md and Working Memory.md
+
+## Guidelines
+
+- **Be selective**: Not everything in Log or Working Memory needs to be saved permanently
+- **Knowledge notes**: Keep small and focused, dictionary-style, term-based
+- **Log consolidation**: Transform timestamped log entries into readable journal summaries, don't just copy verbatim
+- **Map timestamps to weekdays**: Use ISO 8601 timestamps from Log.md to determine correct weekday sub-headers
+- **Preserve work tags**: Keep work ticket tags ([LOR-4883], etc.) from log entries in weekly journal
+- **Show clear diffs**: User needs to see what's changing before approving
+- **Weekly Log structure**: All work entries go under \`## Log\` header with weekday sub-headers
+- **Wait for approval**: Never write files without explicit user approval${
+        includePrivate
+          ? "\n\n## Private Memory\n\nInclude private notes in this reflection."
+          : ""
+      }`;
 
       return {
         content: [

@@ -37,7 +37,7 @@ Claude Code plugin with MCP server integration and notetaker skill.
 **Features:**
 - Automatic MCP server startup
 - Notetaker skill for automatic Working Memory updates
-- Future: Session hooks and `/reflect` command
+- Future: Session hooks for automated reflection workflow
 
 **Installation:** See [Plugin Installation](#plugin-installation) below.
 

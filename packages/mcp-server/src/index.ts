@@ -26,9 +26,6 @@ import { registerCompleteReindex } from "./tools/CompleteReindex.js";
 import { registerReflect } from "./tools/Reflect.js";
 import { registerCompleteReflect } from "./tools/CompleteReflect.js";
 
-// Prompt registrations
-import { registerReflectPrompt } from "./prompts/Reflect.js";
-
 // Parse command line arguments
 const args = process.argv.slice(2);
 const vaultPathIndex = args.indexOf("--vault-path");
@@ -120,9 +117,6 @@ registerReindex(server, toolContext);
 registerCompleteReindex(server, toolContext);
 registerReflect(server, toolContext);
 registerCompleteReflect(server, toolContext);
-
-// Register all prompts
-registerReflectPrompt(server, toolContext);
 
 // Start the server
 async function main() {
