@@ -1,12 +1,68 @@
 # Obsidian Memory - Developer Guide
 
-> Collection of tools for Obsidian integration: MCP server, utilities, and Claude Code plugin
+> MCP server providing Claude Code agents with graph-based memory via Obsidian vault integration
 
 **Repository**: https://github.com/webdesserts/obsidian-memory
 
+**Project Status**: Active development, currently specific to author's personal workspace. May be generalized for broader use in the future.
+
 ---
 
-## Working with Notes - IMPORTANT
+## What Problem Does This Solve?
+
+Claude Code agents have no memory between sessions. Every conversation starts fresh, requiring users to re-explain project context, past decisions, and discovered patterns. This MCP server solves that by:
+
+1. **Persistent memory** - Index.md auto-loads at session start, providing permanent knowledge
+2. **Graph navigation** - Explore interconnected notes via wiki links and backlinks
+3. **Working memory** - Temporary scratch space (Log.md, Working Memory.md) for session notes
+4. **Consolidation** - Tools to review and move temporary notes into permanent knowledge
+
+The system mirrors human memory: working memory for active thoughts, long-term memory for permanent knowledge, and periodic reflection to consolidate insights.
+
+---
+
+## Exploring the Codebase
+
+### Entry Points
+
+**Start here:**
+- `packages/mcp-server/src/index.ts` - Server setup, tool registration, initialization flow
+- `packages/mcp-server/src/server.ts` - MCP server wrapper with tool registration helpers
+
+**Core systems:**
+- `packages/mcp-server/src/graph/` - Graph index tracking wiki links and backlinks
+- `packages/mcp-server/src/memory/` - Memory system, access logging, reindex manager
+- `packages/mcp-server/src/tools/` - Individual tool implementations (one file per tool)
+- `packages/mcp-server/src/prompts/` - MCP prompts for guided workflows
+
+**Shared utilities:**
+- `packages/utils/src/` - Wiki link parsing, path helpers, note name extraction
+
+### How Tools Are Structured
+
+Each tool in `src/tools/` follows this pattern:
+- Export a `register*` function that registers the tool with the MCP server
+- Define input schema using Zod for validation
+- Include JSDoc comments explaining behavior and parameters
+- Return structured responses (text content + optional resources)
+
+Tool registration happens in `index.ts` lines 107-119.
+
+### Key Concepts
+
+**Graph Index** - Scans vault on startup, builds link graph, tracks note locations. File watcher keeps it updated. Used for note discovery and neighborhood exploration.
+
+**Memory System** - Loads Index.md on startup, logs access patterns for usage statistics, manages private memory consent.
+
+**Reindex vs. Reflect** - Two separate consolidation processes:
+- `reindex` - Updates Index.md entry points based on knowledge graph (no approval needed)
+- `reflect` - Reviews Log.md and Working Memory.md, proposes consolidation into permanent notes (requires approval)
+
+---
+
+## Non-Obvious Patterns
+
+### Working with Notes - IMPORTANT
 
 **Use get_note tool for note discovery, then Read/Write tools for content:**
 
@@ -30,142 +86,35 @@ ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:knowledge/CSS")
 
 **Note reference formats:** get_note accepts "Note Name", "knowledge/Note", "memory:Note", or "[[Note]]"
 
+### memory: URIs vs. File Paths
+
+**memory: URIs** - Used for reference and inter-tool communication (e.g., `memory:knowledge/CSS`)
+**File paths** - Used with Claude Code's Read/Write tools (e.g., `/Users/.../notes/knowledge/CSS.md`)
+
+Tools return both formats. Use `filePath` field for file operations, `uri` field for references.
+
+### Error Responses vs. Exceptions
+
+Tools return helpful error responses instead of throwing exceptions. Missing notes aren't protocol errors - the response includes guidance on where to create the note. This keeps workflows smooth.
+
 ---
 
-## What This Is
+## Integration Context
 
-A Model Context Protocol (MCP) server that gives Claude Code deep integration with Obsidian vaults:
+This MCP server is part of a larger memory system. The complete workflow (how notes are organized, when to consolidate, notetaking patterns) is documented separately:
 
-- **Graph navigation** - Explore notes via wiki links and backlinks
-- **Note discovery** - GetNote tool provides metadata, links, and file paths
-- **Memory system** - Auto-loaded Index.md for long-term memory
-- **Resources** - Index/Working Memory exposed as MCP resources
-- **Private memory** - Consent-based access to private notes
+- **Memory system workflow** - See `~/.dots/webdesserts-private/claude/plugins/obsidian-memory/instructions/notetaking.md`
+- **Project notes** - Deeper context, design decisions, and future explorations tracked in personal Obsidian vault
 
----
+This separation exists because the MCP server is a general-purpose tool, while the workflow is specific to personal knowledge management practices.
 
-## Monorepo Structure
+### Monorepo Structure
 
-**Packages:**
-- `@obsidian-memory/utils` - Shared utilities for Obsidian (wiki-links, path helpers)
+- `@obsidian-memory/utils` - Shared utilities (wiki-links, path helpers)
 - `@obsidian-memory/mcp-server` - MCP server implementation
 - `@obsidian-memory/claude-plugin` - Stub for future Claude Code plugin
 
-**Architecture:**
-- ES modules with tree-shaking support
-- TypeScript project references for type-safe cross-package imports
-- npm workspaces for dependency management
-
----
-
-## Current Architecture (MCP Server)
-
-### Core Components
-
-**Graph Index** (`packages/mcp-server/src/graph/graph-index.ts`)
-- Scans vault on startup, builds link graph
-- Tracks forward links and backlinks
-- File watcher for incremental updates
-- Stores note paths for ResourceLink generation
-
-**Memory System** (`packages/mcp-server/src/memory/memory-system.ts`)
-- Auto-loads `Index.md` on startup
-- Access logging for usage statistics
-- Private memory gated behind consent
-
-**File Operations** (`packages/mcp-server/src/tools/file-operations.ts`)
-- Read/write notes with frontmatter support
-- Gray-matter for YAML parsing
-
-**Consolidation** (`packages/mcp-server/src/memory/consolidation.ts`)
-- Lock-based workflow for Index.md updates
-- Generates prompt for Claude to consolidate Working Memory → Index
-- Partially implemented - see GitHub issues
-
-### Shared Utilities (`packages/utils/src/`)
-
-**Wiki Links** (`wiki-links.ts`)
-- Parse Obsidian-style wiki links from markdown
-- Support for aliases, headers, blocks, embeds
-- Extract linked note names
-
-**Path Utilities** (`path.ts`)
-- Path validation within vault (prevents directory traversal)
-- File existence checks
-- Markdown extension helpers
-
----
-
-## Available Tools
-
-### Note Discovery
-- **`GetNote(noteRef)`** - Get metadata and graph connections for a note
-  - Returns: frontmatter, file paths, forward links, backlinks
-  - Note reference formats: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]"
-  - Use returned `filePath` for Read/Write operations
-  - Links returned as `memory:` URIs for reference
-
-### Weekly Journal
-- **`GetWeeklyNote()`** - Get ResourceLink to current week's journal note
-  - Returns URI like `memory:journal/2025-w42`
-
-### Graph Navigation
-- **`GetGraphNeighborhood(noteName, depth, includePrivate)`** - Explore multi-hop connections
-  - Returns ResourceLinks grouped by distance
-  - Use for deep graph exploration (2+ hops)
-
-### Metadata
-- **`UpdateFrontmatter(path, updates)`** - Update YAML frontmatter fields
-
-### Statistics
-- **`GetNoteUsage(notes, period)`** - Query access stats for consolidation
-
-### Memory Management
-- **`LoadPrivateMemory(reason)`** - Load private Index/Working Memory (requires consent)
-- **`ConsolidateMemory(includePrivate)`** - Trigger consolidation workflow
-- **`CompleteConsolidation()`** - Mark consolidation done, delete Working Memory
-
----
-
-## Available Resources
-
-### Static Resources
-
-Auto-loaded on startup (auto-discoverable by Claude):
-
-- **`memory:Index`** - Public long-term memory
-- **`memory:Working Memory`** - Public short-term memory
-- **`memory:private/Index`** - Private long-term (consent required)
-- **`memory:private/Working Memory`** - Private short-term (consent required)
-
-Resources support subscriptions for live updates.
-
-**Note:** For reading arbitrary notes, use GetNote tool instead of resources. Resources are only for auto-loaded memory files.
-
----
-
-## URI Scheme
-
-All resources and ResourceLinks use `memory:` scheme (opaque URLs):
-
-```
-memory:Index                      # Root-level files
-memory:knowledge/MCP Servers      # Knowledge base notes
-memory:journal/2024-w42           # Journal entries
-memory:private/Personal Note      # Private notes
-```
-
----
-
-## Integration with Claude Code
-
-### Global Settings (`~/.claude/CLAUDE.md`)
-- Documents memory priority rules
-- Auto-imports Index.md and Working Memory.md
-- Instructs Claude to search memory before answering
-
-### Permissions (`~/.claude/settings.json`)
-- All tools allowed for seamless integration
+Uses npm workspaces, TypeScript project references, and ES modules.
 
 ---
 
@@ -173,41 +122,10 @@ memory:private/Personal Note      # Private notes
 
 ### Dependencies
 - `@modelcontextprotocol/sdk` - Official MCP SDK
-- `chokidar` - File watching
+- `chokidar` - File watching for graph updates
 - `gray-matter` - YAML frontmatter parsing
 - `zod` - Schema validation
 
-### Key Design Decisions
+### Testing
 
-**Why graph index?**
-- Fast lookups without filesystem scans
-- Enables bi-directional link queries
-- Needed for ResourceLink generation
-
-**Why smart lookup?**
-- Users reference notes by name, not path
-- Graph index finds most notes automatically
-- Fallback search provides convenience
-
-**Why resources for memory files?**
-- More semantic than tools
-- Discoverable in Claude's UI
-- Supports subscriptions for live updates
-- Natural consent flow for private resources
-
-**Why GetNote tool instead of resource template?**
-- Works with Claude Code's Write tool requirement (Read must be called first)
-- Returns metadata without loading full content (more efficient)
-- Provides both discovery (links/backlinks) and paths for Read/Write
-- Clean integration with built-in diff and edit tools
-
-**Why memory: URIs in GetNote responses?**
-- Consistent reference format across tools
-- Human-readable (easier to understand than file paths)
-- Compatible with other tools that accept note references
-- Note: Use `filePath` from response for Read/Write, not the memory: URI
-
-**Why return error responses instead of throwing?**
-- Missing notes aren't protocol errors
-- Error responses provide helpful guidance (where to create the note)
-- Tool succeeds with useful information rather than failing
+Run tests with `npm test`. Each package has its own test suite in `src/**/*.test.ts`.
