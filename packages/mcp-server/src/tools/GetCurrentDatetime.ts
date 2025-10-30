@@ -8,12 +8,16 @@ import type { ToolContext } from "../types.js";
  */
 export function registerGetCurrentDatetime(server: McpServer, context: ToolContext) {
   server.registerTool(
-    "get_current_datetime",
+    "GetCurrentDatetime",
     {
       title: "Get Current Datetime",
       description:
         "Get the current date and time in ISO format for use in Working Memory timeline entries. Returns ISO 8601 formatted datetime (YYYY-MM-DDTHH:MM) and additional context.",
       inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+      },
     },
     async () => {
       const now = new Date();

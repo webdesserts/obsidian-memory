@@ -12,12 +12,17 @@ export function registerCompleteReindex(
   context: ToolContext
 ) {
   server.registerTool(
-    "complete_reindex",
+    "CompleteReindex",
     {
       title: "Complete Reindex",
       description:
         "Mark reindex as complete (reloads Index.md, releases lock)",
       inputSchema: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false,
+      },
     },
     async () => {
       const { reindexManager } = context;

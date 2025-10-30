@@ -13,7 +13,7 @@ export function registerReflect(
   context: ToolContext
 ) {
   server.registerTool(
-    "reflect",
+    "Reflect",
     {
       title: "Reflect on Log and Working Memory",
       description:
@@ -23,6 +23,11 @@ export function registerReflect(
           .boolean()
           .optional()
           .describe("Include private notes in reflection (default: false)"),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
       },
     },
     async ({ includePrivate = false }) => {
@@ -35,7 +40,9 @@ export function registerReflect(
       const weekNumber = getWeekNumber(now);
       const dayOfWeek = getDayOfWeek(now);
       const year = now.getFullYear();
-      const weeklyNotePath = `journal/${year}-w${weekNumber.toString().padStart(2, "0")}.md`;
+      const weeklyNotePath = `journal/${year}-w${weekNumber
+        .toString()
+        .padStart(2, "0")}.md`;
 
       // Generate the reflection instructions inline
       const promptText = `# Memory Reflection
@@ -134,11 +141,11 @@ Wait for explicit approval. Don't proceed without it.
 
 Once approved, apply the changes:
 
-1. Use \`get_note()\` to check if notes exist
+1. Use \`GetNote()\` to check if notes exist
 2. Use \`Read()\` to load existing note content
 3. Use \`Write()\` to save updated notes
-4. Use \`get_weekly_note()\` to get the current week's journal path
-5. Call \`complete_reflect()\` when done to clear Log.md and Working Memory.md
+4. Use \`GetWeeklyNote()\` to get the current week's journal path
+5. Call \`CompleteReflect()\` when done to clear Log.md and Working Memory.md
 
 ## Guidelines
 

@@ -13,12 +13,17 @@ export function registerCompleteReflect(
   context: ToolContext
 ) {
   server.registerTool(
-    "complete_reflect",
+    "CompleteReflect",
     {
       title: "Complete Reflect",
       description:
         "Mark reflection as complete (deletes Log.md and Working Memory.md, releases lock)",
       inputSchema: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false,
+      },
     },
     async () => {
       const { fileOps, memorySystem } = context;

@@ -22,6 +22,13 @@ export class McpServer {
     title?: string;
     description: string;
     inputSchema: any;
+    annotations?: {
+      title?: string;
+      readOnlyHint?: boolean;
+      destructiveHint?: boolean;
+      idempotentHint?: boolean;
+      openWorldHint?: boolean;
+    };
   }> = [];
 
   private prompts: Array<{
@@ -119,6 +126,13 @@ export class McpServer {
       title?: string;
       description: string;
       inputSchema: TInput;
+      annotations?: {
+        title?: string;
+        readOnlyHint?: boolean;
+        destructiveHint?: boolean;
+        idempotentHint?: boolean;
+        openWorldHint?: boolean;
+      };
     },
     handler: (args: z.infer<z.ZodObject<TInput>>) => Promise<{
       content: Array<{ type: string; text?: string; [key: string]: any }>;
@@ -132,6 +146,7 @@ export class McpServer {
       title: config.title,
       description: config.description,
       inputSchema: z.toJSONSchema(z.object(config.inputSchema)),
+      ...(config.annotations && { annotations: config.annotations }),
     });
 
     // Store handler with validation wrapper

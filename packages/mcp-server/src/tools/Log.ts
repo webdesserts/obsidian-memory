@@ -24,7 +24,7 @@ function formatISO8601DateTime(date: Date): string {
  */
 export function registerLog(server: McpServer, context: ToolContext) {
   server.registerTool(
-    "log",
+    "Log",
     {
       title: "Log Timeline Entry",
       description:
@@ -40,6 +40,11 @@ export function registerLog(server: McpServer, context: ToolContext) {
             "Timeline entry content as bullet points. Tool adds timestamp automatically. " +
             "Tag work items with [TICKET-123] format when relevant."
           ),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
       },
     },
     async ({ content }) => {

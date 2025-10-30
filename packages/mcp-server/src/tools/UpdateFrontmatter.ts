@@ -12,7 +12,7 @@ export function registerUpdateFrontmatter(
   context: ToolContext
 ) {
   server.registerTool(
-    "update_frontmatter",
+    "UpdateFrontmatter",
     {
       title: "Update Frontmatter",
       description: "Update frontmatter metadata in a note",
@@ -21,6 +21,12 @@ export function registerUpdateFrontmatter(
         updates: z
           .record(z.string(), z.any())
           .describe("Frontmatter fields to update"),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
       },
     },
     async ({ path, updates }) => {

@@ -9,7 +9,7 @@ import type { ToolContext } from "../types.js";
  */
 export function registerGetNoteUsage(server: McpServer, context: ToolContext) {
   server.registerTool(
-    "get_note_usage",
+    "GetNoteUsage",
     {
       title: "Get Note Usage",
       description: "Get usage statistics for notes (for consolidation)",
@@ -22,6 +22,10 @@ export function registerGetNoteUsage(server: McpServer, context: ToolContext) {
           .enum(["24h", "7d", "30d", "all"])
           .optional()
           .describe("Time period for statistics (default: all)"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
       },
     },
     async ({ notes, period = "all" }) => {

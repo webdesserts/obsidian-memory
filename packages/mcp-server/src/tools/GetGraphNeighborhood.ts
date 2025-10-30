@@ -13,7 +13,7 @@ export function registerGetGraphNeighborhood(
   context: ToolContext
 ) {
   server.registerTool(
-    "get_graph_neighborhood",
+    "GetGraphNeighborhood",
     {
       title: "Get Graph Neighborhood",
       description:
@@ -28,6 +28,10 @@ export function registerGetGraphNeighborhood(
           .boolean()
           .optional()
           .describe("Include private folder notes (default: false)"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
       },
     },
     async ({ noteName, depth = 2, includePrivate = false }) => {

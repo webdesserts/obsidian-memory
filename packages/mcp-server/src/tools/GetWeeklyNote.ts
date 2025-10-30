@@ -15,12 +15,16 @@ import {
  */
 export function registerGetWeeklyNote(server: McpServer, context: ToolContext) {
   server.registerTool(
-    "get_weekly_note",
+    "GetWeeklyNote",
     {
       title: "Get Weekly Note",
       description:
         "Get the URI for the current week's journal note. Returns a resource link that can be read to access the note content.",
       inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+      },
     },
     async () => {
       // Get current weekly note info

@@ -12,13 +12,17 @@ export function registerLoadPrivateMemory(
   context: ToolContext
 ) {
   server.registerTool(
-    "load_private_memory",
+    "LoadPrivateMemory",
     {
       title: "Load Private Memory",
       description:
         "Load private memory indexes (requires explicit user consent)",
       inputSchema: {
         reason: z.string().describe("Reason for loading private memory"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
       },
     },
     async ({ reason }) => {

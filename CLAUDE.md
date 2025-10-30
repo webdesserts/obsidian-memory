@@ -64,11 +64,11 @@ Tool registration happens in `index.ts` lines 107-119.
 
 ### Working with Notes - IMPORTANT
 
-**Use get_note tool for note discovery, then Read/Write tools for content:**
+**Use GetNote tool for note discovery, then Read/Write tools for content:**
 
 ✅ **Correct workflow:**
 ```
-1. get_note(note: "CSS") - Get metadata, links, file path
+1. GetNote(note: "CSS") - Get metadata, links, file path
 2. Read(file_path: "/Users/michael/notes/knowledge/CSS.md") - View content
 3. Write(file_path: "/Users/michael/notes/knowledge/CSS.md") - Edit content
 ```
@@ -79,12 +79,12 @@ ReadMcpResourceTool(server: "obsidian-memory", uri: "memory:knowledge/CSS")
 ```
 
 **Why this workflow?**
-- get_note provides metadata (frontmatter, links, backlinks, paths) without loading full content
+- GetNote provides metadata (frontmatter, links, backlinks, paths) without loading full content
 - Read tool satisfies Write tool's requirement (avoids "File has not been read yet" error)
-- get_note's `memory:` URIs are for reference only - use `filePath` for Read/Write
+- GetNote's `memory:` URIs are for reference only - use `filePath` for Read/Write
 - Clean integration with Claude Code's built-in diff and edit tools
 
-**Note reference formats:** get_note accepts "Note Name", "knowledge/Note", "memory:Note", or "[[Note]]"
+**Note reference formats:** GetNote accepts "Note Name", "knowledge/Note", "memory:Note", or "[[Note]]"
 
 ### memory: URIs vs. File Paths
 

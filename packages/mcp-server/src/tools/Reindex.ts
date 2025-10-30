@@ -12,7 +12,7 @@ export function registerReindex(
   context: ToolContext
 ) {
   server.registerTool(
-    "reindex",
+    "Reindex",
     {
       title: "Reindex Knowledge Graph",
       description:
@@ -22,6 +22,11 @@ export function registerReindex(
           .boolean()
           .optional()
           .describe("Include private notes in reindex (default: false)"),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false,
       },
     },
     async ({ includePrivate = false }) => {

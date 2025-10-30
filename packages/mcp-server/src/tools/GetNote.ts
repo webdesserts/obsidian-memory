@@ -12,7 +12,7 @@ import { resolveNotePath } from "../path-utils.js";
  */
 export function registerGetNote(server: McpServer, context: ToolContext) {
   server.registerTool(
-    "get_note",
+    "GetNote",
     {
       title: "Get Note",
       description:
@@ -24,6 +24,10 @@ export function registerGetNote(server: McpServer, context: ToolContext) {
             'Note reference - supports: "memory:Note Name", "memory:knowledge/Note Name", "knowledge/Note Name", "[[Note Name]]"'
           ),
       },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+      },
     },
     async ({ note }) => {
       const { graphIndex, vaultPath, vaultName, fileOps, memorySystem } = context;
@@ -33,7 +37,7 @@ export function registerGetNote(server: McpServer, context: ToolContext) {
       const noteName = extractNoteName(notePath);
 
       // Log access for usage statistics
-      memorySystem.logAccess(noteName, "get_note");
+      memorySystem.logAccess(noteName, "GetNote");
 
       // Check if note exists in graph
       const resolvedPath = graphIndex.getNotePath(noteName);

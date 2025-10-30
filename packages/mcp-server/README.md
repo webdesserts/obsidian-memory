@@ -32,16 +32,16 @@ claude mcp add --transport stdio obsidian-memory \
 - `read_note` - Read note content
 - `write_note` - Create/modify notes
 - `get_frontmatter` - Read metadata
-- `update_frontmatter` - Modify metadata
+- `UpdateFrontmatter` - Modify metadata
 
 ### Graph Navigation
 - `follow_link` - Load linked note
 - `get_backlinks` - Find what links here
-- `get_graph_neighborhood` - Explore connected notes
+- `GetGraphNeighborhood` - Explore connected notes
 
 ### Memory System
-- `get_note_usage` - Query access statistics
-- `load_private_memory` - Load private indexes (requires consent)
+- `GetNoteUsage` - Query access statistics
+- `LoadPrivateMemory` - Load private indexes (requires consent)
 
 ## Development
 
