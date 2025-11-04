@@ -99,6 +99,16 @@ Read Log.md and Working Memory.md. Categorize each piece of content by its desti
 
 ### Phase 2: Propose Changes
 
+**IMPORTANT: Read notes before proposing changes**
+
+Before creating proposals for existing notes:
+1. Use \`GetNote()\` to check if the note exists
+2. Use \`Read()\` to load and understand the current structure
+3. Consider how new content integrates with existing sections
+4. Avoid duplicating information already present
+5. Look for opportunities to enhance existing sections rather than just appending
+6. DO NOT create "append-only" proposals - integrate thoughtfully with existing content
+
 For each piece of content you're keeping, show a clear proposal with enough context for review.
 
 **Format:**
