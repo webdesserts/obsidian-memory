@@ -25,3 +25,7 @@ export {
   DEFAULT_PRIORITY_ORDER,
   COMMON_SEARCH_PATHS,
 } from "./path-resolver.js";
+
+// Graph visualization exports
+export type { NeighborhoodNode } from "./graph-viz.js";
+export { renderGraphTree } from "./graph-viz.js";

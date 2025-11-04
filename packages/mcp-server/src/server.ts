@@ -60,6 +60,9 @@ export class McpServer {
           roots: {
             listChanged: false,
           },
+          resources: {
+            listChanged: false,
+          },
         },
       }
     );

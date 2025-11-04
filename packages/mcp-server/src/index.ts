@@ -4,7 +4,10 @@ import { basename } from "node:path";
 import { homedir } from "node:os";
 import { McpServer } from "./server.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ListRootsRequestSchema,
+  ListResourcesRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
@@ -99,6 +102,86 @@ server.server.setRequestHandler(ListRootsRequestSchema, async () => {
       {
         uri: `file://${vaultPath}`,
         name: vaultName,
+      },
+    ],
+  };
+});
+
+// List resources - expose key vault files and folders
+server.server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  return {
+    resources: [
+      {
+        name: "Index",
+        uri: "memory:Index",
+        title: "Commonly Used and Important Notes File",
+        description:
+          "Auto-loaded at session start. Contains curated links organized by domain (Projects, Programming Languages, Technical, etc.)",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["assistant"],
+          priority: 1.0,
+        },
+      },
+      {
+        name: "Log",
+        uri: "memory:Log",
+        title: "Short Term Temporal Memory File",
+        description:
+          "Chronological event log with ISO 8601 timestamps. Append-only during sessions, consolidated into weekly journal during reflection.",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["assistant"],
+          priority: 0.8,
+        },
+      },
+      {
+        name: "Working Memory",
+        uri: "memory:Working Memory",
+        title: "Short Term Memory File",
+        description:
+          "Temporary storage for discoveries and decisions. Organized into Knowledge Notes, Project Notes, and optional Episodic sections. Cleared after reflection.",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["assistant"],
+          priority: 0.8,
+        },
+      },
+      {
+        name: "knowledge",
+        uri: "memory:knowledge/",
+        title: "Long Term Memory Directory",
+        description:
+          "Permanent technical knowledge notes. Term-based, dictionary-style entries covering programming languages, frameworks, design patterns, and concepts.",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["assistant", "user"],
+          priority: 0.7,
+        },
+      },
+      {
+        name: "journal",
+        uri: "memory:journal/",
+        title: "Weekly Notes & Logs Directory",
+        description:
+          "Weekly notes in YYYY-wW.md format. Daily work logs organized by weekday, plus optional deeper notes.",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["assistant", "user"],
+          priority: 0.6,
+        },
+      },
+      {
+        name: "private",
+        uri: "memory:private/",
+        title: "Private Long Term Memory Directory",
+        description:
+          "Sensitive or personal notes requiring explicit user approval before access. Not included in main knowledge graph.",
+        mimeType: "text/markdown",
+        annotations: {
+          audience: ["user"],
+          priority: 0.3,
+        },
       },
     ],
   };
