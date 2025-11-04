@@ -8,6 +8,22 @@
 
 ---
 
+## Documentation Principle
+
+**This file teaches you HOW to discover information, not WHAT the information is.**
+
+Don't list all tools, all types, all configuration options, etc. in this file. That creates maintenance burden - every time the code changes, the docs get out of sync.
+
+Instead, document:
+- Where to find information (file paths, patterns)
+- How to read the code (entry points, structure)
+- Non-obvious patterns that aren't clear from code alone
+- Context that explains "why" decisions were made
+
+The code is the source of truth. This file is a map to reading the code effectively.
+
+---
+
 ## What Problem Does This Solve?
 
 Claude Code agents have no memory between sessions. Every conversation starts fresh, requiring users to re-explain project context, past decisions, and discovered patterns. This MCP server solves that by:
@@ -96,6 +112,46 @@ Tools return both formats. Use `filePath` field for file operations, `uri` field
 ### Error Responses vs. Exceptions
 
 Tools return helpful error responses instead of throwing exceptions. Missing notes aren't protocol errors - the response includes guidance on where to create the note. This keeps workflows smooth.
+
+---
+
+## Discovering Available Tools
+
+**Where tools are defined:** `packages/mcp-server/src/tools/` - One file per tool
+
+**Tool registration:** `packages/mcp-server/src/index.ts` lines 110-122 - All `register*` calls
+
+**Tool naming convention:** PascalCase (e.g., `GetNote`, `LoadPrivateMemory`, `CompleteReflect`)
+
+**Finding tool details:**
+- Each tool file exports a `register*` function
+- JSDoc comments explain behavior and parameters
+- Zod schemas define input validation (look for `inputSchema` in registration)
+- MCP annotations show hints: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`
+
+**Example - Reading a tool:**
+```typescript
+// packages/mcp-server/src/tools/GetNote.ts
+export function registerGetNote(server: McpServer, context: ToolContext) {
+  server.registerTool(
+    "GetNote",  // Tool name
+    {
+      description: "...",
+      inputSchema: { note: z.string().describe("...") },  // Parameters
+      annotations: { readOnlyHint: true }  // Behavior hints
+    },
+    async ({ note }) => { ... }  // Implementation
+  );
+}
+```
+
+**Current tool categories** (see registration for current list):
+- Note discovery (GetNote, GetWeeklyNote)
+- Temporal memory (Log, GetCurrentDatetime)
+- Graph navigation (GetGraphNeighborhood)
+- Metadata (UpdateFrontmatter)
+- Statistics (GetNoteUsage)
+- Memory management (LoadPrivateMemory, Reindex, CompleteReindex, Reflect, CompleteReflect)
 
 ---
 
