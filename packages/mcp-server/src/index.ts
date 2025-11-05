@@ -28,6 +28,7 @@ import { registerReindex } from "./tools/Reindex.js";
 import { registerCompleteReindex } from "./tools/CompleteReindex.js";
 import { registerReflect } from "./tools/Reflect.js";
 import { registerCompleteReflect } from "./tools/CompleteReflect.js";
+import { registerSearch } from "./tools/Search.js";
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -200,6 +201,7 @@ registerReindex(server, toolContext);
 registerCompleteReindex(server, toolContext);
 registerReflect(server, toolContext);
 registerCompleteReflect(server, toolContext);
+registerSearch(server, toolContext);
 
 // Start the server
 async function main() {

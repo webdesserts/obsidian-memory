@@ -13,7 +13,20 @@ Custom MCP server for Obsidian with graph-aware memory system and intelligent co
 
 ```bash
 npm install
-npm run build
+```
+
+**Note:** The `npm install` command automatically:
+1. Builds the TypeScript source
+2. Downloads the DeepSeek-R1-Distill-Qwen-1.5B model (~1.12 GB) for the Search tool
+
+To skip model download (e.g., for development without Search):
+```bash
+SKIP_MODEL_DOWNLOAD=1 npm install
+```
+
+To manually download the model later:
+```bash
+npm run download-model
 ```
 
 ## Configuration
