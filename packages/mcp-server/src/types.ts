@@ -7,6 +7,7 @@ import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ReindexManager } from "./memory/reindex.js";
+import { EmbeddingManager } from "./embeddings/manager.js";
 import { JSONSchema } from "zod/v4/core";
 import { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 
@@ -21,6 +22,7 @@ export interface ToolContext {
   graphIndex: GraphIndex;
   memorySystem: MemorySystem;
   reindexManager: ReindexManager;
+  embeddingManager: EmbeddingManager;
   resolveNoteNameToPath: (
     noteName: string,
     includePrivate?: boolean

@@ -12,8 +12,10 @@ import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ReindexManager } from "./memory/reindex.js";
+import { EmbeddingManager } from "./embeddings/manager.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
 import { ToolContext } from "./types.js";
+import path from "path";
 
 // Tool registrations
 import { registerGetNote } from "./tools/GetNote.js";
@@ -33,12 +35,12 @@ import { registerSearch } from "./tools/Search.js";
 // Parse command line arguments
 const args = process.argv.slice(2);
 const vaultPathIndex = args.indexOf("--vault-path");
-let vaultPath =
+let vaultPathRaw =
   vaultPathIndex !== -1
     ? args[vaultPathIndex + 1]
     : process.env.OBSIDIAN_VAULT_PATH;
 
-if (!vaultPath) {
+if (!vaultPathRaw) {
   console.error("Error: Vault path is required.");
   console.error("Usage: obsidian-memory-mcp --vault-path <path>");
   console.error("   or: Set OBSIDIAN_VAULT_PATH environment variable");
@@ -46,9 +48,9 @@ if (!vaultPath) {
 }
 
 // Expand ~ to home directory
-if (vaultPath.startsWith("~/")) {
-  vaultPath = vaultPath.replace("~", homedir());
-}
+const vaultPath = vaultPathRaw.startsWith("~/")
+  ? vaultPathRaw.replace("~", homedir())
+  : vaultPathRaw;
 
 // Derive vault name from path (basename of the vault directory)
 const vaultName = basename(vaultPath);
@@ -57,7 +59,7 @@ console.error(`[Server] Starting Obsidian Memory MCP Server`);
 console.error(`[Server] Vault path: ${vaultPath}`);
 console.error(`[Server] Vault name: ${vaultName}`);
 
-// Initialize file operations, graph index, memory system, and reindex manager
+// Initialize file operations, graph index, memory system, reindex manager, and embedding manager
 const fileOps = new FileOperations({ vaultPath });
 const graphIndex = new GraphIndex(vaultPath);
 const memorySystem = new MemorySystem(vaultPath, fileOps);
@@ -66,6 +68,9 @@ const reindexManager = new ReindexManager(
   fileOps,
   graphIndex
 );
+
+// EmbeddingManager will be initialized in main() after graphIndex is ready
+let embeddingManager: EmbeddingManager;
 
 /**
  * Resolve a note name to a specific path using the graph index
@@ -80,6 +85,7 @@ function resolveNoteNameToPath(
 }
 
 // Build tool context with all dependencies
+// Note: embeddingManager will be initialized in main() and added via getter
 const toolContext = {
   vaultPath,
   vaultName,
@@ -87,6 +93,12 @@ const toolContext = {
   graphIndex,
   memorySystem,
   reindexManager,
+  get embeddingManager() {
+    if (!embeddingManager) {
+      throw new Error("EmbeddingManager not initialized yet");
+    }
+    return embeddingManager;
+  },
   resolveNoteNameToPath,
 } satisfies ToolContext;
 
@@ -209,6 +221,25 @@ async function main() {
   await graphIndex.initialize();
   await memorySystem.initialize();
 
+  // Initialize embedding manager
+  console.error("[Server] Initializing embedding manager...");
+  embeddingManager = await EmbeddingManager.getInstance(vaultPath);
+
+  // Pre-encode all notes to warm up cache (makes first search instant)
+  await embeddingManager.warmupCache(vaultPath, graphIndex);
+
+  // Register file change callback to invalidate embeddings cache
+  graphIndex.onFileChange(async (filePath, event) => {
+    if (event === 'change' || event === 'unlink') {
+      // Convert absolute path to relative path for cache
+      const relativePath = path.relative(vaultPath, filePath);
+      embeddingManager.invalidate(relativePath);
+
+      // Persist cache to disk after invalidation
+      await embeddingManager.saveCache();
+    }
+  });
+
   const transport = new StdioServerTransport();
   await server.server.connect(transport);
   console.error("[Server] Obsidian Memory MCP Server running");
@@ -216,6 +247,10 @@ async function main() {
   // Clean up on exit
   process.on("SIGINT", async () => {
     console.error("[Server] Shutting down...");
+
+    // Save embedding cache to disk
+    await embeddingManager.saveCache();
+
     await graphIndex.dispose();
     process.exit(0);
   });

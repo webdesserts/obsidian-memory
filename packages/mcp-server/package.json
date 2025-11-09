@@ -13,8 +13,7 @@
     "test": "vitest",
     "test:watch": "vitest --watch",
     "start": "node dist/index.js",
-    "prepare": "npm run build && node scripts/download-model.js",
-    "download-model": "node scripts/download-model.js"
+    "prepare": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -27,9 +26,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "@webdesserts/obsidian-memory-utils": "*",
+    "@webdesserts/obsidian-memory-semantic-embeddings": "*",
     "chokidar": "^4.0.3",
     "gray-matter": "^4.0.3",
-    "node-llama-cpp": "^3.13.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {

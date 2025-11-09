@@ -4,6 +4,11 @@ import chokidar, { type FSWatcher } from "chokidar";
 import { extractLinkedNotes } from "@webdesserts/obsidian-memory-utils";
 
 /**
+ * Callback for file change events
+ */
+export type FileChangeCallback = (filePath: string, event: 'add' | 'change' | 'unlink') => void;
+
+/**
  * In-memory graph index tracking forward links and backlinks
  */
 export class GraphIndex {
@@ -22,7 +27,17 @@ export class GraphIndex {
   // Track pending async operations (used by tests to wait for file watcher events)
   private operationCount = 0;
 
+  // Callbacks for file change events
+  private fileChangeCallbacks: FileChangeCallback[] = [];
+
   constructor(private vaultPath: string) {}
+
+  /**
+   * Register a callback to be notified of file changes
+   */
+  onFileChange(callback: FileChangeCallback): void {
+    this.fileChangeCallbacks.push(callback);
+  }
 
   /**
    * Initialize the graph index by scanning the vault
@@ -157,6 +172,9 @@ export class GraphIndex {
             err
           );
         });
+
+        // Notify subscribers
+        this.fileChangeCallbacks.forEach(cb => cb(filePath, 'add'));
       });
 
       this.watcher.on("change", (filePath: string) => {
@@ -171,6 +189,9 @@ export class GraphIndex {
             err
           );
         });
+
+        // Notify subscribers
+        this.fileChangeCallbacks.forEach(cb => cb(filePath, 'change'));
       });
 
       this.watcher.on("unlink", (filePath: string) => {
@@ -181,6 +202,9 @@ export class GraphIndex {
         const noteName = path.basename(filePath, ".md");
         console.error(`[GraphIndex] File deleted: ${relativePath}`);
         this.removeNote(noteName);
+
+        // Notify subscribers
+        this.fileChangeCallbacks.forEach(cb => cb(filePath, 'unlink'));
       });
 
       // Wait for watcher to be ready before resolving
@@ -216,6 +240,13 @@ export class GraphIndex {
    */
   private getNoteName(filePath: string): string {
     return path.basename(filePath, ".md");
+  }
+
+  /**
+   * Get all note names in the index
+   */
+  getAllNotes(): string[] {
+    return Array.from(this.notePaths.keys());
   }
 
   /**

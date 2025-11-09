@@ -48,8 +48,10 @@ The system mirrors human memory: working memory for active thoughts, long-term m
 **Core systems:**
 - `packages/mcp-server/src/graph/` - Graph index tracking wiki links and backlinks
 - `packages/mcp-server/src/memory/` - Memory system, access logging, reindex manager
+- `packages/mcp-server/src/embeddings/` - Semantic embedding cache and WASM manager
 - `packages/mcp-server/src/tools/` - Individual tool implementations (one file per tool)
 - `packages/mcp-server/src/prompts/` - MCP prompts for guided workflows
+- `packages/semantic-embeddings/` - Rust WASM package for sentence transformers
 
 **Shared utilities:**
 - `packages/utils/src/` - Wiki link parsing, path helpers, note name extraction
@@ -69,6 +71,10 @@ Tool registration happens in `index.ts` lines 107-119.
 **Graph Index** - Scans vault on startup, builds link graph, tracks note locations. File watcher keeps it updated. Used for note discovery and neighborhood exploration.
 
 **Memory System** - Loads Index.md on startup, logs access patterns for usage statistics, manages private memory consent.
+
+**Embedding System** - Generates semantic embeddings for all notes using WASM-based sentence transformers (all-MiniLM-L6-v2). SHA-256 content hashing with disk cache for fast startup. File watcher invalidates cache on changes.
+
+**Search** - Uses semantic similarity search (cosine similarity) to find relevant notes. Pre-encodes all notes at startup for instant search results.
 
 **Reindex vs. Reflect** - Two separate consolidation processes:
 - `reindex` - Updates Index.md entry points based on knowledge graph (no approval needed)
@@ -168,19 +174,41 @@ This separation exists because the MCP server is a general-purpose tool, while t
 
 - `@obsidian-memory/utils` - Shared utilities (wiki-links, path helpers)
 - `@obsidian-memory/mcp-server` - MCP server implementation
+- `@obsidian-memory/semantic-embeddings` - Rust WASM package for embeddings
 - `@obsidian-memory/claude-plugin` - Stub for future Claude Code plugin
 
 Uses npm workspaces, TypeScript project references, and ES modules.
+
+### Building
+
+```bash
+# Build WASM embeddings package first
+cd packages/semantic-embeddings
+npm run build
+
+# Build MCP server
+cd ../mcp-server
+npm run build
+```
+
+The semantic-embeddings model files (~87MB) are downloaded automatically via npm prepare script.
 
 ---
 
 ## Technical Notes
 
 ### Dependencies
+
+**TypeScript (MCP Server):**
 - `@modelcontextprotocol/sdk` - Official MCP SDK
 - `chokidar` - File watching for graph updates
 - `gray-matter` - YAML frontmatter parsing
 - `zod` - Schema validation
+
+**Rust (Semantic Embeddings WASM):**
+- `candle-core`, `candle-nn`, `candle-transformers` - ML inference framework
+- `tokenizers` - Hugging Face tokenizer with WASM support
+- `wasm-bindgen` - Rust/JavaScript bindings
 
 ### Testing
 
