@@ -1,0 +1,16 @@
+# Build outputs
+*.node
+index.js
+index.d.ts
+target/
+dist/
+
+# Downloaded models
+models/
+
+# Dependencies
+node_modules/
+
+# Cache
+.cache/
+*.log
