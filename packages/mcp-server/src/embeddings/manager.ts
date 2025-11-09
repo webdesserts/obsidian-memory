@@ -14,6 +14,20 @@ export interface SearchResult {
 }
 
 /**
+ * Prepare content for embedding by prepending the note title
+ *
+ * This ensures notes can be found by title even if they have little content.
+ * Must be used consistently by both warmup and search to ensure cache hits.
+ *
+ * @param noteName - The name of the note (used as title)
+ * @param content - The note's content
+ * @returns Content with title prepended
+ */
+export function prepareContentForEmbedding(noteName: string, content: string): string {
+  return `${noteName}\n\n${content}`;
+}
+
+/**
  * Manager for semantic embeddings - coordinates WASM module and cache
  *
  * Handles model loading, embedding computation with caching, and similarity search.
@@ -109,15 +123,19 @@ export class EmbeddingManager {
       const notePath = graphIndex.getNotePath(noteName);
       if (!notePath) continue;
 
-      // Skip if already in cache (we'll check hash later)
-      if (this.cache.has(notePath)) continue;
-
       try {
         const fs = await import("fs/promises");
         const absolutePath = path.join(vaultPath, `${notePath}.md`);
         const content = await fs.readFile(absolutePath, "utf-8");
 
-        notesToEncode.push({ filePath: notePath, content });
+        // Prepare content with title for embedding
+        const contentWithTitle = prepareContentForEmbedding(noteName, content);
+
+        // Check if this content (with title) is already cached
+        const cached = await this.cache.get(notePath, contentWithTitle);
+        if (cached) continue; // Already cached with correct hash
+
+        notesToEncode.push({ filePath: notePath, content: contentWithTitle });
       } catch (error) {
         console.error(`[EmbeddingManager] Error reading ${notePath}: ${error}`);
       }

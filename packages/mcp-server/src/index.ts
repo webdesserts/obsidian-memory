@@ -16,6 +16,22 @@ import { EmbeddingManager } from "./embeddings/manager.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
 import { ToolContext } from "./types.js";
 import path from "path";
+import { debugLog } from "./utils/logger.js";
+
+// Global error handlers - log all uncaught errors to debug.log
+process.on("uncaughtException", (error) => {
+  debugLog(`[FATAL] Uncaught exception: ${error}`);
+  debugLog(`[FATAL] Stack trace: ${error.stack}`);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  debugLog(`[FATAL] Unhandled rejection at: ${promise}, reason: ${reason}`);
+  if (reason instanceof Error) {
+    debugLog(`[FATAL] Stack trace: ${reason.stack}`);
+  }
+  process.exit(1);
+});
 
 // Tool registrations
 import { registerGetNote } from "./tools/GetNote.js";
@@ -217,50 +233,89 @@ registerSearch(server, toolContext);
 
 // Start the server
 async function main() {
-  // Initialize graph index and memory system
-  await graphIndex.initialize();
-  await memorySystem.initialize();
+  try {
+    debugLog("[Server] Starting initialization...");
 
-  // Initialize embedding manager
-  console.error("[Server] Initializing embedding manager...");
-  embeddingManager = await EmbeddingManager.getInstance(vaultPath);
+    // Initialize graph index and memory system
+    debugLog("[Server] Initializing graph index...");
+    await graphIndex.initialize();
 
-  // Pre-encode all notes to warm up cache (makes first search instant)
-  await embeddingManager.warmupCache(vaultPath, graphIndex);
+    debugLog("[Server] Initializing memory system...");
+    await memorySystem.initialize();
 
-  // Register file change callback to invalidate embeddings cache
-  graphIndex.onFileChange(async (filePath, event) => {
-    if (event === 'change' || event === 'unlink') {
-      try {
-        // Convert absolute path to relative path for cache
-        const relativePath = path.relative(vaultPath, filePath);
-        embeddingManager.invalidate(relativePath);
+    // Initialize embedding manager
+    debugLog("[Server] Initializing embedding manager...");
+    embeddingManager = await EmbeddingManager.getInstance(vaultPath);
 
-        // Persist cache to disk after invalidation
-        await embeddingManager.saveCache();
-      } catch (error) {
-        console.error(`[EmbeddingManager] Error invalidating cache for ${filePath}: ${error}`);
+    // Start warming up cache in background (non-blocking)
+    // Search tool will wait for warmup to complete before first use
+    debugLog("[Server] Starting cache warmup in background...");
+    const warmupPromise = embeddingManager.warmupCache(vaultPath, graphIndex)
+      .then(() => {
+        debugLog("[Server] Cache warmup completed");
+      })
+      .catch((error) => {
+        debugLog(`[Server] Cache warmup failed: ${error}`);
+      });
+
+    // Store warmup promise in tool context so Search can await it
+    (toolContext as any).warmupPromise = warmupPromise;
+
+    // Register file change callback to invalidate embeddings cache
+    graphIndex.onFileChange(async (filePath, event) => {
+      if (event === 'change' || event === 'unlink') {
+        try {
+          // Convert absolute path to relative path for cache
+          const relativePath = path.relative(vaultPath, filePath);
+          embeddingManager.invalidate(relativePath);
+
+          // Persist cache to disk after invalidation
+          await embeddingManager.saveCache();
+        } catch (error) {
+          debugLog(`[EmbeddingManager] Error invalidating cache for ${filePath}: ${error}`);
+        }
       }
-    }
-  });
+    });
 
-  const transport = new StdioServerTransport();
-  await server.server.connect(transport);
-  console.error("[Server] Obsidian Memory MCP Server running");
+    debugLog("[Server] Connecting to transport...");
+    const transport = new StdioServerTransport();
 
-  // Clean up on exit
-  process.on("SIGINT", async () => {
-    console.error("[Server] Shutting down...");
+    // Add error handler for transport
+    transport.onerror = (error) => {
+      debugLog(`[Server] Transport error: ${error}`);
+    };
 
-    // Save embedding cache to disk
-    await embeddingManager.saveCache();
+    await server.server.connect(transport);
 
-    await graphIndex.dispose();
-    process.exit(0);
-  });
+    debugLog("[Server] Obsidian Memory MCP Server running");
+    console.error("[Server] Obsidian Memory MCP Server running");
+
+    // Add error handler for the server
+    server.server.onerror = (error) => {
+      debugLog(`[Server] MCP Server error: ${error}`);
+    };
+
+    // Clean up on exit
+    process.on("SIGINT", async () => {
+      debugLog("[Server] Shutting down...");
+      console.error("[Server] Shutting down...");
+
+      // Save embedding cache to disk
+      await embeddingManager.saveCache();
+
+      await graphIndex.dispose();
+      process.exit(0);
+    });
+  } catch (error) {
+    debugLog(`[Server] Error during initialization: ${error}`);
+    debugLog(`[Server] Stack trace: ${(error as Error).stack}`);
+    throw error;
+  }
 }
 
 main().catch((error) => {
+  debugLog(`[Server] Fatal error: ${error}`);
+  debugLog(`[Server] Stack trace: ${(error as Error).stack}`);
   console.error("[Server] Fatal error:", error);
   process.exit(1);
 });

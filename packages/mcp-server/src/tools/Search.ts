@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
 import { extractNoteName } from "@webdesserts/obsidian-memory-utils";
+import { prepareContentForEmbedding } from "../embeddings/manager.js";
 import path from "path";
 
 /**
@@ -55,6 +56,13 @@ export function registerSearch(server: McpServer, context: ToolContext) {
     async ({ query, includePrivate, topK, minSimilarity }) => {
       console.error(`[Search] Query: "${query}"`);
 
+      // Wait for cache warmup to complete if still in progress
+      if ((context as any).warmupPromise) {
+        console.error(`[Search] Waiting for cache warmup to complete...`);
+        await (context as any).warmupPromise;
+        console.error(`[Search] Cache warmup complete, proceeding with search`);
+      }
+
       // Get all markdown files in vault
       const allFiles = context.graphIndex.getAllNotes();
 
@@ -78,9 +86,8 @@ export function registerSearch(server: McpServer, context: ToolContext) {
         try {
           const { content } = await context.fileOps.readNote(notePath);
 
-          // Include note name in content for embedding to enable title-based matching
-          // This allows empty notes to still be searchable by their title
-          const contentWithTitle = `${noteName}\n\n${content}`;
+          // Prepare content with title for embedding (must match warmup logic)
+          const contentWithTitle = prepareContentForEmbedding(noteName, content);
 
           notesWithContent.push({
             filePath: notePath,
