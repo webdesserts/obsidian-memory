@@ -12,7 +12,7 @@ Model Context Protocol (MCP) server providing graph-aware memory system for Obsi
 
 **Features:**
 - Graph navigation (wiki links, backlinks, neighborhoods)
-- Smart note lookup with auto-search
+- Semantic search via embeddings (fast, offline, no API costs)
 - Memory system with Index.md and Working Memory.md
 - Private memory with consent-based access
 - MCP resources for auto-loaded memory files
@@ -47,6 +47,8 @@ Claude Code plugin with MCP server integration and notetaker skill.
 
 - Node.js 18+
 - npm 7+ (for workspaces support)
+- Rust toolchain (for building semantic-embeddings WASM package)
+- wasm-pack (install via `cargo install wasm-pack`)
 
 ### Setup
 
@@ -174,6 +176,138 @@ After making changes to the MCP server:
 cd ~/code/webdesserts/obsidian-memory
 npm run build
 # MCP server will use updated code on next Claude Code restart
+```
+
+## Troubleshooting
+
+### Model Download Failures
+
+**Problem:** `npm install` fails to download semantic embedding model files.
+
+**Solution:**
+```bash
+cd packages/semantic-embeddings
+npm run download-model
+```
+
+If download still fails, check:
+- Network connectivity
+- Hugging Face CDN availability
+- Disk space (~87MB required for all-MiniLM-L6-v2 model)
+
+### WASM Build Errors
+
+**Problem:** `npm run build` fails with WASM-related errors.
+
+**Solution:**
+
+1. **Check Rust toolchain is installed:**
+   ```bash
+   rustc --version
+   # Should show Rust 1.70+
+   ```
+   If not installed, get it from https://rustup.rs
+
+2. **Check wasm-pack is installed:**
+   ```bash
+   wasm-pack --version
+   # Should show wasm-pack 0.12+
+   ```
+   If not installed:
+   ```bash
+   cargo install wasm-pack
+   ```
+
+3. **Rebuild from clean state:**
+   ```bash
+   npm run clean
+   cd packages/semantic-embeddings && npm run build
+   cd ../.. && npm run build
+   ```
+
+### Missing Model Files Error
+
+**Problem:** MCP server fails to start with "Missing model files" error.
+
+**Solution:**
+
+The semantic embeddings model wasn't downloaded. Run:
+```bash
+cd packages/semantic-embeddings
+npm run download-model
+npm run build
+```
+
+### WASM Module Load Errors at Runtime
+
+**Problem:** Server crashes with "Cannot find module" for WASM files.
+
+**Solution:**
+
+Ensure the semantic-embeddings package was built:
+```bash
+cd packages/semantic-embeddings
+npm run build
+```
+
+The WASM build creates `pkg/` directory with `.wasm` and `.js` files that the MCP server imports.
+
+## Migration Guide
+
+### Migrating from LLM-based Search (v0.0.x)
+
+**What Changed:**
+
+Version 0.1.0 replaces the LLM-guided graph traversal search with semantic embedding-based search.
+
+**Why the Change:**
+
+- **Faster:** Embedding search takes ~10ms vs ~5-10s for LLM search
+- **No API costs:** No token usage for searches
+- **No model download:** 87MB embedding model vs 4-7GB LLM model
+- **More accurate:** Pure semantic similarity vs LLM interpretation
+
+**Migration Steps:**
+
+1. **Clean up old LLM files** (if you used the LLM-based search):
+   ```bash
+   rm -rf packages/mcp-server/models/  # Old GGUF model directory
+   ```
+
+2. **Update dependencies:**
+   ```bash
+   npm install
+   ```
+
+3. **Build new WASM package:**
+   ```bash
+   cd packages/semantic-embeddings
+   npm run build
+   cd ../..
+   npm run build
+   ```
+
+4. **Clear old cache** (optional, but recommended):
+   ```bash
+   rm -f ~/notes/.obsidian/embedding-cache.json
+   ```
+   Cache will rebuild automatically on first search.
+
+**Behavior Differences:**
+
+- **Search results:** Now based on semantic similarity scores (0-1) instead of LLM relevance judgments
+- **Speed:** First search may take 10-30s to encode all notes, subsequent searches are instant
+- **Customization:** Use `minSimilarity` parameter to control result quality (default 0.3)
+- **No natural language:** Query is embedded directly - use keywords rather than questions
+
+**Example:**
+
+```typescript
+// Old LLM-based search (removed)
+Search({ query: "How does React SSR work?" })
+
+// New embedding-based search (current)
+Search({ query: "React server-side rendering", minSimilarity: 0.3 })
 ```
 
 ## License
