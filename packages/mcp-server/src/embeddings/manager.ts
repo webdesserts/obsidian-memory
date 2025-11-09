@@ -72,15 +72,21 @@ export class EmbeddingManager {
    * Initialize the embedding system - load cache and model
    */
   private async initialize(): Promise<void> {
-    console.error("[EmbeddingManager] Initializing...");
+    try {
+      console.error("[EmbeddingManager] Initializing...");
 
-    // Load cache from disk
-    await this.cache.load();
+      // Load cache from disk
+      await this.cache.load();
 
-    // Load WASM module
-    await this.loadWasmModule();
+      // Load WASM module
+      await this.loadWasmModule();
 
-    console.error("[EmbeddingManager] Initialization complete");
+      console.error("[EmbeddingManager] Initialization complete");
+    } catch (error) {
+      // Clean up singleton state on failure to allow retry
+      EmbeddingManager.instancePromise = null;
+      throw error;
+    }
   }
 
   /**

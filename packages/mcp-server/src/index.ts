@@ -231,12 +231,16 @@ async function main() {
   // Register file change callback to invalidate embeddings cache
   graphIndex.onFileChange(async (filePath, event) => {
     if (event === 'change' || event === 'unlink') {
-      // Convert absolute path to relative path for cache
-      const relativePath = path.relative(vaultPath, filePath);
-      embeddingManager.invalidate(relativePath);
+      try {
+        // Convert absolute path to relative path for cache
+        const relativePath = path.relative(vaultPath, filePath);
+        embeddingManager.invalidate(relativePath);
 
-      // Persist cache to disk after invalidation
-      await embeddingManager.saveCache();
+        // Persist cache to disk after invalidation
+        await embeddingManager.saveCache();
+      } catch (error) {
+        console.error(`[EmbeddingManager] Error invalidating cache for ${filePath}: ${error}`);
+      }
     }
   });
 
