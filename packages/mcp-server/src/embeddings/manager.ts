@@ -163,6 +163,25 @@ export class EmbeddingManager {
 
       console.error(`[EmbeddingManager] Loading model from ${modelDir}...`);
 
+      // Validate model files exist before attempting to load
+      const requiredFiles = ["config.json", "tokenizer.json", "model.safetensors"];
+      const missingFiles: string[] = [];
+
+      for (const file of requiredFiles) {
+        try {
+          await fs.access(path.join(modelDir, file));
+        } catch {
+          missingFiles.push(file);
+        }
+      }
+
+      if (missingFiles.length > 0) {
+        throw new Error(
+          `Missing model files: ${missingFiles.join(", ")}\n` +
+          `Run: cd packages/semantic-embeddings && npm run download-model`
+        );
+      }
+
       const [configJson, tokenizerJson, modelWeights] = await Promise.all([
         fs.readFile(path.join(modelDir, "config.json"), "utf-8"),
         fs.readFile(path.join(modelDir, "tokenizer.json"), "utf-8"),
