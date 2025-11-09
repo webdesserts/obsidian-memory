@@ -77,9 +77,14 @@ export function registerSearch(server: McpServer, context: ToolContext) {
 
         try {
           const { content } = await context.fileOps.readNote(notePath);
+
+          // Include note name in content for embedding to enable title-based matching
+          // This allows empty notes to still be searchable by their title
+          const contentWithTitle = `${noteName}\n\n${content}`;
+
           notesWithContent.push({
             filePath: notePath,
-            content,
+            content: contentWithTitle,
           });
         } catch (error) {
           console.error(`[Search] Error reading ${notePath}: ${error}`);
