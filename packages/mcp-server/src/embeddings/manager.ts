@@ -49,6 +49,9 @@ export class EmbeddingManager {
     }
 
     // Start new initialization
+    // Use instancePromise pattern: concurrent calls to getInstance() wait
+    // for the same initialization instead of creating multiple instances.
+    // The promise is stored before starting async work to handle race conditions.
     EmbeddingManager.instancePromise = (async () => {
       const manager = new EmbeddingManager(vaultPath);
       await manager.initialize();

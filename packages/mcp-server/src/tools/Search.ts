@@ -41,7 +41,11 @@ export function registerSearch(server: McpServer, context: ToolContext) {
           .number()
           .optional()
           .default(0.3)
-          .describe("Minimum similarity threshold 0-1 (default: 0.3)"),
+          .describe(
+            "Minimum similarity threshold 0-1 (default: 0.3). " +
+            "0.3 filters out weakly related notes while keeping moderately relevant results. " +
+            "Lower values (0.2) include more results, higher values (0.5+) are very strict."
+          ),
       },
       annotations: {
         readOnlyHint: true,

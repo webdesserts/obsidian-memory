@@ -110,6 +110,10 @@ export class EmbeddingCache {
 
   /**
    * Compute SHA-256 hash of file content
+   *
+   * Uses SHA-256 for collision resistance - ensures that even similar content
+   * produces distinct hashes. Critical for cache invalidation accuracy since
+   * we need to detect any content changes, no matter how small.
    */
   private hashContent(content: string): string {
     return crypto.createHash("sha256").update(content, "utf8").digest("hex");

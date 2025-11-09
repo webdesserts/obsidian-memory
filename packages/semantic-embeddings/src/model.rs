@@ -201,6 +201,12 @@ impl ModelManager {
     }
 
     /// Mean pooling: average token embeddings weighted by attention mask
+    ///
+    /// Uses mean pooling instead of [CLS] token because it better captures the
+    /// overall meaning of the text by averaging information from all tokens.
+    /// The attention mask weights ensure padding tokens don't affect the average.
+    ///
+    /// See: https://www.sbert.net/docs/usage/computing_sentence_embeddings.html
     fn mean_pool(&self, token_embeddings: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         // token_embeddings shape: [batch_size, seq_len, hidden_size]
         // attention_mask shape: [batch_size, seq_len]
@@ -223,6 +229,12 @@ impl ModelManager {
     }
 
     /// Normalize embeddings to unit length (L2 normalization)
+    ///
+    /// Projects embeddings onto the unit hypersphere so cosine similarity becomes
+    /// equivalent to dot product. This makes similarity computation faster and ensures
+    /// embeddings are comparable regardless of input length.
+    ///
+    /// See: https://www.sbert.net/docs/usage/computing_sentence_embeddings.html
     fn normalize(&self, embeddings: &Tensor) -> Result<Tensor> {
         // Compute L2 norm for each embedding
         let norm = embeddings
