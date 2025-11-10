@@ -27,6 +27,7 @@ export interface ToolContext {
     noteName: string,
     includePrivate?: boolean
   ) => string | undefined;
+  warmupPromise?: Promise<void>;
 }
 
 /**

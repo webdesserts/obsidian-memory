@@ -4,7 +4,9 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// File-based debug logging (in project directory to avoid permission prompts)
+// File-based debug logging
+// Location: packages/mcp-server/debug.log (in project directory to avoid permission prompts)
+// This file captures uncaught exceptions and unhandled promise rejections for troubleshooting
 const DEBUG_LOG = path.join(__dirname, "../..", "debug.log");
 
 /**

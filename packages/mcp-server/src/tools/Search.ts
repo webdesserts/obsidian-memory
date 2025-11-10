@@ -57,9 +57,9 @@ export function registerSearch(server: McpServer, context: ToolContext) {
       console.error(`[Search] Query: "${query}"`);
 
       // Wait for cache warmup to complete if still in progress
-      if ((context as any).warmupPromise) {
+      if (context.warmupPromise) {
         console.error(`[Search] Waiting for cache warmup to complete...`);
-        await (context as any).warmupPromise;
+        await context.warmupPromise;
         console.error(`[Search] Cache warmup complete, proceeding with search`);
       }
 
@@ -131,9 +131,14 @@ function formatResults(
 
   if (results.length === 0) {
     output += `No notes found with similarity >= ${Math.round(minSimilarity * 100)}%\n\n`;
-    output += `Try:\n`;
+    output += `**Similarity Ranges:**\n`;
+    output += `- 0.7+ = Very similar (paraphrases, same topic)\n`;
+    output += `- 0.5-0.7 = Related topics\n`;
+    output += `- 0.3-0.5 = Weak relation\n`;
+    output += `- <0.3 = Mostly unrelated\n\n`;
+    output += `**Try:**\n`;
     output += `- Using different search terms\n`;
-    output += `- Lowering minSimilarity threshold\n`;
+    output += `- Lowering minSimilarity threshold (currently ${minSimilarity})\n`;
     output += `- Using GetGraphNeighborhood() to explore from known notes\n`;
     return { content: [{ type: "text", text: output }] };
   }
