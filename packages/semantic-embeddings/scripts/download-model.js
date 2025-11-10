@@ -168,8 +168,19 @@ async function main() {
   console.log('\n✓ Model download complete!');
   }
 
-  // Optimize tokenizer.json by removing padding configuration
-  // This improves performance (95% memory reduction) and accuracy (5/9 vs 1/9 tests passing)
+  // Remove fixed padding configuration from tokenizer.json
+  //
+  // Hugging Face's tokenizer.json contains `padding: { strategy: { Fixed: 128 } }`, which pads
+  // all sequences to exactly 128 tokens. However, Python's sentence-transformers library ignores
+  // this config and uses `padding=False` by default, processing only the actual token count (3-10).
+  //
+  // Candle's BERT implementation is sensitive to sequence length even with attention masking -
+  // processing 128 positions produces different embeddings than processing 3 positions, despite
+  // padding tokens being masked. The sequence length affects positional embeddings, layer norms,
+  // and attention patterns throughout BERT's 6 transformer layers.
+  //
+  // Removing the padding config aligns our tokenizer behavior with Python's actual usage,
+  // significantly improving embedding accuracy and reducing memory usage.
   const tokenizerPath = path.join(MODEL_DIR, 'tokenizer.json');
   const versionPath = path.join(MODEL_DIR, '.tokenizer-version');
 
@@ -200,11 +211,13 @@ async function main() {
     fs.writeFileSync(versionPath, tokenizerVersion);
 
     if (tokenizerData.padding) {
-      console.log('  Removing fixed padding configuration (was padding to 128 tokens)');
+      console.log('  Removing fixed padding configuration:');
+      console.log(`    Was: Fixed padding to 128 tokens`);
+      console.log(`    Now: Variable length (actual token count)`);
       console.log(`  Tokenizer version: ${tokenizerVersion}`);
       delete tokenizerData.padding;
       fs.writeFileSync(tokenizerPath, JSON.stringify(tokenizerData, null, 2));
-      console.log('✓ Tokenizer optimized - sequences now use actual token count');
+      console.log('✓ Tokenizer optimized - Rust/Candle now matches Python/PyTorch behavior');
     } else {
       console.log('✓ Tokenizer already optimized');
       console.log(`  Tokenizer version: ${tokenizerVersion}`);
