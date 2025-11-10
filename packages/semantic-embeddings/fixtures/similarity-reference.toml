@@ -4,7 +4,7 @@
 # Date: 2025-03-01
 
 # Default tolerance for all test cases (can be overridden per-case)
-default_tolerance = 0.05
+default_tolerance = 0.014
 
 # High Similarity Cases (0.75-0.95)
 # These are semantically very similar or paraphrased sentences
