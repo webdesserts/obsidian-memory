@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
+
+#[cfg(feature = "debug")]
+use candle_core::IndexOp;
 use candle_transformers::models::bert::{BertModel, Config};
 use std::sync::Mutex;
 use tokenizers::Tokenizer;

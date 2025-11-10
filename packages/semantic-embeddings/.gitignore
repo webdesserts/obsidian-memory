@@ -4,6 +4,7 @@ index.js
 index.d.ts
 target/
 dist/
+pkg/
 
 # Downloaded models
 models/

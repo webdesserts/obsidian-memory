@@ -7,3 +7,4 @@ dist/
 CLAUDE.local.md
 packages/mcp-server/models/*.gguf
 .claude/settings.local.json
+/packages/semantic-embeddings/.venv-arm

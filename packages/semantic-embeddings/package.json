@@ -1,6 +1,7 @@
 {
   "name": "@webdesserts/obsidian-memory-semantic-embeddings",
   "version": "0.1.0",
+  "type": "module",
   "description": "Rust-based semantic embeddings for Obsidian notes",
   "main": "pkg/semantic_embeddings.js",
   "types": "pkg/semantic_embeddings.d.ts",

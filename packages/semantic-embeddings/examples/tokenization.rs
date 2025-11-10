@@ -1,13 +1,32 @@
-/**
- * Standalone test to check tokenization
- */
+//! Tokenization verification example
+//!
+//! **Purpose:** Verify that tokenization is working correctly and matches expected BERT format
+//!
+//! **When to use:**
+//! - Debugging tokenization issues
+//! - Verifying token IDs match expected BERT vocabulary
+//! - Checking attention mask and special token placement ([CLS], [SEP])
+//!
+//! **Usage:**
+//! ```bash
+//! cargo run --example tokenization
+//! ```
+//!
+//! **Expected output:**
+//! - Token IDs starting with 101 ([CLS]) and ending with 102 ([SEP])
+//! - Attention mask with 1s for real tokens
+//! - Decoded tokens showing word pieces
 
 use std::fs;
+use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tokenizer_path = "models/all-MiniLM-L6-v2/tokenizer.json";
-    let tokenizer_json = fs::read_to_string(tokenizer_path)?;
+    // Load tokenizer using same path resolution as ModelManager
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models/all-MiniLM-L6-v2");
+
+    let tokenizer_json = fs::read_to_string(model_dir.join("tokenizer.json"))?;
     let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes())?;
 
     let texts = vec![
@@ -34,7 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     println!("\n{}", "=".repeat(80));
-    println!("\nThese should match Python's AutoTokenizer output");
+    println!("\nExpected:");
+    println!("- Token IDs should start with 101 ([CLS]) and end with 102 ([SEP])");
+    println!("- Attention mask: 1 for real tokens, 0 for padding");
+    println!("- Should match Python's AutoTokenizer output");
 
     Ok(())
 }

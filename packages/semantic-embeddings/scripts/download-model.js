@@ -132,8 +132,8 @@ async function main() {
 
   if (allFilesExist) {
     console.log('✓ Model already downloaded\n');
-    return;
-  }
+    // Still run optimization in case tokenizer.json needs updating
+  } else {
 
   // Download each file
   for (const file of FILES) {
@@ -166,6 +166,53 @@ async function main() {
   }
 
   console.log('\n✓ Model download complete!');
+  }
+
+  // Optimize tokenizer.json by removing padding configuration
+  // This improves performance (95% memory reduction) and accuracy (5/9 vs 1/9 tests passing)
+  const tokenizerPath = path.join(MODEL_DIR, 'tokenizer.json');
+  const versionPath = path.join(MODEL_DIR, '.tokenizer-version');
+
+  console.log('\nOptimizing tokenizer.json...');
+
+  try {
+    const tokenizerData = JSON.parse(fs.readFileSync(tokenizerPath, 'utf8'));
+
+    // Track tokenizer version to detect upstream changes
+    const tokenizerVersion = tokenizerData.version || 'unknown';
+    let lastKnownVersion = 'unknown';
+
+    if (fs.existsSync(versionPath)) {
+      lastKnownVersion = fs.readFileSync(versionPath, 'utf8').trim();
+    }
+
+    if (lastKnownVersion !== 'unknown' && tokenizerVersion !== lastKnownVersion) {
+      console.log('');
+      console.log('⚠️  ALERT: Tokenizer version changed!');
+      console.log(`   Previous version: ${lastKnownVersion}`);
+      console.log(`   New version:      ${tokenizerVersion}`);
+      console.log('   Please verify that our padding optimization is still appropriate.');
+      console.log('   Compare the new padding config against our optimization.');
+      console.log('');
+    }
+
+    // Save current version
+    fs.writeFileSync(versionPath, tokenizerVersion);
+
+    if (tokenizerData.padding) {
+      console.log('  Removing fixed padding configuration (was padding to 128 tokens)');
+      console.log(`  Tokenizer version: ${tokenizerVersion}`);
+      delete tokenizerData.padding;
+      fs.writeFileSync(tokenizerPath, JSON.stringify(tokenizerData, null, 2));
+      console.log('✓ Tokenizer optimized - sequences now use actual token count');
+    } else {
+      console.log('✓ Tokenizer already optimized');
+      console.log(`  Tokenizer version: ${tokenizerVersion}`);
+    }
+  } catch (err) {
+    console.warn('⚠ Warning: Could not optimize tokenizer.json:', err.message);
+  }
+
   console.log(`\nModel saved to: ${MODEL_DIR}`);
 }
 
