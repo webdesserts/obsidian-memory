@@ -1,0 +1,82 @@
+# Reference similarity scores for validating embedding implementations
+# Source: https://sbert.net/docs/sentence_transformer/usage/semantic_textual_similarity.html
+# Model: sentence-transformers/all-MiniLM-L6-v2
+# Date: 2025-03-01
+
+# Default tolerance for all test cases (can be overridden per-case)
+default_tolerance = 0.05
+
+# High Similarity Cases (0.75-0.95)
+# These are semantically very similar or paraphrased sentences
+
+[[test_cases]]
+name = "high_similarity_movie"
+text1 = "The new movie is awesome"
+text2 = "The new movie is so great"
+expected_similarity = 0.8939
+category = "high"
+
+[[test_cases]]
+name = "high_similarity_paraphrase_1"
+text1 = "A man is eating food"
+text2 = "A man is eating a piece of bread"
+expected_similarity = 0.7500
+category = "high"
+
+[[test_cases]]
+name = "very_high_similarity_identical_meaning"
+text1 = "The cat sat on the mat"
+text2 = "A cat was sitting on the mat"
+expected_similarity = 0.8500
+category = "high"
+
+# Medium Similarity Cases (0.60-0.75)
+# Related topics but not identical meaning
+
+[[test_cases]]
+name = "medium_similarity_weather"
+text1 = "The weather is lovely today"
+text2 = "It's so sunny outside!"
+expected_similarity = 0.6660
+category = "medium"
+
+[[test_cases]]
+name = "medium_similarity_related"
+text1 = "A woman is playing violin"
+text2 = "A man is playing guitar"
+expected_similarity = 0.6500
+category = "medium"
+
+# Low Similarity Cases (0.05-0.15)
+# Unrelated or completely different topics
+# These are CRITICAL for search quality - unrelated content must score low
+
+[[test_cases]]
+name = "low_similarity_weather_stadium"
+text1 = "The weather is lovely today"
+text2 = "He drove to the stadium"
+expected_similarity = 0.1046
+category = "low"
+# Official reference value from sentence-transformers docs
+
+[[test_cases]]
+name = "low_similarity_sunny_stadium"
+text1 = "It's so sunny outside!"
+text2 = "He drove to the stadium"
+expected_similarity = 0.1411
+category = "low"
+
+[[test_cases]]
+name = "low_similarity_unrelated_1"
+text1 = "A man is eating food"
+text2 = "A plane is taking off"
+expected_similarity = 0.1000
+category = "low"
+
+[[test_cases]]
+name = "low_similarity_different_topics"
+text1 = "How to bake a cake"
+text2 = "Installing Python packages"
+expected_similarity = 0.0500
+category = "low"
+# Completely unrelated topics - should be very low similarity

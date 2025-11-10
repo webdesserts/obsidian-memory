@@ -18,9 +18,10 @@ fn test_similarity_against_fixtures() {
             .unwrap_or_else(|_| panic!("Failed to encode text2 for {}", test_case.name));
 
         let actual_similarity = cosine_similarity(&emb1, &emb2);
+        let tolerance = test_case.tolerance(fixtures.default_tolerance);
 
         let diff = (actual_similarity - test_case.expected_similarity).abs();
-        let within_tolerance = diff <= test_case.tolerance;
+        let within_tolerance = diff <= tolerance;
 
         if within_tolerance {
             passed += 1;
@@ -30,18 +31,18 @@ fn test_similarity_against_fixtures() {
                 test_case.category,
                 actual_similarity,
                 test_case.expected_similarity,
-                test_case.tolerance
+                tolerance
             );
         } else {
             failed += 1;
-            let error_pct = (diff / test_case.expected_similarity * 100.0);
+            let error_pct = diff / test_case.expected_similarity * 100.0;
             println!(
                 "✗ {} ({}): {:.4} (expected {:.4} ± {:.4}, diff {:.4} / {:.1}%)",
                 test_case.name,
                 test_case.category,
                 actual_similarity,
                 test_case.expected_similarity,
-                test_case.tolerance,
+                tolerance,
                 diff,
                 error_pct
             );
@@ -50,7 +51,7 @@ fn test_similarity_against_fixtures() {
                 test_case.name,
                 test_case.category,
                 test_case.expected_similarity,
-                test_case.tolerance,
+                tolerance,
                 actual_similarity,
                 diff,
                 error_pct

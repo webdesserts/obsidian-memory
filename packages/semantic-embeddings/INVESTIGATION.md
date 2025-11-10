@@ -235,8 +235,9 @@ This 17% bias (67.2% - 50%) in same-sign dimensions for unrelated content direct
 ## Test Infrastructure
 
 ### Fixtures
-- `fixtures/similarity-reference.json` - 9 test cases with reference similarity scores from official Python implementation
-- `fixtures/similarity-reference.schema.json` - JSON schema for fixture validation
+- `fixtures/similarity-reference.toml` - 9 test cases with reference similarity scores from official Python implementation
+  - Uses TOML format for easy commenting and readability
+  - Includes inline documentation for each test case category
 
 ### Tests (in `tests/` directory)
 - `tests/common/mod.rs` - Shared test utilities (model loading, fixtures, cosine similarity)

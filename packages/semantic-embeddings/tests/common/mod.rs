@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct SimilarityReference {
-    pub model: String,
+    pub default_tolerance: f32,
     pub test_cases: Vec<TestCase>,
 }
 
@@ -16,13 +16,15 @@ pub struct TestCase {
     pub text1: String,
     pub text2: String,
     pub expected_similarity: f32,
-    #[serde(default = "default_tolerance")]
-    pub tolerance: f32,
+    #[serde(default)]
+    pub tolerance: Option<f32>,
     pub category: String,
 }
 
-fn default_tolerance() -> f32 {
-    0.05
+impl TestCase {
+    pub fn tolerance(&self, default: f32) -> f32 {
+        self.tolerance.unwrap_or(default)
+    }
 }
 
 // Shared model instance loaded once for all tests (improves test performance)
@@ -49,13 +51,13 @@ pub static TEST_MODEL: Lazy<ModelManager> = Lazy::new(|| {
 // Load reference similarity values from fixtures
 pub static SIMILARITY_FIXTURES: Lazy<SimilarityReference> = Lazy::new(|| {
     let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/similarity-reference.json");
+        .join("fixtures/similarity-reference.toml");
 
-    let fixture_json = fs::read_to_string(&fixture_path)
-        .expect("Failed to read similarity-reference.json");
+    let fixture_toml = fs::read_to_string(&fixture_path)
+        .expect("Failed to read similarity-reference.toml");
 
-    serde_json::from_str(&fixture_json)
-        .expect("Failed to parse similarity-reference.json")
+    toml::from_str(&fixture_toml)
+        .expect("Failed to parse similarity-reference.toml")
 });
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
