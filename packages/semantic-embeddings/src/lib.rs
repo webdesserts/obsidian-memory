@@ -13,6 +13,22 @@ use std::sync::Arc;
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
+
+    // Initialize logging if debug feature is enabled
+    #[cfg(feature = "debug")]
+    {
+        wasm_logger::init(wasm_logger::Config::default());
+        log::info!("Debug logging enabled for semantic-embeddings (WASM)");
+    }
+}
+
+// Auto-initialize logging for native (non-WASM) builds
+#[cfg(all(feature = "debug", not(target_family = "wasm")))]
+#[ctor::ctor]
+fn init_native_logging() {
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Debug)
+        .try_init();
 }
 
 /// Semantic embedding generator for text content
