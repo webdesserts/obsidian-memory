@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Similarity Reference Schema",
+  "description": "Reference similarity scores for validating embedding implementations",
+  "type": "object",
+  "required": ["model", "test_cases"],
+  "properties": {
+    "model": {
+      "type": "string",
+      "description": "The model these reference values are for"
+    },
+    "source": {
+      "type": "string",
+      "description": "URL or citation for where these values came from"
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "description": "Date these reference values were verified"
+    },
+    "note": {
+      "type": "string",
+      "description": "Additional context about these reference values"
+    },
+    "test_cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "text1", "text2", "expected_similarity", "category"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique identifier for this test case"
+          },
+          "text1": {
+            "type": "string",
+            "description": "First text to compare"
+          },
+          "text2": {
+            "type": "string",
+            "description": "Second text to compare"
+          },
+          "expected_similarity": {
+            "type": "number",
+            "minimum": -1.0,
+            "maximum": 1.0,
+            "description": "Expected cosine similarity (reference value from Python)"
+          },
+          "tolerance": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Acceptable deviation from expected value (default: 0.05)"
+          },
+          "category": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Similarity category for grouping"
+          }
+        }
+      }
+    }
+  }
+}

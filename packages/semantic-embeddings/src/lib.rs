@@ -6,7 +6,9 @@ use js_sys::{Array, Float32Array};
 mod model;
 mod embedding;
 
-use model::ModelManager;
+// Re-export for tests
+pub use model::ModelManager;
+
 use std::sync::Arc;
 
 // Set panic hook for better error messages in WASM

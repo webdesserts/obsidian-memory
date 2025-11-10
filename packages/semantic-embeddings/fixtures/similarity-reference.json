@@ -1,0 +1,81 @@
+{
+  "$schema": "./similarity-reference.schema.json",
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "source": "https://sbert.net/docs/sentence_transformer/usage/semantic_textual_similarity.html",
+  "date": "2025-03-01",
+  "note": "Reference values from official sentence-transformers documentation and examples",
+  "test_cases": [
+    {
+      "name": "high_similarity_movie",
+      "text1": "The new movie is awesome",
+      "text2": "The new movie is so great",
+      "expected_similarity": 0.8939,
+      "tolerance": 0.05,
+      "category": "high"
+    },
+    {
+      "name": "medium_similarity_weather",
+      "text1": "The weather is lovely today",
+      "text2": "It's so sunny outside!",
+      "expected_similarity": 0.6660,
+      "tolerance": 0.05,
+      "category": "medium"
+    },
+    {
+      "name": "low_similarity_weather_stadium",
+      "text1": "The weather is lovely today",
+      "text2": "He drove to the stadium",
+      "expected_similarity": 0.1046,
+      "tolerance": 0.05,
+      "category": "low"
+    },
+    {
+      "name": "low_similarity_sunny_stadium",
+      "text1": "It's so sunny outside!",
+      "text2": "He drove to the stadium",
+      "expected_similarity": 0.1411,
+      "tolerance": 0.05,
+      "category": "low"
+    },
+    {
+      "name": "high_similarity_paraphrase_1",
+      "text1": "A man is eating food",
+      "text2": "A man is eating a piece of bread",
+      "expected_similarity": 0.7500,
+      "tolerance": 0.05,
+      "category": "high"
+    },
+    {
+      "name": "low_similarity_unrelated_1",
+      "text1": "A man is eating food",
+      "text2": "A plane is taking off",
+      "expected_similarity": 0.1000,
+      "tolerance": 0.05,
+      "category": "low"
+    },
+    {
+      "name": "medium_similarity_related",
+      "text1": "A woman is playing violin",
+      "text2": "A man is playing guitar",
+      "expected_similarity": 0.6500,
+      "tolerance": 0.05,
+      "category": "medium"
+    },
+    {
+      "name": "very_high_similarity_identical_meaning",
+      "text1": "The cat sat on the mat",
+      "text2": "A cat was sitting on the mat",
+      "expected_similarity": 0.8500,
+      "tolerance": 0.05,
+      "category": "high"
+    },
+    {
+      "name": "low_similarity_different_topics",
+      "text1": "How to bake a cake",
+      "text2": "Installing Python packages",
+      "expected_similarity": 0.0500,
+      "tolerance": 0.05,
+      "category": "low"
+    }
+  ]
+}
