@@ -250,7 +250,7 @@ async function main() {
     // Start warming up cache in background (non-blocking)
     // Search tool will wait for warmup to complete before first use
     debugLog("[Server] Starting cache warmup in background...");
-    const warmupPromise = embeddingManager.warmupCache(vaultPath, graphIndex)
+    const warmupPromise = embeddingManager.warmupCache(vaultPath, graphIndex, fileOps)
       .then(() => {
         debugLog("[Server] Cache warmup completed");
       })

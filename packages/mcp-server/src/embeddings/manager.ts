@@ -14,17 +14,48 @@ export interface SearchResult {
 }
 
 /**
- * Prepare content for embedding by prepending the note title
+ * Prepare content for embedding by prepending the note title and frontmatter
  *
- * This ensures notes can be found by title even if they have little content.
+ * This ensures notes can be found by:
+ * - Title (even if they have little content)
+ * - Aliases (alternative names for the note)
+ * - Other frontmatter fields that provide searchable context
+ *
  * Must be used consistently by both warmup and search to ensure cache hits.
  *
  * @param noteName - The name of the note (used as title)
- * @param content - The note's content
- * @returns Content with title prepended
+ * @param content - The note's content (without frontmatter)
+ * @param frontmatter - Optional parsed frontmatter object
+ * @returns Content with title and frontmatter prepended
  */
-export function prepareContentForEmbedding(noteName: string, content: string): string {
-  return `${noteName}\n\n${content}`;
+export function prepareContentForEmbedding(
+  noteName: string,
+  content: string,
+  frontmatter?: Record<string, any>
+): string {
+  let prepared = noteName;
+
+  // Add aliases if present (common pattern: aliases: [name1, name2])
+  if (frontmatter?.aliases) {
+    const aliases = Array.isArray(frontmatter.aliases)
+      ? frontmatter.aliases
+      : [frontmatter.aliases];
+    if (aliases.length > 0) {
+      prepared += `\nAliases: ${aliases.join(", ")}`;
+    }
+  }
+
+  // Add tags if present (helps with topic categorization)
+  if (frontmatter?.tags) {
+    const tags = Array.isArray(frontmatter.tags)
+      ? frontmatter.tags
+      : [frontmatter.tags];
+    if (tags.length > 0) {
+      prepared += `\nTags: ${tags.join(", ")}`;
+    }
+  }
+
+  return `${prepared}\n\n${content}`;
 }
 
 /**
@@ -112,7 +143,7 @@ export class EmbeddingManager {
    * This encodes all notes that don't have cached embeddings yet,
    * making first search instant. Run this after initialization.
    */
-  async warmupCache(vaultPath: string, graphIndex: any): Promise<void> {
+  async warmupCache(vaultPath: string, graphIndex: any, fileOps: any): Promise<void> {
     console.error("[EmbeddingManager] Warming up cache...");
 
     const allNotes = graphIndex.getAllNotes();
@@ -124,18 +155,16 @@ export class EmbeddingManager {
       if (!notePath) continue;
 
       try {
-        const fs = await import("fs/promises");
-        const absolutePath = path.join(vaultPath, `${notePath}.md`);
-        const content = await fs.readFile(absolutePath, "utf-8");
+        const { content, frontmatter } = await fileOps.readNote(notePath);
 
-        // Prepare content with title for embedding
-        const contentWithTitle = prepareContentForEmbedding(noteName, content);
+        // Prepare content with title and frontmatter for embedding
+        const preparedContent = prepareContentForEmbedding(noteName, content, frontmatter);
 
-        // Check if this content (with title) is already cached
-        const cached = await this.cache.get(notePath, contentWithTitle);
+        // Check if this content is already cached
+        const cached = await this.cache.get(notePath, preparedContent);
         if (cached) continue; // Already cached with correct hash
 
-        notesToEncode.push({ filePath: notePath, content: contentWithTitle });
+        notesToEncode.push({ filePath: notePath, content: preparedContent });
       } catch (error) {
         console.error(`[EmbeddingManager] Error reading ${notePath}: ${error}`);
       }

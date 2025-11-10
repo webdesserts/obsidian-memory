@@ -84,14 +84,14 @@ export function registerSearch(server: McpServer, context: ToolContext) {
         if (!notePath) continue;
 
         try {
-          const { content } = await context.fileOps.readNote(notePath);
+          const { content, frontmatter } = await context.fileOps.readNote(notePath);
 
-          // Prepare content with title for embedding (must match warmup logic)
-          const contentWithTitle = prepareContentForEmbedding(noteName, content);
+          // Prepare content with title and frontmatter for embedding (must match warmup logic)
+          const preparedContent = prepareContentForEmbedding(noteName, content, frontmatter);
 
           notesWithContent.push({
             filePath: notePath,
-            content: contentWithTitle,
+            content: preparedContent,
           });
         } catch (error) {
           console.error(`[Search] Error reading ${notePath}: ${error}`);

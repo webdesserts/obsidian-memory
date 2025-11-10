@@ -42,6 +42,105 @@ describe("prepareContentForEmbedding", () => {
     });
   });
 
+  describe("frontmatter handling", () => {
+    it("should include single alias", () => {
+      const noteName = "TypeScript";
+      const content = "Content about TypeScript";
+      const frontmatter = { aliases: ["TS"] };
+
+      const result = prepareContentForEmbedding(noteName, content, frontmatter);
+
+      expect(result).toBe("TypeScript\nAliases: TS\n\nContent about TypeScript");
+    });
+
+    it("should include multiple aliases", () => {
+      const noteName = "JavaScript";
+      const content = "Content about JavaScript";
+      const frontmatter = { aliases: ["JS", "ECMAScript", "ES"] };
+
+      const result = prepareContentForEmbedding(noteName, content, frontmatter);
+
+      expect(result).toBe("JavaScript\nAliases: JS, ECMAScript, ES\n\nContent about JavaScript");
+    });
+
+    it("should handle aliases as single string", () => {
+      const noteName = "Note";
+      const content = "Content";
+      const frontmatter = { aliases: "SingleAlias" };
+
+      const result = prepareContentForEmbedding(noteName, content, frontmatter);
+
+      expect(result).toBe("Note\nAliases: SingleAlias\n\nContent");
+    });
+
+    it("should include tags", () => {
+      const noteName = "Note";
+      const content = "Content";
+      const frontmatter = { tags: ["programming", "tutorial"] };
+
+      const result = prepareContentForEmbedding(noteName, content, frontmatter);
+
+      expect(result).toBe("Note\nTags: programming, tutorial\n\nContent");
+    });
+
+    it("should handle tags as single string", () => {
+      const noteName = "Note";
+      const content = "Content";
+      const frontmatter = { tags: "single-tag" };
+
+      const result = prepareContentForEmbedding(noteName, content, frontmatter);
+
+      expect(result).toBe("Note\nTags: single-tag\n\nContent");
+    });
+
+    it("should include both aliases and tags", () => {
+      const noteName = "React";
+      const content = "Content about React";
+      const frontmatter = {
+        aliases: ["ReactJS", "React.js"],
+        tags: ["frontend", "library"]
+      };
+
+      const result = prepareContentForEmbedding(noteName, content, frontmatter);
+
+      expect(result).toBe(
+        "React\nAliases: ReactJS, React.js\nTags: frontend, library\n\nContent about React"
+      );
+    });
+
+    it("should work without frontmatter", () => {
+      const result = prepareContentForEmbedding("Note", "Content");
+      expect(result).toBe("Note\n\nContent");
+    });
+
+    it("should work with empty frontmatter object", () => {
+      const result = prepareContentForEmbedding("Note", "Content", {});
+      expect(result).toBe("Note\n\nContent");
+    });
+
+    it("should ignore empty aliases array", () => {
+      const frontmatter = { aliases: [] };
+      const result = prepareContentForEmbedding("Note", "Content", frontmatter);
+      expect(result).toBe("Note\n\nContent");
+    });
+
+    it("should ignore empty tags array", () => {
+      const frontmatter = { tags: [] };
+      const result = prepareContentForEmbedding("Note", "Content", frontmatter);
+      expect(result).toBe("Note\n\nContent");
+    });
+
+    it("should ignore other frontmatter fields", () => {
+      const frontmatter = {
+        created: "2025-01-01",
+        modified: "2025-01-02",
+        author: "Test Author"
+      };
+      const result = prepareContentForEmbedding("Note", "Content", frontmatter);
+      expect(result).toBe("Note\n\nContent");
+    });
+  });
+
   describe("consistency for caching", () => {
     it("should produce identical output for same inputs", () => {
       const noteName = "Consistent Note";
@@ -165,6 +264,55 @@ describe("prepareContentForEmbedding", () => {
       const hash2 = crypto.createHash("sha256").update(prepared2).digest("hex");
 
       // Different hashes mean cache miss (correct behavior)
+      expect(hash1).not.toBe(hash2);
+    });
+
+    it("should invalidate cache when aliases change", () => {
+      const noteName = "Note";
+      const content = "Content";
+
+      const prepared1 = prepareContentForEmbedding(noteName, content, {
+        aliases: ["Old Alias"]
+      });
+      const prepared2 = prepareContentForEmbedding(noteName, content, {
+        aliases: ["New Alias"]
+      });
+
+      const hash1 = crypto.createHash("sha256").update(prepared1).digest("hex");
+      const hash2 = crypto.createHash("sha256").update(prepared2).digest("hex");
+
+      expect(hash1).not.toBe(hash2);
+    });
+
+    it("should invalidate cache when tags change", () => {
+      const noteName = "Note";
+      const content = "Content";
+
+      const prepared1 = prepareContentForEmbedding(noteName, content, {
+        tags: ["old-tag"]
+      });
+      const prepared2 = prepareContentForEmbedding(noteName, content, {
+        tags: ["new-tag"]
+      });
+
+      const hash1 = crypto.createHash("sha256").update(prepared1).digest("hex");
+      const hash2 = crypto.createHash("sha256").update(prepared2).digest("hex");
+
+      expect(hash1).not.toBe(hash2);
+    });
+
+    it("should invalidate cache when aliases are added", () => {
+      const noteName = "Note";
+      const content = "Content";
+
+      const prepared1 = prepareContentForEmbedding(noteName, content);
+      const prepared2 = prepareContentForEmbedding(noteName, content, {
+        aliases: ["New Alias"]
+      });
+
+      const hash1 = crypto.createHash("sha256").update(prepared1).digest("hex");
+      const hash2 = crypto.createHash("sha256").update(prepared2).digest("hex");
+
       expect(hash1).not.toBe(hash2);
     });
   });
