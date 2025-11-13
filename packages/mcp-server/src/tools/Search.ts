@@ -96,13 +96,21 @@ export function registerSearch(server: McpServer, context: ToolContext) {
             "0.3 filters out weakly related notes while keeping moderately relevant results. " +
             "Lower values (0.2) include more results, higher values (0.5+) are very strict."
           ),
+        debug: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "Show detailed score breakdown (semantic, graph proximity, boost calculation). " +
+            "Useful for understanding how results are ranked."
+          ),
       },
       annotations: {
         readOnlyHint: true,
         openWorldHint: true,
       },
     },
-    async ({ query, includePrivate, topK, minSimilarity }) => {
+    async ({ query, includePrivate, topK, minSimilarity, debug }) => {
       console.error(`[Search] Query: "${query}"`);
 
       // Wait for cache warmup to complete if still in progress
@@ -213,19 +221,51 @@ export function registerSearch(server: McpServer, context: ToolContext) {
       }
 
       // Search using query embedding
-      const results = context.embeddingManager.searchWithVector(
+      let results = context.embeddingManager.searchWithVector(
         queryEmbedding,
         embeddings,
-        topK
+        topK * 2 // Get more results before graph boosting to ensure enough after filtering
       );
+
+      // Apply graph boosting if note references are present
+      let graphProximity: Map<string, number> | null = null;
+      if (hasNoteReferences && resolvedNotes.length > 0) {
+        console.error(`[Search] Computing graph proximity from ${resolvedNotes.length} seed note(s)...`);
+        graphProximity = await context.graphProximityManager.computeMultiSeedProximity(resolvedNotes);
+
+        // Apply multiplicative boost: finalScore = semantic × (1 + graph)
+        results = results.map(result => {
+          const noteName = extractNoteName(result.filePath);
+          const proximity = graphProximity?.get(noteName) || 0;
+          const boostedScore = result.similarity * (1 + proximity);
+
+          return {
+            filePath: result.filePath,
+            similarity: boostedScore,
+            // Store original scores for debug output
+            _semantic: result.similarity,
+            _graph: proximity,
+          };
+        });
+
+        // Re-sort by boosted scores
+        results.sort((a, b) => b.similarity - a.similarity);
+
+        // Trim back to topK after boosting
+        results = results.slice(0, topK);
+
+        console.error(`[Search] Applied graph boost to ${results.length} results`);
+      }
 
       // Filter by minimum similarity threshold
       const filtered = results.filter(r => r.similarity >= minSimilarity);
 
-      // Format results with note references context
+      // Format results with note references context and debug info
       return formatResults(filtered, minSimilarity, context, {
         noteReferences: resolvedNotes,
-        remainingText: hasRemainingText ? parsed.remainingText : undefined
+        remainingText: hasRemainingText ? parsed.remainingText : undefined,
+        debug,
+        graphBoosted: hasNoteReferences && resolvedNotes.length > 0,
       });
     }
   );
@@ -235,19 +275,21 @@ export function registerSearch(server: McpServer, context: ToolContext) {
  * Format search results for display
  */
 function formatResults(
-  results: Array<{ filePath: string; similarity: number }>,
+  results: Array<{ filePath: string; similarity: number; _semantic?: number; _graph?: number }>,
   minSimilarity: number,
   context: ToolContext,
   queryContext?: {
     noteReferences?: string[];
     remainingText?: string;
+    debug?: boolean;
+    graphBoosted?: boolean;
   }
 ): { content: Array<{ type: string; text: string }> } {
   let output = `# Search Results\n\n`;
 
   // Show what was searched (if note references were used)
   if (queryContext) {
-    const { noteReferences, remainingText } = queryContext;
+    const { noteReferences, remainingText, debug, graphBoosted } = queryContext;
 
     if (noteReferences && noteReferences.length > 0) {
       output += `Searching using: `;
@@ -258,6 +300,14 @@ function formatResults(
       }
 
       output += `\n\n`;
+    }
+
+    // Show debug info header
+    if (debug && graphBoosted) {
+      output += `**Debug Mode - Score Breakdown:**\n`;
+      output += `- Semantic: Content similarity from averaged embeddings\n`;
+      output += `- Graph: Proximity via random walk from ${noteReferences?.length || 0} seed note(s)\n`;
+      output += `- Final: semantic × (1 + graph)\n\n`;
     }
   }
 
@@ -277,8 +327,12 @@ function formatResults(
 
   output += `Found ${results.length} relevant notes:\n\n`;
 
+  const debug = queryContext?.debug || false;
+  const graphBoosted = queryContext?.graphBoosted || false;
+
   for (let i = 0; i < results.length; i++) {
-    const { filePath, similarity } = results[i];
+    const result = results[i];
+    const { filePath, similarity } = result;
     const confidence = Math.round(similarity * 100);
 
     // Extract note name from path
@@ -288,9 +342,23 @@ function formatResults(
     const forwardLinks = context.graphIndex.getForwardLinks(noteName).length;
     const backlinks = context.graphIndex.getBacklinks(noteName).length;
 
-    output += `${i + 1}. **[[${noteName}]]** (${confidence}% similar)\n`;
-    output += `   - Path: \`${filePath}\`\n`;
-    output += `   - Links: ${forwardLinks} forward, ${backlinks} backlinks\n\n`;
+    // Format result with debug info if enabled
+    if (debug && graphBoosted && result._semantic !== undefined && result._graph !== undefined) {
+      const semanticPct = Math.round(result._semantic * 100);
+      const graphScore = result._graph.toFixed(2);
+      const boost = (1 + result._graph).toFixed(2);
+
+      output += `${i + 1}. **[[${noteName}]]** (final: ${confidence}%)\n`;
+      output += `   - Semantic: ${semanticPct}%\n`;
+      output += `   - Graph: ${graphScore} (proximity to seeds)\n`;
+      output += `   - Boost: ${semanticPct}% × ${boost} = ${confidence}%\n`;
+      output += `   - Path: \`${filePath}\`\n`;
+      output += `   - Links: ${forwardLinks} forward, ${backlinks} backlinks\n\n`;
+    } else {
+      output += `${i + 1}. **[[${noteName}]]** (${confidence}% similar)\n`;
+      output += `   - Path: \`${filePath}\`\n`;
+      output += `   - Links: ${forwardLinks} forward, ${backlinks} backlinks\n\n`;
+    }
   }
 
   output += `\n*Use GetNote() to view individual note details*`;

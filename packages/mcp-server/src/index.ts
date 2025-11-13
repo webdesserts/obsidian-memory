@@ -13,6 +13,7 @@ import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { ReindexManager } from "./memory/reindex.js";
 import { EmbeddingManager } from "./embeddings/manager.js";
+import { GraphProximityManager } from "./embeddings/graph-manager.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
 import { ToolContext } from "./types.js";
 import path from "path";
@@ -85,8 +86,9 @@ const reindexManager = new ReindexManager(
   graphIndex
 );
 
-// EmbeddingManager will be initialized in main() after graphIndex is ready
+// EmbeddingManager and GraphProximityManager will be initialized in main() after graphIndex is ready
 let embeddingManager: EmbeddingManager;
+let graphProximityManager: GraphProximityManager;
 
 /**
  * Resolve a note name to a specific path using the graph index
@@ -101,7 +103,7 @@ function resolveNoteNameToPath(
 }
 
 // Build tool context with all dependencies
-// Note: embeddingManager will be initialized in main() and added via getter
+// Note: embeddingManager and graphProximityManager will be initialized in main() and added via getters
 const toolContext = {
   vaultPath,
   vaultName,
@@ -114,6 +116,12 @@ const toolContext = {
       throw new Error("EmbeddingManager not initialized yet");
     }
     return embeddingManager;
+  },
+  get graphProximityManager() {
+    if (!graphProximityManager) {
+      throw new Error("GraphProximityManager not initialized yet");
+    }
+    return graphProximityManager;
   },
   resolveNoteNameToPath,
 } satisfies ToolContext;
@@ -247,6 +255,10 @@ async function main() {
     debugLog("[Server] Initializing embedding manager...");
     embeddingManager = await EmbeddingManager.getInstance(vaultPath);
 
+    // Initialize graph proximity manager
+    debugLog("[Server] Initializing graph proximity manager...");
+    graphProximityManager = await GraphProximityManager.getInstance(vaultPath, graphIndex);
+
     // Start warming up cache in background (non-blocking)
     // Search tool will wait for warmup to complete before first use
     debugLog("[Server] Starting cache warmup in background...");
@@ -261,18 +273,22 @@ async function main() {
     // Store warmup promise in tool context so Search can await it
     (toolContext as any).warmupPromise = warmupPromise;
 
-    // Register file change callback to invalidate embeddings cache
+    // Register file change callback to invalidate caches
     graphIndex.onFileChange(async (filePath, event) => {
       if (event === 'change' || event === 'unlink') {
         try {
-          // Convert absolute path to relative path for cache
+          // Convert absolute path to relative path for embedding cache
           const relativePath = path.relative(vaultPath, filePath);
           embeddingManager.invalidate(relativePath);
-
-          // Persist cache to disk after invalidation
           await embeddingManager.saveCache();
+
+          // Invalidate graph proximity cache for the changed note
+          // (links might have changed, affecting proximity scores)
+          const noteName = path.basename(filePath, '.md');
+          graphProximityManager.invalidate(noteName);
+          await graphProximityManager.saveCache();
         } catch (error) {
-          debugLog(`[EmbeddingManager] Error invalidating cache for ${filePath}: ${error}`);
+          debugLog(`[CacheManager] Error invalidating caches for ${filePath}: ${error}`);
         }
       }
     });
