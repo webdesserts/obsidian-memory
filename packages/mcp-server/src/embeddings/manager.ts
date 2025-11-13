@@ -251,6 +251,45 @@ export class EmbeddingManager {
   }
 
   /**
+   * Encode text into an embedding vector (without caching)
+   *
+   * For single text: encodes directly
+   * For multiple texts: encodes each and averages the vectors
+   *
+   * Use this for query text or other non-file content
+   *
+   * @param text - Single text string or array of text strings to encode
+   * @returns Embedding vector (averaged if multiple texts provided)
+   */
+  async encode(text: string | string[]): Promise<EmbeddingVector> {
+    if (!this.modelLoaded || !this.embeddings) {
+      throw new Error("Model not loaded. Call initialize() first.");
+    }
+
+    // Single text - encode directly
+    if (typeof text === 'string') {
+      return await this.embeddings.encode(text);
+    }
+
+    // Multiple texts - encode and average
+    if (text.length === 0) {
+      throw new Error("Cannot encode empty array of texts");
+    }
+
+    if (text.length === 1) {
+      return await this.embeddings.encode(text[0]);
+    }
+
+    // Encode all texts
+    const vectors = await Promise.all(
+      text.map(t => this.embeddings!.encode(t))
+    );
+
+    // Average vectors
+    return this.averageVectors(vectors);
+  }
+
+  /**
    * Encode a single note's content into an embedding vector
    *
    * Uses cache if content hasn't changed, otherwise computes and caches
@@ -346,6 +385,25 @@ export class EmbeddingManager {
     // Encode query
     const queryEmbedding = await this.embeddings.encode(query);
 
+    return this.searchWithVector(queryEmbedding, candidateEmbeddings, topK);
+  }
+
+  /**
+   * Find most similar notes using a pre-computed embedding vector
+   *
+   * @param queryEmbedding - Pre-computed query embedding vector
+   * @param candidateEmbeddings - Map of file paths to their embeddings
+   * @param topK - Number of results to return
+   */
+  searchWithVector(
+    queryEmbedding: EmbeddingVector,
+    candidateEmbeddings: Map<string, EmbeddingVector>,
+    topK = 10
+  ): SearchResult[] {
+    if (!this.modelLoaded || !this.embeddings) {
+      throw new Error("Model not loaded. Call initialize() first.");
+    }
+
     // Convert Map to arrays for WASM
     const filePaths = Array.from(candidateEmbeddings.keys());
     const embeddings = Array.from(candidateEmbeddings.values());
@@ -371,6 +429,46 @@ export class EmbeddingManager {
     }
 
     return results;
+  }
+
+  /**
+   * Average multiple embedding vectors
+   *
+   * Used for multi-note queries where we want to find notes similar to ALL referenced notes.
+   * Averaging vectors produces a vector equidistant from all inputs.
+   *
+   * @param vectors - Array of embedding vectors to average
+   * @returns Averaged embedding vector
+   */
+  averageVectors(vectors: EmbeddingVector[]): EmbeddingVector {
+    if (vectors.length === 0) {
+      throw new Error("Cannot average empty array of vectors");
+    }
+
+    if (vectors.length === 1) {
+      return vectors[0];
+    }
+
+    // All vectors must have same dimension
+    const dimension = vectors[0].length;
+    const averaged = new Float32Array(dimension);
+
+    // Sum all vectors
+    for (const vector of vectors) {
+      if (vector.length !== dimension) {
+        throw new Error(`Vector dimension mismatch: expected ${dimension}, got ${vector.length}`);
+      }
+      for (let i = 0; i < dimension; i++) {
+        averaged[i] += vector[i];
+      }
+    }
+
+    // Divide by count to get average
+    for (let i = 0; i < dimension; i++) {
+      averaged[i] /= vectors.length;
+    }
+
+    return averaged;
   }
 
   /**
