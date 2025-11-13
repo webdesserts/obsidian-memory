@@ -233,11 +233,11 @@ export function registerSearch(server: McpServer, context: ToolContext) {
         console.error(`[Search] Computing graph proximity from ${resolvedNotes.length} seed note(s)...`);
         graphProximity = await context.graphProximityManager.computeMultiSeedProximity(resolvedNotes);
 
-        // Apply multiplicative boost: finalScore = semantic × (1 + graph)
+        // Apply multiplicative boost: finalScore = semantic × (1 + graph), capped at 100%
         results = results.map(result => {
           const noteName = extractNoteName(result.filePath);
           const proximity = graphProximity?.get(noteName) || 0;
-          const boostedScore = result.similarity * (1 + proximity);
+          const boostedScore = Math.min(1.0, result.similarity * (1 + proximity));
 
           return {
             filePath: result.filePath,
@@ -347,11 +347,17 @@ function formatResults(
       const semanticPct = Math.round(result._semantic * 100);
       const graphScore = result._graph.toFixed(2);
       const boost = (1 + result._graph).toFixed(2);
+      const uncappedScore = Math.round(result._semantic * (1 + result._graph) * 100);
+      const wasCapped = uncappedScore > 100;
 
       output += `${i + 1}. **[[${noteName}]]** (final: ${confidence}%)\n`;
       output += `   - Semantic: ${semanticPct}%\n`;
       output += `   - Graph: ${graphScore} (proximity to seeds)\n`;
-      output += `   - Boost: ${semanticPct}% × ${boost} = ${confidence}%\n`;
+      if (wasCapped) {
+        output += `   - Boost: ${semanticPct}% × ${boost} = ${uncappedScore}% → capped at ${confidence}%\n`;
+      } else {
+        output += `   - Boost: ${semanticPct}% × ${boost} = ${confidence}%\n`;
+      }
       output += `   - Path: \`${filePath}\`\n`;
       output += `   - Links: ${forwardLinks} forward, ${backlinks} backlinks\n\n`;
     } else {
