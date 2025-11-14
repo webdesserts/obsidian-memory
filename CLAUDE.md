@@ -74,7 +74,9 @@ Tool registration happens in `index.ts` lines 107-119.
 
 **Embedding System** - Generates semantic embeddings for all notes using WASM-based sentence transformers (all-MiniLM-L6-v2). SHA-256 content hashing with disk cache for fast startup. File watcher invalidates cache on changes.
 
-**Search** - Uses semantic similarity search (cosine similarity) to find relevant notes. Pre-encodes all notes at startup for instant search results.
+**Graph Proximity System** - Computes structural similarity via Personalized PageRank random walks. SHA-256 link signature caching with disk persistence. Integrated into Search tool for graph-boosted results when wiki-links are used.
+
+**Search** - Uses semantic similarity search (cosine similarity) to find relevant notes. Pre-encodes all notes at startup for instant search results. When wiki-link references like `[[TypeScript]]` are present, automatically enhances results with graph proximity scores (Personalized PageRank).
 
 **Reindex vs. Reflect** - Two separate consolidation processes:
 - `reindex` - Updates Index.md entry points based on knowledge graph (no approval needed)
