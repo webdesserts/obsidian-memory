@@ -73,7 +73,8 @@ export function registerSearch(server: McpServer, context: ToolContext) {
             "The search query - what information are you looking for? " +
             "Supports wiki-links: [[Note]] searches using that note's content. " +
             "Multiple notes: [[TypeScript]] [[Projects]] finds notes similar to BOTH. " +
-            "Mixed: 'type safety in [[TypeScript]]' combines note content with text."
+            "Mixed: 'type safety in [[TypeScript]]' combines note content with text. " +
+            "Wiki-links enable graph boosting (connected notes rank higher)."
           ),
         includePrivate: z
           .boolean()
