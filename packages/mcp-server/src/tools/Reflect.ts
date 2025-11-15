@@ -91,7 +91,7 @@ Read Log.md and Working Memory.md. Categorize each piece of content by its desti
      - Show the journey, not just the destination
      - Make it readable weeks later without needing the original context
    - **Structure with headings or bold summaries** to make episodes browsable by topic
-   - **Preserve work ticket tags** ([LOR-4883], etc.) from log entries
+   - **Preserve work ticket tags** (**LOR-4883**, etc.) from log entries
    - Link to relevant [[Project]] and [[Knowledge]] notes
 
 4. **Discard** - Not valuable long-term
@@ -167,7 +167,7 @@ Once approved, apply the changes:
 - **Episodic narratives**: Write weekly journal in "we" voice as shared experiences, not robotic summaries
 - **Natural storytelling**: Include thought process, discoveries, and why decisions mattered - make it flow
 - **Map timestamps to weekdays**: Use ISO 8601 timestamps from Log.md to determine correct weekday sub-headers
-- **Preserve work tags**: Keep work ticket tags ([LOR-4883], etc.) from log entries in weekly journal
+- **Preserve work tags**: Keep work ticket tags (**LOR-4883**, etc.) from log entries in weekly journal
 - **Show clear diffs**: User needs to see what's changing before approving
 - **Weekly Log structure**: All work entries go under \`## Log\` header with weekday sub-headers
 - **Wait for approval**: Never write files without explicit user approval${

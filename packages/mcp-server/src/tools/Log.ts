@@ -31,14 +31,14 @@ export function registerLog(server: McpServer, context: ToolContext) {
         "Append a timestamped entry to Log.md for temporal memory tracking. " +
         "Records chronological session activity - what happened when. " +
         "The tool automatically adds ISO 8601 timestamps. " +
-        "Include work ticket tags (e.g., [LOR-4883]) when logging work on specific items. " +
+        "Include work ticket tags (e.g., **LOR-4883**) when logging work on specific items. " +
         "Use this for tracking session milestones, completed tasks, and temporal sequence of events.",
       inputSchema: {
         content: z
           .string()
           .describe(
             "Timeline entry content as bullet points. Tool adds timestamp automatically. " +
-            "Tag work items with [TICKET-123] format when relevant."
+            "Tag work items with **TICKET-123** format when relevant."
           ),
       },
       annotations: {
