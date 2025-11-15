@@ -49,53 +49,57 @@ export function registerRemember(server: McpServer, context: ToolContext) {
           fs.readFile(weeklyNotePath, "utf-8").catch(() => ""),
         ]);
 
-      // Build combined output
-      let output = "# Session Context\n\n";
-      output += "Complete context loaded from memory system.\n\n";
-      output += "---\n\n";
+      // Build content blocks array - one resource per file
+      const contentBlocks = [];
 
-      // Log.md
       if (logContent) {
-        output += "## Log.md - Recent Activity\n\n";
-        output += logContent;
-        output += "\n\n---\n\n";
+        contentBlocks.push({
+          type: "resource" as const,
+          resource: {
+            uri: `file://${logPath}`,
+            mimeType: "text/markdown",
+            text: logContent,
+          },
+        });
       }
 
-      // Working Memory.md
       if (workingMemoryContent) {
-        output += "## Working Memory.md - Current Focus\n\n";
-        output += workingMemoryContent;
-        output += "\n\n---\n\n";
+        contentBlocks.push({
+          type: "resource" as const,
+          resource: {
+            uri: `file://${workingMemoryPath}`,
+            mimeType: "text/markdown",
+            text: workingMemoryContent,
+          },
+        });
       }
 
-      // Index.md
       if (indexContent) {
-        output += "## Index.md - Knowledge Entry Points\n\n";
-        output += indexContent;
-        output += "\n\n---\n\n";
+        contentBlocks.push({
+          type: "resource" as const,
+          resource: {
+            uri: `file://${indexPath}`,
+            mimeType: "text/markdown",
+            text: indexContent,
+          },
+        });
       }
 
-      // Weekly Note
       if (weeklyNoteContent) {
-        output += "## Weekly Note - This Week's Activity\n\n";
-        output += weeklyNoteContent;
-        output += "\n\n";
+        contentBlocks.push({
+          type: "resource" as const,
+          resource: {
+            uri: weeklyNoteUri,
+            mimeType: "text/markdown",
+            text: weeklyNoteContent,
+          },
+        });
       }
 
       return {
-        content: [
-          {
-            type: "text",
-            text: output,
-          },
-        ],
+        content: contentBlocks,
         structuredContent: {
-          filesLoaded: [
-            logContent ? "Log.md" : null,
-            workingMemoryContent ? "Working Memory.md" : null,
-            indexContent ? "Index.md" : null,
-            weeklyNoteContent ? "Weekly Note" : null,
-          ].filter(Boolean),
+          filesLoaded: contentBlocks.length,
         },
       };
     }
