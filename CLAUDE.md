@@ -121,6 +121,28 @@ Tools return both formats. Use `filePath` field for file operations, `uri` field
 
 Tools return helpful error responses instead of throwing exceptions. Missing notes aren't protocol errors - the response includes guidance on where to create the note. This keeps workflows smooth.
 
+### Project Discovery
+
+**How it works:** The Remember tool automatically discovers project notes when it loads session context by:
+1. Crawling from CWD up to home directory
+2. Extracting git remotes and directory names from each directory
+3. Searching `projects/` folder for notes with matching `remotes` or `slug` in frontmatter
+4. Detecting disconnects via `old_remotes`/`old_slugs` when current values don't match
+
+**Matching strategy:**
+- **Strict match** (auto-load): Current git remote matches note's `remotes`, OR directory name matches note's `slug`
+- **Loose match** (disconnect): Current git remote matches note's `old_remotes`, OR directory name matches note's `old_slugs`
+- **No match**: Search for similar project names, suggest to user
+
+**Implementation:**
+- `packages/mcp-server/src/projects/discovery.ts` - Core discovery algorithm
+- `packages/mcp-server/src/projects/types.ts` - Project metadata and result types
+- `packages/mcp-server/src/tools/Remember.ts` - Integration point
+
+**Cross-machine resilience:** Git remotes are machine-independent. Slug matching works as long as directory names are consistent. Old remotes/slugs enable recovery after renames.
+
+**Parent directory discovery:** Enables patterns like `/code/spatialkey/skweb` loading both `SpatialKey` (parent, slug-matched) and `SKWeb` (child, remote-matched) project notes.
+
 ---
 
 ## Discovering Available Tools
