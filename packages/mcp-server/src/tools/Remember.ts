@@ -4,6 +4,7 @@ import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
 import { getCurrentWeeklyNotePath } from "../week-utils.js";
 import { discoverProjects } from "../projects/discovery.js";
+import { generateDiscoveryStatusMessage } from "../projects/messages.js";
 
 /**
  * Remember Tool
@@ -125,67 +126,8 @@ export function registerRemember(server: McpServer, context: ToolContext) {
         }
       }
 
-      // Build project discovery status message
-      let projectStatus = "";
-
-      if (discoveryResult.strictMatches.length > 0) {
-        const projectNames = discoveryResult.strictMatches
-          .map((m) => `[[${m.metadata.name}]]`)
-          .join(", ");
-        projectStatus = `Projects auto-loaded: ${projectNames}`;
-      } else if (discoveryResult.looseMatches.length > 0) {
-        // Disconnect detected
-        const match = discoveryResult.looseMatches[0];
-        projectStatus =
-          `**Project disconnect detected**\n\n` +
-          `Found project [[${match.metadata.name}]] via ${match.matchedOn} match.\n\n`;
-
-        if (match.matchedOn === "old_remote") {
-          projectStatus +=
-            `Current remote: ${discoveryResult.gitRemotes[0] || "unknown"}\n` +
-            `Note's expected remotes: ${match.metadata.remotes?.join(", ") || "none"}\n\n` +
-            `The remote has changed. Update the project note's frontmatter:\n` +
-            `1. Move old remote to old_remotes array\n` +
-            `2. Add new remote to remotes array\n` +
-            `3. Use UpdateFrontmatter tool or edit the file directly`;
-        } else if (match.matchedOn === "old_slug") {
-          projectStatus +=
-            `Current directory: ${path.basename(cwd)}\n` +
-            `Note's expected slug: ${match.metadata.slug || "none"}\n\n` +
-            `The directory name has changed. Update the project note's frontmatter:\n` +
-            `1. Move old slug to old_slugs array\n` +
-            `2. Update slug to match current directory name\n` +
-            `3. Use UpdateFrontmatter tool or edit the file directly`;
-        }
-      } else if (discoveryResult.suggestions.length > 0) {
-        // No match, but found similar projects
-        const suggestions = discoveryResult.suggestions
-          .map((p) => `- [[${p.name}]]`)
-          .join("\n");
-        projectStatus =
-          `**No project found**\n\n` +
-          `Directory: ${path.basename(cwd)}\n` +
-          `Git remotes: ${discoveryResult.gitRemotes.join(", ") || "none"}\n\n` +
-          `Similar projects found:\n${suggestions}\n\n` +
-          `Is this one of these existing projects, or a new project?\n` +
-          `- To link to existing: Update project frontmatter with current remote/slug\n` +
-          `- To create new: Write a new note in projects/ folder with appropriate frontmatter`;
-      } else {
-        // No match and no suggestions
-        projectStatus =
-          `**No project found**\n\n` +
-          `Directory: ${path.basename(cwd)}\n` +
-          `Git remotes: ${discoveryResult.gitRemotes.join(", ") || "none"}\n\n` +
-          `Create a new project note in projects/ folder with frontmatter:\n` +
-          `\`\`\`yaml\n` +
-          `---\n` +
-          `type: project\n` +
-          (discoveryResult.gitRemotes.length > 0
-            ? `remotes:\n  - ${discoveryResult.gitRemotes[0]}\n`
-            : `slug: ${path.basename(cwd).toLowerCase()}\n`) +
-          `---\n` +
-          `\`\`\``;
-      }
+      // Generate project discovery status message
+      const projectStatus = generateDiscoveryStatusMessage(discoveryResult, cwd);
 
       // Add project status as text content if not empty
       if (projectStatus) {
