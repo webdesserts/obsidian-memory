@@ -322,7 +322,7 @@ function formatResults(
     output += `**Try:**\n`;
     output += `- Using different search terms\n`;
     output += `- Lowering minSimilarity threshold (currently ${minSimilarity})\n`;
-    output += `- Using GetGraphNeighborhood() to explore from known notes\n`;
+    output += `- Using wiki-link references like [[Note]] to boost graph-connected results\n`;
     return { content: [{ type: "text", text: output }] };
   }
 

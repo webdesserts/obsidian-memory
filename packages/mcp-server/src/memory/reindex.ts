@@ -95,7 +95,7 @@ Update Index.md based on knowledge graph changes and access patterns.
    - Find stale entries that are rarely accessed
    - Discover notes with high access counts not currently in Index.md
 3. **Analyze** the knowledge graph structure
-   - Use GetGraphNeighborhood() to explore connections
+   - Use Search() with wiki-links to explore connections
    - Identify new entry points based on graph topology
 4. **Rewrite** Index.md with:
    - Updated entry points organized by domain

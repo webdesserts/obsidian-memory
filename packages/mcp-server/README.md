@@ -50,7 +50,6 @@ claude mcp add --transport stdio obsidian-memory \
 ### Graph Navigation
 - `follow_link` - Load linked note
 - `get_backlinks` - Find what links here
-- `GetGraphNeighborhood` - Explore connected notes
 
 ### Memory System
 - `GetNoteUsage` - Query access statistics

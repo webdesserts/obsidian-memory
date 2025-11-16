@@ -178,7 +178,6 @@ export function registerGetNote(server: McpServer, context: ToolContext) {
 **Current tool categories** (see registration for current list):
 - Note discovery (GetNote, GetWeeklyNote)
 - Temporal memory (Log, GetCurrentDatetime)
-- Graph navigation (GetGraphNeighborhood)
 - Metadata (UpdateFrontmatter)
 - Statistics (GetNoteUsage)
 - Memory management (LoadPrivateMemory, Reindex, CompleteReindex, Reflect, CompleteReflect)
