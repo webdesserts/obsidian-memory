@@ -64,7 +64,7 @@ export async function addLog(
   }
 
   // Parse log into sections
-  const dayHeader = `# ${isoWeekDate} (${dayAbbrev})`;
+  const dayHeader = `## ${isoWeekDate} (${dayAbbrev})`;
   const lines = logContent.split("\n");
 
   let sectionIndex = -1;
@@ -101,7 +101,7 @@ export async function addLog(
     // Collect all entries in this section
     while (
       currentIndex < lines.length &&
-      !lines[currentIndex].startsWith("#")
+      !lines[currentIndex].startsWith("##")
     ) {
       const line = lines[currentIndex];
       if (line.startsWith("-")) {

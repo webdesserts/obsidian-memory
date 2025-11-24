@@ -1,11 +1,12 @@
 import fs from "fs/promises";
 import path from "path";
+import os from "os";
 import { DateTime } from "luxon";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { addLog } from "./Log.js";
 
 describe("addLog", () => {
-  const testVaultPath = path.join(process.cwd(), "test-vault");
+  const testVaultPath = path.join(os.tmpdir(), "obsidian-memory-test-vault");
   const logPath = path.join(testVaultPath, "Log.md");
 
   beforeEach(async () => {
@@ -23,7 +24,7 @@ describe("addLog", () => {
     await addLog(logPath, time, "First entry");
 
     const content = await fs.readFile(logPath, "utf-8");
-    expect(content).toContain("# 2025-W48-1 (Mon)");
+    expect(content).toContain("## 2025-W48-1 (Mon)");
     expect(content).toContain("- 2:30 PM – First entry");
   });
 
@@ -57,7 +58,7 @@ describe("addLog", () => {
     await addLog(logPath, time2, "Entry day 2");
 
     const content = await fs.readFile(logPath, "utf-8");
-    const headers = content.split("\n").filter((line) => line.startsWith("#"));
+    const headers = content.split("\n").filter((line) => line.startsWith("##"));
 
     expect(headers).toHaveLength(2);
     expect(headers[0]).toContain("2025-W48-1 (Mon)");
@@ -99,7 +100,7 @@ describe("addLog", () => {
 
   it("should preserve existing entries when adding to a day section", async () => {
     // Create initial log with existing entry
-    const initialContent = `# 2025-W48-1 (Mon)
+    const initialContent = `## 2025-W48-1 (Mon)
 
 - 9:00 AM – Existing entry
 `;
