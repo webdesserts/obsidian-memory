@@ -8,10 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build:utils && npm run build:mcp",
+    "build": "npm run build --workspaces --if-present",
     "dev": "npm run dev --workspaces --if-present",
-    "build:mcp": "npm run build --workspace=packages/mcp-server",
-    "build:utils": "npm run build --workspace=packages/utils",
     "test": "npm run test --workspaces --if-present",
     "clean": "rm -rf packages/*/dist"
   },
