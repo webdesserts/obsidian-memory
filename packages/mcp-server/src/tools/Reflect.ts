@@ -16,9 +16,12 @@ export function registerReflect(
   server.registerTool(
     "Reflect",
     {
-      title: "Reflect on Log and Working Memory",
+      title: "Reflect and Consolidate Memory",
       description:
-        "Review Log.md and Working Memory.md and consolidate content into permanent notes (knowledge notes, project notes, weekly journal). Returns detailed consolidation instructions.",
+        "Review active context (Log.md, Working Memory.md, current weekly journal, project notes) and consolidate content into permanent storage. " +
+        "Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. " +
+        "Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. " +
+        "Returns detailed consolidation instructions.",
       inputSchema: {
         includePrivate: z
           .boolean()

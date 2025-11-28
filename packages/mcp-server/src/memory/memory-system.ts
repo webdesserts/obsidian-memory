@@ -30,7 +30,6 @@ export class MemorySystem {
   private accessLog: AccessLogEntry[] = [];
   private indexContent: string | null = null;
   private workingMemoryContent: string | null = null;
-  private consolidationInProgress = false;
   private readonly accessLogPath: string;
 
   constructor(
@@ -214,13 +213,6 @@ export class MemorySystem {
   }
 
   /**
-   * Check if consolidation is in progress
-   */
-  isConsolidating(): boolean {
-    return this.consolidationInProgress;
-  }
-
-  /**
    * Check if consolidation is needed
    */
   async shouldConsolidate(): Promise<boolean> {
@@ -255,77 +247,6 @@ export class MemorySystem {
     return deadline;
   }
 
-  /**
-   * Try to acquire consolidation lock
-   */
-  async tryAcquireConsolidationLock(): Promise<boolean> {
-    const lockPath = path.join(this.vaultPath, ".obsidian/consolidation.lock");
-
-    try {
-      // Try to read existing lock
-      const lockContent = await fs.readFile(lockPath, "utf-8");
-      const lock = JSON.parse(lockContent);
-
-      // Check if lock is stale (TTL expired)
-      const now = Date.now();
-      if (now - lock.timestamp > lock.ttl) {
-        // Stale lock, claim it
-        await this.writeLock(lockPath);
-        return true;
-      }
-
-      // Valid lock held by another process
-      return false;
-    } catch (error) {
-      // No lock file exists, create one
-      await this.writeLock(lockPath);
-      return true;
-    }
-  }
-
-  /**
-   * Write lock file
-   */
-  private async writeLock(lockPath: string): Promise<void> {
-    const lock = {
-      laptop: process.env.HOSTNAME || "unknown",
-      timestamp: Date.now(),
-      ttl: 600000, // 10 minutes
-    };
-
-    // Ensure .obsidian directory exists
-    const obsidianDir = path.join(this.vaultPath, ".obsidian");
-    await fs.mkdir(obsidianDir, { recursive: true });
-
-    await fs.writeFile(lockPath, JSON.stringify(lock, null, 2), "utf-8");
-  }
-
-  /**
-   * Release consolidation lock
-   */
-  async releaseConsolidationLock(): Promise<void> {
-    const lockPath = path.join(this.vaultPath, ".obsidian/consolidation.lock");
-
-    try {
-      await fs.unlink(lockPath);
-    } catch (error) {
-      // Lock file doesn't exist or already deleted
-    }
-  }
-
-  /**
-   * Mark consolidation as in progress
-   */
-  startConsolidation(): void {
-    this.consolidationInProgress = true;
-  }
-
-  /**
-   * Mark consolidation as complete
-   */
-  endConsolidation(): void {
-    this.consolidationInProgress = false;
-  }
 
   /**
    * Reload Index.md after consolidation

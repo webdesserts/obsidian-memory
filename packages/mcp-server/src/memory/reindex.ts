@@ -16,11 +16,6 @@ export class ReindexManager {
    * Check if reindex should run on SessionStart
    */
   async shouldReindexOnStartup(): Promise<boolean> {
-    if (this.memorySystem.isConsolidating()) {
-      console.error("[Reindex] Already in progress, skipping");
-      return false;
-    }
-
     return await this.memorySystem.shouldConsolidate();
   }
 
@@ -30,43 +25,19 @@ export class ReindexManager {
   async triggerReindex(includePrivate: boolean = false): Promise<string> {
     console.error("[Reindex] Starting reindex workflow");
 
-    // Check if already reindexing
-    if (this.memorySystem.isConsolidating()) {
-      return "Reindex already in progress";
-    }
+    // Get current memory state
+    const indexMd = this.memorySystem.getIndex() || "";
+    const workingMemoryMd = this.memorySystem.getWorkingMemory() || "";
 
-    // Try to acquire lock
-    const lockAcquired = await this.memorySystem.tryAcquireConsolidationLock();
-    if (!lockAcquired) {
-      return "Reindex already in progress on another device";
-    }
+    // Build reindex prompt
+    const prompt = this.buildReindexPrompt(
+      indexMd,
+      workingMemoryMd,
+      includePrivate
+    );
 
-    try {
-      // Mark as in progress
-      this.memorySystem.startConsolidation();
-
-      // Get current memory state
-      const indexMd = this.memorySystem.getIndex() || "";
-      const workingMemoryMd = this.memorySystem.getWorkingMemory() || "";
-
-      // Get current timestamp for frontmatter
-      const timestamp = new Date().toISOString();
-
-      // Build reindex prompt
-      const prompt = this.buildReindexPrompt(
-        indexMd,
-        workingMemoryMd,
-        includePrivate
-      );
-
-      // Return the prompt for Claude to process with ultrathink
-      return prompt;
-    } catch (error) {
-      // Clean up on error
-      this.memorySystem.endConsolidation();
-      await this.memorySystem.releaseConsolidationLock();
-      throw error;
-    }
+    // Return the prompt for Claude to process with ultrathink
+    return prompt;
   }
 
   /**
@@ -148,32 +119,5 @@ lastReindex: ${timestamp}
     }
 
     return prompt;
-  }
-
-  /**
-   * Complete reindex (called after Claude writes new Index.md)
-   */
-  async completeReindex(): Promise<void> {
-    try {
-      // Reload Index.md to pick up changes
-      await this.memorySystem.reloadIndex();
-
-      // Release lock
-      await this.memorySystem.releaseConsolidationLock();
-
-      console.error("[Reindex] Reindex complete");
-    } finally {
-      // Mark as complete
-      this.memorySystem.endConsolidation();
-    }
-  }
-
-  /**
-   * Cancel reindex (if something goes wrong)
-   */
-  async cancelReindex(): Promise<void> {
-    this.memorySystem.endConsolidation();
-    await this.memorySystem.releaseConsolidationLock();
-    console.error("[Reindex] Reindex cancelled");
   }
 }

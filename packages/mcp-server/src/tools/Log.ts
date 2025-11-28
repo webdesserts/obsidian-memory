@@ -151,10 +151,10 @@ export function registerLog(server: McpServer, context: ToolContext) {
     {
       title: "Log Timeline Entry",
       description:
-        "Append a timestamped entry to Log.md for temporal memory tracking. " +
+        "Append a timestamped entry to Log.md for active work state and debugging context tracking. " +
         "Records chronological session activity - what happened when. " +
         "The tool automatically adds timestamps and organizes entries by day. " +
-        "Use this for tracking session milestones, completed tasks, and temporal sequence of events.",
+        "Use this for tracking work in progress, debugging steps, state changes, and decisions made during active work.",
       inputSchema: {
         content: z
           .string()

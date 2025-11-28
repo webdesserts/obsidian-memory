@@ -44,9 +44,7 @@ import { registerUpdateFrontmatter } from "./tools/UpdateFrontmatter.js";
 import { registerGetNoteUsage } from "./tools/GetNoteUsage.js";
 import { registerLoadPrivateMemory } from "./tools/LoadPrivateMemory.js";
 import { registerReindex } from "./tools/Reindex.js";
-import { registerCompleteReindex } from "./tools/CompleteReindex.js";
 import { registerReflect } from "./tools/Reflect.js";
-import { registerCompleteReflect } from "./tools/CompleteReflect.js";
 import { registerSearch } from "./tools/Search.js";
 
 // Parse command line arguments
@@ -234,9 +232,7 @@ registerUpdateFrontmatter(server, toolContext);
 registerGetNoteUsage(server, toolContext);
 registerLoadPrivateMemory(server, toolContext);
 registerReindex(server, toolContext);
-registerCompleteReindex(server, toolContext);
 registerReflect(server, toolContext);
-registerCompleteReflect(server, toolContext);
 registerSearch(server, toolContext);
 
 // Start the server
@@ -277,8 +273,13 @@ async function main() {
     graphIndex.onFileChange(async (filePath, event) => {
       if (event === 'change' || event === 'unlink') {
         try {
-          // Convert absolute path to relative path for embedding cache
+          // Check if Index.md changed - reload it
           const relativePath = path.relative(vaultPath, filePath);
+          if (relativePath === 'Index.md') {
+            await memorySystem.reloadIndex();
+          }
+
+          // Invalidate embedding cache
           embeddingManager.invalidate(relativePath);
           await embeddingManager.saveCache();
 
