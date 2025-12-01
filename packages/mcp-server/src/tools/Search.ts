@@ -340,32 +340,32 @@ function formatResults(
     // Extract note name from path
     const noteName = extractNoteName(filePath);
 
-    // Get link statistics
-    const forwardLinks = context.graphIndex.getForwardLinks(noteName).length;
-    const backlinks = context.graphIndex.getBacklinks(noteName).length;
-
-    // Format result with debug info if enabled
-    if (debug && graphBoosted && result._semantic !== undefined && result._graph !== undefined) {
+    // Format result with relevance breakdown
+    if (graphBoosted && result._semantic !== undefined && result._graph !== undefined) {
       const semanticPct = Math.round(result._semantic * 100);
-      const graphScore = result._graph.toFixed(2);
-      const boost = (1 + result._graph).toFixed(2);
-      const uncappedScore = Math.round(result._semantic * (1 + result._graph) * 100);
-      const wasCapped = uncappedScore > 100;
+      const graphPct = Math.round(result._graph * 100);
 
-      output += `${i + 1}. **[[${noteName}]]** (final: ${confidence}%)\n`;
+      output += `${i + 1}. **[[${noteName}]]** (${confidence}% relevant)\n`;
       output += `   - Semantic: ${semanticPct}%\n`;
-      output += `   - Graph: ${graphScore} (proximity to seeds)\n`;
-      if (wasCapped) {
-        output += `   - Boost: ${semanticPct}% × ${boost} = ${uncappedScore}% → capped at ${confidence}%\n`;
-      } else {
-        output += `   - Boost: ${semanticPct}% × ${boost} = ${confidence}%\n`;
+      output += `   - Graph: ${graphPct}%\n`;
+
+      // Show boost calculation in debug mode
+      if (debug) {
+        const boost = (1 + result._graph).toFixed(2);
+        const uncappedScore = Math.round(result._semantic * (1 + result._graph) * 100);
+        const wasCapped = uncappedScore > 100;
+
+        if (wasCapped) {
+          output += `   - Boost: ${semanticPct}% × ${boost} = ${uncappedScore}% → capped at ${confidence}%\n`;
+        } else {
+          output += `   - Boost: ${semanticPct}% × ${boost} = ${confidence}%\n`;
+        }
       }
-      output += `   - Path: \`${filePath}\`\n`;
-      output += `   - Links: ${forwardLinks} forward, ${backlinks} backlinks\n\n`;
+
+      output += `   - Path: \`${filePath}\`\n\n`;
     } else {
-      output += `${i + 1}. **[[${noteName}]]** (${confidence}% similar)\n`;
-      output += `   - Path: \`${filePath}\`\n`;
-      output += `   - Links: ${forwardLinks} forward, ${backlinks} backlinks\n\n`;
+      output += `${i + 1}. **[[${noteName}]]** (${confidence}% relevant)\n`;
+      output += `   - Path: \`${filePath}\`\n\n`;
     }
   }
 
