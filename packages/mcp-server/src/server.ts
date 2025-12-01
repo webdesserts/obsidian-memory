@@ -6,6 +6,8 @@ import {
   GetPromptRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z, ZodRawShape } from "zod";
+import { logger } from "./utils/logger.js";
+import { parseWikiLinks } from "@webdesserts/obsidian-memory-utils";
 
 /**
  * Wrapper around SDK Server that mimics McpServer.registerTool() API
@@ -70,6 +72,45 @@ export class McpServer {
     this.setupHandlers();
   }
 
+  /**
+   * Filter tool call params to only include non-default values
+   */
+  private filterParams(name: string, args: Record<string, any>): Record<string, any> {
+    const filtered: Record<string, any> = {};
+
+    // Define default values for each tool
+    const defaults: Record<string, Record<string, any>> = {
+      Search: {
+        includePrivate: false,
+        topK: 10,
+        minSimilarity: 0.3,
+        debug: false,
+      },
+      Reflect: {
+        includePrivate: false,
+      },
+    };
+
+    const toolDefaults = defaults[name] || {};
+
+    // Include params that differ from defaults
+    for (const [key, value] of Object.entries(args)) {
+      if (toolDefaults[key] === undefined || toolDefaults[key] !== value) {
+        filtered[key] = value;
+      }
+    }
+
+    // Special handling for Search tool
+    if (name === "Search" && args.query) {
+      const wikiLinks = parseWikiLinks(args.query);
+      if (wikiLinks.length > 0) {
+        filtered.wikiLinks = wikiLinks.map(link => link.target);
+      }
+    }
+
+    return filtered;
+  }
+
   private setupHandlers() {
     // List available tools
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -83,6 +124,14 @@ export class McpServer {
       try {
         const handler = this.handlers.get(name);
         if (!handler) throw new Error(`Tool not found: ${name}`);
+
+        // Log tool call with filtered params
+        const params = this.filterParams(name, args);
+        if (Object.keys(params).length > 0) {
+          logger.info({ tool: name, params }, "Tool called");
+        } else {
+          logger.info({ tool: name }, "Tool called");
+        }
 
         const result = await handler(args);
 
