@@ -3,6 +3,7 @@ import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
 import { extractNoteName, parseWikiLinks } from "@webdesserts/obsidian-memory-utils";
 import { prepareContentForEmbedding } from "../embeddings/manager.js";
+import { logger } from "../utils/logger.js";
 import path from "path";
 
 /**
@@ -112,13 +113,13 @@ export function registerSearch(server: McpServer, context: ToolContext) {
       },
     },
     async ({ query, includePrivate, topK, minSimilarity, debug }) => {
-      console.error(`[Search] Query: "${query}"`);
+      logger.info({ group: "Search", query }, "Search started");
 
       // Wait for cache warmup to complete if still in progress
       if (context.warmupPromise) {
-        console.error(`[Search] Waiting for cache warmup to complete...`);
+        logger.info({ group: "Search" }, "Waiting for cache warmup to complete");
         await context.warmupPromise;
-        console.error(`[Search] Cache warmup complete, proceeding with search`);
+        logger.info({ group: "Search" }, "Cache warmup complete, proceeding with search");
       }
 
       // Parse query for note references
@@ -127,9 +128,9 @@ export function registerSearch(server: McpServer, context: ToolContext) {
       const hasRemainingText = parsed.remainingText.length > 0;
 
       if (hasNoteReferences) {
-        console.error(`[Search] Found ${parsed.noteReferences.length} note references: ${parsed.noteReferences.join(", ")}`);
+        logger.info({ group: "Search", noteReferences: parsed.noteReferences }, "Found note references");
         if (hasRemainingText) {
-          console.error(`[Search] Remaining text: "${parsed.remainingText}"`);
+          logger.info({ group: "Search", remainingText: parsed.remainingText }, "Remaining text after wiki-links");
         }
       }
 
@@ -144,7 +145,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
             return notePath && !notePath.startsWith("private/");
           });
 
-      console.error(`[Search] Searching ${candidateNotes.length} notes...`);
+      logger.info({ group: "Search", candidateCount: candidateNotes.length }, "Searching notes");
 
       // Load file contents for all candidate notes
       const notesWithContent: Array<{ filePath: string; content: string }> = [];
@@ -164,7 +165,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
             content: preparedContent,
           });
         } catch (error) {
-          console.error(`[Search] Error reading ${notePath}: ${error}`);
+          logger.error({ group: "Search", notePath, err: error }, "Error reading note");
         }
       }
 
@@ -185,7 +186,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
           const notePath = context.graphIndex.getNotePath(noteName);
 
           if (!notePath) {
-            console.error(`[Search] Note reference not found: ${noteName}`);
+            logger.warn({ group: "Search", noteName }, "Note reference not found");
             continue;
           }
 
@@ -195,7 +196,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
             textsToEmbed.push(preparedContent);
             resolvedNotes.push(noteName);
           } catch (error) {
-            console.error(`[Search] Error reading note reference ${notePath}: ${error}`);
+            logger.error({ group: "Search", notePath, err: error }, "Error reading note reference");
           }
         }
 
@@ -214,7 +215,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
         }
 
         // Encode (averaging handled by encode method if multiple texts)
-        console.error(`[Search] Encoding ${textsToEmbed.length} text piece(s)...`);
+        logger.info({ group: "Search", textCount: textsToEmbed.length }, "Encoding query");
         queryEmbedding = await context.embeddingManager.encode(textsToEmbed);
       } else {
         // Simple query - just encode it directly
@@ -231,7 +232,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
       // Apply graph boosting if note references are present
       let graphProximity: Map<string, number> | null = null;
       if (hasNoteReferences && resolvedNotes.length > 0) {
-        console.error(`[Search] Computing graph proximity from ${resolvedNotes.length} seed note(s)...`);
+        logger.info({ group: "Search", seedCount: resolvedNotes.length }, "Computing graph proximity");
         graphProximity = await context.graphProximityManager.computeMultiSeedProximity(resolvedNotes);
 
         // Apply multiplicative boost: finalScore = semantic × (1 + graph), capped at 100%
@@ -255,7 +256,7 @@ export function registerSearch(server: McpServer, context: ToolContext) {
         // Trim back to topK after boosting
         results = results.slice(0, topK);
 
-        console.error(`[Search] Applied graph boost to ${results.length} results`);
+        logger.info({ group: "Search", resultCount: results.length }, "Applied graph boost");
       }
 
       // Filter by minimum similarity threshold

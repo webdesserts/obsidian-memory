@@ -30,11 +30,13 @@
     "chokidar": "^4.0.3",
     "gray-matter": "^4.0.3",
     "luxon": "^3.7.2",
+    "pino": "^9.5.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
     "@types/luxon": "^3.7.1",
     "@types/node": "^22.10.2",
+    "pino-pretty": "^13.0.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   },

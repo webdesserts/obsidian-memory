@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
 import { buildReflectPrompt } from "../prompts/reflectPrompt.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * Reflect Tool
@@ -35,9 +36,7 @@ export function registerReflect(
       },
     },
     async ({ includePrivate = false }) => {
-      console.error(
-        `[Reflect] Triggering reflection (includePrivate: ${includePrivate})`
-      );
+      logger.info({ group: "Reflect", includePrivate }, "Triggering reflection");
 
       // Get current date info
       const now = new Date();

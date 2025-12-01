@@ -1,4 +1,4 @@
-import { appendFileSync } from "fs";
+import pino from "pino";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -6,16 +6,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // File-based debug logging
 // Location: packages/mcp-server/debug.log (in project directory to avoid permission prompts)
-// This file captures uncaught exceptions and unhandled promise rejections for troubleshooting
 const DEBUG_LOG = path.join(__dirname, "../..", "debug.log");
 
 /**
- * Log a debug message to both the debug log file and stderr
- *
- * @param message - The message to log
+ * Pino logger configured to write to both stderr and debug.log file
  */
-export function debugLog(message: string) {
-  const timestamp = new Date().toISOString();
-  appendFileSync(DEBUG_LOG, `[${timestamp}] ${message}\n`);
-  console.error(message);
-}
+export const logger = pino(
+  {
+    level: "info",
+    timestamp: () => `,"time":"${new Date().toISOString()}"`,
+    formatters: {
+      level: (label) => {
+        return { level: label };
+      },
+    },
+  },
+  pino.multistream([
+    // Write to stderr for MCP protocol
+    { stream: process.stderr },
+    // Write to debug.log file
+    { stream: pino.destination({ dest: DEBUG_LOG, sync: false }) },
+  ])
+);

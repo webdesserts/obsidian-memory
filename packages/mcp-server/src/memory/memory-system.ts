@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { FileOperations } from "../file-operations.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * Memory system managing Working Memory.md and consolidation
@@ -17,15 +18,15 @@ export class MemorySystem {
    * Initialize memory system - load Working Memory.md if it exists
    */
   async initialize(): Promise<void> {
-    console.error("[MemorySystem] Initializing...");
+    logger.info({ group: "MemorySystem" }, "Initializing");
 
     // Try to load Working Memory.md
     try {
       const result = await this.fileOps.readNote("Working Memory.md");
       this.workingMemoryContent = result.content;
-      console.error("[MemorySystem] Loaded Working Memory.md");
+      logger.info({ group: "MemorySystem" }, "Loaded Working Memory.md");
     } catch (error) {
-      console.error("[MemorySystem] No Working Memory.md found (will be created when needed)");
+      logger.info({ group: "MemorySystem" }, "No Working Memory.md found (will be created when needed)");
     }
   }
 
@@ -60,7 +61,7 @@ export class MemorySystem {
       const result = await this.fileOps.readNote("private/Working Memory.md");
       workingMemory = result.content;
     } catch (error) {
-      console.error("[MemorySystem] No private/Working Memory.md found");
+      logger.info({ group: "MemorySystem" }, "No private/Working Memory.md found");
     }
 
     return { workingMemory };

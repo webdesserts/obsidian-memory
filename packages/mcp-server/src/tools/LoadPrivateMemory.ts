@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * LoadPrivateMemory Tool
@@ -28,7 +29,7 @@ export function registerLoadPrivateMemory(
     async ({ reason }) => {
       const { memorySystem } = context;
 
-      console.error(`[MemorySystem] Loading private memory: ${reason}`);
+      logger.info({ group: "MemorySystem", reason }, "Loading private memory");
 
       const { workingMemory } = await memorySystem.loadPrivateMemory();
 

@@ -16,20 +16,16 @@ import { GraphProximityManager } from "./embeddings/graph-manager.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
 import { ToolContext } from "./types.js";
 import path from "path";
-import { debugLog } from "./utils/logger.js";
+import { logger } from "./utils/logger.js";
 
 // Global error handlers - log all uncaught errors to debug.log
 process.on("uncaughtException", (error) => {
-  debugLog(`[FATAL] Uncaught exception: ${error}`);
-  debugLog(`[FATAL] Stack trace: ${error.stack}`);
+  logger.fatal({ group: "Process", err: error }, "Uncaught exception");
   process.exit(1);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
-  debugLog(`[FATAL] Unhandled rejection at: ${promise}, reason: ${reason}`);
-  if (reason instanceof Error) {
-    debugLog(`[FATAL] Stack trace: ${reason.stack}`);
-  }
+  logger.fatal({ group: "Process", promise, reason }, "Unhandled rejection");
   process.exit(1);
 });
 
@@ -67,9 +63,8 @@ const vaultPath = vaultPathRaw.startsWith("~/")
 // Derive vault name from path (basename of the vault directory)
 const vaultName = basename(vaultPath);
 
-console.error(`[Server] Starting Obsidian Memory MCP Server`);
-console.error(`[Server] Vault path: ${vaultPath}`);
-console.error(`[Server] Vault name: ${vaultName}`);
+logger.info({ group: "Server" }, "Starting Obsidian Memory MCP Server");
+logger.info({ group: "Server", vaultPath, vaultName }, "Vault configured");
 
 // Initialize file operations, graph index, memory system, and embedding manager
 const fileOps = new FileOperations({ vaultPath });
@@ -215,32 +210,32 @@ registerSearch(server, toolContext);
 // Start the server
 async function main() {
   try {
-    debugLog("[Server] Starting initialization...");
+    logger.info({ group: "Server" }, "Starting initialization");
 
     // Initialize graph index and memory system
-    debugLog("[Server] Initializing graph index...");
+    logger.info({ group: "Server" }, "Initializing graph index");
     await graphIndex.initialize();
 
-    debugLog("[Server] Initializing memory system...");
+    logger.info({ group: "Server" }, "Initializing memory system");
     await memorySystem.initialize();
 
     // Initialize embedding manager
-    debugLog("[Server] Initializing embedding manager...");
+    logger.info({ group: "Server" }, "Initializing embedding manager");
     embeddingManager = await EmbeddingManager.getInstance(vaultPath);
 
     // Initialize graph proximity manager
-    debugLog("[Server] Initializing graph proximity manager...");
+    logger.info({ group: "Server" }, "Initializing graph proximity manager");
     graphProximityManager = await GraphProximityManager.getInstance(vaultPath, graphIndex);
 
     // Start warming up cache in background (non-blocking)
     // Search tool will wait for warmup to complete before first use
-    debugLog("[Server] Starting cache warmup in background...");
+    logger.info({ group: "Server" }, "Starting cache warmup in background");
     const warmupPromise = embeddingManager.warmupCache(vaultPath, graphIndex, fileOps)
       .then(() => {
-        debugLog("[Server] Cache warmup completed");
+        logger.info({ group: "Server" }, "Cache warmup completed");
       })
       .catch((error) => {
-        debugLog(`[Server] Cache warmup failed: ${error}`);
+        logger.error({ group: "Server", err: error }, "Cache warmup failed");
       });
 
     // Store warmup promise in tool context so Search can await it
@@ -262,33 +257,31 @@ async function main() {
           graphProximityManager.invalidate(noteName);
           await graphProximityManager.saveCache();
         } catch (error) {
-          debugLog(`[CacheManager] Error invalidating caches for ${filePath}: ${error}`);
+          logger.error({ group: "CacheManager", filePath, err: error }, "Error invalidating caches");
         }
       }
     });
 
-    debugLog("[Server] Connecting to transport...");
+    logger.info({ group: "Server" }, "Connecting to transport");
     const transport = new StdioServerTransport();
 
     // Add error handler for transport
     transport.onerror = (error) => {
-      debugLog(`[Server] Transport error: ${error}`);
+      logger.error({ group: "Server", err: error }, "Transport error");
     };
 
     await server.server.connect(transport);
 
-    debugLog("[Server] Obsidian Memory MCP Server running");
-    console.error("[Server] Obsidian Memory MCP Server running");
+    logger.info({ group: "Server" }, "Obsidian Memory MCP Server running");
 
     // Add error handler for the server
     server.server.onerror = (error) => {
-      debugLog(`[Server] MCP Server error: ${error}`);
+      logger.error({ group: "Server", err: error }, "MCP Server error");
     };
 
     // Clean up on exit
     process.on("SIGINT", async () => {
-      debugLog("[Server] Shutting down...");
-      console.error("[Server] Shutting down...");
+      logger.info({ group: "Server" }, "Shutting down");
 
       // Save embedding cache to disk
       await embeddingManager.saveCache();
@@ -297,15 +290,12 @@ async function main() {
       process.exit(0);
     });
   } catch (error) {
-    debugLog(`[Server] Error during initialization: ${error}`);
-    debugLog(`[Server] Stack trace: ${(error as Error).stack}`);
+    logger.error({ group: "Server", err: error }, "Error during initialization");
     throw error;
   }
 }
 
 main().catch((error) => {
-  debugLog(`[Server] Fatal error: ${error}`);
-  debugLog(`[Server] Stack trace: ${(error as Error).stack}`);
-  console.error("[Server] Fatal error:", error);
+  logger.fatal({ group: "Server", err: error }, "Fatal error");
   process.exit(1);
 });
