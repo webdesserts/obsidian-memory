@@ -6,7 +6,6 @@ import { z, ZodJSONSchema } from "zod";
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
-import { ReindexManager } from "./memory/reindex.js";
 import { EmbeddingManager } from "./embeddings/manager.js";
 import { GraphProximityManager } from "./embeddings/graph-manager.js";
 import { JSONSchema } from "zod/v4/core";
@@ -22,7 +21,6 @@ export interface ToolContext {
   fileOps: FileOperations;
   graphIndex: GraphIndex;
   memorySystem: MemorySystem;
-  reindexManager: ReindexManager;
   embeddingManager: EmbeddingManager;
   graphProximityManager: GraphProximityManager;
   resolveNoteNameToPath: (

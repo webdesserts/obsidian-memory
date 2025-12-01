@@ -19,10 +19,10 @@ export function registerRemember(server: McpServer, context: ToolContext) {
       title: "Remember Session Context",
       description:
         "Load all session context files in a single call. " +
-        "Returns Log.md, Working Memory.md, Index.md, current weekly note, and discovered project notes. " +
+        "Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. " +
         "Automatically discovers projects based on git remotes and directory names. " +
         "Use this at the start of every session to get complete context about recent work, " +
-        "current focus, knowledge index, this week's activity, and project context.",
+        "current focus, this week's activity, and project context.",
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -35,7 +35,6 @@ export function registerRemember(server: McpServer, context: ToolContext) {
       // Define paths to all context files
       const logPath = path.join(vaultPath, "Log.md");
       const workingMemoryPath = path.join(vaultPath, "Working Memory.md");
-      const indexPath = path.join(vaultPath, "Index.md");
 
       // Get weekly note path
       const weeklyNoteUri = getCurrentWeeklyNotePath();
@@ -47,11 +46,10 @@ export function registerRemember(server: McpServer, context: ToolContext) {
       const discoveryResult = discoverProjects(cwd, graphIndex, vaultPath);
 
       // Read all context files in parallel
-      const [logContent, workingMemoryContent, indexContent, weeklyNoteContent] =
+      const [logContent, workingMemoryContent, weeklyNoteContent] =
         await Promise.all([
           fs.readFile(logPath, "utf-8").catch(() => ""),
           fs.readFile(workingMemoryPath, "utf-8").catch(() => ""),
-          fs.readFile(indexPath, "utf-8").catch(() => ""),
           fs.readFile(weeklyNotePath, "utf-8").catch(() => ""),
         ]);
 
@@ -86,17 +84,6 @@ export function registerRemember(server: McpServer, context: ToolContext) {
             uri: `file://${workingMemoryPath}`,
             mimeType: "text/markdown",
             text: workingMemoryContent,
-          },
-        });
-      }
-
-      if (indexContent) {
-        contentBlocks.push({
-          type: "resource" as const,
-          resource: {
-            uri: `file://${indexPath}`,
-            mimeType: "text/markdown",
-            text: indexContent,
           },
         });
       }

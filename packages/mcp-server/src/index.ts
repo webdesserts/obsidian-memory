@@ -11,7 +11,6 @@ import {
 import { FileOperations } from "./file-operations.js";
 import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
-import { ReindexManager } from "./memory/reindex.js";
 import { EmbeddingManager } from "./embeddings/manager.js";
 import { GraphProximityManager } from "./embeddings/graph-manager.js";
 import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
@@ -41,9 +40,7 @@ import { registerGetCurrentDatetime } from "./tools/GetCurrentDatetime.js";
 import { registerLog } from "./tools/Log.js";
 import { registerRemember } from "./tools/Remember.js";
 import { registerUpdateFrontmatter } from "./tools/UpdateFrontmatter.js";
-import { registerGetNoteUsage } from "./tools/GetNoteUsage.js";
 import { registerLoadPrivateMemory } from "./tools/LoadPrivateMemory.js";
-import { registerReindex } from "./tools/Reindex.js";
 import { registerReflect } from "./tools/Reflect.js";
 import { registerSearch } from "./tools/Search.js";
 
@@ -74,15 +71,10 @@ console.error(`[Server] Starting Obsidian Memory MCP Server`);
 console.error(`[Server] Vault path: ${vaultPath}`);
 console.error(`[Server] Vault name: ${vaultName}`);
 
-// Initialize file operations, graph index, memory system, reindex manager, and embedding manager
+// Initialize file operations, graph index, memory system, and embedding manager
 const fileOps = new FileOperations({ vaultPath });
 const graphIndex = new GraphIndex(vaultPath);
 const memorySystem = new MemorySystem(vaultPath, fileOps);
-const reindexManager = new ReindexManager(
-  memorySystem,
-  fileOps,
-  graphIndex
-);
 
 // EmbeddingManager and GraphProximityManager will be initialized in main() after graphIndex is ready
 let embeddingManager: EmbeddingManager;
@@ -108,7 +100,6 @@ const toolContext = {
   fileOps,
   graphIndex,
   memorySystem,
-  reindexManager,
   get embeddingManager() {
     if (!embeddingManager) {
       throw new Error("EmbeddingManager not initialized yet");
@@ -146,18 +137,6 @@ server.server.setRequestHandler(ListRootsRequestSchema, async () => {
 server.server.setRequestHandler(ListResourcesRequestSchema, async () => {
   return {
     resources: [
-      {
-        name: "Index",
-        uri: "memory:Index",
-        title: "Commonly Used and Important Notes File",
-        description:
-          "Auto-loaded at session start. Contains curated links organized by domain (Projects, Programming Languages, Technical, etc.)",
-        mimeType: "text/markdown",
-        annotations: {
-          audience: ["assistant"],
-          priority: 1.0,
-        },
-      },
       {
         name: "Log",
         uri: "memory:Log",
@@ -229,9 +208,7 @@ registerGetCurrentDatetime(server, toolContext);
 registerLog(server, toolContext);
 registerRemember(server, toolContext);
 registerUpdateFrontmatter(server, toolContext);
-registerGetNoteUsage(server, toolContext);
 registerLoadPrivateMemory(server, toolContext);
-registerReindex(server, toolContext);
 registerReflect(server, toolContext);
 registerSearch(server, toolContext);
 
@@ -273,11 +250,7 @@ async function main() {
     graphIndex.onFileChange(async (filePath, event) => {
       if (event === 'change' || event === 'unlink') {
         try {
-          // Check if Index.md changed - reload it
           const relativePath = path.relative(vaultPath, filePath);
-          if (relativePath === 'Index.md') {
-            await memorySystem.reloadIndex();
-          }
 
           // Invalidate embedding cache
           embeddingManager.invalidate(relativePath);

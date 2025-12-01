@@ -30,16 +30,9 @@ export function registerLoadPrivateMemory(
 
       console.error(`[MemorySystem] Loading private memory: ${reason}`);
 
-      const { longTermIndex, workingMemory } =
-        await memorySystem.loadPrivateMemory();
+      const { workingMemory } = await memorySystem.loadPrivateMemory();
 
       let response = `# Private Memory Loaded\n\nReason: ${reason}\n\n`;
-
-      if (longTermIndex) {
-        response += `## Private Index.md\n\n${longTermIndex}\n\n`;
-      } else {
-        response += `## Private Index.md\n\nNo private Index.md found\n\n`;
-      }
 
       if (workingMemory) {
         response += `## Private Working Memory.md\n\n${workingMemory}\n\n`;
