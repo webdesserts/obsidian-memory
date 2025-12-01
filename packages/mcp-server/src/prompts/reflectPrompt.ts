@@ -62,6 +62,12 @@ Read Log.md, Working Memory.md, current weekly journal, and any project notes lo
 - **Weekly journal:** Check if this week's log entries are getting too detailed/verbose - compress if needed
 - **Project notes:** Look for completed RDMPs that can be archived, large sections that should extract to dedicated notes
 
+**Four consolidation techniques:**
+- **Forget** - Remove incorrect, irrelevant, or no longer useful information. Search first to avoid leaving phantom memories in other notes.
+- **Compact** - Rewrite to be more concise while preserving essential information. Details that are lost are essentially "forgotten."
+- **Migrate** - Move information from one file to another. Co-located in labile notes doesn't mean co-located long-term.
+- **Fragment** - Split large notes into smaller focused notes connected by wiki-links when a note exceeds ~2.5k tokens.
+
 1. **Knowledge notes** - Technical facts, APIs, patterns, how things work
    - Term-based, small, focused (dictionary-style)
    - Example: \`knowledge/React Server Components.md\`, \`knowledge/MCP Prompts.md\`
