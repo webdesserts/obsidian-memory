@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { addLog } from "./Log.js";
 
 describe("addLog", () => {
-  const testVaultPath = path.join(os.tmpdir(), "obsidian-memory-test-vault");
+  const testVaultPath = path.join(os.tmpdir(), "obsidian-memory-test-vault-log");
   const logPath = path.join(testVaultPath, "Log.md");
 
   beforeEach(async () => {

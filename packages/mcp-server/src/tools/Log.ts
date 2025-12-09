@@ -4,40 +4,12 @@ import { DateTime } from "luxon";
 import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
-
-/**
- * Format ISO week date as YYYY-Www-D (e.g., 2025-W48-1)
- */
-function formatISOWeekDate(dt: DateTime): string {
-  return dt.toFormat("kkkk-'W'WW-c");
-}
-
-/**
- * Get 3-letter day abbreviation (Mon, Tue, etc.)
- */
-function getDayAbbreviation(dt: DateTime): string {
-  return dt.toFormat("ccc");
-}
-
-/**
- * Format time as 12-hour clock (h:MM AM/PM)
- */
-function format12HourTime(dt: DateTime): string {
-  return dt.toFormat("h:mm a");
-}
-
-/**
- * Parse a log entry to extract time (for sorting)
- */
-function parseEntryTime(entry: string): DateTime | null {
-  const match = entry.match(/^- (.+?) –/);
-  if (!match) return null;
-
-  const timeStr = match[1];
-  const parsed = DateTime.fromFormat(timeStr, "h:mm a");
-
-  return parsed.isValid ? parsed : null;
-}
+import {
+  formatISOWeekDate,
+  getDayAbbreviation,
+  format12HourTime,
+  parseEntryTime,
+} from "../utils/log-format.js";
 
 /**
  * Add a new entry to the log file, organizing by day and sorting chronologically
@@ -123,11 +95,24 @@ export async function addLog(
     }
 
     // Find chronological position
+    // Normalize the new entry time to just hour/minute for comparison
+    const newEntryTime = time.startOf("minute");
+
     for (const entry of entries) {
-      if (entry.time && entry.time > time) {
-        insertIndex = entry.index;
-        break;
+      if (entry.time) {
+        // Normalize existing entry time to the same date as new entry for comparison
+        const existingTime = entry.time.set({
+          year: time.year,
+          month: time.month,
+          day: time.day,
+        });
+
+        if (existingTime > newEntryTime) {
+          insertIndex = entry.index;
+          break;
+        }
       }
+      // Only update insertIndex if we're continuing (new entry is later)
       insertIndex = entry.index + 1;
     }
 
