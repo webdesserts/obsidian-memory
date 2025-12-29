@@ -56,21 +56,37 @@ pub fn personalized_pagerank_with_params(
     let mut personalization: HashMap<String, f64> = HashMap::new();
     personalization.insert(seed.to_string(), 1.0);
 
+    // Pre-compute reverse adjacency map (node -> nodes that link to it)
+    // This changes algorithm from O(n²) to O(n×avg_degree) per iteration
+    let start_time = std::time::Instant::now();
+    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+    for source_node in &nodes {
+        let neighbors = graph.get_neighborhood(source_node);
+        for target in neighbors {
+            incoming.entry(target).or_default().push(source_node.clone());
+        }
+    }
+    
+    tracing::debug!(
+        seed = seed,
+        nodes = n,
+        avg_incoming = incoming.values().map(|v| v.len()).sum::<usize>() / n.max(1),
+        "Starting Personalized PageRank"
+    );
+    
     // Iteratively compute PageRank
-    for _ in 0..max_iter {
+    let mut converged_at = None;
+    for iteration in 0..max_iter {
         let mut new_scores: HashMap<String, f64> = HashMap::new();
         
         for node in &nodes {
             let mut score = 0.0;
             
-            // Sum contributions from ALL nodes that link to this node
-            for source_node in &nodes {
-                let source_neighbors = graph.get_neighborhood(source_node);
-                
-                // If source links to current node, add contribution
-                if source_neighbors.contains(node) {
+            // Sum contributions from nodes that link to this node (reverse adjacency)
+            if let Some(sources) = incoming.get(node) {
+                for source_node in sources {
                     let source_score = scores.get(source_node).copied().unwrap_or(0.0);
-                    let source_out_degree = source_neighbors.len() as f64;
+                    let source_out_degree = graph.get_neighborhood(source_node).len() as f64;
                     
                     if source_out_degree > 0.0 {
                         score += source_score / source_out_degree;
@@ -95,9 +111,37 @@ pub fn personalized_pagerank_with_params(
         
         scores = new_scores;
         
+        // Log progress every 10 iterations
+        if iteration % 10 == 0 && iteration > 0 {
+            tracing::debug!(
+                iteration = iteration,
+                max_iter = max_iter,
+                diff = diff,
+                "PageRank iteration progress"
+            );
+        }
+        
         if diff < tolerance {
+            converged_at = Some(iteration);
             break;
         }
+    }
+    
+    let elapsed = start_time.elapsed();
+    if let Some(iter) = converged_at {
+        tracing::debug!(
+            seed = seed,
+            iterations = iter,
+            elapsed_ms = elapsed.as_millis(),
+            "PageRank converged"
+        );
+    } else {
+        tracing::warn!(
+            seed = seed,
+            max_iter = max_iter,
+            elapsed_ms = elapsed.as_millis(),
+            "PageRank did not converge"
+        );
     }
     
     // Normalize so all scores are relative to the max score

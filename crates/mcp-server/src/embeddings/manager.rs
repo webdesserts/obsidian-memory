@@ -81,6 +81,11 @@ impl EmbeddingManager {
         Ok(())
     }
 
+    /// Check if the model is currently loaded.
+    pub async fn is_model_loaded(&self) -> bool {
+        *self.model_loaded.read().await
+    }
+
     /// Ensure the model is loaded before use.
     async fn ensure_loaded(&self) -> Result<()> {
         if !*self.model_loaded.read().await {
@@ -155,6 +160,12 @@ impl EmbeddingManager {
 
         // Batch compute embeddings for cache misses
         if !to_compute.is_empty() {
+            tracing::debug!(
+                cache_hits = results.len(),
+                cache_misses = to_compute.len(),
+                "Computing embeddings for cache misses"
+            );
+            
             let texts: Vec<String> = to_compute.iter().map(|(_, _, c)| c.clone()).collect();
             let embeddings = self.embeddings.encode_batch(&texts)?;
 
@@ -170,6 +181,10 @@ impl EmbeddingManager {
                 );
                 results.push((path, embedding));
             }
+            
+            tracing::debug!(cache_size = cache.len(), "Embeddings cached");
+        } else {
+            tracing::debug!(cache_hits = results.len(), "All embeddings from cache");
         }
 
         Ok(results)

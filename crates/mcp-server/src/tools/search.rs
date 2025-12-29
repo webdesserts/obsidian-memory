@@ -31,6 +31,12 @@ pub async fn execute(
     include_private: bool,
     debug: bool,
 ) -> Result<CallToolResult, ErrorData> {
+    tracing::info!(
+        query_len = query.len(),
+        include_private = include_private,
+        "Starting search"
+    );
+
     // Parse wiki-links from query
     let (note_refs, remaining_text) = parse_query(query);
 
@@ -46,6 +52,12 @@ pub async fn execute(
             "No notes found in vault.",
         )]));
     }
+
+    tracing::info!(
+        vault_notes = notes.len(),
+        wiki_links = note_refs.len(),
+        "Computing embeddings"
+    );
 
     // Compute embeddings for all notes
     let note_embeddings = embeddings
@@ -93,6 +105,12 @@ pub async fn execute(
 
     // Trim to top K
     results.truncate(TOP_K);
+
+    tracing::info!(
+        results = results.len(),
+        top_score = results.first().map(|r| r.final_score).unwrap_or(0.0),
+        "Search complete"
+    );
 
     // Format output
     let output = format_results(&note_refs, &remaining_text, &results, debug);

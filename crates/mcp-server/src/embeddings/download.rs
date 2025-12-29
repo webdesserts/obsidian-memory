@@ -38,7 +38,7 @@ pub async fn download_model(model_dir: &Path) -> Result<PathBuf> {
     tracing::info!("Downloading all-MiniLM-L6-v2 model from Hugging Face...");
 
     // Download each file
-    for file in MODEL_FILES {
+    for (idx, file) in MODEL_FILES.iter().enumerate() {
         let dest_path = model_dir.join(file);
 
         // Skip if already exists and is valid
@@ -53,7 +53,12 @@ pub async fn download_model(model_dir: &Path) -> Result<PathBuf> {
         }
 
         let url = format!("https://huggingface.co/{}/resolve/main/{}", REPO, file);
-        tracing::info!("Downloading {}...", file);
+        let progress_pct = ((idx + 1) * 100) / MODEL_FILES.len();
+        tracing::info!(
+            file = file,
+            progress = format!("{}%", progress_pct),
+            "Downloading model file"
+        );
 
         download_file(&url, &dest_path).await
             .with_context(|| format!("Failed to download {}", file))?;
