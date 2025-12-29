@@ -53,12 +53,16 @@ pub struct MemoryServer {
 
 #[tool_router]
 impl MemoryServer {
-    pub fn new(config: Config) -> Self {
-        Self {
+    pub async fn new(config: Config) -> Result<Self, std::io::Error> {
+        // Initialize graph index by scanning the vault
+        let mut graph = GraphIndex::new();
+        graph.initialize(&config.vault_path).await?;
+
+        Ok(Self {
             config: Arc::new(config),
-            graph: Arc::new(RwLock::new(GraphIndex::new())),
+            graph: Arc::new(RwLock::new(graph)),
             tool_router: Self::tool_router(),
-        }
+        })
     }
 
     #[tool(description = "Get the current date and time in ISO format for use in Working Memory timeline entries. Returns ISO 8601 formatted datetime (YYYY-MM-DDTHH:MM) and additional context.")]
@@ -135,9 +139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration from environment
     let config = Config::from_env()?;
+    tracing::info!("Vault path: {}", config.vault_path.display());
 
-    // Create and run the server with STDIO transport
-    let server = MemoryServer::new(config);
+    // Create server (this scans the vault and builds the graph index)
+    let server = MemoryServer::new(config).await?;
+
+    // Run the server with STDIO transport
     let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("Error starting server: {}", e);
     })?;

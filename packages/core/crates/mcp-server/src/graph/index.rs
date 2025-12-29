@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use tokio::fs;
+use wiki_links::extract_linked_notes;
 
 /// Tracks forward links and backlinks between notes in the vault.
 ///
@@ -12,13 +15,98 @@ pub struct GraphIndex {
     forward_links: HashMap<String, HashSet<String>>,
     /// Map from note name to notes that link TO it
     backlinks: HashMap<String, HashSet<String>>,
-    /// Map from note name to its file path
+    /// Map from note name to its file path (relative to vault root)
     paths: HashMap<String, PathBuf>,
 }
 
 impl GraphIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Initialize the graph index by scanning the vault.
+    ///
+    /// Recursively scans all markdown files in the vault, extracts wiki-links,
+    /// and builds the forward links and backlinks graph.
+    pub async fn initialize(&mut self, vault_path: &Path) -> Result<(), std::io::Error> {
+        tracing::info!("Scanning vault for notes...");
+
+        let files = Self::get_all_markdown_files(vault_path).await?;
+        tracing::info!("Found {} markdown files", files.len());
+
+        for file_path in files {
+            if let Err(e) = self.index_file(vault_path, &file_path).await {
+                tracing::warn!("Failed to index {}: {}", file_path.display(), e);
+            }
+        }
+
+        tracing::info!(
+            "Indexed {} notes with {} total links",
+            self.paths.len(),
+            self.get_total_links()
+        );
+
+        Ok(())
+    }
+
+    /// Recursively get all markdown files in a directory.
+    async fn get_all_markdown_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+        let mut files = Vec::new();
+        let mut entries = fs::read_dir(dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            // Skip hidden directories (.obsidian, .git, .trash, etc.)
+            if file_name_str.starts_with('.') {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                // Recursively scan subdirectories
+                let sub_files = Box::pin(Self::get_all_markdown_files(&path)).await?;
+                files.extend(sub_files);
+            } else if file_type.is_file() && file_name_str.ends_with(".md") {
+                files.push(path);
+            }
+        }
+
+        Ok(files)
+    }
+
+    /// Index a single file (extract links and update graph).
+    async fn index_file(&mut self, vault_path: &Path, file_path: &Path) -> Result<(), std::io::Error> {
+        let content = fs::read_to_string(file_path).await?;
+
+        // Get note name (filename without .md extension)
+        let note_name = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Get relative path from vault root
+        let relative_path = file_path
+            .strip_prefix(vault_path)
+            .unwrap_or(file_path)
+            .to_path_buf();
+
+        // Extract linked notes using wiki-links crate
+        let linked_notes = extract_linked_notes(&content);
+        let links: HashSet<String> = linked_notes.into_iter().collect();
+
+        // Update the graph
+        self.update_note(&note_name, relative_path, links);
+
+        Ok(())
+    }
+
+    /// Get total number of links in the graph.
+    fn get_total_links(&self) -> usize {
+        self.forward_links.values().map(|links| links.len()).sum()
     }
 
     /// Add or update a note's links in the index.
