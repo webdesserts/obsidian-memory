@@ -59,5 +59,8 @@ hex = "0.4"
 # Semantic embeddings
 semantic-embeddings = { path = "../semantic-embeddings" }
 
+# Regex for parsing wiki-links
+regex = "1"
+
 [dev-dependencies]
 tempfile = "3"

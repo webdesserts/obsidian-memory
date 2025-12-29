@@ -24,6 +24,34 @@ fn get_day_abbreviation(dt: &DateTime<Local>) -> &'static str {
     }
 }
 
+/// Get day abbreviation from ISO week date (e.g., "2025-W50-1" -> "Mon")
+pub fn get_day_abbreviation_from_iso(iso_week_date: &str) -> &'static str {
+    // Parse the day number from YYYY-Www-D format
+    let parts: Vec<&str> = iso_week_date.split('-').collect();
+    if parts.len() == 3 {
+        if let Ok(day) = parts[2].parse::<u32>() {
+            return match day {
+                1 => "Mon",
+                2 => "Tue",
+                3 => "Wed",
+                4 => "Thu",
+                5 => "Fri",
+                6 => "Sat",
+                7 => "Sun",
+                _ => "???",
+            };
+        }
+    }
+    "???"
+}
+
+/// Format ISO week date (unused but kept for API symmetry with write_logs)
+pub fn format_iso_week_date_from_str(_s: &str) -> String {
+    // This function is a no-op since the input is already formatted
+    // Kept for API consistency
+    _s.to_string()
+}
+
 /// Format time as 12-hour clock (h:MM AM/PM)
 fn format_12_hour_time(dt: &DateTime<Local>) -> String {
     let hour = dt.hour();

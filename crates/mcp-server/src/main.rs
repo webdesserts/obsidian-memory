@@ -19,6 +19,7 @@ mod tools;
 mod watcher;
 
 use config::Config;
+use embeddings::EmbeddingManager;
 use graph::GraphIndex;
 use watcher::VaultWatcher;
 
@@ -46,11 +47,35 @@ pub struct UpdateFrontmatterParams {
     pub updates: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Parameters for the Search tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchParams {
+    /// The search query - what information are you looking for? Supports wiki-links: [[Note]] searches using that note's content. Multiple notes: [[TypeScript]] [[Projects]] finds notes similar to BOTH. Mixed: 'type safety in [[TypeScript]]' combines note content with text. Wiki-links enable graph boosting (connected notes rank higher).
+    pub query: String,
+    /// Whether to include private notes in search. Requires explicit user consent.
+    #[serde(default)]
+    pub include_private: bool,
+    /// Show detailed score breakdown (semantic, graph proximity, boost calculation). Useful for understanding how results are ranked.
+    #[serde(default)]
+    pub debug: bool,
+}
+
+/// Parameters for the WriteLogs tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteLogsParams {
+    /// ISO week date in YYYY-Www-D format (e.g., '2025-W50-1' for Monday of week 50). Week starts on Monday (1=Mon, 7=Sun).
+    #[serde(rename = "isoWeekDate")]
+    pub iso_week_date: String,
+    /// Object mapping time strings to log messages. Keys: '9:00 AM', '2:30 PM', etc. (12-hour format with AM/PM). Values: Log entry content. Example: { '9:00 AM': 'Started investigation', '2:30 PM': 'Fixed bug #123' }
+    pub entries: std::collections::HashMap<String, String>,
+}
+
 /// The main MCP server state, holding configuration and shared resources.
 #[derive(Clone)]
 pub struct MemoryServer {
     config: Arc<Config>,
     graph: Arc<RwLock<GraphIndex>>,
+    embeddings: Arc<EmbeddingManager>,
     tool_router: ToolRouter<Self>,
     /// File watcher handle - kept alive for the lifetime of the server.
     /// Wrapped in Arc for Clone, Option for tests that don't need watching.
@@ -79,9 +104,13 @@ impl MemoryServer {
             }
         };
 
+        // Create embedding manager (model download happens lazily on first search)
+        let embeddings = Arc::new(EmbeddingManager::new(&config.vault_path));
+
         Ok(Self {
             config: Arc::new(config),
             graph,
+            embeddings,
             tool_router: Self::tool_router(),
             watcher,
         })
@@ -129,6 +158,20 @@ impl MemoryServer {
         let graph = self.graph.read().await;
         let cwd = std::env::current_dir().unwrap_or_default();
         tools::remember::execute(&self.config.vault_path, &graph, &cwd).await
+    }
+
+    #[tool(description = "Search for relevant notes using semantic similarity. Encodes the query and compares it against all note embeddings. Returns similarity-ordered list of potentially relevant notes. Supports note references via wiki-links: [[Note Name]]")]
+    async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph.read().await;
+        tools::search::execute(
+            &self.config.vault_path,
+            &graph,
+            &self.embeddings,
+            &params.0.query,
+            params.0.include_private,
+            params.0.debug,
+        )
+        .await
     }
 }
 
