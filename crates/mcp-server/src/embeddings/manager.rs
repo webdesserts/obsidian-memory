@@ -81,11 +81,6 @@ impl EmbeddingManager {
         Ok(())
     }
 
-    /// Check if the model is currently loaded.
-    pub async fn is_model_loaded(&self) -> bool {
-        *self.model_loaded.read().await
-    }
-
     /// Ensure the model is loaded before use.
     async fn ensure_loaded(&self) -> Result<()> {
         if !*self.model_loaded.read().await {
@@ -190,21 +185,6 @@ impl EmbeddingManager {
         Ok(results)
     }
 
-    /// Save cache to disk.
-    pub async fn save_cache(&self) -> Result<()> {
-        let cache = self.cache.read().await;
-        let json = serde_json::to_string(&*cache)?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.cache_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        fs::write(&self.cache_path, json).await?;
-        tracing::debug!("Saved embedding cache ({} entries)", cache.len());
-        Ok(())
-    }
-
     /// Load cache from disk.
     async fn load_cache(&self) -> Result<()> {
         if !self.cache_path.exists() {
@@ -245,15 +225,6 @@ impl EmbeddingManager {
     /// Compute cosine similarity between two embeddings.
     pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32> {
         SemanticEmbeddings::cosine_similarity(a, b)
-    }
-
-    /// Find most similar notes to a query embedding.
-    pub fn find_most_similar(
-        query: &[f32],
-        candidates: &[Vec<f32>],
-        top_k: usize,
-    ) -> Result<Vec<u32>> {
-        SemanticEmbeddings::find_most_similar(query, candidates, top_k)
     }
 }
 
