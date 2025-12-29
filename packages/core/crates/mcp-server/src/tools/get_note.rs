@@ -8,19 +8,6 @@ use tokio::fs;
 
 use crate::graph::GraphIndex;
 
-/// Result structure for GetNote tool
-pub struct NoteInfo {
-    pub note_name: String,
-    pub path: String,
-    pub file_path: String,
-    pub memory_uri: String,
-    pub obsidian_uri: String,
-    pub exists: bool,
-    pub forward_links: Vec<String>,
-    pub backlinks: Vec<String>,
-    pub frontmatter_keys: Vec<String>,
-}
-
 /// Resolve a note reference to a file path, searching the vault if needed.
 ///
 /// Returns (resolved_path_without_ext, exists)

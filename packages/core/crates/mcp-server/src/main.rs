@@ -13,6 +13,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 mod config;
 mod graph;
+mod projects;
 mod tools;
 
 use config::Config;
@@ -31,6 +32,15 @@ pub struct LogParams {
 pub struct GetNoteParams {
     /// Note reference - supports: "memory:Note Name", "memory:knowledge/Note Name", "knowledge/Note Name", "[[Note Name]]"
     pub note: String,
+}
+
+/// Parameters for the UpdateFrontmatter tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateFrontmatterParams {
+    /// Path to the note relative to vault root
+    pub path: String,
+    /// Frontmatter fields to update
+    pub updates: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// The main MCP server state, holding configuration and shared resources.
@@ -76,6 +86,23 @@ impl MemoryServer {
             &params.0.note,
         )
         .await
+    }
+
+    #[tool(description = "Update frontmatter metadata in a note")]
+    async fn update_frontmatter(&self, params: Parameters<UpdateFrontmatterParams>) -> Result<CallToolResult, ErrorData> {
+        tools::update_frontmatter::execute(
+            &self.config.vault_path,
+            &params.0.path,
+            params.0.updates,
+        )
+        .await
+    }
+
+    #[tool(description = "Load all session context files in a single call. Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. Automatically discovers projects based on git remotes and directory names. Use this at the start of every session to get complete context about recent work, current focus, this week's activity, and project context.")]
+    async fn remember(&self) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph.read().await;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        tools::remember::execute(&self.config.vault_path, &graph, &cwd).await
     }
 }
 

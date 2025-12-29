@@ -107,6 +107,75 @@ pub fn parse_frontmatter(raw: &str) -> ParsedNote<'_> {
     }
 }
 
+/// Serialize frontmatter to a YAML string.
+///
+/// Returns the YAML content without the surrounding `---` delimiters.
+pub fn serialize_frontmatter(frontmatter: &Frontmatter) -> Result<String, FrontmatterError> {
+    // Convert JSON values to YAML values
+    let yaml_map: serde_yaml::Mapping = frontmatter
+        .iter()
+        .map(|(k, v)| (serde_yaml::Value::String(k.clone()), json_to_yaml(v)))
+        .collect();
+
+    serde_yaml::to_string(&yaml_map).map_err(FrontmatterError::SerializationError)
+}
+
+/// Build a complete note with frontmatter and content.
+///
+/// If frontmatter is empty, returns just the content without frontmatter block.
+pub fn build_note_with_frontmatter(frontmatter: &Frontmatter, content: &str) -> Result<String, FrontmatterError> {
+    if frontmatter.is_empty() {
+        return Ok(content.to_string());
+    }
+
+    let yaml = serialize_frontmatter(frontmatter)?;
+    Ok(format!("---\n{}---\n{}", yaml, content))
+}
+
+/// Error type for frontmatter operations
+#[derive(Debug)]
+pub enum FrontmatterError {
+    SerializationError(serde_yaml::Error),
+}
+
+impl std::fmt::Display for FrontmatterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrontmatterError::SerializationError(e) => write!(f, "Failed to serialize frontmatter: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for FrontmatterError {}
+
+/// Convert a JSON value to a YAML value
+fn json_to_yaml(json: &JsonValue) -> serde_yaml::Value {
+    match json {
+        JsonValue::Null => serde_yaml::Value::Null,
+        JsonValue::Bool(b) => serde_yaml::Value::Bool(*b),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_yaml::Value::Number(i.into())
+            } else if let Some(f) = n.as_f64() {
+                serde_yaml::Value::Number(f.into())
+            } else {
+                serde_yaml::Value::Null
+            }
+        }
+        JsonValue::String(s) => serde_yaml::Value::String(s.clone()),
+        JsonValue::Array(arr) => {
+            serde_yaml::Value::Sequence(arr.iter().map(json_to_yaml).collect())
+        }
+        JsonValue::Object(obj) => {
+            let map: serde_yaml::Mapping = obj
+                .iter()
+                .map(|(k, v)| (serde_yaml::Value::String(k.clone()), json_to_yaml(v)))
+                .collect();
+            serde_yaml::Value::Mapping(map)
+        }
+    }
+}
+
 /// Convert a YAML value to a JSON HashMap (for the top-level frontmatter)
 fn yaml_to_json_map(yaml: serde_yaml::Value) -> Option<Frontmatter> {
     match yaml {

@@ -7,7 +7,10 @@
 
 mod frontmatter;
 
-pub use frontmatter::{parse_frontmatter, split_frontmatter, Frontmatter, ParsedNote};
+pub use frontmatter::{
+    build_note_with_frontmatter, parse_frontmatter, serialize_frontmatter, split_frontmatter,
+    Frontmatter, FrontmatterError, ParsedNote,
+};
 
 use serde::{Deserialize, Serialize};
 

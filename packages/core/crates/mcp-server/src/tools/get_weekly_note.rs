@@ -1,18 +1,20 @@
+use std::path::Path;
+
 use chrono::{Datelike, IsoWeek, Local};
 use rmcp::model::{CallToolResult, Content, RawResource};
 
-/// Get the current weekly note URI and metadata.
+/// Get the current ISO week date string and day name.
 ///
-/// Returns a ResourceLink to the current week's journal note using
-/// ISO 8601 week date format (e.g., memory:journal/2025-w01).
-pub fn execute() -> Result<CallToolResult, rmcp::model::ErrorData> {
+/// Returns (iso_week_date, day_name) where iso_week_date is like "2025-W01".
+pub fn get_current_week_info() -> (String, &'static str) {
     let now = Local::now();
     let iso_week: IsoWeek = now.iso_week();
     let week = iso_week.week();
     let year = iso_week.year();
 
-    // Day of week (Monday, Tuesday, etc.)
-    let current_day = match now.weekday() {
+    let iso_week_date = format!("{}-W{:02}", year, week);
+
+    let day_name = match now.weekday() {
         chrono::Weekday::Mon => "Monday",
         chrono::Weekday::Tue => "Tuesday",
         chrono::Weekday::Wed => "Wednesday",
@@ -22,8 +24,31 @@ pub fn execute() -> Result<CallToolResult, rmcp::model::ErrorData> {
         chrono::Weekday::Sun => "Sunday",
     };
 
+    (iso_week_date, day_name)
+}
+
+/// Format the weekly note URI given a vault path and ISO week date.
+///
+/// Returns a file:// URI pointing to the weekly note file.
+pub fn format_weekly_note_uri(vault_path: &Path, iso_week_date: &str) -> String {
+    let file_path = vault_path.join(format!("journal/{}.md", iso_week_date.to_lowercase()));
+    format!("file://{}", file_path.display())
+}
+
+/// Get the current weekly note URI and metadata.
+///
+/// Returns a ResourceLink to the current week's journal note using
+/// ISO 8601 week date format (e.g., memory:journal/2025-w01).
+pub fn execute() -> Result<CallToolResult, rmcp::model::ErrorData> {
+    let (iso_week_date, current_day) = get_current_week_info();
+
     // Weekly note URI format: memory:journal/YYYY-wWW
-    let weekly_note_uri = format!("memory:journal/{}-w{:02}", year, week);
+    let weekly_note_uri = format!("memory:journal/{}", iso_week_date.to_lowercase());
+
+    // Parse year and week from iso_week_date for display
+    let parts: Vec<&str> = iso_week_date.split('-').collect();
+    let year = parts[0];
+    let week = parts[1].trim_start_matches('W');
 
     // Return ResourceLink to the weekly note
     let resource = RawResource {
