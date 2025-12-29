@@ -97,7 +97,7 @@ async fn process_events(
                         }
                     } else {
                         // File was deleted
-                        remove_file(path, &graph).await;
+                        remove_file(&vault_path, path, &graph).await;
                     }
                 }
                 DebouncedEventKind::AnyContinuous => {
@@ -146,17 +146,21 @@ async fn update_file(
 }
 
 /// Remove a file from the graph index.
-async fn remove_file(file_path: &Path, graph: &Arc<RwLock<GraphIndex>>) {
+async fn remove_file(vault_path: &Path, file_path: &Path, graph: &Arc<RwLock<GraphIndex>>) {
     let note_name = file_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string();
+        
+    let relative_path = file_path
+        .strip_prefix(vault_path)
+        .unwrap_or(file_path);
 
     if !note_name.is_empty() {
         let mut graph = graph.write().await;
-        graph.remove_note(&note_name);
-        tracing::debug!("Removed from index: {}", note_name);
+        graph.remove_note(&note_name, relative_path);
+        tracing::debug!("Removed from index: {}", relative_path.display());
     }
 }
 
@@ -188,7 +192,8 @@ mod tests {
             .unwrap();
 
         let graph = graph.read().await;
-        let links = graph.get_forward_links("test").unwrap();
+        // get_forward_links now takes a path
+        let links = graph.get_forward_links("test.md").unwrap();
         assert!(links.contains("Note A"));
         assert!(links.contains("Note B"));
     }
@@ -213,14 +218,14 @@ mod tests {
         // Verify it exists
         {
             let g = graph.read().await;
-            assert!(g.get_forward_links("test").is_some());
+            assert!(g.get_forward_links("test.md").is_some());
         }
 
-        // Remove it
-        remove_file(&file_path, &graph).await;
+        // Remove it - now takes vault_path as well
+        remove_file(temp_dir.path(), &file_path, &graph).await;
 
         // Verify it's gone
         let g = graph.read().await;
-        assert!(g.get_forward_links("test").is_none());
+        assert!(g.get_forward_links("test.md").is_none());
     }
 }

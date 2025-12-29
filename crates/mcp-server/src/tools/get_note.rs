@@ -87,12 +87,15 @@ pub async fn execute(
     }
 
     // Note exists - get links and frontmatter
+    // Get forward links using the path (with .md extension)
+    let path_with_ext = ensure_markdown_extension(&resolved_path);
     let forward_links: Vec<String> = graph
-        .get_forward_links(&note_name)
+        .get_forward_links(&path_with_ext)
         .map(|links| {
             links
                 .iter()
                 .map(|link| {
+                    // link is a note name, resolve to path
                     let path = graph
                         .get_path(link)
                         .map(|p| p.to_string_lossy().replace(".md", ""))
@@ -103,17 +106,16 @@ pub async fn execute(
         })
         .unwrap_or_default();
 
+    // Get backlinks (notes that link to this note by name)
     let backlinks: Vec<String> = graph
         .get_backlinks(&note_name)
         .map(|links| {
+            // links are now paths, not note names
             links
                 .iter()
-                .map(|link| {
-                    let path = graph
-                        .get_path(link)
-                        .map(|p| p.to_string_lossy().replace(".md", ""))
-                        .unwrap_or_else(|| link.clone());
-                    format!("memory:{}", path)
+                .map(|path| {
+                    let path_without_ext = path.strip_suffix(".md").unwrap_or(path);
+                    format!("memory:{}", path_without_ext)
                 })
                 .collect()
         })

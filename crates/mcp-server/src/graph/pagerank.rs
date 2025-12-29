@@ -2,6 +2,7 @@
 
 use super::GraphIndex;
 use std::collections::HashMap;
+use std::path::Path;
 
 const DEFAULT_DAMPING: f64 = 0.85;
 const DEFAULT_TOLERANCE: f64 = 1e-6;
@@ -37,11 +38,18 @@ pub fn personalized_pagerank_with_params(
     tolerance: f64,
     max_iter: usize,
 ) -> HashMap<String, f64> {
-    // Build list of all nodes
-    let nodes: Vec<String> = graph.note_names().cloned().collect();
+    // Build list of all nodes (paths)
+    let nodes: Vec<String> = graph.all_paths().cloned().collect();
     let n = nodes.len();
     
-    if n == 0 || !nodes.iter().any(|n| n == seed) {
+    // Seed is a note name, find matching paths
+    let seed_paths: Vec<&String> = nodes.iter()
+        .filter(|p| {
+            Path::new(p).file_stem().and_then(|s| s.to_str()) == Some(seed)
+        })
+        .collect();
+    
+    if n == 0 || seed_paths.is_empty() {
         return HashMap::new();
     }
 
@@ -52,9 +60,12 @@ pub fn personalized_pagerank_with_params(
         scores.insert(node.clone(), init_score);
     }
 
-    // Personalization vector (restart only at seed)
+    // Personalization vector (restart only at seed paths)
     let mut personalization: HashMap<String, f64> = HashMap::new();
-    personalization.insert(seed.to_string(), 1.0);
+    let restart_prob = 1.0 / seed_paths.len() as f64;
+    for seed_path in &seed_paths {
+        personalization.insert((*seed_path).clone(), restart_prob);
+    }
 
     // Pre-compute reverse adjacency map (node -> nodes that link to it)
     // This changes algorithm from O(n²) to O(n×avg_degree) per iteration
@@ -153,7 +164,17 @@ pub fn personalized_pagerank_with_params(
         }
     }
     
-    scores
+    // Convert path keys to note name keys for the caller
+    // If multiple paths have the same note name, take the max score
+    let mut name_scores: HashMap<String, f64> = HashMap::new();
+    for (path, score) in scores {
+        if let Some(name) = Path::new(&path).file_stem().and_then(|s| s.to_str()) {
+            let entry = name_scores.entry(name.to_string()).or_insert(0.0);
+            *entry = entry.max(score);
+        }
+    }
+    
+    name_scores
 }
 
 #[cfg(test)]

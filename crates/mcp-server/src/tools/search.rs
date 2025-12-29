@@ -215,19 +215,15 @@ async fn get_all_notes(
 ) -> Vec<(String, String)> {
     let mut notes = Vec::new();
 
-    for note_name in graph.note_names() {
-        if let Some(rel_path) = graph.get_path(note_name) {
-            let path_str = rel_path.to_string_lossy();
+    for rel_path in graph.all_paths() {
+        // Skip private notes unless requested
+        if !include_private && rel_path.starts_with("private/") {
+            continue;
+        }
 
-            // Skip private notes unless requested
-            if !include_private && path_str.starts_with("private/") {
-                continue;
-            }
-
-            let full_path = vault_path.join(rel_path);
-            if let Ok(content) = fs::read_to_string(&full_path).await {
-                notes.push((path_str.to_string(), content));
-            }
+        let full_path = vault_path.join(rel_path);
+        if let Ok(content) = fs::read_to_string(&full_path).await {
+            notes.push((rel_path.clone(), content));
         }
     }
 

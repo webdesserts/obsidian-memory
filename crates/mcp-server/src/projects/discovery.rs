@@ -159,20 +159,21 @@ fn load_project_metadata(note_name: &str, file_path: &Path) -> Option<ProjectMet
 fn get_all_projects(graph_index: &GraphIndex, vault_path: &Path) -> Vec<ProjectMetadata> {
     let mut projects = Vec::new();
 
-    for note_name in graph_index.note_names() {
-        // Get the path for this note
-        if let Some(path) = graph_index.get_path(note_name) {
-            let path_str = path.to_string_lossy();
+    for rel_path in graph_index.all_paths() {
+        // Only consider notes in projects/ folder
+        if !rel_path.starts_with("projects/") {
+            continue;
+        }
 
-            // Only consider notes in projects/ folder
-            if !path_str.starts_with("projects/") {
-                continue;
-            }
+        // Extract note name from path
+        let note_name = std::path::Path::new(rel_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
 
-            let file_path = vault_path.join(path);
-            if let Some(metadata) = load_project_metadata(note_name, &file_path) {
-                projects.push(metadata);
-            }
+        let file_path = vault_path.join(rel_path);
+        if let Some(metadata) = load_project_metadata(note_name, &file_path) {
+            projects.push(metadata);
         }
     }
 
