@@ -10,7 +10,6 @@
 //! Note content here...
 //! ```
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
@@ -18,15 +17,17 @@ use std::collections::HashMap;
 /// Using JSON values allows flexible typing (strings, numbers, arrays, objects).
 pub type Frontmatter = HashMap<String, JsonValue>;
 
-/// A parsed note with frontmatter separated from content
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ParsedNote {
+/// A parsed note with frontmatter separated from content.
+/// 
+/// The `content` field borrows from `raw` to avoid unnecessary allocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedNote<'a> {
     /// The frontmatter key-value pairs, if present
     pub frontmatter: Option<Frontmatter>,
-    /// The note content after the frontmatter
-    pub content: String,
+    /// The note content after the frontmatter (borrows from raw)
+    pub content: &'a str,
     /// The raw file content (frontmatter + content)
-    pub raw: String,
+    pub raw: &'a str,
 }
 
 /// Split a note into frontmatter YAML string and content, without parsing the YAML.
@@ -88,7 +89,8 @@ fn find_closing_delimiter(s: &str) -> Option<usize> {
 /// Parse a note's raw content into frontmatter and content.
 ///
 /// The frontmatter is parsed as YAML and converted to a HashMap with JSON values.
-pub fn parse_frontmatter(raw: &str) -> ParsedNote {
+/// The returned `ParsedNote` borrows from the input string.
+pub fn parse_frontmatter(raw: &str) -> ParsedNote<'_> {
     let (yaml_str, content) = split_frontmatter(raw);
 
     let frontmatter = yaml_str.and_then(|yaml| {
@@ -100,8 +102,8 @@ pub fn parse_frontmatter(raw: &str) -> ParsedNote {
 
     ParsedNote {
         frontmatter,
-        content: content.to_string(),
-        raw: raw.to_string(),
+        content,
+        raw,
     }
 }
 
