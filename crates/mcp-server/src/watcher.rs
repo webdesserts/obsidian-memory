@@ -1,7 +1,8 @@
-//! File watcher for keeping the graph index up to date.
+//! File watcher for keeping the graph index and embeddings up to date.
 //!
 //! Watches the vault directory for changes to markdown files and updates
-//! the graph index accordingly. Uses debouncing to batch rapid changes.
+//! the graph index and invalidates stale embeddings accordingly. 
+//! Uses debouncing to batch rapid changes.
 
 use notify::RecommendedWatcher;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind, Debouncer};
@@ -12,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use wiki_links::extract_linked_notes;
 
+use crate::embeddings::EmbeddingManager;
 use crate::graph::GraphIndex;
 
 /// Watches vault directory and updates graph index on file changes.
@@ -23,10 +25,11 @@ impl VaultWatcher {
     /// Start watching the vault directory.
     ///
     /// Spawns a background task that listens for file system events and
-    /// updates the graph index when markdown files change.
+    /// updates the graph index and invalidates embeddings when markdown files change.
     pub fn start(
         vault_path: PathBuf,
         graph: Arc<RwLock<GraphIndex>>,
+        embeddings: Arc<EmbeddingManager>,
     ) -> Result<Self, notify::Error> {
         let (tx, rx) = mpsc::channel(100);
         let vault_path_clone = vault_path.clone();
@@ -62,7 +65,7 @@ impl VaultWatcher {
         tracing::info!("Started file watcher for {}", vault_path.display());
 
         // Spawn background task to process events
-        tokio::spawn(process_events(rx, vault_path_clone, graph));
+        tokio::spawn(process_events(rx, vault_path_clone, graph, embeddings));
 
         Ok(Self {
             _debouncer: debouncer,
@@ -70,11 +73,12 @@ impl VaultWatcher {
     }
 }
 
-/// Process file system events and update the graph index.
+/// Process file system events and update the graph index and embeddings.
 async fn process_events(
     mut rx: mpsc::Receiver<Vec<notify_debouncer_mini::DebouncedEvent>>,
     vault_path: PathBuf,
     graph: Arc<RwLock<GraphIndex>>,
+    embeddings: Arc<EmbeddingManager>,
 ) {
     while let Some(events) = rx.recv().await {
         for event in events {
@@ -87,17 +91,28 @@ async fn process_events(
             {
                 continue;
             }
+            
+            // Get relative path for embedding cache key
+            let relative_path = path
+                .strip_prefix(&vault_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
 
             match event.kind {
                 DebouncedEventKind::Any => {
-                    // File created or modified - re-index it
+                    // File created or modified - re-index it and invalidate embedding
                     if path.exists() {
                         if let Err(e) = update_file(&vault_path, path, &graph).await {
                             tracing::warn!("Failed to update index for {}: {}", path.display(), e);
                         }
+                        // Invalidate stale embedding so it gets recomputed on next search
+                        embeddings.invalidate(&relative_path).await;
+                        tracing::debug!("Invalidated embedding for: {}", relative_path);
                     } else {
                         // File was deleted
                         remove_file(&vault_path, path, &graph).await;
+                        embeddings.invalidate(&relative_path).await;
                     }
                 }
                 DebouncedEventKind::AnyContinuous => {
@@ -174,8 +189,13 @@ mod tests {
     async fn test_watcher_starts_successfully() {
         let temp_dir = TempDir::new().unwrap();
         let graph = Arc::new(RwLock::new(GraphIndex::new()));
+        let embeddings = Arc::new(EmbeddingManager::new(temp_dir.path()));
 
-        let watcher = VaultWatcher::start(temp_dir.path().to_path_buf(), graph);
+        let watcher = VaultWatcher::start(
+            temp_dir.path().to_path_buf(),
+            graph,
+            embeddings,
+        );
         assert!(watcher.is_ok());
     }
 

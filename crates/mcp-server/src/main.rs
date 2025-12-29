@@ -107,8 +107,15 @@ impl MemoryServer {
 
         let graph = Arc::new(RwLock::new(graph));
 
-        // Start file watcher to keep graph index up to date
-        let watcher = match VaultWatcher::start(config.vault_path.clone(), graph.clone()) {
+        // Create embedding manager (model download happens lazily on first search)
+        let embeddings = Arc::new(EmbeddingManager::new(&config.vault_path));
+
+        // Start file watcher to keep graph index and embeddings up to date
+        let watcher = match VaultWatcher::start(
+            config.vault_path.clone(),
+            graph.clone(),
+            embeddings.clone(),
+        ) {
             Ok(w) => {
                 tracing::info!("File watcher started successfully");
                 Some(Arc::new(w))
@@ -118,9 +125,6 @@ impl MemoryServer {
                 None
             }
         };
-
-        // Create embedding manager (model download happens lazily on first search)
-        let embeddings = Arc::new(EmbeddingManager::new(&config.vault_path));
 
         Ok(Self {
             config: Arc::new(config),
