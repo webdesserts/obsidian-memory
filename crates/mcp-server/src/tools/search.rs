@@ -1,12 +1,24 @@
 //! Search tool for semantic search with graph boosting.
 
 use anyhow::Result;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 use tokio::fs;
 
 use crate::embeddings::EmbeddingManager;
 use crate::graph::GraphIndex;
+
+/// Regex for extracting [[wiki-links]] from query text
+static WIKI_LINK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[\[([^\]]+)\]\]").expect("Invalid wiki-link regex")
+});
+
+/// Regex for normalizing whitespace
+static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\s+").expect("Invalid whitespace regex")
+});
 
 /// Hardcoded search parameters
 const TOP_K: usize = 10;
@@ -123,9 +135,8 @@ fn parse_query(query: &str) -> (Vec<String>, String) {
     let mut note_refs = Vec::new();
     let mut remaining = query.to_string();
 
-    // Find all [[wiki-links]]
-    let re = regex::Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
-    for cap in re.captures_iter(query) {
+    // Find all [[wiki-links]] using pre-compiled regex
+    for cap in WIKI_LINK_RE.captures_iter(query) {
         if let Some(m) = cap.get(1) {
             // Extract note name (handle aliases like [[Note|alias]])
             let note_ref = m.as_str();
@@ -135,12 +146,11 @@ fn parse_query(query: &str) -> (Vec<String>, String) {
     }
 
     // Remove wiki-links from remaining text
-    remaining = re.replace_all(&remaining, "").to_string();
+    remaining = WIKI_LINK_RE.replace_all(&remaining, "").to_string();
     remaining = remaining.trim().to_string();
 
-    // Normalize whitespace
-    let whitespace_re = regex::Regex::new(r"\s+").unwrap();
-    remaining = whitespace_re.replace_all(&remaining, " ").to_string();
+    // Normalize whitespace using pre-compiled regex
+    remaining = WHITESPACE_RE.replace_all(&remaining, " ").to_string();
 
     (note_refs, remaining)
 }

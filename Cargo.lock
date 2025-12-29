@@ -1895,6 +1895,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "obsidian-fs",
+ "once_cell",
  "regex",
  "reqwest",
  "rmcp",
