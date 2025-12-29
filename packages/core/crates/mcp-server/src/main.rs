@@ -53,6 +53,11 @@ impl MemoryServer {
     async fn log(&self, params: Parameters<LogParams>) -> Result<CallToolResult, ErrorData> {
         tools::log::execute(&self.config.vault_path, &params.0.content).await
     }
+
+    #[tool(description = "Get the URI for the current week's journal note. Returns a resource link that can be read to access the note content.")]
+    async fn get_weekly_note(&self) -> Result<CallToolResult, ErrorData> {
+        tools::get_weekly_note::execute()
+    }
 }
 
 #[tool_handler]
