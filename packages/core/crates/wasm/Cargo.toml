@@ -1,0 +1,26 @@
+[package]
+name = "obsidian-memory-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "WASM entry point for obsidian-memory-core"
+
+# wasm-pack optimization settings
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O2", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-simd"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+console_error_panic_hook.workspace = true
+
+# Internal crates (will be added as they're created)
+# wiki-links = { path = "../wiki-links" }
+# obsidian-fs = { path = "../obsidian-fs" }
+# semantic-embeddings = { path = "../semantic-embeddings" }
+
+[dev-dependencies]
+wasm-bindgen-test.workspace = true
