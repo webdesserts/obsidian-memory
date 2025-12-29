@@ -1,15 +1,15 @@
-node_modules/
-dist/
-*.log
-.DS_Store
-.env
-*.tsbuildinfo
-CLAUDE.local.md
-packages/mcp-server/models/*.gguf
-.claude/settings.local.json
-/packages/semantic-embeddings/.venv-arm
-
 # Rust build artifacts
 target/
-pkg/
-Cargo.lock
+
+# Downloaded ML models
+models/
+
+# OS files
+.DS_Store
+
+# Logs
+*.log
+
+# Claude Code local settings
+.claude/settings.local.json
+CLAUDE.local.md

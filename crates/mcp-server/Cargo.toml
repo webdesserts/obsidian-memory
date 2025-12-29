@@ -1,0 +1,63 @@
+[package]
+name = "obsidian-memory-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "obsidian-memory"
+path = "src/main.rs"
+
+[dependencies]
+# MCP SDK
+rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror = "2"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# JSON Schema for tool parameters
+schemars = "1.0"
+
+# URL encoding
+urlencoding = "2.1"
+
+# Platform directories (home dir, etc.)
+dirs = "6"
+
+# Workspace crates
+wiki-links = { path = "../wiki-links" }
+obsidian-fs = { path = "../obsidian-fs" }
+
+# Tracing/logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File watching
+notify = "8"
+notify-debouncer-mini = "0.6"
+
+# HTTP client for model downloads
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+
+# Hashing for cache keys
+sha2 = "0.10"
+hex = "0.4"
+
+# Semantic embeddings
+semantic-embeddings = { path = "../semantic-embeddings" }
+
+[dev-dependencies]
+tempfile = "3"
