@@ -30,6 +30,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # JSON Schema for tool parameters
 schemars = "1.0"
 
+# URL encoding
+urlencoding = "2.1"
+
 # Workspace crates
 wiki-links = { path = "../wiki-links" }
 obsidian-fs = { path = "../obsidian-fs" }
