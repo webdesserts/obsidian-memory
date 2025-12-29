@@ -3,7 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { EmbeddingCache } from "./cache.js";
 import type { EmbeddingVector } from "./types.js";
-import type { SemanticEmbeddings } from "../../../semantic-embeddings/pkg/semantic_embeddings.js";
+import type { SemanticEmbeddings } from "../../../core/semantic-embeddings-pkg/semantic_embeddings.js";
 
 /**
  * Search result with similarity score
@@ -192,12 +192,12 @@ export class EmbeddingManager {
   private async loadWasmModule(): Promise<void> {
     try {
       // Import WASM module
-      // Get path to semantic-embeddings package
+      // Get path to core package's semantic-embeddings WASM
       const __filename = fileURLToPath(import.meta.url);
       const __dirname = path.dirname(__filename);
       const wasmPath = path.resolve(
         __dirname,
-        "../../../semantic-embeddings/pkg/semantic_embeddings.js"
+        "../../../core/semantic-embeddings-pkg/semantic_embeddings.js"
       );
 
       const wasmModule = await import(wasmPath);
@@ -207,7 +207,7 @@ export class EmbeddingManager {
       // Load model files
       const modelDir = path.resolve(
         __dirname,
-        "../../../semantic-embeddings/models",
+        "../../../core/models",
         this.modelName
       );
 
@@ -228,7 +228,7 @@ export class EmbeddingManager {
       if (missingFiles.length > 0) {
         throw new Error(
           `Missing model files: ${missingFiles.join(", ")}\n` +
-          `Run: cd packages/semantic-embeddings && npm run download-model`
+          `Run: cd packages/core && npm run download-model`
         );
       }
 

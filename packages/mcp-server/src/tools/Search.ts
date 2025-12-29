@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
-import { extractNoteName, parseWikiLinks } from "@webdesserts/obsidian-memory-utils";
+import { extractNoteName, parseWikiLinks } from "@webdesserts/obsidian-memory-core";
 import { prepareContentForEmbedding } from "../embeddings/manager.js";
 import { logger } from "../utils/logger.js";
 import path from "path";
@@ -22,8 +22,8 @@ interface ParsedQuery {
  * Parse query for note references (wiki-links) and extract remaining text
  */
 function parseQueryForNoteReferences(query: string): ParsedQuery {
-  const wikiLinks = parseWikiLinks(query);
-  const noteReferences = wikiLinks.map(link => link.target);
+  const wikiLinks = parseWikiLinks(query) as Array<{ target: string }>;
+  const noteReferences = wikiLinks.map((link) => link.target);
 
   // Remove all wiki-links from query to get remaining text
   let remainingText = query.replace(/\[\[([^\]]+?)\]\]/g, "");

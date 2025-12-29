@@ -9,6 +9,7 @@
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wiki_links::WikiLink;
+use obsidian_fs::{NoteRef, ResolutionOptions};
 
 /// Initialize panic hook for better error messages in browser console.
 /// Call this once at startup.
@@ -89,8 +90,128 @@ pub fn extract_linked_notes(content: &str) -> Result<JsValue, JsError> {
     serde_wasm_bindgen::to_value(&notes).map_err(|e| JsError::new(&e.to_string()))
 }
 
+// =============================================================================
+// obsidian-fs bindings
+// =============================================================================
+
+/// JS-compatible representation of NoteRef
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NoteRefJs {
+    /// The path without extension: "knowledge/Note"
+    path: String,
+    /// Just the note name: "Note"
+    name: String,
+}
+
+impl From<NoteRef> for NoteRefJs {
+    fn from(note_ref: NoteRef) -> Self {
+        NoteRefJs {
+            path: note_ref.path,
+            name: note_ref.name,
+        }
+    }
+}
+
+/// Normalize a note reference (strip memory: URI scheme, [[brackets]], and .md extension)
+///
+/// Accepts:
+/// - Plain name: "Note"
+/// - Path: "knowledge/Note"
+/// - Memory URI: "memory:knowledge/Note"
+/// - Wiki link: "[[knowledge/Note]]"
+/// - With .md: "knowledge/Note.md"
+///
+/// Returns an object with `path` and `name` properties.
+#[wasm_bindgen(js_name = normalizeNoteReference)]
+pub fn normalize_note_reference(note_ref: &str) -> Result<JsValue, JsError> {
+    let result: NoteRefJs = obsidian_fs::normalize_note_reference(note_ref).into();
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Extract note name from a path (last component without extension)
+///
+/// @param notePath - Path to the note (can be memory: URI, [[wiki link]], or plain path)
+/// @returns Just the note name
+#[wasm_bindgen(js_name = extractNoteName)]
+pub fn extract_note_name(note_path: &str) -> String {
+    obsidian_fs::normalize_note_reference(note_path).name
+}
+
+/// Generate search paths for a note name.
+///
+/// Returns an array of paths to try (without .md extension).
+/// Paths include: root, knowledge/, journal/, projects/, and optionally private/
+#[wasm_bindgen(js_name = generateSearchPaths)]
+pub fn generate_search_paths(note_name: &str, include_private: bool) -> Result<JsValue, JsError> {
+    let paths = obsidian_fs::generate_search_paths(note_name, include_private);
+    serde_wasm_bindgen::to_value(&paths).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Resolve a note path from available options using priority order.
+///
+/// Priority: root → knowledge/ → journal/ → projects/ → others → private/
+///
+/// @param availablePaths - Array of paths to choose from
+/// @param includePrivate - Whether to include private paths in resolution
+/// @returns The best matching path, or undefined if no paths provided
+#[wasm_bindgen(js_name = resolveNotePath)]
+pub fn resolve_note_path(available_paths: Vec<String>, include_private: bool) -> Option<String> {
+    if available_paths.is_empty() {
+        return None;
+    }
+    let path_refs: Vec<&str> = available_paths.iter().map(|s| s.as_str()).collect();
+    let options = ResolutionOptions { include_private };
+    obsidian_fs::resolve_note_path(&path_refs, &options)
+}
+
+/// Ensure .md extension on note paths
+#[wasm_bindgen(js_name = ensureMarkdownExtension)]
+pub fn ensure_markdown_extension(note_path: &str) -> String {
+    obsidian_fs::ensure_markdown_extension(note_path)
+}
+
+/// Validate that a relative path is safe (no directory traversal)
+///
+/// Returns the cleaned path (with leading slash stripped) or throws an error.
+#[wasm_bindgen(js_name = validateRelativePath)]
+pub fn validate_relative_path(path: &str) -> Result<String, JsError> {
+    obsidian_fs::validate_relative_path(path).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Parse frontmatter from markdown content.
+///
+/// Returns an object with `content` (the markdown body) and optional `frontmatter` (parsed YAML).
+#[wasm_bindgen(js_name = parseFrontmatter)]
+pub fn parse_frontmatter(content: &str) -> Result<JsValue, JsError> {
+    let parsed = obsidian_fs::parse_frontmatter(content);
+    
+    #[derive(Serialize)]
+    struct ParsedNoteJs {
+        content: String,
+        raw: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        frontmatter: Option<serde_json::Value>,
+    }
+    
+    // Convert HashMap<String, JsonValue> to serde_json::Value::Object
+    let frontmatter_value = parsed.frontmatter.map(|fm| {
+        serde_json::Value::Object(fm.into_iter().collect())
+    });
+    
+    let result = ParsedNoteJs {
+        content: parsed.content.to_string(),
+        raw: parsed.raw.to_string(),
+        frontmatter: frontmatter_value,
+    };
+    
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    
     #[test]
     fn test_parse_wiki_links() {
         let links = wiki_links::parse_wiki_links("[[Test]]");
@@ -102,5 +223,24 @@ mod tests {
     fn test_extract_linked_notes() {
         let notes = wiki_links::extract_linked_notes("[[A]] and [[B]]");
         assert_eq!(notes.len(), 2);
+    }
+    
+    #[test]
+    fn test_extract_note_name() {
+        assert_eq!(extract_note_name("knowledge/Note"), "Note");
+        assert_eq!(extract_note_name("memory:knowledge/Note"), "Note");
+        assert_eq!(extract_note_name("[[Note]]"), "Note");
+    }
+    
+    #[test]
+    fn test_resolve_note_path() {
+        let paths = vec!["knowledge/Note".to_string(), "Note".to_string()];
+        assert_eq!(resolve_note_path(paths, false), Some("Note".to_string()));
+    }
+    
+    #[test]
+    fn test_ensure_markdown_extension() {
+        assert_eq!(ensure_markdown_extension("Note"), "Note.md");
+        assert_eq!(ensure_markdown_extension("Note.md"), "Note.md");
     }
 }

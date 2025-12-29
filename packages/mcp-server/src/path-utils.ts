@@ -7,10 +7,42 @@ import {
   extractNoteName,
   normalizeNoteReference,
   generateSearchPaths,
-  validatePath,
-  fileExists,
   ensureMarkdownExtension,
-} from "@webdesserts/obsidian-memory-utils";
+} from "@webdesserts/obsidian-memory-core";
+import path from "path";
+import fs from "fs/promises";
+
+/**
+ * Validates that a file path is within the vault and safe to access
+ */
+function validatePath(vaultPath: string, relativePath: string): string {
+  // Remove leading slash if present
+  const cleanPath = relativePath.startsWith("/")
+    ? relativePath.slice(1)
+    : relativePath;
+
+  // Resolve absolute path
+  const absolutePath = path.resolve(vaultPath, cleanPath);
+
+  // Ensure path is within vault (prevent directory traversal)
+  if (!absolutePath.startsWith(path.resolve(vaultPath))) {
+    throw new Error(`Path outside vault: ${relativePath}`);
+  }
+
+  return absolutePath;
+}
+
+/**
+ * Checks if a file exists
+ */
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export interface ResolveNotePathOptions {
   /** Note reference (supports: "Note Name", "knowledge/Note", "memory:Note", "[[Note]]") */
@@ -30,10 +62,11 @@ export async function resolveNotePath(
   const { vaultPath } = context;
 
   // Normalize the reference (handles memory: URIs, [[links]], .md extensions)
-  let notePath = normalizeNoteReference(note);
+  const noteRef = normalizeNoteReference(note) as { path: string; name: string };
+  const notePath = noteRef.path;
+  const noteNameOnly = noteRef.name;
 
-  // Extract just the note name and any parent path
-  const noteNameOnly = extractNoteName(notePath);
+  // Check if path contains parent folder
   const parentPath = notePath.includes("/")
     ? notePath.substring(0, notePath.lastIndexOf("/"))
     : "";

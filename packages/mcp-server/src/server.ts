@@ -7,7 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z, ZodRawShape } from "zod";
 import { logger } from "./utils/logger.js";
-import { parseWikiLinks } from "@webdesserts/obsidian-memory-utils";
+import { parseWikiLinks } from "@webdesserts/obsidian-memory-core";
 
 /**
  * Wrapper around SDK Server that mimics McpServer.registerTool() API
@@ -102,9 +102,9 @@ export class McpServer {
 
     // Special handling for Search tool
     if (name === "Search" && args.query) {
-      const wikiLinks = parseWikiLinks(args.query);
+      const wikiLinks = parseWikiLinks(args.query) as Array<{ target: string }>;
       if (wikiLinks.length > 0) {
-        filtered.wikiLinks = wikiLinks.map(link => link.target);
+        filtered.wikiLinks = wikiLinks.map((link) => link.target);
       }
     }
 

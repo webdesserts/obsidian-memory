@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "../server.js";
 import type { ToolContext } from "../types.js";
-import { extractNoteName } from "@webdesserts/obsidian-memory-utils";
+import { extractNoteName } from "@webdesserts/obsidian-memory-core";
 import { resolveNotePath } from "../path-utils.js";
 
 /**

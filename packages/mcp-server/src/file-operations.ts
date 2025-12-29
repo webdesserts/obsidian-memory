@@ -1,6 +1,33 @@
 import fs from "fs/promises";
+import path from "path";
 import matter from "gray-matter";
-import { validatePath, fileExists, ensureMarkdownExtension } from "@webdesserts/obsidian-memory-utils";
+import { ensureMarkdownExtension } from "@webdesserts/obsidian-memory-core";
+
+/**
+ * Validates that a file path is within the vault and safe to access
+ */
+function validatePath(vaultPath: string, relativePath: string): string {
+  const cleanPath = relativePath.startsWith("/")
+    ? relativePath.slice(1)
+    : relativePath;
+  const absolutePath = path.resolve(vaultPath, cleanPath);
+  if (!absolutePath.startsWith(path.resolve(vaultPath))) {
+    throw new Error(`Path outside vault: ${relativePath}`);
+  }
+  return absolutePath;
+}
+
+/**
+ * Checks if a file exists
+ */
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export interface FileOperationsConfig {
   vaultPath: string;

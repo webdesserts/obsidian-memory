@@ -2,14 +2,8 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./dist",
-    "rootDir": "./src",
-    "paths": {
-      "@webdesserts/obsidian-memory-utils": ["../utils/src"]
-    }
+    "rootDir": "./src"
   },
-  "references": [
-    { "path": "../utils" }
-  ],
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }

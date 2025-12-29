@@ -13,7 +13,7 @@ import { GraphIndex } from "./graph/graph-index.js";
 import { MemorySystem } from "./memory/memory-system.js";
 import { EmbeddingManager } from "./embeddings/manager.js";
 import { GraphProximityManager } from "./embeddings/graph-manager.js";
-import { resolveNotePath } from "@webdesserts/obsidian-memory-utils";
+import { resolveNotePath } from "@webdesserts/obsidian-memory-core";
 import { ToolContext } from "./types.js";
 import path from "path";
 import { logger } from "./utils/logger.js";
@@ -85,7 +85,7 @@ function resolveNoteNameToPath(
   includePrivate: boolean = false
 ): string | undefined {
   const availablePaths = graphIndex.getAllNotePaths(noteName);
-  return resolveNotePath(availablePaths, { includePrivate });
+  return resolveNotePath(availablePaths, includePrivate);
 }
 
 // Build tool context with all dependencies

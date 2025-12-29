@@ -17,11 +17,12 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen.workspace = true
 console_error_panic_hook.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde-wasm-bindgen.workspace = true
 
 # Internal crates
 wiki-links = { path = "../wiki-links" }
-# obsidian-fs = { path = "../obsidian-fs" }
+obsidian-fs = { path = "../obsidian-fs" }
 # semantic-embeddings = { path = "../semantic-embeddings" }
 
 [dev-dependencies]

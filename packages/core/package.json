@@ -6,13 +6,18 @@
   "main": "pkg/obsidian_memory_core.js",
   "types": "pkg/obsidian_memory_core.d.ts",
   "files": [
-    "pkg"
+    "pkg",
+    "semantic-embeddings-pkg",
+    "models"
   ],
   "scripts": {
-    "build": "wasm-pack build --target bundler --out-dir ../../pkg crates/wasm",
+    "build": "npm run build:core && npm run build:embeddings",
+    "build:core": "wasm-pack build --target bundler --out-dir ../../pkg crates/wasm",
+    "build:embeddings": "wasm-pack build --target bundler --out-dir ../../semantic-embeddings-pkg crates/semantic-embeddings",
     "build:debug": "wasm-pack build --target bundler --dev --out-dir ../../pkg crates/wasm",
     "test": "cargo test --workspace",
-    "test:wasm": "wasm-pack test --node crates/wasm"
+    "test:wasm": "wasm-pack test --node crates/wasm",
+    "download-model": "node scripts/download-model.js"
   },
   "keywords": [
     "obsidian",

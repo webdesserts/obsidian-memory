@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import chokidar, { type FSWatcher } from "chokidar";
-import { extractLinkedNotes } from "@webdesserts/obsidian-memory-utils";
+import { extractLinkedNotes } from "@webdesserts/obsidian-memory-core";
 
 /**
  * Callback for file change events
