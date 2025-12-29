@@ -9,6 +9,7 @@ use tokio::fs;
 
 use crate::embeddings::EmbeddingManager;
 use crate::graph::GraphIndex;
+use semantic_embeddings::{Embedding, EMBEDDING_DIM};
 
 /// Regex for extracting [[wiki-links]] from query text
 static WIKI_LINK_RE: Lazy<Regex> = Lazy::new(|| {
@@ -195,15 +196,13 @@ async fn build_query_embedding(
     }
 
     // Average embeddings for all texts
-    let mut combined = vec![0.0f32; 384]; // all-MiniLM-L6-v2 dimension
+    let mut combined: Embedding = vec![0.0; EMBEDDING_DIM];
     let mut count = 0;
 
     for text in texts {
         let embedding = embeddings.get_embedding("__query__", &text).await?;
         for (i, val) in embedding.iter().enumerate() {
-            if i < combined.len() {
-                combined[i] += val;
-            }
+            combined[i] += val;
         }
         count += 1;
     }

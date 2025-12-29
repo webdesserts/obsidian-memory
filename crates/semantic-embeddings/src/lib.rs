@@ -7,6 +7,13 @@ mod model;
 pub use embedding::{cosine_similarity, find_most_similar};
 pub use model::ModelManager;
 
+/// Embedding dimension for all-MiniLM-L6-v2 model.
+/// This is determined by the model architecture's hidden size.
+pub const EMBEDDING_DIM: usize = 384;
+
+/// Type alias for an embedding vector.
+pub type Embedding = Vec<f32>;
+
 // Auto-initialize logging for debug builds
 #[cfg(feature = "debug")]
 #[ctor::ctor]
