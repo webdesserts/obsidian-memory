@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, Local, Timelike, Weekday};
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 use tokio::fs;
@@ -11,35 +11,34 @@ fn format_iso_week_date(dt: &DateTime<Local>) -> String {
     format!("{}-W{:02}-{}", iso_week.year(), iso_week.week(), weekday)
 }
 
-/// Get 3-letter day abbreviation (Mon, Tue, etc.)
-fn get_day_abbreviation(dt: &DateTime<Local>) -> &'static str {
-    match dt.weekday() {
-        chrono::Weekday::Mon => "Mon",
-        chrono::Weekday::Tue => "Tue",
-        chrono::Weekday::Wed => "Wed",
-        chrono::Weekday::Thu => "Thu",
-        chrono::Weekday::Fri => "Fri",
-        chrono::Weekday::Sat => "Sat",
-        chrono::Weekday::Sun => "Sun",
+/// Get 3-letter abbreviation for a weekday.
+fn weekday_abbreviation(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Mon => "Mon",
+        Weekday::Tue => "Tue",
+        Weekday::Wed => "Wed",
+        Weekday::Thu => "Thu",
+        Weekday::Fri => "Fri",
+        Weekday::Sat => "Sat",
+        Weekday::Sun => "Sun",
     }
+}
+
+/// Get 3-letter day abbreviation from DateTime (Mon, Tue, etc.)
+fn get_day_abbreviation(dt: &DateTime<Local>) -> &'static str {
+    weekday_abbreviation(dt.weekday())
 }
 
 /// Get day abbreviation from ISO week date (e.g., "2025-W50-1" -> "Mon")
 pub fn get_day_abbreviation_from_iso(iso_week_date: &str) -> &'static str {
-    // Parse the day number from YYYY-Www-D format
+    // Parse the day number from YYYY-Www-D format (1=Mon, 7=Sun)
     let parts: Vec<&str> = iso_week_date.split('-').collect();
     if parts.len() == 3 {
         if let Ok(day) = parts[2].parse::<u32>() {
-            return match day {
-                1 => "Mon",
-                2 => "Tue",
-                3 => "Wed",
-                4 => "Thu",
-                5 => "Fri",
-                6 => "Sat",
-                7 => "Sun",
-                _ => "???",
-            };
+            // chrono's num_days_from_monday is 0-indexed, ISO week day is 1-indexed
+            if let Some(weekday) = Weekday::try_from(day as u8 - 1).ok() {
+                return weekday_abbreviation(weekday);
+            }
         }
     }
     "???"
