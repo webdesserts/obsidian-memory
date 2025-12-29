@@ -29,15 +29,15 @@ cargo build --release
 # Binary is at: target/release/obsidian-memory
 ```
 
-### Download ML Model
+### ML Model
 
-The semantic search requires the all-MiniLM-L6-v2 model:
+The semantic search uses the all-MiniLM-L6-v2 model (~87MB). The model is **automatically downloaded** on first search to `$VAULT/.obsidian/models/all-MiniLM-L6-v2/`.
 
+Alternatively, for a shared location or offline setup:
 ```bash
 node scripts/download-model.js
 ```
-
-This downloads ~87MB of model files to `models/all-MiniLM-L6-v2/`.
+This downloads to `models/all-MiniLM-L6-v2/` in the project root (requires updating the code to use this path).
 
 ## Usage
 
@@ -108,9 +108,10 @@ cargo build --release
 | GetNote | Get metadata and links for a note |
 | UpdateFrontmatter | Update note frontmatter |
 | Remember | Load session context (Working Memory, Log, projects) |
-| Search | Semantic search with graph boosting (coming soon) |
-| WriteLogs | Bulk replace day's log entries (coming soon) |
-| Reflect | Memory consolidation prompt (coming soon) |
+| Search | Semantic search with graph boosting |
+| WriteLogs | Bulk replace day's log entries |
+| Reflect | Memory consolidation prompt |
+| LoadPrivateMemory | Load private notes (requires consent) |
 
 ## License
 
