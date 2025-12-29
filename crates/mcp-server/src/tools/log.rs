@@ -45,12 +45,7 @@ pub fn get_day_abbreviation_from_iso(iso_week_date: &str) -> &'static str {
     "???"
 }
 
-/// Format ISO week date (unused but kept for API symmetry with write_logs)
-pub fn format_iso_week_date_from_str(_s: &str) -> String {
-    // This function is a no-op since the input is already formatted
-    // Kept for API consistency
-    _s.to_string()
-}
+
 
 /// Format time as 12-hour clock (h:MM AM/PM)
 fn format_12_hour_time(dt: &DateTime<Local>) -> String {

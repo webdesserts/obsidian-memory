@@ -16,25 +16,27 @@ pub async fn execute(
     let note_path = ensure_markdown_extension(relative_path);
     let absolute_path = vault_path.join(&note_path);
 
-    // Validate path is within vault (no directory traversal)
+    // Validate path is within vault BEFORE reading (prevent directory traversal)
     let canonical_vault = vault_path
         .canonicalize()
         .map_err(|e| ErrorData::internal_error(format!("Invalid vault path: {}", e), None))?;
 
-    // Read existing file
-    let raw_content = fs::read_to_string(&absolute_path)
+    // Canonicalize the target path and verify it's within vault
+    let canonical_file = absolute_path
+        .canonicalize()
+        .map_err(|e| ErrorData::invalid_params(format!("Invalid path: {}", e), None))?;
+
+    if !canonical_file.starts_with(&canonical_vault) {
+        return Err(ErrorData::invalid_params(
+            format!("Path outside vault: {}", relative_path),
+            None,
+        ));
+    }
+
+    // Read existing file (now safe - path validated)
+    let raw_content = fs::read_to_string(&canonical_file)
         .await
         .map_err(|e| ErrorData::invalid_params(format!("Failed to read note: {}", e), None))?;
-
-    // Validate path after reading (ensures the resolved path is within vault)
-    if let Ok(canonical_file) = absolute_path.canonicalize() {
-        if !canonical_file.starts_with(&canonical_vault) {
-            return Err(ErrorData::invalid_params(
-                format!("Path outside vault: {}", relative_path),
-                None,
-            ));
-        }
-    }
 
     // Parse existing frontmatter
     let parsed = parse_frontmatter(&raw_content);

@@ -55,10 +55,12 @@ impl EmbeddingManager {
 
     /// Initialize the embedding manager by loading the model.
     ///
-    /// Downloads the model if not present.
+    /// Downloads the model if not present. Uses write lock for the entire
+    /// operation to prevent race conditions with concurrent initialization.
     pub async fn initialize(&self) -> Result<()> {
-        // Check if already loaded
-        if *self.model_loaded.read().await {
+        // Hold write lock for entire initialization to prevent TOCTOU race
+        let mut loaded = self.model_loaded.write().await;
+        if *loaded {
             return Ok(());
         }
 
@@ -70,7 +72,7 @@ impl EmbeddingManager {
             .load_model_from_dir(&self.model_dir)
             .context("Failed to load embedding model")?;
 
-        *self.model_loaded.write().await = true;
+        *loaded = true;
 
         // Load cache from disk
         self.load_cache().await?;

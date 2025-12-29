@@ -1,7 +1,9 @@
 pub mod get_current_datetime;
 pub mod get_note;
 pub mod get_weekly_note;
+pub mod load_private_memory;
 pub mod log;
+pub mod reflect;
 pub mod remember;
 pub mod search;
 pub mod update_frontmatter;

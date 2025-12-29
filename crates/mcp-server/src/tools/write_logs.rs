@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs;
 
-use super::log::{format_iso_week_date_from_str, get_day_abbreviation_from_iso};
+use super::log::get_day_abbreviation_from_iso;
 
 /// Replace an entire day's log entries with new entries.
 pub async fn execute(
@@ -176,14 +176,14 @@ fn is_valid_iso_week_date(s: &str) -> bool {
     if !parts[1].starts_with('W') || parts[1].len() != 3 {
         return false;
     }
-    let week: u32 = match parts[1][1..].parse() {
-        Ok(w) if (1..=53).contains(&w) => w,
+    match parts[1][1..].parse::<u32>() {
+        Ok(w) if (1..=53).contains(&w) => {}
         _ => return false,
     };
 
     // Day: 1-7
-    let day: u32 = match parts[2].parse() {
-        Ok(d) if (1..=7).contains(&d) => d,
+    match parts[2].parse::<u32>() {
+        Ok(d) if (1..=7).contains(&d) => {}
         _ => return false,
     };
 

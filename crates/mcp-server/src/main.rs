@@ -70,6 +70,21 @@ pub struct WriteLogsParams {
     pub entries: std::collections::HashMap<String, String>,
 }
 
+/// Parameters for the Reflect tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReflectParams {
+    /// Include private notes in reflection (default: false)
+    #[serde(default, rename = "includePrivate")]
+    pub include_private: bool,
+}
+
+/// Parameters for the LoadPrivateMemory tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LoadPrivateMemoryParams {
+    /// Reason for loading private memory
+    pub reason: String,
+}
+
 /// The main MCP server state, holding configuration and shared resources.
 #[derive(Clone)]
 pub struct MemoryServer {
@@ -172,6 +187,26 @@ impl MemoryServer {
             params.0.debug,
         )
         .await
+    }
+
+    #[tool(description = "Replace an entire day's log entries with consolidated/compacted entries. Use this ONLY during memory consolidation to rewrite or summarize a day's logs. For adding new entries during active work, use the Log tool instead (it's simpler and doesn't require reading the log first). This tool automatically formats entries with correct timestamps, en-dashes, and chronological sorting. Pass an empty object to delete the entire day section (header and all entries).")]
+    async fn write_logs(&self, params: Parameters<WriteLogsParams>) -> Result<CallToolResult, ErrorData> {
+        tools::write_logs::execute(
+            &self.config.vault_path,
+            &params.0.iso_week_date,
+            params.0.entries,
+        )
+        .await
+    }
+
+    #[tool(description = "Review active context (Log.md, Working Memory.md, current weekly journal, project notes) and consolidate content into permanent storage. Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. Returns detailed consolidation instructions.")]
+    async fn reflect(&self, params: Parameters<ReflectParams>) -> Result<CallToolResult, ErrorData> {
+        tools::reflect::execute(params.0.include_private)
+    }
+
+    #[tool(description = "Load private memory indexes (requires explicit user consent)")]
+    async fn load_private_memory(&self, params: Parameters<LoadPrivateMemoryParams>) -> Result<CallToolResult, ErrorData> {
+        tools::load_private_memory::execute(&self.config.vault_path, &params.0.reason).await
     }
 }
 
