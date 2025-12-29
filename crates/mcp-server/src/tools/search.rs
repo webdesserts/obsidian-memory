@@ -216,54 +216,30 @@ async fn get_all_notes(
     notes
 }
 
-/// Compute graph proximity score using connected notes.
+/// Compute graph proximity score using Personalized PageRank.
 ///
-/// Returns a score 0-1 based on how many of the seed notes are connected
-/// to the target note through wiki-links.
+/// For single seed: returns PageRank score from that seed.
+/// For multiple seeds: computes PageRank from each seed and multiplies scores
+/// (intersection - note must be close to ALL seeds).
 fn compute_graph_proximity(graph: &GraphIndex, seeds: &[String], target: &str) -> f32 {
+    use crate::graph::pagerank::personalized_pagerank;
+    
     if seeds.is_empty() {
         return 0.0;
     }
 
-    // Count how many seeds are connected to the target
-    let mut connected = 0;
+    let mut combined_score = 1.0;
+    
     for seed in seeds {
-        // Check forward links from seed
-        if let Some(links) = graph.get_forward_links(seed) {
-            if links.contains(target) {
-                connected += 1;
-                continue;
-            }
-        }
-
-        // Check backlinks from seed
-        if let Some(backlinks) = graph.get_backlinks(seed) {
-            if backlinks.contains(target) {
-                connected += 1;
-                continue;
-            }
-        }
-
-        // Check if target is in seed's neighborhood (2-hop)
-        let neighborhood = graph.get_neighborhood(seed);
-        for neighbor in &neighborhood {
-            if let Some(neighbor_links) = graph.get_forward_links(neighbor) {
-                if neighbor_links.contains(target) {
-                    connected += 1;
-                    break;
-                }
-            }
-            if let Some(neighbor_backlinks) = graph.get_backlinks(neighbor) {
-                if neighbor_backlinks.contains(target) {
-                    connected += 1;
-                    break;
-                }
-            }
-        }
+        let scores = personalized_pagerank(graph, seed);
+        let score = scores.get(target).copied().unwrap_or(0.0) as f32;
+        
+        // Multiply scores for intersection (must be close to ALL seeds)
+        combined_score *= score;
     }
-
-    // Normalize by number of seeds
-    connected as f32 / seeds.len() as f32 * 0.5 // Cap at 0.5 boost factor
+    
+    // Cap at 1.0 (100% boost)
+    combined_score.min(1.0)
 }
 
 /// Format search results for output.

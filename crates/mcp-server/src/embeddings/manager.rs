@@ -197,12 +197,27 @@ impl EmbeddingManager {
         }
 
         let json = fs::read_to_string(&self.cache_path).await?;
-        let loaded: HashMap<String, CacheEntry> = serde_json::from_str(&json)?;
+        
+        // Try to load cache, but if format is incompatible (old cache from TypeScript),
+        // just start fresh rather than failing
+        match serde_json::from_str::<HashMap<String, CacheEntry>>(&json) {
+            Ok(loaded) => {
+                let mut cache = self.cache.write().await;
+                *cache = loaded;
+                tracing::debug!("Loaded embedding cache ({} entries)", cache.len());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load embedding cache (format incompatible): {}. Starting with empty cache.",
+                    e
+                );
+                // Delete the incompatible cache file
+                if let Err(del_err) = fs::remove_file(&self.cache_path).await {
+                    tracing::warn!("Failed to delete incompatible cache: {}", del_err);
+                }
+            }
+        }
 
-        let mut cache = self.cache.write().await;
-        *cache = loaded;
-
-        tracing::debug!("Loaded embedding cache ({} entries)", cache.len());
         Ok(())
     }
 
