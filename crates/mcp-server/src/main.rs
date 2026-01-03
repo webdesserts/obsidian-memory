@@ -318,9 +318,11 @@ impl MemoryServer {
             })
             .collect();
 
+        let graph = self.graph.read().await;
         tools::edit_note::execute(
             &self.config.vault_path,
             self.storage.as_ref(),
+            &graph,
             &self.read_whitelist,
             ClientId::stdio(),
             &params.0.note,

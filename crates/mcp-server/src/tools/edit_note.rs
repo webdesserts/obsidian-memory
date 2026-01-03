@@ -8,6 +8,7 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
+use crate::graph::GraphIndex;
 use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
 
 /// A single edit operation.
@@ -70,6 +71,39 @@ fn truncate_for_display(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Resolve a note reference to a memory URI (same logic as read_note).
+///
+/// Handles wiki-links, memory URIs, and plain names.
+/// Returns (memory_uri, exists).
+async fn resolve_note_uri<S: Storage>(
+    storage: &S,
+    graph: &GraphIndex,
+    note_ref: &str,
+) -> Result<(String, bool), StorageError> {
+    let normalized = normalize_note_reference(note_ref);
+
+    // First check if the reference includes a path
+    if normalized.path.contains('/') {
+        // Try the exact path
+        if storage.exists(&normalized.path).await? {
+            return Ok((normalized.path, true));
+        }
+    }
+
+    // Try to find in graph index by name
+    if let Some(graph_path) = graph.get_path(&normalized.name) {
+        let uri = graph_path
+            .to_string_lossy()
+            .strip_suffix(".md")
+            .unwrap_or(&graph_path.to_string_lossy())
+            .to_string();
+        return Ok((uri, true));
+    }
+
+    // Not found - return the normalized path
+    Ok((normalized.path, false))
+}
+
 /// Execute the EditNote tool.
 ///
 /// Makes surgical text replacements using oldText/newText pairs.
@@ -78,19 +112,31 @@ fn truncate_for_display(s: &str, max_len: usize) -> String {
 pub async fn execute<S: Storage>(
     vault_path: &Path,
     storage: &S,
+    graph: &GraphIndex,
     read_whitelist: &RwLock<ReadWhitelist>,
     client_id: ClientId,
     note: &str,
     edits: Vec<Edit>,
     dry_run: bool,
 ) -> Result<CallToolResult, ErrorData> {
+    // Resolve the note reference using the same logic as read_note
+    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
+        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
+    })?;
+
+    if !exists {
+        return Err(ErrorData::invalid_params(
+            format!("Note not found: {}", note),
+            None,
+        ));
+    }
+
     let normalized = normalize_note_reference(note);
-    let uri = &normalized.path;
 
     // Check whitelist (must read before edit)
     {
         let whitelist = read_whitelist.read().await;
-        if !whitelist.can_write(&client_id, &PathBuf::from(uri)) {
+        if !whitelist.can_write(&client_id, &PathBuf::from(&uri)) {
             return Err(ErrorData::invalid_params(
                 format!(
                     "Must read note before editing: {}\n\n\
@@ -103,7 +149,7 @@ pub async fn execute<S: Storage>(
     }
 
     // Read current content
-    let (content, _metadata) = storage.read(uri).await.map_err(|e| match e {
+    let (content, _metadata) = storage.read(&uri).await.map_err(|e| match e {
         StorageError::NotFound { uri } => ErrorData::invalid_params(
             format!(
                 "Note not found: {}. Cannot edit a note that doesn't exist.",
@@ -120,7 +166,7 @@ pub async fn execute<S: Storage>(
     })?;
 
     let file_path = vault_path
-        .join(ensure_markdown_extension(uri))
+        .join(ensure_markdown_extension(&uri))
         .to_string_lossy()
         .to_string();
 
@@ -137,14 +183,14 @@ pub async fn execute<S: Storage>(
     }
 
     // Write the modified content
-    storage.write(uri, &modified, None).await.map_err(|e| {
+    storage.write(&uri, &modified, None).await.map_err(|e| {
         ErrorData::internal_error(format!("Failed to write note: {}", e), None)
     })?;
 
     // Keep whitelist valid after edit (client knows the content)
     {
         let mut whitelist = read_whitelist.write().await;
-        whitelist.mark_read(client_id, PathBuf::from(uri));
+        whitelist.mark_read(client_id, PathBuf::from(&uri));
     }
 
     let text = format!(
@@ -152,7 +198,7 @@ pub async fn execute<S: Storage>(
          **URI:** memory:{}\n\
          **File:** {}\n\n\
          ## Changes\n\n{}",
-        normalized.name, uri, file_path, diff
+        normalized.name, &uri, file_path, diff
     );
 
     Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -162,14 +208,16 @@ pub async fn execute<S: Storage>(
 mod tests {
     use super::*;
     use crate::storage::FileStorage;
+    use std::collections::HashSet;
     use tempfile::TempDir;
     use tokio::fs;
 
-    async fn create_test_env() -> (TempDir, FileStorage, RwLock<ReadWhitelist>) {
+    async fn create_test_env() -> (TempDir, FileStorage, GraphIndex, RwLock<ReadWhitelist>) {
         let temp_dir = TempDir::new().unwrap();
         let storage = FileStorage::new(temp_dir.path().to_path_buf());
+        let graph = GraphIndex::new();
         let whitelist = RwLock::new(ReadWhitelist::new());
-        (temp_dir, storage, whitelist)
+        (temp_dir, storage, graph, whitelist)
     }
 
     async fn mark_readable(whitelist: &RwLock<ReadWhitelist>, uri: &str) {
@@ -179,11 +227,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_requires_read_first() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         fs::write(temp_dir.path().join("test.md"), "Hello, world!")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let edits = vec![Edit {
             old_text: "world".to_string(),
@@ -194,6 +243,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -209,11 +259,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_single_replacement() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         fs::write(temp_dir.path().join("test.md"), "Hello, world!")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
         mark_readable(&whitelist, "test").await;
 
         let edits = vec![Edit {
@@ -224,6 +275,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -253,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_multiple_replacements() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         fs::write(
             temp_dir.path().join("test.md"),
@@ -261,6 +313,7 @@ mod tests {
         )
         .await
         .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
         mark_readable(&whitelist, "test").await;
 
         let edits = vec![
@@ -277,6 +330,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -304,11 +358,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_fails_if_text_not_found() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         fs::write(temp_dir.path().join("test.md"), "Hello, world!")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
         mark_readable(&whitelist, "test").await;
 
         let edits = vec![Edit {
@@ -319,6 +374,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -334,11 +390,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_fails_if_text_ambiguous() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         fs::write(temp_dir.path().join("test.md"), "foo bar foo")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
         mark_readable(&whitelist, "test").await;
 
         let edits = vec![Edit {
@@ -349,6 +406,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -364,11 +422,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_dry_run() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         fs::write(temp_dir.path().join("test.md"), "Hello, world!")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
         mark_readable(&whitelist, "test").await;
 
         let edits = vec![Edit {
@@ -379,6 +438,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -407,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_nonexistent_note() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
         mark_readable(&whitelist, "nonexistent").await;
 
         let edits = vec![Edit {
@@ -418,6 +478,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "nonexistent",
