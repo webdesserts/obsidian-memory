@@ -1,10 +1,15 @@
+pub mod delete_note;
+pub mod edit_note;
 pub mod get_current_datetime;
-pub mod get_note;
+pub mod get_note_info;
 pub mod get_weekly_note;
 pub mod load_private_memory;
 pub mod log;
+pub mod move_note;
+pub mod read_note;
 pub mod reflect;
 pub mod remember;
 pub mod search;
 pub mod update_frontmatter;
 pub mod write_logs;
+pub mod write_note;

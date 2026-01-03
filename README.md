@@ -17,16 +17,22 @@ A pure Rust MCP (Model Context Protocol) server for graph-aware memory integrati
 - Rust toolchain (install via [rustup.rs](https://rustup.rs))
 - Obsidian vault
 
-### Build
+### Install
 
 ```bash
 git clone https://github.com/webdesserts/obsidian-memory.git
 cd obsidian-memory
 
-# Build release binary
-cargo build --release
+# Install to ~/.cargo/bin (must be in your PATH)
+cargo install --path .
 
-# Binary is at: target/release/obsidian-memory
+# Verify installation
+obsidian-memory --help
+```
+
+In the future, you'll be able to install directly from crates.io:
+```bash
+cargo install obsidian-memory  # Not yet published
 ```
 
 ### ML Model
@@ -48,10 +54,18 @@ This downloads to `models/all-MiniLM-L6-v2/` in the project root (requires updat
 ### Running the Server
 
 ```bash
-OBSIDIAN_VAULT_PATH=/path/to/vault ./target/release/obsidian-memory
+OBSIDIAN_VAULT_PATH=/path/to/vault obsidian-memory
 ```
 
-### OpenCode / Claude Code Configuration
+### Claude Code Configuration
+
+```bash
+claude mcp add obsidian-memory --scope user \
+  -e OBSIDIAN_VAULT_PATH=/path/to/vault \
+  -- obsidian-memory
+```
+
+### OpenCode Configuration
 
 Add to `~/.config/opencode/opencode.json`:
 
@@ -60,7 +74,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "obsidian-memory": {
       "type": "local",
-      "command": ["/path/to/obsidian-memory/target/release/obsidian-memory"],
+      "command": ["obsidian-memory"],
       "environment": {
         "OBSIDIAN_VAULT_PATH": "/path/to/vault"
       },

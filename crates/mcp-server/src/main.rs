@@ -15,12 +15,14 @@ mod config;
 mod embeddings;
 mod graph;
 mod projects;
+mod storage;
 mod tools;
 mod watcher;
 
 use config::Config;
 use embeddings::EmbeddingManager;
 use graph::GraphIndex;
+use storage::{ClientId, FileStorage, ReadWhitelist};
 use watcher::VaultWatcher;
 
 /// Parameters for the Log tool
@@ -31,9 +33,9 @@ pub struct LogParams {
     pub content: String,
 }
 
-/// Parameters for the GetNote tool
+/// Parameters for the GetNoteInfo tool
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetNoteParams {
+pub struct GetNoteInfoParams {
     /// Note reference - supports: "memory:Note Name", "memory:knowledge/Note Name", "knowledge/Note Name", "[[Note Name]]"
     pub note: String,
 }
@@ -85,12 +87,70 @@ pub struct LoadPrivateMemoryParams {
     pub reason: String,
 }
 
+/// Parameters for the ReadNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadNoteParams {
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
+}
+
+/// Parameters for the WriteNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteNoteParams {
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
+    /// The content to write to the note
+    pub content: String,
+}
+
+/// A single edit operation for the EditNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditOperation {
+    /// Text to search for - must match exactly and appear only once
+    #[serde(rename = "oldText")]
+    pub old_text: String,
+    /// Text to replace with
+    #[serde(rename = "newText")]
+    pub new_text: String,
+}
+
+/// Parameters for the EditNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditNoteParams {
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
+    /// Array of edit operations. Each oldText must appear exactly once in the note.
+    pub edits: Vec<EditOperation>,
+    /// Preview changes without applying them (default: false)
+    #[serde(default, rename = "dryRun")]
+    pub dry_run: bool,
+}
+
+/// Parameters for the DeleteNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteNoteParams {
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
+}
+
+/// Parameters for the MoveNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MoveNoteParams {
+    /// Source note reference
+    pub from: String,
+    /// Destination note reference
+    pub to: String,
+}
+
 /// The main MCP server state, holding configuration and shared resources.
 #[derive(Clone)]
 pub struct MemoryServer {
     config: Arc<Config>,
     graph: Arc<RwLock<GraphIndex>>,
     embeddings: Arc<EmbeddingManager>,
+    storage: Arc<FileStorage>,
+    /// Tracks which notes have been read, enabling "must read before write" checks.
+    read_whitelist: Arc<RwLock<ReadWhitelist>>,
     tool_router: ToolRouter<Self>,
     /// File watcher handle - kept alive for the lifetime of the server.
     /// Wrapped in Arc for Clone, Option for tests that don't need watching.
@@ -110,11 +170,18 @@ impl MemoryServer {
         // Create embedding manager (model download happens lazily on first search)
         let embeddings = Arc::new(EmbeddingManager::new(&config.vault_path));
 
-        // Start file watcher to keep graph index and embeddings up to date
+        // Create storage backend
+        let storage = Arc::new(FileStorage::new(config.vault_path.clone()));
+
+        // Create read whitelist for "must read before write" tracking
+        let read_whitelist = Arc::new(RwLock::new(ReadWhitelist::new()));
+
+        // Start file watcher to keep graph index, embeddings, and whitelist up to date
         let watcher = match VaultWatcher::start(
             config.vault_path.clone(),
             graph.clone(),
             embeddings.clone(),
+            read_whitelist.clone(),
         ) {
             Ok(w) => {
                 tracing::info!("File watcher started successfully");
@@ -130,6 +197,8 @@ impl MemoryServer {
             config: Arc::new(config),
             graph,
             embeddings,
+            storage,
+            read_whitelist,
             tool_router: Self::tool_router(),
             watcher,
         })
@@ -150,10 +219,10 @@ impl MemoryServer {
         tools::get_weekly_note::execute()
     }
 
-    #[tool(description = "Get metadata and graph connections for a note. Returns frontmatter, file paths, and links/backlinks. Use Read tool to get content.")]
-    async fn get_note(&self, params: Parameters<GetNoteParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(description = "Get metadata and graph connections for a note. Returns frontmatter, file paths, and links/backlinks. Use ReadNote tool to get content.")]
+    async fn get_note_info(&self, params: Parameters<GetNoteInfoParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph.read().await;
-        tools::get_note::execute(
+        tools::get_note_info::execute(
             &self.config.vault_path,
             &self.config.vault_name,
             &graph,
@@ -211,6 +280,76 @@ impl MemoryServer {
     #[tool(description = "Load private memory indexes (requires explicit user consent)")]
     async fn load_private_memory(&self, params: Parameters<LoadPrivateMemoryParams>) -> Result<CallToolResult, ErrorData> {
         tools::load_private_memory::execute(&self.config.vault_path, &params.0.reason).await
+    }
+
+    #[tool(description = "Read the complete contents of a note. Marks the note as readable for subsequent writes. Use this before WriteNote or EditNote to see current content.")]
+    async fn read_note(&self, params: Parameters<ReadNoteParams>) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph.read().await;
+        tools::read_note::execute(
+            self.storage.as_ref(),
+            &graph,
+            &self.read_whitelist,
+            ClientId::stdio(),
+            &params.0.note,
+        )
+        .await
+    }
+
+    #[tool(description = "Create a new note or overwrite an existing note. For existing notes, you must call ReadNote first to see the current content and confirm the overwrite. Uses atomic writes for safety.")]
+    async fn write_note(&self, params: Parameters<WriteNoteParams>) -> Result<CallToolResult, ErrorData> {
+        tools::write_note::execute(
+            &self.config.vault_path,
+            self.storage.as_ref(),
+            &self.read_whitelist,
+            ClientId::stdio(),
+            &params.0.note,
+            &params.0.content,
+        )
+        .await
+    }
+
+    #[tool(description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. You must call ReadNote first. Use dryRun to preview changes without modifying the file.")]
+    async fn edit_note(&self, params: Parameters<EditNoteParams>) -> Result<CallToolResult, ErrorData> {
+        let edits: Vec<tools::edit_note::Edit> = params.0.edits
+            .into_iter()
+            .map(|e| tools::edit_note::Edit {
+                old_text: e.old_text,
+                new_text: e.new_text,
+            })
+            .collect();
+
+        tools::edit_note::execute(
+            &self.config.vault_path,
+            self.storage.as_ref(),
+            &self.read_whitelist,
+            ClientId::stdio(),
+            &params.0.note,
+            edits,
+            params.0.dry_run,
+        )
+        .await
+    }
+
+    #[tool(description = "Permanently delete a note from the vault. Returns an error if the note doesn't exist.")]
+    async fn delete_note(&self, params: Parameters<DeleteNoteParams>) -> Result<CallToolResult, ErrorData> {
+        tools::delete_note::execute(
+            &self.config.vault_path,
+            self.storage.as_ref(),
+            &params.0.note,
+        )
+        .await
+    }
+
+    #[tool(description = "Move or rename a note. Automatically updates wiki-links in all notes that reference the moved note. Fails if destination already exists.")]
+    async fn move_note(&self, params: Parameters<MoveNoteParams>) -> Result<CallToolResult, ErrorData> {
+        tools::move_note::execute(
+            &self.config.vault_path,
+            self.storage.as_ref(),
+            &self.graph,
+            &params.0.from,
+            &params.0.to,
+        )
+        .await
     }
 }
 
