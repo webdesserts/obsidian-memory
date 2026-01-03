@@ -1,45 +1,12 @@
 //! ReadNote tool - read note content and mark as readable for writes.
 
-use obsidian_fs::normalize_note_reference;
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
+use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
 use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
-
-/// Resolve a note reference to a memory URI.
-///
-/// Handles wiki-links, memory URIs, and plain names.
-/// Returns (memory_uri, exists).
-async fn resolve_note_uri<S: Storage>(
-    storage: &S,
-    graph: &GraphIndex,
-    note_ref: &str,
-) -> Result<(String, bool), StorageError> {
-    let normalized = normalize_note_reference(note_ref);
-
-    // First check if the reference includes a path
-    if normalized.path.contains('/') {
-        // Try the exact path
-        if storage.exists(&normalized.path).await? {
-            return Ok((normalized.path, true));
-        }
-    }
-
-    // Try to find in graph index by name
-    if let Some(graph_path) = graph.get_path(&normalized.name) {
-        let uri = graph_path
-            .to_string_lossy()
-            .strip_suffix(".md")
-            .unwrap_or(&graph_path.to_string_lossy())
-            .to_string();
-        return Ok((uri, true));
-    }
-
-    // Not found - return the normalized path
-    Ok((normalized.path, false))
-}
 
 /// Execute the ReadNote tool.
 ///

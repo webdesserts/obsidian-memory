@@ -8,8 +8,9 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
+use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
-use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
+use crate::storage::{ClientId, ReadWhitelist, Storage};
 
 /// A single edit operation.
 #[derive(Debug, Clone)]
@@ -71,39 +72,6 @@ fn truncate_for_display(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Resolve a note reference to a memory URI (same logic as read_note).
-///
-/// Handles wiki-links, memory URIs, and plain names.
-/// Returns (memory_uri, exists).
-async fn resolve_note_uri<S: Storage>(
-    storage: &S,
-    graph: &GraphIndex,
-    note_ref: &str,
-) -> Result<(String, bool), StorageError> {
-    let normalized = normalize_note_reference(note_ref);
-
-    // First check if the reference includes a path
-    if normalized.path.contains('/') {
-        // Try the exact path
-        if storage.exists(&normalized.path).await? {
-            return Ok((normalized.path, true));
-        }
-    }
-
-    // Try to find in graph index by name
-    if let Some(graph_path) = graph.get_path(&normalized.name) {
-        let uri = graph_path
-            .to_string_lossy()
-            .strip_suffix(".md")
-            .unwrap_or(&graph_path.to_string_lossy())
-            .to_string();
-        return Ok((uri, true));
-    }
-
-    // Not found - return the normalized path
-    Ok((normalized.path, false))
-}
-
 /// Execute the EditNote tool.
 ///
 /// Makes surgical text replacements using oldText/newText pairs.
@@ -148,16 +116,9 @@ pub async fn execute<S: Storage>(
         }
     }
 
-    // Read current content
-    let (content, _metadata) = storage.read(&uri).await.map_err(|e| match e {
-        StorageError::NotFound { uri } => ErrorData::invalid_params(
-            format!(
-                "Note not found: {}. Cannot edit a note that doesn't exist.",
-                uri
-            ),
-            None,
-        ),
-        _ => ErrorData::internal_error(format!("Failed to read note: {}", e), None),
+    // Read current content (note existence already verified by resolve_note_uri)
+    let (content, _metadata) = storage.read(&uri).await.map_err(|e| {
+        ErrorData::internal_error(format!("Failed to read note: {}", e), None)
     })?;
 
     // Apply edits
@@ -490,5 +451,137 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("Note not found"));
+    }
+
+    // Integration tests - test the actual ReadNote→EditNote flow
+
+    #[tokio::test]
+    async fn test_read_then_edit_subdirectory_note_by_name() {
+        // This is the bug scenario: note in subdirectory, referenced by name only
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+
+        // Create note in subdirectory
+        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
+        fs::write(
+            temp_dir.path().join("knowledge/My Note.md"),
+            "Hello, world!",
+        )
+        .await
+        .unwrap();
+        graph.update_note(
+            "My Note",
+            PathBuf::from("knowledge/My Note.md"),
+            HashSet::new(),
+        );
+
+        let client = ClientId::stdio();
+
+        // Step 1: ReadNote by name only (not full path)
+        let read_result = super::super::read_note::execute(
+            &storage,
+            &graph,
+            &whitelist,
+            client.clone(),
+            "My Note", // Just the name, not "knowledge/My Note"
+        )
+        .await
+        .expect("ReadNote should succeed");
+
+        let text = read_result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+        assert_eq!(text, "Hello, world!");
+
+        // Step 2: EditNote by name only (should use same resolution as ReadNote)
+        let edits = vec![Edit {
+            old_text: "world".to_string(),
+            new_text: "Rust".to_string(),
+        }];
+
+        let edit_result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            &whitelist,
+            client,
+            "My Note", // Same name-only reference
+            edits,
+            false,
+        )
+        .await
+        .expect("EditNote should succeed after ReadNote");
+
+        let edit_text = edit_result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+        assert!(edit_text.contains("Edited note"));
+
+        // Verify the file was actually modified
+        let content = fs::read_to_string(temp_dir.path().join("knowledge/My Note.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "Hello, Rust!");
+    }
+
+    #[tokio::test]
+    async fn test_read_then_edit_with_wiki_link_syntax() {
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+
+        // Create note in subdirectory
+        fs::create_dir(temp_dir.path().join("projects")).await.unwrap();
+        fs::write(
+            temp_dir.path().join("projects/foo-bar.md"),
+            "Original content",
+        )
+        .await
+        .unwrap();
+        graph.update_note(
+            "foo-bar",
+            PathBuf::from("projects/foo-bar.md"),
+            HashSet::new(),
+        );
+
+        let client = ClientId::stdio();
+
+        // ReadNote with wiki-link syntax
+        super::super::read_note::execute(
+            &storage,
+            &graph,
+            &whitelist,
+            client.clone(),
+            "[[foo-bar]]",
+        )
+        .await
+        .expect("ReadNote should succeed");
+
+        // EditNote with wiki-link syntax
+        let edits = vec![Edit {
+            old_text: "Original".to_string(),
+            new_text: "Modified".to_string(),
+        }];
+
+        execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            &whitelist,
+            client,
+            "[[foo-bar]]",
+            edits,
+            false,
+        )
+        .await
+        .expect("EditNote should succeed with wiki-link syntax");
+
+        let content = fs::read_to_string(temp_dir.path().join("projects/foo-bar.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "Modified content");
     }
 }

@@ -1,3 +1,4 @@
+mod common;
 pub mod delete_note;
 pub mod edit_note;
 pub mod get_current_datetime;

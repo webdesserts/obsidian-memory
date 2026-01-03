@@ -5,6 +5,8 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
+use super::common::resolve_note_uri;
+use crate::graph::GraphIndex;
 use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
 
 /// Execute the WriteNote tool.
@@ -14,23 +16,23 @@ use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
 pub async fn execute<S: Storage>(
     vault_path: &Path,
     storage: &S,
+    graph: &GraphIndex,
     read_whitelist: &RwLock<ReadWhitelist>,
     client_id: ClientId,
     note: &str,
     content: &str,
 ) -> Result<CallToolResult, ErrorData> {
     let normalized = normalize_note_reference(note);
-    let uri = &normalized.path;
 
-    // Check if note exists
-    let exists = storage.exists(uri).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to check note existence: {}", e), None)
+    // Resolve the note reference using the graph index
+    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
+        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
     })?;
 
     // For existing notes, check whitelist (must read before write)
     if exists {
         let whitelist = read_whitelist.read().await;
-        if !whitelist.can_write(&client_id, &PathBuf::from(uri)) {
+        if !whitelist.can_write(&client_id, &PathBuf::from(&uri)) {
             return Err(ErrorData::invalid_params(
                 format!(
                     "Must read note before writing: {}\n\n\
@@ -43,7 +45,7 @@ pub async fn execute<S: Storage>(
     }
 
     // Attempt to write
-    let _result = storage.write(uri, content, None).await.map_err(|e| match e {
+    let _result = storage.write(&uri, content, None).await.map_err(|e| match e {
         StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
             format!(
                 "Parent directory doesn't exist for '{}': {}. \
@@ -60,11 +62,11 @@ pub async fn execute<S: Storage>(
     // (the client has the current content since they just wrote it)
     {
         let mut whitelist = read_whitelist.write().await;
-        whitelist.mark_read(client_id, PathBuf::from(uri));
+        whitelist.mark_read(client_id, PathBuf::from(&uri));
     }
 
     let file_path = vault_path
-        .join(ensure_markdown_extension(uri))
+        .join(ensure_markdown_extension(&uri))
         .to_string_lossy()
         .to_string();
 
@@ -75,7 +77,7 @@ pub async fn execute<S: Storage>(
          **URI:** memory:{}\n\
          **File:** {}\n\n\
          Content written successfully ({} bytes).",
-        action, normalized.name, uri, file_path, content.len()
+        action, normalized.name, &uri, file_path, content.len()
     );
 
     Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -85,23 +87,26 @@ pub async fn execute<S: Storage>(
 mod tests {
     use super::*;
     use crate::storage::FileStorage;
+    use std::collections::HashSet;
     use tempfile::TempDir;
     use tokio::fs;
 
-    async fn create_test_env() -> (TempDir, FileStorage, RwLock<ReadWhitelist>) {
+    async fn create_test_env() -> (TempDir, FileStorage, GraphIndex, RwLock<ReadWhitelist>) {
         let temp_dir = TempDir::new().unwrap();
         let storage = FileStorage::new(temp_dir.path().to_path_buf());
+        let graph = GraphIndex::new();
         let whitelist = RwLock::new(ReadWhitelist::new());
-        (temp_dir, storage, whitelist)
+        (temp_dir, storage, graph, whitelist)
     }
 
     #[tokio::test]
     async fn test_write_new_note() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
 
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -131,17 +136,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_existing_requires_read_first() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         // Create existing note
         fs::write(temp_dir.path().join("test.md"), "Existing content")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         // Try to write without reading first
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "test",
@@ -156,12 +163,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_existing_after_read() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         // Create existing note
         fs::write(temp_dir.path().join("test.md"), "Version 1")
             .await
             .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let client = ClientId::stdio();
 
@@ -175,6 +183,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             client,
             "test",
@@ -201,13 +210,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_updates_whitelist() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
         let client = ClientId::stdio();
 
         // Write a new note
         execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             client.clone(),
             "test",
@@ -226,6 +236,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             client,
             "test",
@@ -238,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_to_subdirectory() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
 
         // Create subdirectory
         fs::create_dir(temp_dir.path().join("knowledge"))
@@ -248,6 +259,7 @@ mod tests {
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "knowledge/test",
@@ -272,11 +284,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_fails_if_parent_missing() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
 
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "missing/parent/test",
@@ -291,11 +304,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_with_wiki_link_syntax() {
-        let (temp_dir, storage, whitelist) = create_test_env().await;
+        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
 
         let result = execute(
             temp_dir.path(),
             &storage,
+            &graph,
             &whitelist,
             ClientId::stdio(),
             "[[test]]",
@@ -313,5 +327,75 @@ mod tests {
 
         assert!(text.contains("Created note"));
         assert!(temp_dir.path().join("test.md").exists());
+    }
+
+    // Integration tests - test the actual ReadNote→WriteNote flow
+
+    #[tokio::test]
+    async fn test_read_then_write_subdirectory_note_by_name() {
+        // This tests the bug scenario: note in subdirectory, referenced by name only
+        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+
+        // Create note in subdirectory
+        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
+        fs::write(
+            temp_dir.path().join("knowledge/My Note.md"),
+            "Version 1",
+        )
+        .await
+        .unwrap();
+        graph.update_note(
+            "My Note",
+            PathBuf::from("knowledge/My Note.md"),
+            HashSet::new(),
+        );
+
+        let client = ClientId::stdio();
+
+        // Step 1: ReadNote by name only (not full path)
+        let read_result = super::super::read_note::execute(
+            &storage,
+            &graph,
+            &whitelist,
+            client.clone(),
+            "My Note", // Just the name, not "knowledge/My Note"
+        )
+        .await
+        .expect("ReadNote should succeed");
+
+        let text = read_result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+        assert_eq!(text, "Version 1");
+
+        // Step 2: WriteNote by name only (should use same resolution as ReadNote)
+        let write_result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            &whitelist,
+            client,
+            "My Note", // Same name-only reference
+            "Version 2",
+        )
+        .await
+        .expect("WriteNote should succeed after ReadNote");
+
+        let write_text = write_result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+        assert!(write_text.contains("Updated note"));
+
+        // Verify the file was actually modified
+        let content = fs::read_to_string(temp_dir.path().join("knowledge/My Note.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "Version 2");
     }
 }

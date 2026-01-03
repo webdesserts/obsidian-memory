@@ -297,9 +297,11 @@ impl MemoryServer {
 
     #[tool(description = "Create a new note or overwrite an existing note. For existing notes, you must call ReadNote first to see the current content and confirm the overwrite. Uses atomic writes for safety.")]
     async fn write_note(&self, params: Parameters<WriteNoteParams>) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph.read().await;
         tools::write_note::execute(
             &self.config.vault_path,
             self.storage.as_ref(),
+            &graph,
             &self.read_whitelist,
             ClientId::stdio(),
             &params.0.note,
