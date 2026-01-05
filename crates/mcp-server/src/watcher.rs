@@ -1,8 +1,15 @@
-//! File watcher for keeping the graph index, embeddings, and read whitelist up to date.
+//! File watcher for keeping the graph index and embeddings up to date.
 //!
 //! Watches the vault directory for changes to markdown files and updates
-//! the graph index, invalidates stale embeddings, and clears read whitelist entries.
+//! the graph index and invalidates stale embeddings.
 //! Uses debouncing to batch rapid changes.
+//!
+//! Note: The read whitelist is NOT invalidated by the file watcher. Instead,
+//! staleness is detected at write-time using content hash comparison. This
+//! approach correctly handles:
+//! - Multiple MCP servers (each checks against actual file content)
+//! - Self-edits (client's own writes don't invalidate their whitelist entry)
+//! - External edits (hash mismatch triggers re-read requirement)
 
 use notify::RecommendedWatcher;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind, Debouncer};
@@ -15,7 +22,6 @@ use wiki_links::extract_linked_notes;
 
 use crate::embeddings::EmbeddingManager;
 use crate::graph::GraphIndex;
-use crate::storage::ReadWhitelist;
 
 /// Watches vault directory and updates graph index on file changes.
 pub struct VaultWatcher {
@@ -26,13 +32,11 @@ impl VaultWatcher {
     /// Start watching the vault directory.
     ///
     /// Spawns a background task that listens for file system events and
-    /// updates the graph index, invalidates embeddings, and clears read whitelist
-    /// entries when markdown files change.
+    /// updates the graph index and invalidates embeddings when markdown files change.
     pub fn start(
         vault_path: PathBuf,
         graph: Arc<RwLock<GraphIndex>>,
         embeddings: Arc<EmbeddingManager>,
-        read_whitelist: Arc<RwLock<ReadWhitelist>>,
     ) -> Result<Self, notify::Error> {
         let (tx, rx) = mpsc::channel(100);
         let vault_path_clone = vault_path.clone();
@@ -68,7 +72,7 @@ impl VaultWatcher {
         tracing::info!("Started file watcher for {}", vault_path.display());
 
         // Spawn background task to process events
-        tokio::spawn(process_events(rx, vault_path_clone, graph, embeddings, read_whitelist));
+        tokio::spawn(process_events(rx, vault_path_clone, graph, embeddings));
 
         Ok(Self {
             _debouncer: debouncer,
@@ -76,13 +80,12 @@ impl VaultWatcher {
     }
 }
 
-/// Process file system events and update the graph index, embeddings, and read whitelist.
+/// Process file system events and update the graph index and embeddings.
 async fn process_events(
     mut rx: mpsc::Receiver<Vec<notify_debouncer_mini::DebouncedEvent>>,
     vault_path: PathBuf,
     graph: Arc<RwLock<GraphIndex>>,
     embeddings: Arc<EmbeddingManager>,
-    read_whitelist: Arc<RwLock<ReadWhitelist>>,
 ) {
     while let Some(events) = rx.recv().await {
         for event in events {
@@ -96,23 +99,16 @@ async fn process_events(
                 continue;
             }
             
-            // Get relative path for embedding cache key and whitelist
+            // Get relative path for embedding cache key
             let relative_path = path
                 .strip_prefix(&vault_path)
                 .unwrap_or(path);
             
             let relative_path_str = relative_path.to_string_lossy().to_string();
-            
-            // Get URI for whitelist (path without .md extension)
-            let whitelist_uri = relative_path
-                .to_string_lossy()
-                .strip_suffix(".md")
-                .unwrap_or(&relative_path.to_string_lossy())
-                .to_string();
 
             match event.kind {
                 DebouncedEventKind::Any => {
-                    // File created or modified - re-index it, invalidate embedding, and clear whitelist
+                    // File created or modified - re-index it and invalidate embedding
                     if path.exists() {
                         if let Err(e) = update_file(&vault_path, path, &graph).await {
                             tracing::warn!("Failed to update index for {}: {}", path.display(), e);
@@ -125,13 +121,9 @@ async fn process_events(
                         remove_file(&vault_path, path, &graph).await;
                         embeddings.invalidate(&relative_path_str).await;
                     }
-                    
-                    // Invalidate read whitelist - requires re-read before write
-                    {
-                        let mut whitelist = read_whitelist.write().await;
-                        whitelist.invalidate_path(&PathBuf::from(&whitelist_uri));
-                        tracing::debug!("Invalidated read whitelist for: {}", whitelist_uri);
-                    }
+                    // Note: Read whitelist is NOT invalidated here. Staleness is detected
+                    // at write-time via content hash comparison. This handles self-edits
+                    // correctly (client's own writes don't block subsequent writes).
                 }
                 DebouncedEventKind::AnyContinuous => {
                     // Continuous events (like ongoing writes) - skip until settled
@@ -208,13 +200,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let graph = Arc::new(RwLock::new(GraphIndex::new()));
         let embeddings = Arc::new(EmbeddingManager::new(temp_dir.path()));
-        let read_whitelist = Arc::new(RwLock::new(ReadWhitelist::new()));
 
         let watcher = VaultWatcher::start(
             temp_dir.path().to_path_buf(),
             graph,
             embeddings,
-            read_whitelist,
         );
         assert!(watcher.is_ok());
     }

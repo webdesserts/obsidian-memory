@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
-use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
+use crate::storage::{ClientId, ContentHash, ReadWhitelist, Storage, StorageError};
 
 /// Execute the ReadNote tool.
 ///
@@ -39,10 +39,11 @@ pub async fn execute<S: Storage>(
         _ => ErrorData::internal_error(format!("Failed to read note: {}", e), None),
     })?;
 
-    // Mark this note as readable for subsequent writes
+    // Mark this note as readable for subsequent writes, storing the content hash
     {
+        let content_hash = ContentHash::from_content(&content);
         let mut whitelist = read_whitelist.write().await;
-        whitelist.mark_read(client_id, PathBuf::from(&uri));
+        whitelist.mark_read(client_id, PathBuf::from(&uri), content_hash);
     }
 
     // Return just the content, like the filesystem MCP server
@@ -94,17 +95,19 @@ mod tests {
     async fn test_read_marks_whitelist() {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
-        fs::write(temp_dir.path().join("test.md"), "Content")
+        let content = "Content";
+        fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let client = ClientId::stdio();
+        let content_hash = ContentHash::from_content(content);
 
         // Before read, should not be whitelisted
         {
             let wl = whitelist.read().await;
-            assert!(!wl.can_write(&client, &PathBuf::from("test")));
+            assert!(!wl.can_write(&client, &PathBuf::from("test"), &content_hash));
         }
 
         // Read the note
@@ -112,10 +115,10 @@ mod tests {
             .await
             .expect("should succeed");
 
-        // After read, should be whitelisted
+        // After read, should be whitelisted (hash matches current content)
         {
             let wl = whitelist.read().await;
-            assert!(wl.can_write(&client, &PathBuf::from("test")));
+            assert!(wl.can_write(&client, &PathBuf::from("test"), &content_hash));
         }
     }
 

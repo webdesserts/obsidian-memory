@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
-use crate::storage::{ClientId, ReadWhitelist, Storage, StorageError};
+use crate::storage::{ClientId, ContentHash, ReadWhitelist, Storage, StorageError};
 
 /// Execute the WriteNote tool.
 ///
@@ -29,14 +29,21 @@ pub async fn execute<S: Storage>(
         ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
     })?;
 
-    // For existing notes, check whitelist (must read before write)
+    // For existing notes, check whitelist using content hash (must read before write)
     if exists {
+        // Read current content to compute hash for comparison
+        let (current_content, _) = storage.read(&uri).await.map_err(|e| {
+            ErrorData::internal_error(format!("Failed to read note for hash check: {}", e), None)
+        })?;
+        let current_hash = ContentHash::from_content(&current_content);
+        
         let whitelist = read_whitelist.read().await;
-        if !whitelist.can_write(&client_id, &PathBuf::from(&uri)) {
+        if !whitelist.can_write(&client_id, &PathBuf::from(&uri), &current_hash) {
             return Err(ErrorData::invalid_params(
                 format!(
                     "Must read note before writing: {}\n\n\
-                     Use ReadNote first to see the current content, then retry WriteNote.",
+                     Use ReadNote first to see the current content, then retry WriteNote.\n\
+                     (If you already read it, the file may have been modified externally.)",
                     note
                 ),
                 None,
@@ -58,11 +65,12 @@ pub async fn execute<S: Storage>(
         _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
     })?;
 
-    // After successful write, update whitelist so subsequent writes don't require re-read
-    // (the client has the current content since they just wrote it)
+    // After successful write, update whitelist with new content hash
+    // (the client knows the content since they just wrote it)
     {
+        let new_hash = ContentHash::from_content(content);
         let mut whitelist = read_whitelist.write().await;
-        whitelist.mark_read(client_id, PathBuf::from(&uri));
+        whitelist.mark_read(client_id, PathBuf::from(&uri), new_hash);
     }
 
     let file_path = vault_path
@@ -166,17 +174,19 @@ mod tests {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
         // Create existing note
-        fs::write(temp_dir.path().join("test.md"), "Version 1")
+        let original_content = "Version 1";
+        fs::write(temp_dir.path().join("test.md"), original_content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let client = ClientId::stdio();
 
-        // Mark as read (simulating ReadNote)
+        // Mark as read (simulating ReadNote) - must include content hash
         {
+            let hash = ContentHash::from_content(original_content);
             let mut wl = whitelist.write().await;
-            wl.mark_read(client.clone(), PathBuf::from("test"));
+            wl.mark_read(client.clone(), PathBuf::from("test"), hash);
         }
 
         // Now write should succeed
@@ -213,6 +223,8 @@ mod tests {
         let (temp_dir, storage, graph, whitelist) = create_test_env().await;
         let client = ClientId::stdio();
 
+        let first_content = "Content";
+
         // Write a new note
         execute(
             temp_dir.path(),
@@ -221,15 +233,16 @@ mod tests {
             &whitelist,
             client.clone(),
             "test",
-            "Content",
+            first_content,
         )
         .await
         .expect("should succeed");
 
-        // Should now be whitelisted (can write again without read)
+        // Should now be whitelisted with the new content's hash
         {
+            let content_hash = ContentHash::from_content(first_content);
             let wl = whitelist.read().await;
-            assert!(wl.can_write(&client, &PathBuf::from("test")));
+            assert!(wl.can_write(&client, &PathBuf::from("test"), &content_hash));
         }
 
         // Second write should succeed without explicit read

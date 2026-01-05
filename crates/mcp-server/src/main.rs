@@ -176,12 +176,12 @@ impl MemoryServer {
         // Create read whitelist for "must read before write" tracking
         let read_whitelist = Arc::new(RwLock::new(ReadWhitelist::new()));
 
-        // Start file watcher to keep graph index, embeddings, and whitelist up to date
+        // Start file watcher to keep graph index and embeddings up to date
+        // Note: Read whitelist staleness is handled via content hash comparison at write-time
         let watcher = match VaultWatcher::start(
             config.vault_path.clone(),
             graph.clone(),
             embeddings.clone(),
-            read_whitelist.clone(),
         ) {
             Ok(w) => {
                 tracing::info!("File watcher started successfully");

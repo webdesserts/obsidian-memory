@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
-use crate::storage::{ClientId, ReadWhitelist, Storage};
+use crate::storage::{ClientId, ContentHash, ReadWhitelist, Storage};
 
 /// A single edit operation.
 #[derive(Debug, Clone)]
@@ -101,25 +101,27 @@ pub async fn execute<S: Storage>(
 
     let normalized = normalize_note_reference(note);
 
-    // Check whitelist (must read before edit)
+    // Read current content (note existence already verified by resolve_note_uri)
+    let (content, _metadata) = storage.read(&uri).await.map_err(|e| {
+        ErrorData::internal_error(format!("Failed to read note: {}", e), None)
+    })?;
+
+    // Check whitelist using content hash (must read before edit, and file must not have changed)
+    let current_hash = ContentHash::from_content(&content);
     {
         let whitelist = read_whitelist.read().await;
-        if !whitelist.can_write(&client_id, &PathBuf::from(&uri)) {
+        if !whitelist.can_write(&client_id, &PathBuf::from(&uri), &current_hash) {
             return Err(ErrorData::invalid_params(
                 format!(
                     "Must read note before editing: {}\n\n\
-                     Use ReadNote first to see the current content, then retry EditNote.",
+                     Use ReadNote first to see the current content, then retry EditNote.\n\
+                     (If you already read it, the file may have been modified externally.)",
                     note
                 ),
                 None,
             ));
         }
     }
-
-    // Read current content (note existence already verified by resolve_note_uri)
-    let (content, _metadata) = storage.read(&uri).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to read note: {}", e), None)
-    })?;
 
     // Apply edits
     let (modified, diff) = apply_edits(&content, &edits).map_err(|e| {
@@ -148,10 +150,11 @@ pub async fn execute<S: Storage>(
         ErrorData::internal_error(format!("Failed to write note: {}", e), None)
     })?;
 
-    // Keep whitelist valid after edit (client knows the content)
+    // Update whitelist with new content hash (client knows the new content)
     {
+        let new_hash = ContentHash::from_content(&modified);
         let mut whitelist = read_whitelist.write().await;
-        whitelist.mark_read(client_id, PathBuf::from(&uri));
+        whitelist.mark_read(client_id, PathBuf::from(&uri), new_hash);
     }
 
     let text = format!(
@@ -181,9 +184,12 @@ mod tests {
         (temp_dir, storage, graph, whitelist)
     }
 
-    async fn mark_readable(whitelist: &RwLock<ReadWhitelist>, uri: &str) {
+    /// Mark a note as readable with a specific content for testing.
+    /// Uses the actual content to compute the hash, simulating a proper ReadNote call.
+    async fn mark_readable_with_content(whitelist: &RwLock<ReadWhitelist>, uri: &str, content: &str) {
         let mut wl = whitelist.write().await;
-        wl.mark_read(ClientId::stdio(), PathBuf::from(uri));
+        let hash = ContentHash::from_content(content);
+        wl.mark_read(ClientId::stdio(), PathBuf::from(uri), hash);
     }
 
     #[tokio::test]
@@ -222,11 +228,12 @@ mod tests {
     async fn test_edit_single_replacement() {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
-        fs::write(temp_dir.path().join("test.md"), "Hello, world!")
+        let content = "Hello, world!";
+        fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable(&whitelist, "test").await;
+        mark_readable_with_content(&whitelist, "test", content).await;
 
         let edits = vec![Edit {
             old_text: "world".to_string(),
@@ -268,14 +275,12 @@ mod tests {
     async fn test_edit_multiple_replacements() {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
-        fs::write(
-            temp_dir.path().join("test.md"),
-            "Hello, world! Goodbye, world!",
-        )
-        .await
-        .unwrap();
+        let content = "Hello, world! Goodbye, world!";
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable(&whitelist, "test").await;
+        mark_readable_with_content(&whitelist, "test", content).await;
 
         let edits = vec![
             Edit {
@@ -321,11 +326,12 @@ mod tests {
     async fn test_edit_fails_if_text_not_found() {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
-        fs::write(temp_dir.path().join("test.md"), "Hello, world!")
+        let content = "Hello, world!";
+        fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable(&whitelist, "test").await;
+        mark_readable_with_content(&whitelist, "test", content).await;
 
         let edits = vec![Edit {
             old_text: "nonexistent".to_string(),
@@ -353,11 +359,12 @@ mod tests {
     async fn test_edit_fails_if_text_ambiguous() {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
-        fs::write(temp_dir.path().join("test.md"), "foo bar foo")
+        let content = "foo bar foo";
+        fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable(&whitelist, "test").await;
+        mark_readable_with_content(&whitelist, "test", content).await;
 
         let edits = vec![Edit {
             old_text: "foo".to_string(),
@@ -385,11 +392,12 @@ mod tests {
     async fn test_edit_dry_run() {
         let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
 
-        fs::write(temp_dir.path().join("test.md"), "Hello, world!")
+        let content = "Hello, world!";
+        fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable(&whitelist, "test").await;
+        mark_readable_with_content(&whitelist, "test", content).await;
 
         let edits = vec![Edit {
             old_text: "world".to_string(),
@@ -429,7 +437,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_nonexistent_note() {
         let (temp_dir, storage, graph, whitelist) = create_test_env().await;
-        mark_readable(&whitelist, "nonexistent").await;
+        // Even with a whitelist entry, the note doesn't exist
+        mark_readable_with_content(&whitelist, "nonexistent", "").await;
 
         let edits = vec![Edit {
             old_text: "foo".to_string(),

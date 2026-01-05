@@ -13,4 +13,4 @@ mod whitelist;
 
 pub use file::FileStorage;
 pub use traits::{Storage, StorageError};
-pub use whitelist::{ClientId, ReadWhitelist};
+pub use whitelist::{ClientId, ContentHash, ReadWhitelist};
