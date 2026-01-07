@@ -25,5 +25,5 @@ install-path = "CARGO_HOME"
 features = ["embedded-model"]
 # Don't use default features (which includes download-model)
 default-features = false
-# Allow customizations to release.yml (we add model download steps)
-allow-dirty = ["ci"]
+# Custom build setup to download model before building
+github-build-setup = "../build-setup.yml"

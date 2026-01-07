@@ -127,6 +127,21 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Install jq (for tokenizer optimization)"
+        run: |
+          if ! command -v jq &> /dev/null; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              brew install jq
+            elif [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo apt-get update && sudo apt-get install -y jq
+            fi
+          fi
+        shell: "bash"
+      - name: "Download embedding model"
+        run: |
+          chmod +x scripts/download-model.sh
+          ./scripts/download-model.sh
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -139,21 +154,6 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - name: Install jq (for tokenizer optimization)
-        shell: bash
-        run: |
-          if ! command -v jq &> /dev/null; then
-            if [[ "$RUNNER_OS" == "macOS" ]]; then
-              brew install jq
-            elif [[ "$RUNNER_OS" == "Linux" ]]; then
-              sudo apt-get update && sudo apt-get install -y jq
-            fi
-          fi
-      - name: Download embedding model
-        shell: bash
-        run: |
-          chmod +x scripts/download-model.sh
-          ./scripts/download-model.sh
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

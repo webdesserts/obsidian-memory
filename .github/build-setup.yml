@@ -1,0 +1,20 @@
+# Custom build setup steps for cargo-dist
+# These run before the build in the build-local-artifacts job
+# See: https://axodotdev.github.io/cargo-dist/book/ci/customizing.html#customizing-build-setup
+
+- name: Install jq (for tokenizer optimization)
+  shell: bash
+  run: |
+    if ! command -v jq &> /dev/null; then
+      if [[ "$RUNNER_OS" == "macOS" ]]; then
+        brew install jq
+      elif [[ "$RUNNER_OS" == "Linux" ]]; then
+        sudo apt-get update && sudo apt-get install -y jq
+      fi
+    fi
+
+- name: Download embedding model
+  shell: bash
+  run: |
+    chmod +x scripts/download-model.sh
+    ./scripts/download-model.sh
