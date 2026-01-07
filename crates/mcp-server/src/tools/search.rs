@@ -340,7 +340,7 @@ fn format_results(
         output.push('\n');
     }
 
-    output.push_str("*Use GetNote() to view individual note details*\n");
+    output.push_str("*Use ReadNote to view note contents*\n");
 
     output
 }
