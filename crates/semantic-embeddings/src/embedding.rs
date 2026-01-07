@@ -11,10 +11,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32> {
     }
 
     // Compute dot product
-    let dot_product: f32 = a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| x * y)
-        .sum();
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
 
     // Compute magnitudes
     let magnitude_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -30,11 +27,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32> {
 /// Find indices of top K most similar embeddings to query
 ///
 /// Returns indices sorted by similarity (descending)
-pub fn find_most_similar(
-    query: &[f32],
-    candidates: &[Vec<f32>],
-    top_k: usize,
-) -> Result<Vec<u32>> {
+pub fn find_most_similar(query: &[f32], candidates: &[Vec<f32>], top_k: usize) -> Result<Vec<u32>> {
     if candidates.is_empty() {
         return Ok(vec![]);
     }
@@ -69,7 +62,10 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&a, &b).unwrap();
-        assert!((sim - 1.0).abs() < 1e-6, "Identical vectors should have similarity 1.0");
+        assert!(
+            (sim - 1.0).abs() < 1e-6,
+            "Identical vectors should have similarity 1.0"
+        );
     }
 
     #[test]
@@ -77,7 +73,10 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let sim = cosine_similarity(&a, &b).unwrap();
-        assert!(sim.abs() < 1e-6, "Orthogonal vectors should have similarity 0.0");
+        assert!(
+            sim.abs() < 1e-6,
+            "Orthogonal vectors should have similarity 0.0"
+        );
     }
 
     #[test]
@@ -85,20 +84,27 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![-1.0, -2.0, -3.0];
         let sim = cosine_similarity(&a, &b).unwrap();
-        assert!((sim + 1.0).abs() < 1e-6, "Opposite vectors should have similarity -1.0");
+        assert!(
+            (sim + 1.0).abs() < 1e-6,
+            "Opposite vectors should have similarity -1.0"
+        );
     }
 
     #[test]
     fn test_find_most_similar() {
         let query = vec![1.0, 0.0, 0.0];
         let candidates = vec![
-            vec![1.0, 0.0, 0.0],  // idx 0: similarity 1.0
-            vec![0.0, 1.0, 0.0],  // idx 1: similarity 0.0
-            vec![0.7, 0.7, 0.0],  // idx 2: similarity ~0.7
+            vec![1.0, 0.0, 0.0], // idx 0: similarity 1.0
+            vec![0.0, 1.0, 0.0], // idx 1: similarity 0.0
+            vec![0.7, 0.7, 0.0], // idx 2: similarity ~0.7
         ];
 
         let top_2 = find_most_similar(&query, &candidates, 2).unwrap();
-        assert_eq!(top_2, vec![0, 2], "Should return indices of top 2 most similar");
+        assert_eq!(
+            top_2,
+            vec![0, 2],
+            "Should return indices of top 2 most similar"
+        );
     }
 
     #[test]
@@ -106,6 +112,9 @@ mod tests {
         let query = vec![1.0, 0.0];
         let candidates: Vec<Vec<f32>> = vec![];
         let result = find_most_similar(&query, &candidates, 5).unwrap();
-        assert!(result.is_empty(), "Empty candidates should return empty result");
+        assert!(
+            result.is_empty(),
+            "Empty candidates should return empty result"
+        );
     }
 }

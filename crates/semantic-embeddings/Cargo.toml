@@ -11,6 +11,8 @@ crate-type = ["rlib"]
 
 [features]
 debug = ["log", "env_logger", "ctor"]
+# Embed model files directly in binary (for release builds)
+embedded-model = []
 
 [dependencies]
 # Candle for ML inference

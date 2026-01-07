@@ -52,8 +52,8 @@ impl ModelManager {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
         // Parse model config
-        let config: Config = serde_json::from_str(config_json)
-            .context("Failed to parse config.json")?;
+        let config: Config =
+            serde_json::from_str(config_json).context("Failed to parse config.json")?;
 
         // Load model weights from bytes
         let vb = VarBuilder::from_buffered_safetensors(
@@ -78,9 +78,7 @@ impl ModelManager {
         let state_guard = self.state.lock().unwrap();
 
         if state_guard.is_none() {
-            anyhow::bail!(
-                "Model not loaded. Call loadModel() first with model data."
-            );
+            anyhow::bail!("Model not loaded. Call loadModel() first with model data.");
         }
 
         Ok(())
@@ -94,14 +92,14 @@ impl ModelManager {
         let state = state_guard.as_ref().unwrap();
 
         // Tokenize
-        let encoding = state.tokenizer
+        let encoding = state
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         let tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        let token_ids = Tensor::new(&tokens[..], &state.device)?
-            .unsqueeze(0)?; // Add batch dimension
+        let token_ids = Tensor::new(&tokens[..], &state.device)?.unsqueeze(0)?; // Add batch dimension
 
         // Get attention mask from tokenizer encoding (marks real tokens as 1, padding as 0)
         // Note: Using U32 instead of F32 because BertModel internally converts to F32
@@ -119,8 +117,7 @@ impl ModelManager {
             );
         }
 
-        let attention_mask = Tensor::new(&mask[..], &state.device)?
-            .unsqueeze(0)?; // Add batch dimension
+        let attention_mask = Tensor::new(&mask[..], &state.device)?.unsqueeze(0)?; // Add batch dimension
 
         // Run model inference (token_type_ids = None for single sequence)
         let output = state.model.forward(&token_ids, &attention_mask, None)?;
@@ -169,7 +166,8 @@ impl ModelManager {
         }
 
         // Remove batch dimension and convert to Vec<f32>
-        normalized.squeeze(0)?
+        normalized
+            .squeeze(0)?
             .to_vec1()
             .context("Failed to convert tensor to vec")
     }
@@ -189,7 +187,8 @@ impl ModelManager {
         let encodings: Vec<_> = texts
             .iter()
             .map(|text| {
-                state.tokenizer
+                state
+                    .tokenizer
                     .encode(text.as_str(), true)
                     .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))
             })
@@ -238,7 +237,8 @@ impl ModelManager {
         // Convert to Vec<Vec<f32>>
         let embedding_vecs: Vec<Vec<f32>> = (0..texts.len())
             .map(|i| {
-                normalized.get(i)
+                normalized
+                    .get(i)
                     .ok()
                     .and_then(|tensor| tensor.to_vec1().ok())
                     .unwrap_or_default()
@@ -312,7 +312,8 @@ impl ModelManager {
             .sqrt()?;
 
         // Divide by norm
-        embeddings.broadcast_div(&norm)
+        embeddings
+            .broadcast_div(&norm)
             .context("Normalization failed")
     }
 }

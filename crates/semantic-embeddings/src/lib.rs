@@ -3,6 +3,9 @@
 mod embedding;
 mod model;
 
+#[cfg(feature = "embedded-model")]
+mod embedded;
+
 // Re-export for external use
 pub use embedding::{cosine_similarity, find_most_similar};
 pub use model::ModelManager;
@@ -96,6 +99,22 @@ impl SemanticEmbeddings {
     ) -> anyhow::Result<()> {
         self.model
             .load_model(config_json, tokenizer_json, model_weights)
+    }
+
+    /// Load the embedded model (when compiled with `embedded-model` feature).
+    ///
+    /// This is the preferred method for release builds - no network access required.
+    /// The model files are baked into the binary at compile time.
+    ///
+    /// # Errors
+    /// Returns an error if model loading fails (should not happen with valid embedded data).
+    #[cfg(feature = "embedded-model")]
+    pub fn load_embedded_model(&self) -> anyhow::Result<()> {
+        self.model.load_model(
+            embedded::CONFIG_JSON,
+            embedded::TOKENIZER_JSON,
+            embedded::MODEL_WEIGHTS,
+        )
     }
 
     /// Encode a single text into an embedding vector.

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
 
+#[cfg(feature = "download-model")]
 use super::download::download_model;
 
 /// Cache entry storing an embedding and its content hash.
@@ -55,8 +56,10 @@ impl EmbeddingManager {
 
     /// Initialize the embedding manager by loading the model.
     ///
-    /// Downloads the model if not present. Uses write lock for the entire
-    /// operation to prevent race conditions with concurrent initialization.
+    /// With `embedded-model` feature: loads model from binary (no network).
+    /// With `download-model` feature: downloads from HuggingFace if not present.
+    ///
+    /// Uses write lock for the entire operation to prevent race conditions.
     pub async fn initialize(&self) -> Result<()> {
         // Hold write lock for entire initialization to prevent TOCTOU race
         let mut loaded = self.model_loaded.write().await;
@@ -64,13 +67,33 @@ impl EmbeddingManager {
             return Ok(());
         }
 
-        // Download model if needed
-        download_model(&self.model_dir).await?;
+        // Load model based on feature flags
+        #[cfg(feature = "embedded-model")]
+        {
+            self.embeddings
+                .load_embedded_model()
+                .context("Failed to load embedded model")?;
+            tracing::info!("Loaded embedded model");
+        }
 
-        // Load model from disk
-        self.embeddings
-            .load_model_from_dir(&self.model_dir)
-            .context("Failed to load embedding model")?;
+        #[cfg(all(feature = "download-model", not(feature = "embedded-model")))]
+        {
+            // Download model if needed
+            download_model(&self.model_dir).await?;
+
+            // Load model from disk
+            self.embeddings
+                .load_model_from_dir(&self.model_dir)
+                .context("Failed to load embedding model")?;
+            tracing::info!("Loaded model from disk");
+        }
+
+        #[cfg(not(any(feature = "embedded-model", feature = "download-model")))]
+        {
+            anyhow::bail!(
+                "No model loading method available. Enable either 'embedded-model' or 'download-model' feature."
+            );
+        }
 
         *loaded = true;
 

@@ -4,10 +4,20 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository = "https://github.com/webdesserts/obsidian-memory"
+homepage = "https://github.com/webdesserts/obsidian-memory"
+description = "MCP server for Obsidian memory integration with Claude"
 
 [[bin]]
 name = "obsidian-memory"
 path = "src/main.rs"
+
+[features]
+default = ["download-model"]
+# Download model from HuggingFace at runtime (default for dev)
+download-model = ["dep:reqwest", "dep:futures-util"]
+# Use model embedded in binary (for release builds)
+embedded-model = ["semantic-embeddings/embedded-model"]
 
 [dependencies]
 # MCP SDK
@@ -48,9 +58,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 notify = "8"
 notify-debouncer-mini = "0.6"
 
-# HTTP client for model downloads
-reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
-futures-util = "0.3"
+# HTTP client for model downloads (optional, only needed without embedded-model)
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # Hashing for cache keys
 sha2 = "0.10"

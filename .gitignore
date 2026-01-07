@@ -1,8 +1,11 @@
 # Rust build artifacts
 target/
 
-# Downloaded ML models
+# Downloaded ML models (runtime download location)
 models/
+
+# Embedded model files (downloaded for release builds)
+crates/semantic-embeddings/models/
 
 # OS files
 .DS_Store
