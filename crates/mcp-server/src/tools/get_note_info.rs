@@ -1,12 +1,12 @@
-use obsidian_fs::{
-    ensure_markdown_extension, generate_search_paths, normalize_note_reference,
-    parse_frontmatter, NoteRef,
-};
+use obsidian_fs::{ensure_markdown_extension, generate_search_paths, normalize_note_reference, NoteRef};
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
-use tokio::fs;
 
 use crate::graph::GraphIndex;
+use crate::tools::common::{
+    format_frontmatter_summary, format_links_summary, read_frontmatter_keys, resolve_backlinks,
+    resolve_forward_links,
+};
 
 /// Resolve a note reference to a file path, searching the vault if needed.
 ///
@@ -80,89 +80,34 @@ pub async fn execute(
              - File path: {}\n\
              - Memory URI: {}\n\
              - Obsidian URI: {}\n\n\
-             Use the Write tool with the file path to create this note.",
+             Use WriteNote tool to create this note.",
             note_name, file_path, memory_uri, obsidian_uri
         );
         return Ok(CallToolResult::success(vec![Content::text(text)]));
     }
 
-    // Note exists - get links and frontmatter
-    // Get forward links using the path (with .md extension)
+    // Note exists - get links and frontmatter using shared helpers
     let path_with_ext = ensure_markdown_extension(&resolved_path);
-    let forward_links: Vec<String> = graph
-        .get_forward_links(&path_with_ext)
-        .map(|links| {
-            links
-                .iter()
-                .map(|link| {
-                    // link is a note name, resolve to path
-                    let path = graph
-                        .get_path(link)
-                        .map(|p| p.to_string_lossy().replace(".md", ""))
-                        .unwrap_or_else(|| link.clone());
-                    format!("memory:{}", path)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let forward_links = resolve_forward_links(graph, &path_with_ext);
+    let backlinks = resolve_backlinks(graph, &note_name);
+    let frontmatter_keys = read_frontmatter_keys(&file_path).await;
 
-    // Get backlinks (notes that link to this note by name)
-    let backlinks: Vec<String> = graph
-        .get_backlinks(&note_name)
-        .map(|links| {
-            // links are now paths, not note names
-            links
-                .iter()
-                .map(|path| {
-                    let path_without_ext = path.strip_suffix(".md").unwrap_or(path);
-                    format!("memory:{}", path_without_ext)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Read frontmatter
-    let frontmatter_keys: Vec<String> = match fs::read_to_string(&file_path).await {
-        Ok(content) => {
-            let parsed = parse_frontmatter(&content);
-            parsed
-                .frontmatter
-                .map(|fm| fm.keys().cloned().collect())
-                .unwrap_or_default()
-        }
-        Err(_) => Vec::new(),
-    };
-
-    // Build response text
-    let links_summary = if !forward_links.is_empty() {
-        format!("\n\nLinks to: {}", forward_links.join(", "))
-    } else {
-        String::new()
-    };
-
-    let backlinks_summary = if !backlinks.is_empty() {
-        format!("\n\nLinked from: {}", backlinks.join(", "))
-    } else {
-        String::new()
-    };
-
-    let frontmatter_summary = if !frontmatter_keys.is_empty() {
-        format!("\n\nFrontmatter: {}", frontmatter_keys.join(", "))
-    } else {
-        String::new()
-    };
+    // Build response text using shared formatters
+    let (links_summary, backlinks_summary) = format_links_summary(&forward_links, &backlinks);
+    let frontmatter_summary = format_frontmatter_summary(&frontmatter_keys);
 
     let text = format!(
         "Note: {}\n\
          Path: {}\n\
          File: {}\n\
-         Memory URI: {}{}{}{}\n\n\
-         Use Read tool with the file path to view content.\n\
-         Use Write tool with the file path to edit content.",
+         Memory URI: {}\n\
+         Obsidian URI: {}{}{}{}\n\n\
+         Use ReadNote tool to view content.",
         note_name,
         resolved_path,
         file_path,
         memory_uri,
+        obsidian_uri,
         links_summary,
         backlinks_summary,
         frontmatter_summary
@@ -176,6 +121,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use tempfile::TempDir;
+    use tokio::fs;
 
     async fn create_test_vault() -> (TempDir, GraphIndex) {
         let temp_dir = TempDir::new().unwrap();

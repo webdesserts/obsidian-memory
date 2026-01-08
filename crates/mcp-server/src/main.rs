@@ -214,9 +214,15 @@ impl MemoryServer {
         tools::log::execute(&self.config.vault_path, &params.0.content).await
     }
 
-    #[tool(description = "Get the URI for the current week's journal note. Returns a resource link that can be read to access the note content.")]
-    async fn get_weekly_note(&self) -> Result<CallToolResult, ErrorData> {
-        tools::get_weekly_note::execute()
+    #[tool(description = "Get metadata and graph connections for the current week's journal note. Returns path, URIs, frontmatter, and links/backlinks. Works whether or not the note exists yet. Use ReadNote tool to get content.")]
+    async fn get_weekly_note_info(&self) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph.read().await;
+        tools::get_weekly_note_info::execute(
+            &self.config.vault_path,
+            &self.config.vault_name,
+            &graph,
+        )
+        .await
     }
 
     #[tool(description = "Get metadata and graph connections for a note. Returns frontmatter, file paths, and links/backlinks. Use ReadNote tool to get content.")]

@@ -11,7 +11,7 @@ use rmcp::model::{CallToolResult, Content, ErrorData, ResourceContents};
 
 use crate::graph::GraphIndex;
 use crate::projects::{discover_projects, generate_discovery_status_message, DiscoveryResult};
-use crate::tools::get_weekly_note;
+use crate::tools::get_weekly_note_info;
 
 /// Execute the Remember tool
 pub async fn execute(
@@ -102,17 +102,11 @@ pub async fn execute(
 
 /// Get the weekly note URI and file path
 fn get_weekly_note_path(vault_path: &Path) -> (String, std::path::PathBuf) {
-    let (iso_week_date, _) = get_weekly_note::get_current_week_info();
-    let weekly_note_uri = get_weekly_note::format_weekly_note_uri(vault_path, &iso_week_date);
+    let (iso_week_date, _) = get_weekly_note_info::get_current_week_info();
 
-    // Parse the URI to get the file path
-    // URI format: file:///Users/.../notes/journal/2025-w01.md
-    let file_path = if let Some(path) = weekly_note_uri.strip_prefix("file://") {
-        std::path::PathBuf::from(path)
-    } else {
-        // Fallback: construct path directly
-        vault_path.join(format!("journal/{}.md", iso_week_date.to_lowercase()))
-    };
+    // Build file path directly (simpler than parsing URI)
+    let file_path = vault_path.join(format!("journal/{}.md", iso_week_date));
+    let weekly_note_uri = format!("file://{}", file_path.display());
 
     (weekly_note_uri, file_path)
 }
@@ -152,7 +146,7 @@ mod tests {
 
         // Create journal folder and weekly note
         std::fs::create_dir_all(vault_path.join("journal")).unwrap();
-        let (iso_week_date, _) = get_weekly_note::get_current_week_info();
+        let (iso_week_date, _) = get_weekly_note_info::get_current_week_info();
         std::fs::write(
             vault_path.join(format!("journal/{}.md", iso_week_date.to_lowercase())),
             "# Week Notes\n\nThis week's journal\n",

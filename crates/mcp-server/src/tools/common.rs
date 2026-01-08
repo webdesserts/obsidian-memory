@@ -1,9 +1,97 @@
 //! Shared utilities for note tools.
 
-use obsidian_fs::normalize_note_reference;
+use obsidian_fs::{normalize_note_reference, parse_frontmatter};
+use tokio::fs;
 
 use crate::graph::GraphIndex;
 use crate::storage::{Storage, StorageError};
+
+/// Resolve forward links from the graph index to memory URIs.
+///
+/// Takes a path with `.md` extension and returns a list of `memory:` URIs
+/// for all notes this note links to.
+pub fn resolve_forward_links(graph: &GraphIndex, path_with_ext: &str) -> Vec<String> {
+    graph
+        .get_forward_links(path_with_ext)
+        .map(|links| {
+            links
+                .iter()
+                .map(|link| {
+                    let path = graph
+                        .get_path(link)
+                        .map(|p| p.to_string_lossy().replace(".md", ""))
+                        .unwrap_or_else(|| link.clone());
+                    format!("memory:{}", path)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve backlinks from the graph index to memory URIs.
+///
+/// Takes a note name and returns a list of `memory:` URIs for all notes
+/// that link to this note.
+pub fn resolve_backlinks(graph: &GraphIndex, note_name: &str) -> Vec<String> {
+    graph
+        .get_backlinks(note_name)
+        .map(|links| {
+            links
+                .iter()
+                .map(|path| {
+                    let path_without_ext = path.strip_suffix(".md").unwrap_or(path);
+                    format!("memory:{}", path_without_ext)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read frontmatter keys from a note file.
+///
+/// Returns an empty vec if the file cannot be read or has no frontmatter.
+/// Logs a warning if the file exists but cannot be read (e.g., permission error).
+pub async fn read_frontmatter_keys(file_path: &str) -> Vec<String> {
+    match fs::read_to_string(file_path).await {
+        Ok(content) => {
+            let parsed = parse_frontmatter(&content);
+            parsed
+                .frontmatter
+                .map(|fm| fm.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read frontmatter from {}: {}", file_path, e);
+            Vec::new()
+        }
+    }
+}
+
+/// Format link summaries for note info output.
+pub fn format_links_summary(forward_links: &[String], backlinks: &[String]) -> (String, String) {
+    let links_summary = if !forward_links.is_empty() {
+        format!("\n\nLinks to: {}", forward_links.join(", "))
+    } else {
+        String::new()
+    };
+
+    let backlinks_summary = if !backlinks.is_empty() {
+        format!("\n\nLinked from: {}", backlinks.join(", "))
+    } else {
+        String::new()
+    };
+
+    (links_summary, backlinks_summary)
+}
+
+/// Format frontmatter summary for note info output.
+pub fn format_frontmatter_summary(frontmatter_keys: &[String]) -> String {
+    if !frontmatter_keys.is_empty() {
+        format!("\n\nFrontmatter: {}", frontmatter_keys.join(", "))
+    } else {
+        String::new()
+    }
+}
 
 /// Resolve a note reference to a memory URI.
 ///
