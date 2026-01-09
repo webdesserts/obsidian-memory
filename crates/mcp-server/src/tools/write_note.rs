@@ -30,7 +30,8 @@ pub async fn execute<S: Storage>(
     })?;
 
     // For existing notes, check whitelist using content hash (must read before write)
-    if exists {
+    // We store the hash to pass to storage.write() for optimistic locking (TOCTOU protection)
+    let expected_hash = if exists {
         // Read current content to compute hash for comparison
         let (current_content, _) = storage.read(&uri).await.map_err(|e| {
             ErrorData::internal_error(format!("Failed to read note for hash check: {}", e), None)
@@ -49,10 +50,13 @@ pub async fn execute<S: Storage>(
                 None,
             ));
         }
-    }
+        Some(current_hash)
+    } else {
+        None
+    };
 
-    // Attempt to write
-    let _result = storage.write(&uri, content, None).await.map_err(|e| match e {
+    // Attempt to write with optimistic locking (pass hash for existing files)
+    let _result = storage.write(&uri, content, expected_hash.as_ref().map(|h| h.as_str())).await.map_err(|e| match e {
         StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
             format!(
                 "Parent directory doesn't exist for '{}': {}. \

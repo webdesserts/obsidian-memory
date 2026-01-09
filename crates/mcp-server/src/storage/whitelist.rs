@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 /// Unique identifier for a client connection.
 ///
 /// For stdio transport, there's a single implicit client.
-/// For remote transport, this will be derived from the connection/session.
+/// For HTTP transport, each session gets a unique ID generated at server construction time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientId(pub String);
 
@@ -27,6 +27,14 @@ impl ClientId {
     /// The default client ID for stdio transport (single client per process).
     pub fn stdio() -> Self {
         Self("stdio".to_string())
+    }
+
+    /// Generate a unique client ID for HTTP sessions.
+    /// Each MemoryServer instance created by the HTTP service factory gets a unique ID.
+    pub fn generate() -> Self {
+        use rand::Rng;
+        let id: u64 = rand::rng().random();
+        Self(format!("http-{:016x}", id))
     }
 }
 
@@ -41,6 +49,11 @@ impl ContentHash {
         hasher.update(content.as_bytes());
         let result = hasher.finalize();
         Self(hex::encode(result))
+    }
+
+    /// Get the hash string for use with Storage::write() optimistic locking.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

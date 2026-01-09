@@ -18,10 +18,18 @@ default = ["download-model"]
 download-model = ["dep:reqwest", "dep:futures-util"]
 # Use model embedded in binary (for release builds)
 embedded-model = ["semantic-embeddings/embedded-model"]
+# Enable HTTP transport for remote MCP server
+http = ["rmcp/transport-streamable-http-server", "dep:axum", "dep:clap"]
 
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
+
+# HTTP server (optional, for HTTP transport)
+axum = { version = "0.8", optional = true }
+
+# CLI argument parsing (optional, for HTTP transport)
+clap = { version = "4", features = ["derive"], optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
