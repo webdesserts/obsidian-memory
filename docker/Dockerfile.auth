@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM rust:latest AS builder
+FROM rust:1.85 AS builder
 
 WORKDIR /app
 
@@ -14,17 +14,9 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests first for better layer caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/auth-service/Cargo.toml crates/auth-service/
-COPY crates/mcp-server/Cargo.toml crates/mcp-server/
-COPY crates/wiki-links/Cargo.toml crates/wiki-links/
-COPY crates/obsidian-fs/Cargo.toml crates/obsidian-fs/
-COPY crates/semantic-embeddings/Cargo.toml crates/semantic-embeddings/
 
 # Create dummy source files for dependency compilation
-RUN mkdir -p crates/auth-service/src && echo "fn main() {}" > crates/auth-service/src/main.rs \
-    && mkdir -p crates/mcp-server/src && echo "fn main() {}" > crates/mcp-server/src/main.rs \
-    && mkdir -p crates/wiki-links/src && echo "" > crates/wiki-links/src/lib.rs \
-    && mkdir -p crates/obsidian-fs/src && echo "" > crates/obsidian-fs/src/lib.rs \
-    && mkdir -p crates/semantic-embeddings/src && echo "" > crates/semantic-embeddings/src/lib.rs
+RUN mkdir -p crates/auth-service/src && echo "fn main() {}" > crates/auth-service/src/main.rs
 
 # Build dependencies only (cached layer)
 RUN cargo build --release -p auth-service 2>/dev/null || true

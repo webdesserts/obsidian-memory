@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+
+# Build stage
+FROM rust:1.85 AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+COPY crates/sync-daemon/Cargo.toml crates/sync-daemon/
+COPY crates/sync-core/Cargo.toml crates/sync-core/
+
+# Create dummy source files for dependency compilation
+RUN mkdir -p crates/sync-daemon/src && echo "fn main() {}" > crates/sync-daemon/src/main.rs \
+    && mkdir -p crates/sync-core/src && echo "" > crates/sync-core/src/lib.rs
+
+# Build dependencies only (cached layer)
+RUN cargo build --release -p sync-daemon 2>/dev/null || true
+
+# Copy actual source code
+COPY crates/sync-daemon/ crates/sync-daemon/
+COPY crates/sync-core/ crates/sync-core/
+
+# Touch source file to invalidate the cache
+RUN touch crates/sync-daemon/src/main.rs crates/sync-core/src/lib.rs
+
+# Build the actual binary
+RUN cargo build --release -p sync-daemon
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user (UID 1000 for consistency)
+RUN useradd -m -u 1000 syncuser
+
+# Copy binary
+COPY --from=builder /app/target/release/sync-daemon /usr/local/bin/
+
+# Create vault mount point
+RUN mkdir -p /notes && chown syncuser:syncuser /notes
+
+USER syncuser
+WORKDIR /notes
+
+EXPOSE 8080
+
+# Health check - verify WebSocket port is listening
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD nc -z localhost 8080 || exit 1
+
+ENTRYPOINT ["sync-daemon"]
+CMD ["--vault", "/notes", "--listen", "0.0.0.0:8080"]
