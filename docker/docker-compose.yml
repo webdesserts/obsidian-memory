@@ -1,9 +1,10 @@
 services:
   # OAuth 2.1 + API key authentication
   auth-service:
+    image: ghcr.io/webdesserts/auth-service:${VERSION:-latest}
     build:
       context: ..
-      dockerfile: crates/auth-service/Dockerfile
+      dockerfile: docker/Dockerfile.auth
     volumes:
       - auth-config:/config
     environment:
@@ -21,15 +22,16 @@ services:
         max-file: "3"
 
   # MCP server with HTTP transport
-  obsidian-memory:
+  memory:
+    image: ghcr.io/webdesserts/memory:${VERSION:-latest}
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.memory
     volumes:
       - notes:/notes:rw
     environment:
       - OBSIDIAN_VAULT_PATH=/notes
-      - RUST_LOG=info,obsidian_memory=debug
+      - RUST_LOG=info,memory=debug
     expose:
       - "3000"
     depends_on:
@@ -44,9 +46,10 @@ services:
 
   # P2P vault sync daemon
   sync-daemon:
+    image: ghcr.io/webdesserts/sync-daemon:${VERSION:-latest}
     build:
-      context: ${SYNC_DAEMON_PATH:-../../obsidian-p2p-sync}
-      dockerfile: docker/Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile.sync
     volumes:
       - notes:/notes:rw
     environment:
@@ -75,7 +78,7 @@ services:
       - DOMAIN=${DOMAIN:-leda.webdesserts.com}
     depends_on:
       - auth-service
-      - obsidian-memory
+      - memory
       - sync-daemon
     restart: unless-stopped
     logging:
