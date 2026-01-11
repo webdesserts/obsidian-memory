@@ -106,12 +106,6 @@ export default class P2PSyncPlugin extends Plugin {
     cleanup(this.lastSyncedVersions, this.MAX_MAP_ENTRIES);
     cleanup(this.pendingBroadcasts, this.MAX_MAP_ENTRIES);
   }
-    };
-
-    cleanup(this.lastBroadcastTime, this.MAX_MAP_ENTRIES);
-    cleanup(this.lastSyncedVersions, this.MAX_MAP_ENTRIES);
-    cleanup(this.pendingBroadcasts, this.MAX_MAP_ENTRIES);
-  }
 
   async onload() {
     log.info("Loading plugin...");
