@@ -88,11 +88,12 @@ export default class P2PSyncPlugin extends Plugin {
 
   /**
    * Clean up old entries from Maps when they grow too large.
-   * Uses approximate LRU by removing oldest entries.
+   * Uses approximate LRU by removing oldest entries (for timestamp maps).
    * Only called when Maps exceed MAX_MAP_ENTRIES to prevent unbounded growth.
    */
   private cleanupMaps(): void {
-    const cleanup = <K>(map: Map<K, number>, maxSize: number): void => {
+    // Clean timestamp-based maps (can sort by value)
+    const cleanupTimestamps = <K>(map: Map<K, number>, maxSize: number): void => {
       if (map.size <= maxSize) return;
       const toRemove = map.size - maxSize;
       const entries = Array.from(map.entries())
@@ -102,9 +103,19 @@ export default class P2PSyncPlugin extends Plugin {
       }
     };
 
-    cleanup(this.lastBroadcastTime, this.MAX_MAP_ENTRIES);
-    cleanup(this.lastSyncedVersions, this.MAX_MAP_ENTRIES);
-    cleanup(this.pendingBroadcasts, this.MAX_MAP_ENTRIES);
+    // Clean non-timestamp maps (FIFO - remove oldest inserted)
+    const cleanupFifo = <K, V>(map: Map<K, V>, maxSize: number): void => {
+      if (map.size <= maxSize) return;
+      const toRemove = map.size - maxSize;
+      const keys = Array.from(map.keys());
+      for (let i = 0; i < toRemove && i < keys.length; i++) {
+        map.delete(keys[i]);
+      }
+    };
+
+    cleanupTimestamps(this.lastBroadcastTime, this.MAX_MAP_ENTRIES);
+    cleanupTimestamps(this.pendingBroadcasts, this.MAX_MAP_ENTRIES);
+    cleanupFifo(this.lastSyncedVersions, this.MAX_MAP_ENTRIES);
   }
 
   async onload() {
