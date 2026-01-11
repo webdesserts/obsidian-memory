@@ -2313,6 +2313,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.8",
+ "chrono",
+ "clap",
+ "dirs",
+ "futures-util",
+ "hex",
+ "notify",
+ "notify-debouncer-mini",
+ "obsidian-fs",
+ "once_cell",
+ "rand 0.9.2",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "semantic-embeddings",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "wiki-links",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2560,40 +2594,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
-]
-
-[[package]]
-name = "obsidian-memory-mcp"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum 0.8.8",
- "chrono",
- "clap",
- "dirs",
- "futures-util",
- "hex",
- "notify",
- "notify-debouncer-mini",
- "obsidian-fs",
- "once_cell",
- "rand 0.9.2",
- "regex",
- "reqwest",
- "rmcp",
- "schemars",
- "semantic-embeddings",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "wiki-links",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mcp-server",
+    "crates/memory",
     "crates/wiki-links",
     "crates/obsidian-fs",
     "crates/semantic-embeddings",

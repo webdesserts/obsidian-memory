@@ -1,5 +1,5 @@
 [package]
-name = "obsidian-memory-mcp"
+name = "memory"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,7 +9,7 @@ homepage = "https://github.com/webdesserts/obsidian-memory"
 description = "MCP server for Obsidian memory integration with Claude"
 
 [[bin]]
-name = "obsidian-memory"
+name = "memory"
 path = "src/main.rs"
 
 [features]
