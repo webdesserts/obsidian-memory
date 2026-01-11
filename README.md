@@ -37,7 +37,7 @@ Requires Rust toolchain ([rustup.rs](https://rustup.rs)).
 ```bash
 git clone https://github.com/webdesserts/obsidian-memory.git
 cd obsidian-memory
-cargo install --path crates/mcp-server
+cargo install --path crates/memory
 ```
 
 Note: Building from source uses runtime model download from HuggingFace. Pre-built binaries have the model embedded and work on corporate networks that block HuggingFace.
@@ -146,21 +146,21 @@ The `Search` tool combines semantic embeddings with graph structure:
 
 ## Development
 
-Requires Rust 1.75+ (edition 2021).
+Requires Rust 1.85+ (edition 2024).
 
 ```bash
 # Run tests
 cargo test
 
 # Run locally (downloads model from HuggingFace on first run)
-OBSIDIAN_VAULT_PATH=~/notes cargo run -p obsidian-memory-mcp
+OBSIDIAN_VAULT_PATH=~/notes cargo run -p memory
 
 # Build release
 cargo build --release
 
 # Build with embedded model (for testing release builds)
 ./scripts/download-model.sh
-cargo build --features embedded-model --no-default-features -p obsidian-memory-mcp
+cargo build --features embedded-model --no-default-features -p memory
 ```
 
 ## Troubleshooting
