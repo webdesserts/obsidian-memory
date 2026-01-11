@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM rust:1.85 AS builder
+FROM rust:latest AS builder
 
 WORKDIR /app
 
@@ -13,12 +13,24 @@ RUN apt-get update && apt-get install -y \
 
 # Copy manifests first for better layer caching
 COPY Cargo.toml Cargo.lock ./
-COPY crates/sync-daemon/Cargo.toml crates/sync-daemon/
+COPY crates/auth-service/Cargo.toml crates/auth-service/
+COPY crates/memory/Cargo.toml crates/memory/
+COPY crates/wiki-links/Cargo.toml crates/wiki-links/
+COPY crates/obsidian-fs/Cargo.toml crates/obsidian-fs/
+COPY crates/semantic-embeddings/Cargo.toml crates/semantic-embeddings/
 COPY crates/sync-core/Cargo.toml crates/sync-core/
+COPY crates/sync-daemon/Cargo.toml crates/sync-daemon/
+COPY crates/sync-wasm/Cargo.toml crates/sync-wasm/
 
 # Create dummy source files for dependency compilation
-RUN mkdir -p crates/sync-daemon/src && echo "fn main() {}" > crates/sync-daemon/src/main.rs \
-    && mkdir -p crates/sync-core/src && echo "" > crates/sync-core/src/lib.rs
+RUN mkdir -p crates/auth-service/src && echo "fn main() {}" > crates/auth-service/src/main.rs \
+    && mkdir -p crates/memory/src && echo "fn main() {}" > crates/memory/src/main.rs \
+    && mkdir -p crates/wiki-links/src && echo "" > crates/wiki-links/src/lib.rs \
+    && mkdir -p crates/obsidian-fs/src && echo "" > crates/obsidian-fs/src/lib.rs \
+    && mkdir -p crates/semantic-embeddings/src && echo "" > crates/semantic-embeddings/src/lib.rs \
+    && mkdir -p crates/sync-core/src && echo "" > crates/sync-core/src/lib.rs \
+    && mkdir -p crates/sync-daemon/src && echo "fn main() {}" > crates/sync-daemon/src/main.rs \
+    && mkdir -p crates/sync-wasm/src && echo "" > crates/sync-wasm/src/lib.rs
 
 # Build dependencies only (cached layer)
 RUN cargo build --release -p sync-daemon 2>/dev/null || true
