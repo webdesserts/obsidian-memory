@@ -209,6 +209,86 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Normalize a WebSocket URL for consistent peer ID generation.
+   * Removes default ports, query strings, and fragments.
+   */
+  private normalizeUrl(url: string): string {
+    const parsed = new URL(url);
+    // Remove default ports
+    if ((parsed.protocol === 'wss:' && parsed.port === '443') ||
+        (parsed.protocol === 'ws:' && parsed.port === '80')) {
+      parsed.port = '';
+    }
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.href.replace(/\/$/, '');
+  }
+
+  /**
+   * Connect to a peer using a full WebSocket URL.
+   * Use this for connecting through reverse proxies or with custom paths.
+   *
+   * @param url - Full WebSocket URL (e.g., wss://example.com/sync)
+   */
+  async connectToUrl(url: string): Promise<string> {
+    let normalized: string;
+    try {
+      normalized = this.normalizeUrl(url);
+    } catch {
+      throw new Error(`Invalid URL: ${url}`);
+    }
+
+    const peerId = `url-${normalized}`;
+
+    if (this.outgoingConnections.has(peerId)) {
+      throw new Error(`Already connected to ${url}`);
+    }
+
+    const client = new SyncWebSocketClient();
+
+    // Add client to map BEFORE connecting so it's available when 'open' fires
+    this.outgoingConnections.set(peerId, client);
+
+    client.on("open", () => {
+      const peerInfo: PeerInfo = {
+        id: peerId,
+        address: normalized,
+        direction: "outgoing",
+        connectedAt: new Date(),
+      };
+      this.peers.set(peerId, peerInfo);
+      this.emit("peer-connected", peerInfo);
+
+      // Send our peer ID as handshake
+      this.sendHandshake(peerId, "client");
+    });
+
+    client.on("message", (data) => {
+      this.handleMessage(peerId, data);
+    });
+
+    client.on("close", () => {
+      // Clean up both temp and real peer IDs
+      const realPeerId = this.tempToRealId.get(peerId) ?? peerId;
+      this.outgoingConnections.delete(peerId);
+      this.outgoingConnections.delete(realPeerId);
+      this.peers.delete(peerId);
+      this.peers.delete(realPeerId);
+      this.tempToRealId.delete(peerId);
+      this.realToTempId.delete(realPeerId);
+      this.emit("peer-disconnected", realPeerId);
+    });
+
+    client.on("error", (err) => {
+      this.emit("error", err);
+    });
+
+    await client.connect({ url: normalized, reconnect: true, reconnectDelay: 5000 });
+
+    return peerId;
+  }
+
+  /**
    * Disconnect from a specific peer.
    */
   disconnectPeer(peerId: string): void {

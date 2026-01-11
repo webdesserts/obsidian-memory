@@ -20,8 +20,7 @@
 
   // Connect form
   let showConnectForm = false;
-  let connectAddress = "";
-  let connectPort = "8765";
+  let connectInput = "";
 
   // Event subscription
   let eventRef: EventRef | null = null;
@@ -72,10 +71,17 @@
     }
   }
 
-  // Connect to peer
-  async function connectToPeer() {
-    if (!connectAddress.trim()) {
-      errorMessage = "Please enter an IP address";
+  // Check if input is a WebSocket URL
+  function isUrl(input: string): boolean {
+    const lower = input.toLowerCase().trim();
+    return lower.startsWith('ws://') || lower.startsWith('wss://');
+  }
+
+  // Connect to peer (smart-detect URL vs IP:port)
+  async function connect() {
+    const input = connectInput.trim();
+    if (!input) {
+      errorMessage = "Please enter a URL or IP address";
       return;
     }
 
@@ -83,10 +89,16 @@
     errorMessage = null;
 
     try {
-      const port = parseInt(connectPort, 10) || 8765;
-      await plugin.connectToPeer(connectAddress.trim(), port);
+      if (isUrl(input)) {
+        await plugin.connectToUrl(input);
+      } else {
+        // Parse as ip:port (default port 8765)
+        const [address, portStr] = input.split(':');
+        const port = parseInt(portStr, 10) || 8765;
+        await plugin.connectToPeer(address, port);
+      }
       showConnectForm = false;
-      connectAddress = "";
+      connectInput = "";
       await checkStatus();
     } catch (e) {
       console.error("p2p-sync: Error connecting to peer", e);
@@ -133,8 +145,7 @@
   function toggleConnectForm() {
     showConnectForm = !showConnectForm;
     if (!showConnectForm) {
-      connectAddress = "";
-      connectPort = "8765";
+      connectInput = "";
     }
   }
 
@@ -287,20 +298,14 @@
           <div class="p2p-sync-connect-form">
             <input
               type="text"
-              placeholder="IP Address (e.g., 192.168.1.100)"
-              bind:value={connectAddress}
+              placeholder="wss://example.com/sync or 192.168.1.100:8765"
+              bind:value={connectInput}
               class="p2p-sync-input"
-            />
-            <input
-              type="text"
-              placeholder="Port"
-              bind:value={connectPort}
-              class="p2p-sync-input p2p-sync-input-port"
             />
             <div class="p2p-sync-connect-buttons">
               <button
                 class="p2p-sync-button-primary"
-                on:click={connectToPeer}
+                on:click={connect}
                 disabled={isConnecting}
               >
                 {isConnecting ? "Connecting..." : "Connect"}
@@ -519,10 +524,6 @@
     border-radius: 4px;
     background: var(--background-primary);
     color: var(--text-normal);
-  }
-
-  .p2p-sync-input-port {
-    width: 80px;
   }
 
   .p2p-sync-connect-buttons {

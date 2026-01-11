@@ -276,6 +276,18 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   /**
+   * Connect to a peer using a full WebSocket URL.
+   * Use this for connecting through reverse proxies or with custom paths.
+   */
+  async connectToUrl(url: string): Promise<void> {
+    if (!this.peerManager) {
+      throw new Error("Peer manager not started");
+    }
+
+    await this.peerManager.connectToUrl(url);
+  }
+
+  /**
    * Get the list of connected peers.
    */
   getConnectedPeers(): PeerInfo[] {
