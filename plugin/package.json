@@ -1,0 +1,37 @@
+{
+  "name": "obsidian-p2p-sync",
+  "version": "0.1.0",
+  "description": "P2P vault synchronization for Obsidian using Loro CRDTs",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "npm run build:wasm && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build:wasm": "cd ../crates/sync-wasm && wasm-pack build --target web --out-dir ../../plugin/pkg",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "obsidian",
+    "sync",
+    "p2p",
+    "crdt"
+  ],
+  "author": "webdesserts",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.0",
+    "esbuild-svelte": "^0.8.0",
+    "obsidian": "latest",
+    "svelte": "^5.0.0",
+    "svelte-preprocess": "^6.0.0",
+    "tslib": "^2.6.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.3"
+  }
+}

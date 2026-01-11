@@ -6,6 +6,9 @@ members = [
     "crates/obsidian-fs",
     "crates/semantic-embeddings",
     "crates/auth-service",
+    "crates/sync-core",
+    "crates/sync-daemon",
+    "crates/sync-wasm",
 ]
 
 [workspace.package]

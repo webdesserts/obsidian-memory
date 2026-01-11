@@ -1,0 +1,21 @@
+//! sync-core: Shared Rust library for P2P vault synchronization using Loro CRDTs.
+//!
+//! This crate provides the core functionality for:
+//! - Managing Loro documents for markdown notes
+//! - Parsing/serializing markdown with frontmatter
+//! - Sync protocol between peers
+//! - FileSystem and SyncTransport trait abstractions
+
+pub mod document;
+pub mod fs;
+pub mod markdown;
+pub mod sync;
+pub mod sync_engine;
+pub mod transport;
+pub mod vault;
+
+pub use document::NoteDocument;
+pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
+pub use sync::{SyncMessage, SyncResult};
+pub use transport::{PeerConnection, PeerInfo, SyncTransport};
+pub use vault::Vault;

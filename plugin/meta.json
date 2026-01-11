@@ -1,0 +1,538 @@
+{
+  "inputs": {
+    "node_modules/ws/lib/constants.js": {
+      "bytes": 479,
+      "imports": [],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/buffer-util.js": {
+      "bytes": 3056,
+      "imports": [
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        },
+        {
+          "path": "bufferutil",
+          "kind": "require-call",
+          "external": true
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/limiter.js": {
+      "bytes": 1034,
+      "imports": [],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/permessage-deflate.js": {
+      "bytes": 14510,
+      "imports": [
+        {
+          "path": "zlib",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "node_modules/ws/lib/buffer-util.js",
+          "kind": "require-call",
+          "original": "./buffer-util"
+        },
+        {
+          "path": "node_modules/ws/lib/limiter.js",
+          "kind": "require-call",
+          "original": "./limiter"
+        },
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/validation.js": {
+      "bytes": 3903,
+      "imports": [
+        {
+          "path": "buffer",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        },
+        {
+          "path": "utf-8-validate",
+          "kind": "require-call",
+          "external": true
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/receiver.js": {
+      "bytes": 16460,
+      "imports": [
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "node_modules/ws/lib/permessage-deflate.js",
+          "kind": "require-call",
+          "original": "./permessage-deflate"
+        },
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        },
+        {
+          "path": "node_modules/ws/lib/buffer-util.js",
+          "kind": "require-call",
+          "original": "./buffer-util"
+        },
+        {
+          "path": "node_modules/ws/lib/validation.js",
+          "kind": "require-call",
+          "original": "./validation"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/sender.js": {
+      "bytes": 16711,
+      "imports": [
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "crypto",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "node_modules/ws/lib/permessage-deflate.js",
+          "kind": "require-call",
+          "original": "./permessage-deflate"
+        },
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        },
+        {
+          "path": "node_modules/ws/lib/validation.js",
+          "kind": "require-call",
+          "original": "./validation"
+        },
+        {
+          "path": "node_modules/ws/lib/buffer-util.js",
+          "kind": "require-call",
+          "original": "./buffer-util"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/event-target.js": {
+      "bytes": 7321,
+      "imports": [
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/extension.js": {
+      "bytes": 6183,
+      "imports": [
+        {
+          "path": "node_modules/ws/lib/validation.js",
+          "kind": "require-call",
+          "original": "./validation"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/websocket.js": {
+      "bytes": 36463,
+      "imports": [
+        {
+          "path": "events",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "https",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "http",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "net",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "tls",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "crypto",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "url",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "node_modules/ws/lib/permessage-deflate.js",
+          "kind": "require-call",
+          "original": "./permessage-deflate"
+        },
+        {
+          "path": "node_modules/ws/lib/receiver.js",
+          "kind": "require-call",
+          "original": "./receiver"
+        },
+        {
+          "path": "node_modules/ws/lib/sender.js",
+          "kind": "require-call",
+          "original": "./sender"
+        },
+        {
+          "path": "node_modules/ws/lib/validation.js",
+          "kind": "require-call",
+          "original": "./validation"
+        },
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        },
+        {
+          "path": "node_modules/ws/lib/event-target.js",
+          "kind": "require-call",
+          "original": "./event-target"
+        },
+        {
+          "path": "node_modules/ws/lib/extension.js",
+          "kind": "require-call",
+          "original": "./extension"
+        },
+        {
+          "path": "node_modules/ws/lib/buffer-util.js",
+          "kind": "require-call",
+          "original": "./buffer-util"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/stream.js": {
+      "bytes": 4204,
+      "imports": [
+        {
+          "path": "node_modules/ws/lib/websocket.js",
+          "kind": "require-call",
+          "original": "./websocket"
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/subprotocol.js": {
+      "bytes": 1498,
+      "imports": [
+        {
+          "path": "node_modules/ws/lib/validation.js",
+          "kind": "require-call",
+          "original": "./validation"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/lib/websocket-server.js": {
+      "bytes": 16393,
+      "imports": [
+        {
+          "path": "events",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "http",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "crypto",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "node_modules/ws/lib/extension.js",
+          "kind": "require-call",
+          "original": "./extension"
+        },
+        {
+          "path": "node_modules/ws/lib/permessage-deflate.js",
+          "kind": "require-call",
+          "original": "./permessage-deflate"
+        },
+        {
+          "path": "node_modules/ws/lib/subprotocol.js",
+          "kind": "require-call",
+          "original": "./subprotocol"
+        },
+        {
+          "path": "node_modules/ws/lib/websocket.js",
+          "kind": "require-call",
+          "original": "./websocket"
+        },
+        {
+          "path": "node_modules/ws/lib/constants.js",
+          "kind": "require-call",
+          "original": "./constants"
+        }
+      ],
+      "format": "cjs"
+    },
+    "node_modules/ws/wrapper.mjs": {
+      "bytes": 341,
+      "imports": [
+        {
+          "path": "node_modules/ws/lib/stream.js",
+          "kind": "import-statement",
+          "original": "./lib/stream.js"
+        },
+        {
+          "path": "node_modules/ws/lib/receiver.js",
+          "kind": "import-statement",
+          "original": "./lib/receiver.js"
+        },
+        {
+          "path": "node_modules/ws/lib/sender.js",
+          "kind": "import-statement",
+          "original": "./lib/sender.js"
+        },
+        {
+          "path": "node_modules/ws/lib/websocket.js",
+          "kind": "import-statement",
+          "original": "./lib/websocket.js"
+        },
+        {
+          "path": "node_modules/ws/lib/websocket-server.js",
+          "kind": "import-statement",
+          "original": "./lib/websocket-server.js"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/network/WebSocketServer.ts": {
+      "bytes": 5810,
+      "imports": [
+        {
+          "path": "node_modules/ws/wrapper.mjs",
+          "kind": "import-statement",
+          "original": "ws"
+        },
+        {
+          "path": "events",
+          "kind": "import-statement",
+          "external": true
+        }
+      ],
+      "format": "esm"
+    }
+  },
+  "outputs": {
+    "../../../../../../dev/null": {
+      "imports": [
+        {
+          "path": "bufferutil",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "zlib",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "buffer",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "utf-8-validate",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "crypto",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "events",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "https",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "http",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "net",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "tls",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "crypto",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "url",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "events",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "http",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "stream",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "crypto",
+          "kind": "require-call",
+          "external": true
+        },
+        {
+          "path": "events",
+          "kind": "require-call",
+          "external": true
+        }
+      ],
+      "exports": [],
+      "entryPoint": "src/network/WebSocketServer.ts",
+      "inputs": {
+        "node_modules/ws/lib/constants.js": {
+          "bytesInOutput": 643
+        },
+        "node_modules/ws/lib/buffer-util.js": {
+          "bytesInOutput": 2325
+        },
+        "node_modules/ws/lib/limiter.js": {
+          "bytesInOutput": 1187
+        },
+        "node_modules/ws/lib/permessage-deflate.js": {
+          "bytesInOutput": 14355
+        },
+        "node_modules/ws/lib/validation.js": {
+          "bytesInOutput": 3614
+        },
+        "node_modules/ws/lib/receiver.js": {
+          "bytesInOutput": 18301
+        },
+        "node_modules/ws/lib/sender.js": {
+          "bytesInOutput": 17402
+        },
+        "node_modules/ws/lib/event-target.js": {
+          "bytesInOutput": 7633
+        },
+        "node_modules/ws/lib/extension.js": {
+          "bytesInOutput": 5677
+        },
+        "node_modules/ws/lib/websocket.js": {
+          "bytesInOutput": 31285
+        },
+        "node_modules/ws/lib/stream.js": {
+          "bytesInOutput": 2933
+        },
+        "node_modules/ws/lib/subprotocol.js": {
+          "bytesInOutput": 1512
+        },
+        "node_modules/ws/lib/websocket-server.js": {
+          "bytesInOutput": 15436
+        },
+        "src/network/WebSocketServer.ts": {
+          "bytesInOutput": 4741
+        },
+        "node_modules/ws/wrapper.mjs": {
+          "bytesInOutput": 280
+        }
+      },
+      "bytes": 129575
+    }
+  }
+}
