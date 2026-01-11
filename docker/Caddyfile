@@ -4,18 +4,18 @@
 {$DOMAIN} {
     # OAuth metadata discovery (public)
     handle /auth/.well-known/oauth-authorization-server {
+        uri strip_prefix /auth
         reverse_proxy auth-service:3001 {
             header_up X-Forwarded-Proto {scheme}
         }
-        rewrite * /.well-known/oauth-authorization-server
     }
 
     # OAuth endpoints (public)
     handle /auth/register {
+        uri strip_prefix /auth
         reverse_proxy auth-service:3001 {
             header_up X-Forwarded-Proto {scheme}
         }
-        rewrite * /register
     }
 
     handle /auth/authorize* {
@@ -26,10 +26,10 @@
     }
 
     handle /auth/token {
+        uri strip_prefix /auth
         reverse_proxy auth-service:3001 {
             header_up X-Forwarded-Proto {scheme}
         }
-        rewrite * /token
     }
 
     # Setup endpoint for first-time passkey registration (public but rate-limited)
@@ -46,7 +46,7 @@
             uri /validate
             copy_headers Authorization
         }
-        reverse_proxy obsidian-memory:3000 {
+        reverse_proxy memory:3000 {
             # Critical: disable buffering for SSE streaming
             flush_interval -1
             header_up X-Forwarded-Proto {scheme}
