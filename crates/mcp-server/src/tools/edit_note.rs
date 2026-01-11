@@ -145,8 +145,8 @@ pub async fn execute<S: Storage>(
         return Ok(CallToolResult::success(vec![Content::text(text)]));
     }
 
-    // Write the modified content
-    storage.write(&uri, &modified, None).await.map_err(|e| {
+    // Write the modified content with optimistic locking (TOCTOU protection)
+    storage.write(&uri, &modified, Some(current_hash.as_str())).await.map_err(|e| {
         ErrorData::internal_error(format!("Failed to write note: {}", e), None)
     })?;
 

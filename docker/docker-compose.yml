@@ -1,0 +1,101 @@
+services:
+  # OAuth 2.1 + API key authentication
+  auth-service:
+    build:
+      context: ..
+      dockerfile: crates/auth-service/Dockerfile
+    volumes:
+      - auth-config:/config
+    environment:
+      - RUST_LOG=info,auth_service=debug
+      - AUTH_CONFIG_PATH=/config
+      - AUTH_PUBLIC_URL=https://${DOMAIN:-leda.webdesserts.com}/auth
+    expose:
+      - "3001"
+    restart: unless-stopped
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # MCP server with HTTP transport
+  obsidian-memory:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - notes:/notes:rw
+    environment:
+      - OBSIDIAN_VAULT_PATH=/notes
+      - RUST_LOG=info,obsidian_memory=debug
+    expose:
+      - "3000"
+    depends_on:
+      - auth-service
+    restart: unless-stopped
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # P2P vault sync daemon
+  sync-daemon:
+    build:
+      context: ${SYNC_DAEMON_PATH:-../../obsidian-p2p-sync}
+      dockerfile: docker/Dockerfile
+    volumes:
+      - notes:/notes:rw
+    environment:
+      - RUST_LOG=info,sync_daemon=debug
+    expose:
+      - "8080"
+    restart: unless-stopped
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # TLS termination + routing
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-leda.webdesserts.com}
+    depends_on:
+      - auth-service
+      - obsidian-memory
+      - sync-daemon
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # Vault data - bind mount to host directory
+  notes:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NOTES_PATH:?NOTES_PATH must be set to vault directory}
+
+  # Persistent config for auth service (tokens, clients, API keys)
+  auth-config:
+
+  # Caddy TLS certificates and config
+  caddy-data:
+  caddy-config:

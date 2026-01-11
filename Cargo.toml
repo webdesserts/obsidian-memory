@@ -5,6 +5,7 @@ members = [
     "crates/wiki-links",
     "crates/obsidian-fs",
     "crates/semantic-embeddings",
+    "crates/auth-service",
 ]
 
 [workspace.package]

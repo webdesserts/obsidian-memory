@@ -11,6 +11,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+#[cfg(feature = "http")]
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpService,
+};
+
 mod config;
 mod embeddings;
 mod graph;
@@ -142,24 +147,21 @@ pub struct MoveNoteParams {
     pub to: String,
 }
 
-/// The main MCP server state, holding configuration and shared resources.
+/// Shared state that can be reused across multiple HTTP sessions.
+/// Pre-initialized once, then passed to each session's MemoryServer.
 #[derive(Clone)]
-pub struct MemoryServer {
+pub struct SharedState {
     config: Arc<Config>,
     graph: Arc<RwLock<GraphIndex>>,
     embeddings: Arc<EmbeddingManager>,
     storage: Arc<FileStorage>,
-    /// Tracks which notes have been read, enabling "must read before write" checks.
-    read_whitelist: Arc<RwLock<ReadWhitelist>>,
-    tool_router: ToolRouter<Self>,
-    /// File watcher handle - kept alive for the lifetime of the server.
-    /// Wrapped in Arc for Clone, Option for tests that don't need watching.
+    /// File watcher handle - kept alive for the lifetime of the shared state.
     #[allow(dead_code)]
     watcher: Option<Arc<VaultWatcher>>,
 }
 
-#[tool_router]
-impl MemoryServer {
+impl SharedState {
+    /// Initialize shared state (async, call once before starting HTTP server).
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         // Initialize graph index by scanning the vault
         let mut graph = GraphIndex::new();
@@ -173,11 +175,7 @@ impl MemoryServer {
         // Create storage backend
         let storage = Arc::new(FileStorage::new(config.vault_path.clone()));
 
-        // Create read whitelist for "must read before write" tracking
-        let read_whitelist = Arc::new(RwLock::new(ReadWhitelist::new()));
-
         // Start file watcher to keep graph index and embeddings up to date
-        // Note: Read whitelist staleness is handled via content hash comparison at write-time
         let watcher = match VaultWatcher::start(
             config.vault_path.clone(),
             graph.clone(),
@@ -198,10 +196,59 @@ impl MemoryServer {
             graph,
             embeddings,
             storage,
-            read_whitelist,
-            tool_router: Self::tool_router(),
             watcher,
         })
+    }
+}
+
+/// The main MCP server state, holding configuration and shared resources.
+#[derive(Clone)]
+pub struct MemoryServer {
+    /// Shared state (graph, embeddings, storage, config) - same across all sessions
+    shared: SharedState,
+    /// Tracks which notes have been read, enabling "must read before write" checks.
+    /// Per-session state - not shared between HTTP clients.
+    read_whitelist: Arc<RwLock<ReadWhitelist>>,
+    /// Unique identifier for this client session.
+    /// For stdio: always "stdio". For HTTP: unique per session.
+    client_id: ClientId,
+    tool_router: ToolRouter<Self>,
+}
+
+#[tool_router]
+impl MemoryServer {
+    /// Create a new server for stdio transport (single client).
+    pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let shared = SharedState::new(config).await?;
+        Ok(Self::from_shared(shared, ClientId::stdio()))
+    }
+
+    /// Create a server from pre-initialized shared state (sync, for HTTP factory).
+    /// Each HTTP session gets its own read_whitelist and client_id.
+    pub fn from_shared(shared: SharedState, client_id: ClientId) -> Self {
+        Self {
+            shared,
+            read_whitelist: Arc::new(RwLock::new(ReadWhitelist::new())),
+            client_id,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    // Accessor methods for shared state fields
+    fn config(&self) -> &Config {
+        &self.shared.config
+    }
+
+    fn graph(&self) -> &Arc<RwLock<GraphIndex>> {
+        &self.shared.graph
+    }
+
+    fn embeddings(&self) -> &Arc<EmbeddingManager> {
+        &self.shared.embeddings
+    }
+
+    fn storage(&self) -> &FileStorage {
+        &self.shared.storage
     }
 
     #[tool(description = "Get the current date and time in ISO format for use in Working Memory timeline entries. Returns ISO 8601 formatted datetime (YYYY-MM-DDTHH:MM) and additional context.")]
@@ -211,15 +258,15 @@ impl MemoryServer {
 
     #[tool(description = "Append a timestamped entry to Log.md for active work state and debugging context tracking. Records chronological session activity - what happened when. The tool automatically adds timestamps and organizes entries by day. Use this for tracking work in progress, debugging steps, state changes, and decisions made during active work.")]
     async fn log(&self, params: Parameters<LogParams>) -> Result<CallToolResult, ErrorData> {
-        tools::log::execute(&self.config.vault_path, &params.0.content).await
+        tools::log::execute(&self.config().vault_path, &params.0.content).await
     }
 
     #[tool(description = "Get metadata and graph connections for the current week's journal note. Returns path, URIs, frontmatter, and links/backlinks. Works whether or not the note exists yet. Use ReadNote tool to get content.")]
     async fn get_weekly_note_info(&self) -> Result<CallToolResult, ErrorData> {
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         tools::get_weekly_note_info::execute(
-            &self.config.vault_path,
-            &self.config.vault_name,
+            &self.config().vault_path,
+            &self.config().vault_name,
             &graph,
         )
         .await
@@ -227,10 +274,10 @@ impl MemoryServer {
 
     #[tool(description = "Get metadata and graph connections for a note. Returns frontmatter, file paths, and links/backlinks. Use ReadNote tool to get content.")]
     async fn get_note_info(&self, params: Parameters<GetNoteInfoParams>) -> Result<CallToolResult, ErrorData> {
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         tools::get_note_info::execute(
-            &self.config.vault_path,
-            &self.config.vault_name,
+            &self.config().vault_path,
+            &self.config().vault_name,
             &graph,
             &params.0.note,
         )
@@ -240,7 +287,7 @@ impl MemoryServer {
     #[tool(description = "Update frontmatter metadata in a note")]
     async fn update_frontmatter(&self, params: Parameters<UpdateFrontmatterParams>) -> Result<CallToolResult, ErrorData> {
         tools::update_frontmatter::execute(
-            &self.config.vault_path,
+            &self.config().vault_path,
             &params.0.path,
             params.0.updates,
         )
@@ -249,18 +296,18 @@ impl MemoryServer {
 
     #[tool(description = "Load all session context files in a single call. Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. Automatically discovers projects based on git remotes and directory names. Use this at the start of every session to get complete context about recent work, current focus, this week's activity, and project context.")]
     async fn remember(&self) -> Result<CallToolResult, ErrorData> {
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         let cwd = std::env::current_dir().unwrap_or_default();
-        tools::remember::execute(&self.config.vault_path, &graph, &cwd).await
+        tools::remember::execute(&self.config().vault_path, &graph, &cwd).await
     }
 
     #[tool(description = "Search for relevant notes using semantic similarity. Encodes the query and compares it against all note embeddings. Returns similarity-ordered list of potentially relevant notes. Supports note references via wiki-links: [[Note Name]]")]
     async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, ErrorData> {
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         tools::search::execute(
-            &self.config.vault_path,
+            &self.config().vault_path,
             &graph,
-            &self.embeddings,
+            self.embeddings(),
             &params.0.query,
             params.0.include_private,
             params.0.debug,
@@ -271,7 +318,7 @@ impl MemoryServer {
     #[tool(description = "Replace an entire day's log entries with consolidated/compacted entries. Use this ONLY during memory consolidation to rewrite or summarize a day's logs. For adding new entries during active work, use the Log tool instead (it's simpler and doesn't require reading the log first). This tool automatically formats entries with correct timestamps, en-dashes, and chronological sorting. Pass an empty object to delete the entire day section (header and all entries).")]
     async fn write_logs(&self, params: Parameters<WriteLogsParams>) -> Result<CallToolResult, ErrorData> {
         tools::write_logs::execute(
-            &self.config.vault_path,
+            &self.config().vault_path,
             &params.0.iso_week_date,
             params.0.entries,
         )
@@ -285,17 +332,17 @@ impl MemoryServer {
 
     #[tool(description = "Load private memory indexes (requires explicit user consent)")]
     async fn load_private_memory(&self, params: Parameters<LoadPrivateMemoryParams>) -> Result<CallToolResult, ErrorData> {
-        tools::load_private_memory::execute(&self.config.vault_path, &params.0.reason).await
+        tools::load_private_memory::execute(&self.config().vault_path, &params.0.reason).await
     }
 
     #[tool(description = "Read the complete contents of a note. Marks the note as readable for subsequent writes. Use this before WriteNote or EditNote to see current content.")]
     async fn read_note(&self, params: Parameters<ReadNoteParams>) -> Result<CallToolResult, ErrorData> {
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         tools::read_note::execute(
-            self.storage.as_ref(),
+            self.storage(),
             &graph,
             &self.read_whitelist,
-            ClientId::stdio(),
+            self.client_id.clone(),
             &params.0.note,
         )
         .await
@@ -303,13 +350,13 @@ impl MemoryServer {
 
     #[tool(description = "Create a new note or overwrite an existing note. For existing notes, you must call ReadNote first to see the current content and confirm the overwrite. Uses atomic writes for safety.")]
     async fn write_note(&self, params: Parameters<WriteNoteParams>) -> Result<CallToolResult, ErrorData> {
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         tools::write_note::execute(
-            &self.config.vault_path,
-            self.storage.as_ref(),
+            &self.config().vault_path,
+            self.storage(),
             &graph,
             &self.read_whitelist,
-            ClientId::stdio(),
+            self.client_id.clone(),
             &params.0.note,
             &params.0.content,
         )
@@ -326,13 +373,13 @@ impl MemoryServer {
             })
             .collect();
 
-        let graph = self.graph.read().await;
+        let graph = self.graph().read().await;
         tools::edit_note::execute(
-            &self.config.vault_path,
-            self.storage.as_ref(),
+            &self.config().vault_path,
+            self.storage(),
             &graph,
             &self.read_whitelist,
-            ClientId::stdio(),
+            self.client_id.clone(),
             &params.0.note,
             edits,
             params.0.dry_run,
@@ -343,8 +390,8 @@ impl MemoryServer {
     #[tool(description = "Permanently delete a note from the vault. Returns an error if the note doesn't exist.")]
     async fn delete_note(&self, params: Parameters<DeleteNoteParams>) -> Result<CallToolResult, ErrorData> {
         tools::delete_note::execute(
-            &self.config.vault_path,
-            self.storage.as_ref(),
+            &self.config().vault_path,
+            self.storage(),
             &params.0.note,
         )
         .await
@@ -353,9 +400,9 @@ impl MemoryServer {
     #[tool(description = "Move or rename a note. Automatically updates wiki-links in all notes that reference the moved note. Fails if destination already exists.")]
     async fn move_note(&self, params: Parameters<MoveNoteParams>) -> Result<CallToolResult, ErrorData> {
         tools::move_note::execute(
-            &self.config.vault_path,
-            self.storage.as_ref(),
-            &self.graph,
+            &self.config().vault_path,
+            self.storage(),
+            self.graph(),
             &params.0.from,
             &params.0.to,
         )
@@ -382,6 +429,28 @@ impl rmcp::ServerHandler for MemoryServer {
     }
 }
 
+/// CLI arguments for the MCP server.
+#[cfg(feature = "http")]
+#[derive(clap::Parser)]
+#[command(name = "obsidian-memory")]
+#[command(about = "MCP server for Obsidian memory integration")]
+struct Cli {
+    /// Run in HTTP mode instead of stdio
+    #[arg(long)]
+    http: bool,
+
+    /// Port to listen on in HTTP mode
+    #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
+    port: u16,
+
+    /// Address to bind to in HTTP mode. Use 0.0.0.0 for all interfaces (unsafe without auth).
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+}
+
+#[cfg(feature = "http")]
+const DEFAULT_HTTP_PORT: u16 = 3000;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for logging
@@ -394,16 +463,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     tracing::info!("Vault path: {}", config.vault_path.display());
 
-    // Create server (this scans the vault and builds the graph index)
+    #[cfg(feature = "http")]
+    {
+        use clap::Parser;
+        let cli = Cli::parse();
+
+        if cli.http {
+            return run_http_server(config, &cli.bind, cli.port).await;
+        }
+    }
+
+    // Default: Run with STDIO transport
+    run_stdio_server(config).await
+}
+
+/// Run the server with STDIO transport (default mode).
+async fn run_stdio_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let server = MemoryServer::new(config).await?;
 
-    // Run the server with STDIO transport
     let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("Error starting server: {}", e);
     })?;
 
-    tracing::info!("Obsidian Memory MCP server started");
+    tracing::info!("Obsidian Memory MCP server started (stdio)");
     service.waiting().await?;
 
     Ok(())
+}
+
+/// Run the server with HTTP transport.
+#[cfg(feature = "http")]
+async fn run_http_server(
+    config: Config,
+    bind: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Pre-initialize shared state (graph, embeddings, storage, watcher).
+    // This is done once before starting the HTTP server.
+    let shared = Arc::new(SharedState::new(config).await?);
+
+    // The StreamableHttpService creates a new MemoryServer for each session.
+    // Each session gets its own read_whitelist and client_id.
+    let service = StreamableHttpService::new(
+        {
+            let shared = shared.clone();
+            move || {
+                // Sync factory: create server from pre-initialized shared state
+                Ok(MemoryServer::from_shared(
+                    (*shared).clone(),
+                    ClientId::generate(),
+                ))
+            }
+        },
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+
+    // Parse bind address - default to localhost for safety
+    let bind_addr: std::net::IpAddr = bind.parse().map_err(|e| {
+        format!("Invalid bind address '{}': {}", bind, e)
+    })?;
+    let addr = std::net::SocketAddr::from((bind_addr, port));
+
+    // Warn if binding to all interfaces without auth
+    if bind_addr.is_unspecified() {
+        tracing::warn!(
+            "Binding to all interfaces ({}). This server has NO AUTHENTICATION. \
+             Do not expose to untrusted networks.",
+            bind
+        );
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        format!("Failed to bind to {}:{} - {}", bind, port, e)
+    })?;
+
+    tracing::info!("Obsidian Memory MCP server started (HTTP) at http://{}/mcp", addr);
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    Ok(())
+}
+
+/// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix).
+#[cfg(feature = "http")]
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Shutdown signal received, stopping server...");
 }
