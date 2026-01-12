@@ -3,7 +3,7 @@
 use crate::document::NoteDocument;
 use crate::fs::{FileSystem, FsError};
 
-use loro::LoroDoc;
+use loro::{LoroDoc, LoroTree, TreeID, TreeParentId};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -65,8 +65,12 @@ impl ReconcileReport {
 
 /// Manages a vault of documents
 pub struct Vault<F: FileSystem> {
-    /// File registry (tracks all files in vault)
+    /// File registry (tracks all files in vault via LoroTree)
     pub(crate) registry: LoroDoc,
+
+    /// Path lookup cache (LoroTree has no path-based lookup)
+    /// Rebuilt after sync and updated inline for local operations
+    path_to_node: HashMap<String, TreeID>,
 
     /// Loaded documents
     pub(crate) documents: HashMap<String, NoteDocument>,
@@ -86,6 +90,9 @@ impl<F: FileSystem> Vault<F> {
         fs.mkdir(&format!("{}/documents", SYNC_DIR)).await?;
 
         let registry = LoroDoc::new();
+        // Initialize the file tree (LoroTree inside registry)
+        // The tree is created on first access via get_tree()
+        let _file_tree = registry.get_tree("files");
 
         // Save initial registry
         let registry_bytes = registry.export(loro::ExportMode::Snapshot).unwrap();
@@ -93,6 +100,7 @@ impl<F: FileSystem> Vault<F> {
 
         let mut vault = Self {
             registry,
+            path_to_node: HashMap::new(),
             documents: HashMap::new(),
             fs,
             peer_id,
@@ -105,10 +113,10 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Load an existing vault and reconcile with filesystem.
-    /// 
+    ///
     /// Reconciliation ensures the Loro state matches the filesystem:
     /// - New files (no .loro) → index them
-    /// - Modified files (markdown ≠ Loro) → re-index from markdown  
+    /// - Modified files (markdown ≠ Loro) → re-index from markdown
     /// - Orphaned .loro files → logged for future cleanup
     pub async fn load(fs: F, peer_id: String) -> Result<Self> {
         // Check if vault is initialized
@@ -123,16 +131,23 @@ impl<F: FileSystem> Vault<F> {
             doc.import(&bytes).ok();
             doc
         } else {
-            LoroDoc::new()
+            let doc = LoroDoc::new();
+            // Initialize file tree for new registries
+            let _file_tree = doc.get_tree("files");
+            doc
         };
 
         let mut vault = Self {
             registry,
+            path_to_node: HashMap::new(),
             documents: HashMap::new(),
             fs,
             peer_id,
         };
-        
+
+        // Build path cache from loaded tree
+        vault.rebuild_path_cache();
+
         // Reconcile filesystem with Loro state
         vault.reconcile().await?;
 
@@ -574,7 +589,7 @@ impl<F: FileSystem> Vault<F> {
     /// by the CRDT before any sync operations.
     async fn index_existing_files(&mut self) -> Result<()> {
         let files = self.list_files().await?;
-        
+
         for path in files {
             // Process each file as if it was just changed
             // This creates the Loro document and saves the sync state
@@ -585,6 +600,312 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(())
+    }
+
+    // ========== File Tree Operations (LoroTree) ==========
+
+    /// Get the file tree from the registry
+    fn file_tree(&self) -> LoroTree {
+        self.registry.get_tree("files")
+    }
+
+    /// Rebuild the path cache from the current tree state.
+    /// Call this after applying sync updates.
+    fn rebuild_path_cache(&mut self) {
+        self.path_to_node.clear();
+        let tree = self.file_tree();
+
+        // Iterate over all non-deleted nodes
+        for node_id in tree.nodes() {
+            // Skip deleted nodes
+            if tree.is_node_deleted(&node_id).unwrap_or(true) {
+                continue;
+            }
+
+            // Only cache file nodes (not folders)
+            if let Ok(meta) = tree.get_meta(node_id) {
+                let node_type = meta.get("type").and_then(|v| {
+                    if let loro::ValueOrContainer::Value(val) = v {
+                        val.as_string().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                });
+
+                if node_type.as_deref() == Some("file") {
+                    if let Some(path) = self.get_node_path(&node_id) {
+                        self.path_to_node.insert(path, node_id);
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("Rebuilt path cache with {} entries", self.path_to_node.len());
+    }
+
+    /// Get the path for a node by walking up the tree
+    fn get_node_path(&self, node_id: &TreeID) -> Option<String> {
+        let tree = self.file_tree();
+        let mut parts = vec![];
+        let mut current = *node_id;
+
+        loop {
+            // Get node metadata
+            let meta = tree.get_meta(current).ok()?;
+            let name = meta.get("name").and_then(|v| {
+                if let loro::ValueOrContainer::Value(val) = v {
+                    val.as_string().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })?;
+            parts.push(name);
+
+            // Get parent
+            match tree.parent(current) {
+                Some(TreeParentId::Node(parent_id)) => {
+                    current = parent_id;
+                }
+                Some(TreeParentId::Root) | None => break,
+                _ => break,
+            }
+        }
+
+        parts.reverse();
+        Some(parts.join("/"))
+    }
+
+    /// Find a node by path using the cache
+    fn find_node_by_path(&self, path: &str) -> Option<TreeID> {
+        self.path_to_node.get(path).copied()
+    }
+
+    /// Validate a sync path for security
+    fn validate_sync_path(path: &str) -> Result<()> {
+        // Path traversal
+        if path.contains("..") {
+            return Err(VaultError::Other("Path traversal not allowed".into()));
+        }
+        // Absolute paths (Unix)
+        if path.starts_with('/') {
+            return Err(VaultError::Other("Absolute path not allowed".into()));
+        }
+        // Absolute paths (Windows - drive letter)
+        if path.len() >= 2 && path.chars().nth(1) == Some(':') {
+            return Err(VaultError::Other("Windows absolute path not allowed".into()));
+        }
+        // Backslash
+        if path.contains('\\') {
+            return Err(VaultError::Other("Backslash in path not allowed".into()));
+        }
+        // Null bytes
+        if path.contains('\0') {
+            return Err(VaultError::Other("Null byte in path not allowed".into()));
+        }
+        // Must be .md
+        if !path.ends_with(".md") {
+            return Err(VaultError::Other("Only markdown files allowed".into()));
+        }
+        // Control characters
+        if path.chars().any(|c| c.is_control()) {
+            return Err(VaultError::Other("Control character in path not allowed".into()));
+        }
+        Ok(())
+    }
+
+    /// Register a new file in the tree (creates parent folders as needed).
+    /// Returns the TreeID of the created file node.
+    pub fn register_file(&mut self, path: &str) -> Result<TreeID> {
+        Self::validate_sync_path(path)?;
+
+        // Check if file already registered
+        if let Some(existing_id) = self.find_node_by_path(path) {
+            return Ok(existing_id);
+        }
+
+        let parts: Vec<&str> = path.split('/').collect();
+        let (folders, file_name) = parts.split_at(parts.len() - 1);
+
+        // Ensure parent folders exist
+        let mut parent_id = TreeParentId::Root;
+        for folder_name in folders {
+            parent_id = self.get_or_create_folder(parent_id, folder_name)?;
+        }
+
+        // Create file node
+        let tree = self.file_tree();
+        let node_id = tree
+            .create(parent_id)
+            .map_err(|e| VaultError::Other(format!("Failed to create file node: {}", e)))?;
+
+        let meta = tree
+            .get_meta(node_id)
+            .map_err(|e| VaultError::Other(format!("Failed to get file meta: {}", e)))?;
+        meta.insert("type", "file")
+            .map_err(|e| VaultError::Other(format!("Failed to set file type: {}", e)))?;
+        meta.insert("name", file_name[0])
+            .map_err(|e| VaultError::Other(format!("Failed to set file name: {}", e)))?;
+        meta.insert("doc_id", simple_hash(path))
+            .map_err(|e| VaultError::Other(format!("Failed to set doc_id: {}", e)))?;
+
+        // Update cache
+        self.path_to_node.insert(path.to_string(), node_id);
+
+        tracing::debug!("Registered file in tree: {}", path);
+        Ok(node_id)
+    }
+
+    /// Delete a file from the tree (CRDT operation - tracked, reversible).
+    /// Also cleans up the .loro document file.
+    pub async fn delete_file(&mut self, path: &str) -> Result<()> {
+        Self::validate_sync_path(path)?;
+
+        if let Some(node_id) = self.find_node_by_path(path) {
+            let tree = self.file_tree();
+            tree.delete(node_id)
+                .map_err(|e| VaultError::Other(format!("Failed to delete file node: {}", e)))?;
+
+            // Remove from cache
+            self.path_to_node.remove(path);
+
+            // Clean up .loro document
+            let sync_path = self.document_sync_path(path);
+            if self.fs.exists(&sync_path).await? {
+                self.fs.delete(&sync_path).await?;
+            }
+
+            // Remove from documents cache
+            self.documents.remove(path);
+
+            tracing::info!("Deleted file from tree: {}", path);
+        }
+
+        Ok(())
+    }
+
+    /// Rename/move a file in the tree (CRDT operation via tree move).
+    pub async fn rename_file(&mut self, old_path: &str, new_path: &str) -> Result<()> {
+        Self::validate_sync_path(old_path)?;
+        Self::validate_sync_path(new_path)?;
+
+        let Some(node_id) = self.find_node_by_path(old_path) else {
+            return Err(VaultError::Other(format!("Source file not found: {}", old_path)));
+        };
+
+        // Check target doesn't exist
+        if self.find_node_by_path(new_path).is_some() {
+            return Err(VaultError::Other(format!("Target already exists: {}", new_path)));
+        }
+
+        let new_parts: Vec<&str> = new_path.split('/').collect();
+        let (new_folders, new_name) = new_parts.split_at(new_parts.len() - 1);
+
+        // Ensure new parent folders exist
+        let mut new_parent = TreeParentId::Root;
+        for folder_name in new_folders {
+            new_parent = self.get_or_create_folder(new_parent, folder_name)?;
+        }
+
+        let tree = self.file_tree();
+
+        // Move node to new parent (Loro API is `mov`)
+        tree.mov(node_id, new_parent)
+            .map_err(|e| VaultError::Other(format!("Failed to move file node: {}", e)))?;
+
+        // Update name in metadata
+        let meta = tree
+            .get_meta(node_id)
+            .map_err(|e| VaultError::Other(format!("Failed to get file meta: {}", e)))?;
+        meta.insert("name", new_name[0])
+            .map_err(|e| VaultError::Other(format!("Failed to update file name: {}", e)))?;
+        meta.insert("doc_id", simple_hash(new_path))
+            .map_err(|e| VaultError::Other(format!("Failed to update doc_id: {}", e)))?;
+
+        // Update caches
+        self.path_to_node.remove(old_path);
+        self.path_to_node.insert(new_path.to_string(), node_id);
+
+        // Move .loro document file
+        let old_sync_path = self.document_sync_path(old_path);
+        let new_sync_path = self.document_sync_path(new_path);
+        if self.fs.exists(&old_sync_path).await? {
+            let bytes = self.fs.read(&old_sync_path).await?;
+            self.fs.write(&new_sync_path, &bytes).await?;
+            self.fs.delete(&old_sync_path).await?;
+        }
+
+        // Update documents cache
+        if let Some(doc) = self.documents.remove(old_path) {
+            self.documents.insert(new_path.to_string(), doc);
+        }
+
+        tracing::info!("Renamed file in tree: {} -> {}", old_path, new_path);
+        Ok(())
+    }
+
+    /// Check if a file is deleted in the tree
+    pub fn is_file_deleted(&self, path: &str) -> bool {
+        match self.find_node_by_path(path) {
+            Some(node_id) => {
+                let tree = self.file_tree();
+                tree.is_node_deleted(&node_id).unwrap_or(true)
+            }
+            None => true, // Not in tree = effectively deleted
+        }
+    }
+
+    /// Get or create a folder node
+    fn get_or_create_folder(&mut self, parent: TreeParentId, name: &str) -> Result<TreeParentId> {
+        let tree = self.file_tree();
+
+        // Look for existing folder with this name under parent
+        let children = match &parent {
+            TreeParentId::Root => tree.roots(),
+            TreeParentId::Node(parent_id) => tree.children(parent_id).unwrap_or_default(),
+            _ => vec![],
+        };
+
+        for child_id in children {
+            if let Ok(meta) = tree.get_meta(child_id) {
+                let is_folder = meta
+                    .get("type")
+                    .and_then(|v| {
+                        if let loro::ValueOrContainer::Value(val) = v {
+                            val.as_string().map(|s| s.as_ref() == "folder")
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false);
+
+                let child_name = meta.get("name").and_then(|v| {
+                    if let loro::ValueOrContainer::Value(val) = v {
+                        val.as_string().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                });
+
+                if is_folder && child_name.as_deref() == Some(name) {
+                    return Ok(TreeParentId::Node(child_id));
+                }
+            }
+        }
+
+        // Create new folder node
+        let node_id = tree
+            .create(parent)
+            .map_err(|e| VaultError::Other(format!("Failed to create folder node: {}", e)))?;
+
+        let meta = tree
+            .get_meta(node_id)
+            .map_err(|e| VaultError::Other(format!("Failed to get folder meta: {}", e)))?;
+        meta.insert("type", "folder")
+            .map_err(|e| VaultError::Other(format!("Failed to set folder type: {}", e)))?;
+        meta.insert("name", name)
+            .map_err(|e| VaultError::Other(format!("Failed to set folder name: {}", e)))?;
+
+        Ok(TreeParentId::Node(node_id))
     }
 }
 
