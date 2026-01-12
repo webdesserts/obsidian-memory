@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 // Use library exports
 use sync_daemon::connection::ConnectionEvent;
@@ -211,14 +211,14 @@ impl Daemon {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Set up logging
-    let level = if args.verbose {
-        Level::DEBUG
+    // Set up logging - respects RUST_LOG env var, defaults to info (or debug with --verbose)
+    let default_filter = if args.verbose {
+        "debug,sync_daemon=debug"
     } else {
-        Level::INFO
+        "info,sync_daemon=info"
     };
-    let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     info!("Starting sync-daemon");
     info!("Vault path: {:?}", args.vault);
