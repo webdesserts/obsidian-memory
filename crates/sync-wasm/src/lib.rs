@@ -270,6 +270,40 @@ mod wasm_impl {
                 None => Ok(JsValue::NULL),
             }
         }
+
+        // ========== File Tree Operations ==========
+
+        /// Delete a file from the tree (CRDT operation).
+        ///
+        /// Call this when Obsidian fires a delete event for a markdown file.
+        /// The deletion is tracked in the registry LoroTree and syncs to peers.
+        #[wasm_bindgen(js_name = deleteFile)]
+        pub async fn delete_file(&mut self, path: &str) -> Result<(), JsError> {
+            self.inner
+                .delete_file(path)
+                .await
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Rename/move a file in the tree (CRDT operation).
+        ///
+        /// Call this when Obsidian fires a rename event for a markdown file.
+        /// The rename is tracked in the registry LoroTree and syncs to peers.
+        #[wasm_bindgen(js_name = renameFile)]
+        pub async fn rename_file(&mut self, old_path: &str, new_path: &str) -> Result<(), JsError> {
+            self.inner
+                .rename_file(old_path, new_path)
+                .await
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Check if a file is deleted in the tree.
+        ///
+        /// Returns true if the file is deleted or not found in the tree.
+        #[wasm_bindgen(js_name = isFileDeleted)]
+        pub fn is_file_deleted(&self, path: &str) -> bool {
+            self.inner.is_file_deleted(path)
+        }
     }
 
     /// Result from processing a sync message
