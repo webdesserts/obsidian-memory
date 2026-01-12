@@ -263,6 +263,8 @@ impl<F: FileSystem> Vault<F> {
                 // Truly new file (not a move target)
                 tracing::info!("New file detected, indexing: {}", path);
                 self.on_file_changed(path).await?;
+                // Register in tree for delete/rename tracking
+                self.register_file(path)?;
                 report.indexed.push(path.clone());
             }
         }
@@ -302,6 +304,9 @@ impl<F: FileSystem> Vault<F> {
 
         // Update cache
         self.documents.insert(new_path.to_string(), doc);
+
+        // Register in tree (the old path's node was already processed as orphaned)
+        self.register_file(new_path)?;
 
         Ok(())
     }
@@ -532,6 +537,10 @@ impl<F: FileSystem> Vault<F> {
         let snapshot = new_doc.export_snapshot();
         self.fs.write(&sync_path, &snapshot).await?;
         self.documents.insert(path.to_string(), new_doc);
+
+        // Register in tree for delete/rename tracking
+        self.register_file(path)?;
+
         tracing::debug!("Created new document: {}", path);
 
         Ok(())
