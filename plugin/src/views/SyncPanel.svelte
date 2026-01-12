@@ -1,18 +1,30 @@
 <script lang="ts">
   import type P2PSyncPlugin from "../main";
+  import type { KnownPeer } from "../main";
   import type { PeerInfo } from "../network";
   import type { EventRef } from "obsidian";
   import { onMount, onDestroy } from "svelte";
 
   export let plugin: P2PSyncPlugin;
 
+  /** Combined view of a peer with connection status */
+  interface PeerView {
+    url: string;
+    label: string;
+    isConnected: boolean;
+    lastActivityAt: Date | null;
+    /** The connected peer's ID (needed for disconnect) */
+    connectedPeerId: string | null;
+    /** Whether this peer is in known peers (saved for auto-reconnect) */
+    isKnownPeer: boolean;
+  }
+
   // Reactive state
   let isInitialized = false;
   let isChecking = true;
   let isSyncing = false;
   let isConnecting = false;
-  let connectedPeers: PeerInfo[] = [];
-  let lastSyncTime: Date | null = null;
+  let peers: PeerView[] = [];
   let errorMessage: string | null = null;
   let lanUrl: string | null = null;
   let disabledReason: string | null = null;
@@ -23,6 +35,108 @@
 
   // Event subscription
   let eventRef: EventRef | null = null;
+
+  // Refresh interval for relative times
+  let refreshInterval: number | null = null;
+
+  /**
+   * Extract host:port from a URL or address string for comparison.
+   * Returns the host:port portion, or the original string if parsing fails.
+   */
+  function extractHostPort(urlOrAddress: string): string {
+    // If it looks like a URL, parse it
+    if (urlOrAddress.startsWith('ws://') || urlOrAddress.startsWith('wss://')) {
+      try {
+        const parsed = new URL(urlOrAddress);
+        return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+      } catch {
+        return urlOrAddress;
+      }
+    }
+    // Otherwise return as-is (already host:port or just host)
+    return urlOrAddress;
+  }
+
+  /**
+   * Check if a known peer matches a connected peer.
+   */
+  function peersMatch(known: KnownPeer, connected: PeerInfo): boolean {
+    // For URL-based connections, PeerInfo.address is the normalized URL
+    if (connected.address.startsWith('ws://') || connected.address.startsWith('wss://')) {
+      return connected.address === known.url;
+    }
+
+    // For IP:port or plain IP connections, compare host parts
+    const knownHostPort = extractHostPort(known.url);
+    const connectedHostPort = extractHostPort(connected.address);
+
+    // Exact match
+    if (knownHostPort === connectedHostPort) {
+      return true;
+    }
+
+    // For incoming connections, server only reports IP without port.
+    // Match if the IP portion is the same (e.g., "10.0.0.115:8765" matches "10.0.0.115")
+    const knownHost = knownHostPort.split(':')[0];
+    const connectedHost = connectedHostPort.split(':')[0];
+    return knownHost === connectedHost;
+  }
+
+  /**
+   * Build a unified peer view by merging known peers with connection status.
+   */
+  function buildPeerView(knownPeers: KnownPeer[], connectedPeers: PeerInfo[]): PeerView[] {
+    const result: PeerView[] = [];
+    const matchedPeerIds = new Set<string>();
+
+    // First, add all known peers with their connection status
+    for (const known of knownPeers) {
+      // Find ALL connections that match this known peer (could be both incoming and outgoing)
+      const matchingConnections = connectedPeers.filter(p => peersMatch(known, p));
+
+      // Mark all matching connections as matched
+      for (const conn of matchingConnections) {
+        matchedPeerIds.add(conn.id);
+      }
+
+      // Use the most recent activity from any matching connection
+      const mostRecentActivity = matchingConnections.length > 0
+        ? matchingConnections.reduce((latest, conn) =>
+            conn.lastActivityAt > latest ? conn.lastActivityAt : latest,
+            matchingConnections[0].lastActivityAt
+          )
+        : null;
+
+      // Use first matching connection's ID for disconnect (prefer outgoing)
+      const primaryConnection = matchingConnections.find(c => c.direction === 'outgoing')
+        ?? matchingConnections[0];
+
+      result.push({
+        url: known.url,
+        label: known.label,
+        isConnected: matchingConnections.length > 0,
+        lastActivityAt: mostRecentActivity,
+        connectedPeerId: primaryConnection?.id ?? null,
+        isKnownPeer: true,
+      });
+    }
+
+    // Add any connected peers that aren't in known peers (incoming connections from unknown peers)
+    for (const connected of connectedPeers) {
+      if (!matchedPeerIds.has(connected.id)) {
+        result.push({
+          url: connected.address,
+          label: connected.address,
+          isConnected: true,
+          lastActivityAt: connected.lastActivityAt,
+          connectedPeerId: connected.id,
+          isKnownPeer: false,
+        });
+      }
+    }
+
+    return result;
+  }
 
   // Check sync status
   async function checkStatus() {
@@ -39,12 +153,14 @@
 
       // Get LAN URL from plugin
       lanUrl = plugin.getLanUrl();
-      
+
       // Check if vault is initialized
       isInitialized = plugin.isVaultInitialized();
-      
-      // Get connected peers
-      connectedPeers = plugin.getConnectedPeers();
+
+      // Build unified peer view
+      const knownPeers = plugin.getKnownPeers();
+      const connectedPeers = plugin.getConnectedPeers();
+      peers = buildPeerView(knownPeers, connectedPeers);
     } catch (e) {
       console.error("p2p-sync: Error checking status", e);
       errorMessage = `Error: ${e}`;
@@ -106,26 +222,34 @@
     }
   }
 
-  // Manual sync trigger
-  async function syncNow() {
-    isSyncing = true;
-    errorMessage = null;
-
-    try {
-      // TODO: Implement actual sync
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      lastSyncTime = new Date();
-    } catch (e) {
-      console.error("p2p-sync: Error syncing", e);
-      errorMessage = `Sync failed: ${e}`;
-    } finally {
-      isSyncing = false;
-    }
+  // Format relative time for last activity
+  function formatRelativeTime(date: Date): string {
+    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h`;
   }
 
-  function formatTime(date: Date | null): string {
-    if (!date) return "Never";
-    return date.toLocaleTimeString();
+  // Remove a known peer (disconnect + delete from settings)
+  async function removePeer(peer: PeerView) {
+    // Disconnect if connected
+    if (peer.connectedPeerId) {
+      plugin.disconnectPeer(peer.connectedPeerId);
+    }
+    // Remove from known peers
+    await plugin.removeKnownPeer(peer.url);
+    await checkStatus();
+  }
+
+  // Just disconnect an incoming peer (don't remove from known, since it's not there)
+  async function disconnectPeer(peer: PeerView) {
+    if (peer.connectedPeerId) {
+      plugin.disconnectPeer(peer.connectedPeerId);
+    }
+    // Refresh UI (state-changed event may be async)
+    await checkStatus();
   }
 
   function copyLanUrl() {
@@ -147,11 +271,18 @@
     eventRef = plugin.events.on("state-changed", () => {
       checkStatus();
     });
+    // Refresh relative times every 10 seconds
+    refreshInterval = window.setInterval(() => {
+      peers = peers; // Trigger Svelte reactivity
+    }, 10000);
   });
 
   onDestroy(() => {
     if (eventRef) {
       plugin.events.offref(eventRef);
+    }
+    if (refreshInterval) {
+      clearInterval(refreshInterval);
     }
   });
 </script>
@@ -231,42 +362,53 @@
         <span>Sync enabled</span>
       </div>
       
-      <div class="p2p-sync-details">
-        {#if lanUrl}
+      {#if lanUrl}
+        <div class="p2p-sync-details">
           <div class="p2p-sync-detail-row">
             <span class="p2p-sync-label">LAN URL:</span>
             <button class="p2p-sync-url-value" on:click={copyLanUrl} title="Click to copy">
               {lanUrl}
             </button>
           </div>
-        {/if}
-        <div class="p2p-sync-detail-row">
-          <span class="p2p-sync-label">Last sync:</span>
-          <span class="p2p-sync-value">{formatTime(lastSyncTime)}</span>
         </div>
-      </div>
-
-      <button
-        class="p2p-sync-button"
-        on:click={syncNow}
-        disabled={isSyncing}
-      >
-        {#if isSyncing}
-          Syncing...
-        {:else}
-          Sync Now
-        {/if}
-      </button>
+      {/if}
 
       <div class="p2p-sync-peers">
         <h4>Peers</h4>
-        {#if connectedPeers.length === 0}
-          <p class="p2p-sync-muted">No peers connected</p>
+        {#if peers.length === 0}
+          <p class="p2p-sync-muted">No peers configured</p>
         {:else}
           <ul class="p2p-sync-peer-list">
-            {#each connectedPeers as peer}
+            {#each peers as peer}
               <li class="p2p-sync-peer-item">
-                <span class="p2p-sync-peer-address">{peer.address}</span>
+                <div class="p2p-sync-peer-info">
+                  <span
+                    class="p2p-sync-peer-status"
+                    class:p2p-sync-peer-online={peer.isConnected}
+                    class:p2p-sync-peer-offline={!peer.isConnected}
+                  ></span>
+                  <span class="p2p-sync-peer-address">{peer.label}</span>
+                </div>
+                <div class="p2p-sync-peer-actions">
+                  {#if peer.isConnected && peer.lastActivityAt}
+                    <span class="p2p-sync-peer-activity">{formatRelativeTime(peer.lastActivityAt)}</span>
+                  {:else if !peer.isConnected}
+                    <span class="p2p-sync-peer-activity p2p-sync-peer-offline-text">offline</span>
+                  {/if}
+                  {#if peer.isKnownPeer}
+                    <button
+                      class="p2p-sync-remove-btn"
+                      on:click={() => removePeer(peer)}
+                      title="Remove peer"
+                    >✕</button>
+                  {:else}
+                    <button
+                      class="p2p-sync-remove-btn"
+                      on:click={() => disconnectPeer(peer)}
+                      title="Disconnect"
+                    >✕</button>
+                  {/if}
+                </div>
               </li>
             {/each}
           </ul>
@@ -441,10 +583,6 @@
     color: var(--text-muted);
   }
 
-  .p2p-sync-value {
-    color: var(--text-normal);
-  }
-
   .p2p-sync-peers {
     margin-top: 24px;
   }
@@ -477,9 +615,67 @@
     font-size: var(--font-ui-small);
   }
 
+  .p2p-sync-peer-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .p2p-sync-peer-status {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .p2p-sync-peer-online {
+    background: var(--text-success);
+  }
+
+  .p2p-sync-peer-offline {
+    background: var(--text-muted);
+  }
+
+  .p2p-sync-peer-offline-text {
+    font-style: italic;
+  }
+
   .p2p-sync-peer-address {
     font-family: var(--font-monospace);
     font-size: var(--font-ui-smaller);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .p2p-sync-peer-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .p2p-sync-peer-activity {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+  }
+
+  .p2p-sync-remove-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    font-size: 12px;
+    line-height: 1;
+    border-radius: 2px;
+  }
+
+  .p2p-sync-remove-btn:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-error);
   }
 
   .p2p-sync-connect-form {

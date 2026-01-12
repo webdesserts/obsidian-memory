@@ -32,6 +32,7 @@ export interface PeerInfo {
   address: string;
   direction: "incoming" | "outgoing";
   connectedAt: Date;
+  lastActivityAt: Date;
 }
 
 /**
@@ -93,11 +94,13 @@ export class PeerManager extends EventEmitter {
       this.server = server;
 
       server.on("connection", (conn: { id: string; remoteAddress: string }) => {
+        const now = new Date();
         const peerInfo: PeerInfo = {
           id: conn.id,
           address: conn.remoteAddress,
           direction: "incoming",
-          connectedAt: new Date(),
+          connectedAt: now,
+          lastActivityAt: now,
         };
         this.peers.set(conn.id, peerInfo);
         this.emit("peer-connected", peerInfo);
@@ -170,11 +173,13 @@ export class PeerManager extends EventEmitter {
     this.outgoingConnections.set(peerId, client);
 
     client.on("open", () => {
+      const now = new Date();
       const peerInfo: PeerInfo = {
         id: peerId,
         address: `${address}:${port}`,
         direction: "outgoing",
-        connectedAt: new Date(),
+        connectedAt: now,
+        lastActivityAt: now,
       };
       this.peers.set(peerId, peerInfo);
       this.emit("peer-connected", peerInfo);
@@ -250,11 +255,13 @@ export class PeerManager extends EventEmitter {
     this.outgoingConnections.set(peerId, client);
 
     client.on("open", () => {
+      const now = new Date();
       const peerInfo: PeerInfo = {
         id: peerId,
         address: normalized,
         direction: "outgoing",
-        connectedAt: new Date(),
+        connectedAt: now,
+        lastActivityAt: now,
       };
       this.peers.set(peerId, peerInfo);
       this.emit("peer-connected", peerInfo);
@@ -298,14 +305,24 @@ export class PeerManager extends EventEmitter {
       client.disconnect();
       this.outgoingConnections.delete(peerId);
       this.peers.delete(peerId);
+      // Clean up ID maps
+      const tempId = this.realToTempId.get(peerId);
+      if (tempId) {
+        this.tempToRealId.delete(tempId);
+        this.realToTempId.delete(peerId);
+      }
       this.emit("peer-disconnected", peerId);
       return;
     }
 
-    // Check incoming connections
+    // Check incoming connections - server uses temp IDs
     if (this.server) {
-      this.server.disconnect(peerId);
+      const tempId = this.realToTempId.get(peerId) ?? peerId;
+      this.server.disconnect(tempId);
       this.peers.delete(peerId);
+      // Clean up ID maps
+      this.tempToRealId.delete(tempId);
+      this.realToTempId.delete(peerId);
       this.emit("peer-disconnected", peerId);
     }
   }
@@ -374,6 +391,17 @@ export class PeerManager extends EventEmitter {
    */
   getConnectedPeers(): PeerInfo[] {
     return Array.from(this.peers.values());
+  }
+
+  /**
+   * Update the last activity timestamp for a peer and emit event.
+   */
+  updatePeerActivity(peerId: string): void {
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      peer.lastActivityAt = new Date();
+      this.emit("peer-activity", peerId);
+    }
   }
 
   /**
@@ -452,18 +480,20 @@ export class PeerManager extends EventEmitter {
         const peerInfo = this.peers.get(tempPeerId);
         if (peerInfo) {
           peerInfo.id = msg.peerId;
-          
-          // Keep both keys pointing to the same peer for lookup
-          // This allows send() to work with either ID
+
+          // Remove temp ID entry to avoid duplicates in getConnectedPeers()
+          this.peers.delete(tempPeerId);
+          // Store under real ID only
           this.peers.set(msg.peerId, peerInfo);
-          
-          // Map both directions for ID resolution
+
+          // Map both directions for ID resolution (needed for send/disconnect)
           this.tempToRealId.set(tempPeerId, msg.peerId);
           this.realToTempId.set(msg.peerId, tempPeerId);
-          
+
           // Also update outgoing connections map if this was an outgoing connection
           const client = this.outgoingConnections.get(tempPeerId);
           if (client) {
+            this.outgoingConnections.delete(tempPeerId);
             this.outgoingConnections.set(msg.peerId, client);
           }
         }

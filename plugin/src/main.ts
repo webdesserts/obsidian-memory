@@ -27,6 +27,24 @@ const MAX_SYNC_MESSAGE_SIZE = 50 * 1024 * 1024;
 /** Minimum time between broadcasts for the same file (ms). Prevents flooding. */
 const BROADCAST_THROTTLE_MS = 1000;
 
+/** A saved peer address for auto-reconnect */
+export interface KnownPeer {
+  /** Full WebSocket URL (ws:// or wss://) */
+  url: string;
+  /** Display label (hostname:port or full URL for proxied connections) */
+  label: string;
+}
+
+/** Plugin settings persisted to data.json */
+interface P2PSyncSettings {
+  /** Peers to auto-reconnect to on plugin load */
+  knownPeers: KnownPeer[];
+}
+
+const DEFAULT_SETTINGS: P2PSyncSettings = {
+  knownPeers: [],
+};
+
 /**
  * Plugin events:
  * - 'state-changed': Emitted when peers connect/disconnect or vault initializes
@@ -34,6 +52,9 @@ const BROADCAST_THROTTLE_MS = 1000;
 export default class P2PSyncPlugin extends Plugin {
   /** Event emitter for UI updates */
   readonly events = new Events();
+
+  /** Plugin settings */
+  settings: P2PSyncSettings = DEFAULT_SETTINGS;
 
   /** The vault manager from WASM */
   vault: WasmVault | null = null;
@@ -158,6 +179,9 @@ export default class P2PSyncPlugin extends Plugin {
     this.peerId = this.loadPeerId();
     log.info("Peer ID:", this.peerId);
 
+    // Load settings (known peers, etc.)
+    await this.loadSettings();
+
     // Register the sidebar view
     this.registerView(VIEW_TYPE_SYNC, (leaf) => new SyncView(leaf, this));
 
@@ -258,7 +282,12 @@ export default class P2PSyncPlugin extends Plugin {
 
     this.peerManager.on("message", async (peerId: string, data: Uint8Array) => {
       log.debug(`Message from ${peerId}:`, data.length, "bytes");
+      this.peerManager?.updatePeerActivity(peerId);
       await this.handleSyncMessage(peerId, data);
+    });
+
+    this.peerManager.on("peer-activity", () => {
+      this.events.trigger("state-changed");
     });
 
     this.peerManager.on("error", (err: Error) => {
@@ -273,6 +302,38 @@ export default class P2PSyncPlugin extends Plugin {
       log.error("Failed to start peer manager:", err);
       // Non-fatal - can still work as client
     }
+
+    // Auto-reconnect to known peers (fire-and-forget, don't block startup)
+    this.reconnectToKnownPeers();
+  }
+
+  /**
+   * Attempt to reconnect to all known peers in parallel.
+   * Runs in background - failures are logged but don't block startup.
+   */
+  private async reconnectToKnownPeers(): Promise<void> {
+    if (this.settings.knownPeers.length === 0) {
+      return;
+    }
+
+    log.info(`Auto-reconnecting to ${this.settings.knownPeers.length} known peer(s)...`);
+
+    // Connect to all peers in parallel
+    const results = await Promise.allSettled(
+      this.settings.knownPeers.map(async (peer) => {
+        await this.peerManager?.connectToUrl(peer.url);
+        return peer.label;
+      })
+    );
+
+    // Log results
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        log.info(`Reconnected to ${result.value}`);
+      } else {
+        log.warn(`Failed to reconnect:`, result.reason);
+      }
+    }
   }
 
   /**
@@ -284,6 +345,11 @@ export default class P2PSyncPlugin extends Plugin {
     }
 
     await this.peerManager.connectToPeer(address, port);
+
+    // Save to known peers for auto-reconnect
+    const url = `ws://${address}:${port}`;
+    const label = port === DEFAULT_PORT ? address : `${address}:${port}`;
+    await this.addKnownPeer(url, label);
   }
 
   /**
@@ -296,6 +362,20 @@ export default class P2PSyncPlugin extends Plugin {
     }
 
     await this.peerManager.connectToUrl(url);
+
+    // Save to known peers for auto-reconnect
+    // Build a readable label from the URL
+    const parsed = new URL(url);
+    let label = parsed.hostname;
+    // Include port if non-default
+    if (parsed.port && parsed.port !== '443' && parsed.port !== '80') {
+      label += `:${parsed.port}`;
+    }
+    // Include path if not root
+    if (parsed.pathname && parsed.pathname !== '/') {
+      label += parsed.pathname;
+    }
+    await this.addKnownPeer(url, label);
   }
 
   /**
@@ -303,6 +383,18 @@ export default class P2PSyncPlugin extends Plugin {
    */
   getConnectedPeers(): PeerInfo[] {
     return this.peerManager?.getConnectedPeers() ?? [];
+  }
+
+  /**
+   * Disconnect from a specific peer.
+   */
+  disconnectPeer(peerId: string): void {
+    if (!this.peerManager) return;
+    try {
+      this.peerManager.disconnectPeer(peerId);
+    } catch (e) {
+      log.error("Failed to disconnect peer:", e);
+    }
   }
 
   /**
@@ -344,6 +436,95 @@ export default class P2PSyncPlugin extends Plugin {
     const newId = generatePeerId();
     localStorage.setItem(vaultKey, newId);
     return newId;
+  }
+
+  /**
+   * Load plugin settings from data.json.
+   */
+  private async loadSettings(): Promise<void> {
+    const data = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+
+    // Validate knownPeers array
+    if (!Array.isArray(this.settings.knownPeers)) {
+      log.warn("Invalid knownPeers in settings, resetting to empty array");
+      this.settings.knownPeers = [];
+    } else {
+      // Filter out invalid entries and deduplicate by normalized URL
+      const seen = new Set<string>();
+      this.settings.knownPeers = this.settings.knownPeers.filter(p => {
+        if (!p || typeof p.url !== 'string' || typeof p.label !== 'string') {
+          return false;
+        }
+        const normalized = this.normalizeWsUrl(p.url);
+        if (seen.has(normalized)) {
+          return false;
+        }
+        seen.add(normalized);
+        return true;
+      });
+    }
+  }
+
+  /**
+   * Save plugin settings to data.json.
+   */
+  private async saveSettings(): Promise<void> {
+    await this.saveData(this.settings);
+  }
+
+  /**
+   * Normalize a WebSocket URL for consistent storage and comparison.
+   * Must match PeerManager.normalizeUrl() exactly for peer matching to work.
+   * Removes default ports, query strings, fragments, and trailing slashes.
+   */
+  private normalizeWsUrl(url: string): string {
+    try {
+      const parsed = new URL(url);
+      // Remove default ports
+      if ((parsed.protocol === 'wss:' && parsed.port === '443') ||
+          (parsed.protocol === 'ws:' && parsed.port === '80')) {
+        parsed.port = '';
+      }
+      // Remove query and hash (PeerManager strips these)
+      parsed.search = '';
+      parsed.hash = '';
+      // Remove trailing slash (URL.href always adds one for root paths)
+      return parsed.href.replace(/\/$/, '');
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * Add a peer to known peers (for auto-reconnect).
+   */
+  private async addKnownPeer(url: string, label: string): Promise<void> {
+    // Normalize URL for consistent comparison
+    const normalizedUrl = this.normalizeWsUrl(url);
+
+    // Don't add duplicates
+    if (this.settings.knownPeers.some(p => p.url === normalizedUrl)) {
+      return;
+    }
+    this.settings.knownPeers.push({ url: normalizedUrl, label });
+    await this.saveSettings();
+  }
+
+  /**
+   * Remove a peer from known peers.
+   */
+  async removeKnownPeer(url: string): Promise<void> {
+    const normalizedUrl = this.normalizeWsUrl(url);
+    this.settings.knownPeers = this.settings.knownPeers.filter(p => p.url !== normalizedUrl);
+    await this.saveSettings();
+  }
+
+  /**
+   * Get the list of known peers (for UI display).
+   */
+  getKnownPeers(): KnownPeer[] {
+    return this.settings.knownPeers;
   }
 
   /**
