@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use sync_daemon::{
-    message::HandshakeMessage, native_fs::NativeFs, server::WebSocketServer,
-    watcher::FileWatcher, FileEventKind,
+    connection::ConnectionEvent, message::HandshakeMessage, native_fs::NativeFs,
+    server::WebSocketServer, watcher::FileWatcher, FileEventKind,
 };
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -90,6 +90,33 @@ impl TestClient {
 }
 
 // ============================================================================
+// Helpers
+// ============================================================================
+
+/// Process pending events from the server, registering/removing peers as needed.
+async fn process_pending_events(server: &Arc<Mutex<WebSocketServer>>) {
+    loop {
+        let mut guard = server.lock().await;
+        // Use try_recv pattern via recv_event with timeout
+        match tokio::time::timeout(Duration::from_millis(10), guard.recv_event()).await {
+            Ok(Some(event)) => {
+                match event {
+                    ConnectionEvent::Message(_) => {} // Ignore messages in test helper
+                    ConnectionEvent::Handshake { temp_id, peer_id } => {
+                        guard.register_peer(&temp_id, peer_id);
+                    }
+                    ConnectionEvent::Closed { temp_id } => {
+                        guard.remove_peer(&temp_id);
+                    }
+                }
+                drop(guard);
+            }
+            _ => break, // Timeout or None means no more events
+        }
+    }
+}
+
+// ============================================================================
 // Test Cases
 // ============================================================================
 
@@ -113,9 +140,7 @@ async fn test_handshake_exchange() {
 
         // Wait for handshake event to arrive and process it
         tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Poll events to process the handshake
-        while server_clone.lock().await.poll_events().await.is_some() {}
+        process_pending_events(&server_clone).await;
     });
 
     // Connect client
@@ -157,7 +182,7 @@ async fn test_multiple_clients() {
 
         // Wait for handshake events and process them
         tokio::time::sleep(Duration::from_millis(200)).await;
-        while server_clone.lock().await.poll_events().await.is_some() {}
+        process_pending_events(&server_clone).await;
     });
 
     // Connect two clients
@@ -199,7 +224,7 @@ async fn test_message_broadcast() {
 
         // Wait for handshake events and process them
         tokio::time::sleep(Duration::from_millis(200)).await;
-        while server_clone.lock().await.poll_events().await.is_some() {}
+        process_pending_events(&server_clone).await;
     });
 
     let mut client1 = TestClient::connect_and_handshake(addr).await;
@@ -442,7 +467,7 @@ async fn test_connection_events_flow() {
 
         // Wait for handshake event and process it
         tokio::time::sleep(Duration::from_millis(200)).await;
-        while server_clone.lock().await.poll_events().await.is_some() {}
+        process_pending_events(&server_clone).await;
     });
 
     // Connect and handshake

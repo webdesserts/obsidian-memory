@@ -290,13 +290,12 @@ async fn main() -> Result<()> {
                         daemon.on_sync_message(msg).await;
                     }
                     ConnectionEvent::Handshake { temp_id, peer_id } => {
-                        // Handshake is handled internally by server
-                        daemon.server.poll_events().await;
                         debug!("Handshake event for {} -> {}", temp_id, peer_id);
+                        daemon.server.register_peer(&temp_id, peer_id);
                     }
                     ConnectionEvent::Closed { temp_id } => {
-                        daemon.server.poll_events().await;
                         info!("Peer disconnected: {}", temp_id);
+                        daemon.server.remove_peer(&temp_id);
                     }
                 }
             }

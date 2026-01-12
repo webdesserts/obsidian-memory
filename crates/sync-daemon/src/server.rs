@@ -2,7 +2,7 @@
 //!
 //! Manages connection lifecycle, peer ID mapping, and message routing.
 
-use crate::connection::{ConnectionEvent, IncomingMessage, PeerConnection};
+use crate::connection::{ConnectionEvent, PeerConnection};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -91,36 +91,13 @@ impl WebSocketServer {
         self.connections.insert(temp_id, conn);
     }
 
-    /// Process pending connection events.
-    ///
-    /// Returns incoming sync messages. Handles handshakes and closes internally.
-    pub async fn poll_events(&mut self) -> Option<IncomingMessage> {
-        loop {
-            match self.event_rx.try_recv() {
-                Ok(event) => match event {
-                    ConnectionEvent::Message(msg) => {
-                        return Some(msg);
-                    }
-                    ConnectionEvent::Handshake { temp_id, peer_id } => {
-                        self.handle_handshake(&temp_id, peer_id);
-                    }
-                    ConnectionEvent::Closed { temp_id } => {
-                        self.handle_close(&temp_id);
-                    }
-                },
-                Err(mpsc::error::TryRecvError::Empty) => return None,
-                Err(mpsc::error::TryRecvError::Disconnected) => return None,
-            }
-        }
-    }
-
     /// Wait for the next connection event.
     pub async fn recv_event(&mut self) -> Option<ConnectionEvent> {
         self.event_rx.recv().await
     }
 
-    /// Handle a handshake completion.
-    fn handle_handshake(&mut self, temp_id: &str, peer_id: String) {
+    /// Register a peer after handshake completion.
+    pub fn register_peer(&mut self, temp_id: &str, peer_id: String) {
         debug!(
             "Handshake complete: {} is now known as {}",
             temp_id, peer_id
@@ -139,10 +116,8 @@ impl WebSocketServer {
         let _ = self.peer_connected_tx.send(peer_id);
     }
 
-    /// Handle a connection close.
-    fn handle_close(&mut self, temp_id: &str) {
-        info!("Connection closed: {}", temp_id);
-
+    /// Remove a peer after connection close.
+    pub fn remove_peer(&mut self, temp_id: &str) {
         // Clean up ID mappings
         if let Some(peer_id) = self.temp_to_peer.remove(temp_id) {
             self.peer_to_temp.remove(&peer_id);
