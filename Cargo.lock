@@ -3868,6 +3868,7 @@ version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "clap",
  "futures",
  "notify",

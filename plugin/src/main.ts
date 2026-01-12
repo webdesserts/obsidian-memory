@@ -976,7 +976,13 @@ export default class P2PSyncPlugin extends Plugin {
           // Delete file from tree (CRDT operation)
           await this.vaultQueue.run(() => this.vault!.deleteFile(file.path));
           log.info(`Deleted ${file.path} from registry tree`);
-          // Registry change syncs automatically via normal sync protocol
+
+          // Broadcast deletion to peers
+          if (this.peerManager && this.peerManager.peerCount > 0) {
+            const msg = this.vault!.prepareFileDeleted(file.path);
+            this.peerManager.broadcast(msg);
+            log.debug(`Broadcast deletion of ${file.path} to ${this.peerManager.peerCount} peer(s)`);
+          }
         } catch (err) {
           log.error("Failed to handle file delete:", err);
         }
@@ -994,7 +1000,13 @@ export default class P2PSyncPlugin extends Plugin {
           // Rename file in tree (CRDT operation)
           await this.vaultQueue.run(() => this.vault!.renameFile(oldPath, file.path));
           log.info(`Renamed ${oldPath} -> ${file.path} in registry tree`);
-          // Registry change syncs automatically via normal sync protocol
+
+          // Broadcast rename to peers
+          if (this.peerManager && this.peerManager.peerCount > 0) {
+            const msg = this.vault!.prepareFileRenamed(oldPath, file.path);
+            this.peerManager.broadcast(msg);
+            log.debug(`Broadcast rename ${oldPath} -> ${file.path} to ${this.peerManager.peerCount} peer(s)`);
+          }
         } catch (err) {
           log.error("Failed to handle file rename:", err);
         }

@@ -80,9 +80,21 @@ impl Daemon {
             return;
         }
 
-        // Registry change syncs automatically via normal sync protocol
-        // when peers reconnect or exchange version vectors
-        info!("Deleted {} from registry tree", path);
+        // Broadcast deletion to peers
+        if self.server.peer_count() > 0 {
+            match vault.prepare_file_deleted(path) {
+                Ok(msg) => {
+                    drop(vault); // Release lock before network I/O
+                    self.server.broadcast(&msg).await;
+                    info!("Broadcast deletion of {} to {} peer(s)", path, self.server.peer_count());
+                }
+                Err(e) => {
+                    error!("Failed to prepare deletion message for {}: {}", path, e);
+                }
+            }
+        } else {
+            info!("Deleted {} from registry tree (no peers to broadcast)", path);
+        }
     }
 
     /// Handle a file modification.
@@ -151,14 +163,19 @@ impl Daemon {
 
         debug!("Processing sync message from {} ({} bytes)", peer_id, msg.data.len());
 
+        // Check if this is a FileDeleted or FileRenamed message that should be relayed directly
+        let should_relay_raw = self.is_file_lifecycle_message(&msg.data);
+
         let mut vault = self.vault.lock().await;
 
         match vault.process_sync_message(&msg.data).await {
             Ok((response, modified_paths)) => {
-                // Track synced versions for modified files
+                // Track synced versions for modified files (skip for deletions)
                 for path in &modified_paths {
-                    if let Ok(Some(version)) = vault.get_document_version(path).await {
-                        self.last_synced_versions.insert(path.clone(), version);
+                    if !vault.is_file_deleted(path) {
+                        if let Ok(Some(version)) = vault.get_document_version(path).await {
+                            self.last_synced_versions.insert(path.clone(), version);
+                        }
                     }
                 }
 
@@ -169,28 +186,38 @@ impl Daemon {
                     }
                 }
 
-                // Relay updates to OTHER peers (not the sender)
-                // This is the key for hub relay mode - forward updates between peers
+                // Relay to OTHER peers (not the sender)
                 if !modified_paths.is_empty() && self.server.peer_count() > 1 {
-                    for path in &modified_paths {
-                        match vault.prepare_document_update(path).await {
-                            Ok(Some(update)) => {
-                                self.server.broadcast_except(&update, &msg.temp_id).await;
-                            }
-                            Ok(None) => {
-                                debug!("No update to relay for {}", path);
-                            }
-                            Err(e) => {
-                                error!("Failed to prepare relay update for {}: {}", path, e);
+                    if should_relay_raw {
+                        // FileDeleted/FileRenamed: relay the original message directly
+                        self.server.broadcast_except(&msg.data, &msg.temp_id).await;
+                        info!(
+                            "Relayed file lifecycle event for {} to {} other peer(s)",
+                            modified_paths.join(", "),
+                            self.server.peer_count() - 1
+                        );
+                    } else {
+                        // DocumentUpdate or other: prepare fresh updates
+                        for path in &modified_paths {
+                            match vault.prepare_document_update(path).await {
+                                Ok(Some(update)) => {
+                                    self.server.broadcast_except(&update, &msg.temp_id).await;
+                                }
+                                Ok(None) => {
+                                    debug!("No update to relay for {}", path);
+                                }
+                                Err(e) => {
+                                    error!("Failed to prepare relay update for {}: {}", path, e);
+                                }
                             }
                         }
+                        info!(
+                            "Relayed {} file(s) from {} to {} other peer(s)",
+                            modified_paths.len(),
+                            peer_id,
+                            self.server.peer_count() - 1
+                        );
                     }
-                    info!(
-                        "Relayed {} file(s) from {} to {} other peer(s)",
-                        modified_paths.len(),
-                        peer_id,
-                        self.server.peer_count() - 1
-                    );
                 }
 
                 drop(vault); // Release lock after all operations
@@ -203,6 +230,17 @@ impl Daemon {
                 error!("Failed to process sync message from {}: {}", peer_id, e);
             }
         }
+    }
+
+    /// Check if a message is a FileDeleted or FileRenamed (should be relayed directly)
+    fn is_file_lifecycle_message(&self, data: &[u8]) -> bool {
+        // Deserialize to check the variant type safely (don't rely on bincode internals)
+        let msg: Result<sync_core::SyncMessage, _> = bincode::deserialize(data);
+        matches!(
+            msg,
+            Ok(sync_core::SyncMessage::FileDeleted { .. })
+                | Ok(sync_core::SyncMessage::FileRenamed { .. })
+        )
     }
 
     /// Handle a newly connected peer (after handshake).

@@ -16,6 +16,6 @@ pub mod vault;
 
 pub use document::NoteDocument;
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
-pub use sync::{SyncMessage, SyncResult};
+pub use sync::SyncMessage;
 pub use transport::{PeerConnection, PeerInfo, SyncTransport};
 pub use vault::Vault;

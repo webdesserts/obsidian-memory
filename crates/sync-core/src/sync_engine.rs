@@ -20,7 +20,7 @@ use crate::vault::Vault;
 
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Error)]
 pub enum SyncEngineError {
@@ -158,6 +158,13 @@ impl<F: FileSystem> Vault<F> {
                 self.delete_file(&path).await?;
                 Ok((None, vec![path]))
             }
+
+            SyncMessage::FileRenamed { old_path, new_path } => {
+                // Handle file rename via tree operation
+                debug!("Received file rename: {} -> {}", old_path, new_path);
+                self.rename_file(&old_path, &new_path).await?;
+                Ok((None, vec![new_path]))
+            }
         }
     }
 
@@ -180,6 +187,27 @@ impl<F: FileSystem> Vault<F> {
             .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
 
         Ok(Some(bytes))
+    }
+
+    /// Prepare a file deletion message to broadcast.
+    pub fn prepare_file_deleted(&self, path: &str) -> Result<Vec<u8>> {
+        let msg = SyncMessage::FileDeleted {
+            path: path.to_string(),
+        };
+
+        bincode::serialize(&msg)
+            .map_err(|e| SyncEngineError::Serialization(e.to_string()))
+    }
+
+    /// Prepare a file renamed message to broadcast.
+    pub fn prepare_file_renamed(&self, old_path: &str, new_path: &str) -> Result<Vec<u8>> {
+        let msg = SyncMessage::FileRenamed {
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+        };
+
+        bincode::serialize(&msg)
+            .map_err(|e| SyncEngineError::Serialization(e.to_string()))
     }
 
     /// Get the registry version vector as bytes.
@@ -343,13 +371,17 @@ impl<F: FileSystem> Vault<F> {
                     // Remove from filesystem
                     if self.fs.exists(&path).await.unwrap_or(false) {
                         debug!("apply_registry_changes: deleting {}", path);
-                        let _ = self.fs.delete(&path).await;
+                        if let Err(e) = self.fs.delete(&path).await {
+                            warn!("Failed to delete {}: {}", path, e);
+                        }
                     }
 
                     // Remove .loro document
                     let sync_path = self.document_sync_path(&path);
                     if self.fs.exists(&sync_path).await.unwrap_or(false) {
-                        let _ = self.fs.delete(&sync_path).await;
+                        if let Err(e) = self.fs.delete(&sync_path).await {
+                            warn!("Failed to delete .loro file {}: {}", sync_path, e);
+                        }
                     }
 
                     // Remove from documents cache

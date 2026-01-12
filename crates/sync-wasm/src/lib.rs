@@ -304,6 +304,34 @@ mod wasm_impl {
         pub fn is_file_deleted(&self, path: &str) -> bool {
             self.inner.is_file_deleted(path)
         }
+
+        /// Prepare a file deletion message to broadcast to peers.
+        ///
+        /// Call this after `deleteFile` to get the message to broadcast.
+        #[wasm_bindgen(js_name = prepareFileDeleted)]
+        pub fn prepare_file_deleted(&self, path: &str) -> Result<JsValue, JsError> {
+            let bytes = self
+                .inner
+                .prepare_file_deleted(path)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+
+            let array = js_sys::Uint8Array::from(bytes.as_slice());
+            Ok(array.into())
+        }
+
+        /// Prepare a file renamed message to broadcast to peers.
+        ///
+        /// Call this after `renameFile` to get the message to broadcast.
+        #[wasm_bindgen(js_name = prepareFileRenamed)]
+        pub fn prepare_file_renamed(&self, old_path: &str, new_path: &str) -> Result<JsValue, JsError> {
+            let bytes = self
+                .inner
+                .prepare_file_renamed(old_path, new_path)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+
+            let array = js_sys::Uint8Array::from(bytes.as_slice());
+            Ok(array.into())
+        }
     }
 
     /// Result from processing a sync message

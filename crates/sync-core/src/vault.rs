@@ -691,9 +691,17 @@ impl<F: FileSystem> Vault<F> {
 
     /// Validate a sync path for security
     fn validate_sync_path(path: &str) -> Result<()> {
+        // Empty path
+        if path.is_empty() {
+            return Err(VaultError::Other("Empty path not allowed".into()));
+        }
         // Path traversal
         if path.contains("..") {
             return Err(VaultError::Other("Path traversal not allowed".into()));
+        }
+        // Empty segments (a//b.md)
+        if path.contains("//") {
+            return Err(VaultError::Other("Empty path segment not allowed".into()));
         }
         // Absolute paths (Unix)
         if path.starts_with('/') {
@@ -718,6 +726,10 @@ impl<F: FileSystem> Vault<F> {
         // Control characters
         if path.chars().any(|c| c.is_control()) {
             return Err(VaultError::Other("Control character in path not allowed".into()));
+        }
+        // Path length limit (filesystem safety)
+        if path.len() > 1024 {
+            return Err(VaultError::Other("Path too long".into()));
         }
         Ok(())
     }
@@ -796,6 +808,11 @@ impl<F: FileSystem> Vault<F> {
     pub async fn rename_file(&mut self, old_path: &str, new_path: &str) -> Result<()> {
         Self::validate_sync_path(old_path)?;
         Self::validate_sync_path(new_path)?;
+
+        // No-op if paths are identical
+        if old_path == new_path {
+            return Ok(());
+        }
 
         let Some(node_id) = self.find_node_by_path(old_path) else {
             return Err(VaultError::Other(format!("Source file not found: {}", old_path)));
@@ -918,14 +935,18 @@ impl<F: FileSystem> Vault<F> {
     }
 }
 
-/// Simple string hash for deterministic file naming
+/// FNV-1a hash for deterministic file naming.
+/// Uses FNV-1a instead of DefaultHasher because DefaultHasher is not stable across Rust versions.
 fn simple_hash(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
 
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hash = FNV_OFFSET;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}", hash)
 }
 
 #[cfg(test)]
@@ -1169,6 +1190,43 @@ mod tests {
         assert!(result.is_err());
 
         let result = vault.delete_file("image.png").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_empty_path_rejected() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Empty path should be rejected
+        let result = vault.register_file("");
+        assert!(result.is_err());
+
+        let result = vault.delete_file("").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_empty_segment_rejected() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Empty path segments (a//b.md) should be rejected
+        let result = vault.register_file("a//b.md");
+        assert!(result.is_err());
+
+        let result = vault.delete_file("foo//bar.md").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_path_too_long_rejected() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Path over 1024 chars should be rejected
+        let long_path = format!("{}.md", "a".repeat(1025));
+        let result = vault.register_file(&long_path);
         assert!(result.is_err());
     }
 
