@@ -783,8 +783,12 @@ export default class P2PSyncPlugin extends Plugin {
     }
     // Normalize and verify it doesn't escape vault
     const normalized = path.replace(/\\/g, "/");
-    // Allow only alphanumerics, underscores, hyphens, dots (for extensions), and slashes
-    return /^[a-zA-Z0-9_\-\./]+$/.test(normalized);
+    // Reject leading/trailing whitespace (filesystem inconsistencies)
+    if (normalized !== normalized.trim()) return false;
+    // Allow alphanumerics, common filename characters, and path separators
+    // Excludes: .. (path traversal), leading slashes, control chars, ?% (URL-like)
+    // TODO: Add Unicode support (\p{L}\p{N}\p{M} with u flag) for international filenames
+    return /^[a-zA-Z0-9_\-\./ '(),&#@+\[\]]+$/.test(normalized);
   }
 
   /**
