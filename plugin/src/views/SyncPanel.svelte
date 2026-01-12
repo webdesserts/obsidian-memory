@@ -14,8 +14,7 @@
   let connectedPeers: PeerInfo[] = [];
   let lastSyncTime: Date | null = null;
   let errorMessage: string | null = null;
-  let peerId: string | null = null;
-  let serverPort: number = 8765;
+  let lanUrl: string | null = null;
   let disabledReason: string | null = null;
 
   // Connect form
@@ -38,9 +37,8 @@
         return;
       }
 
-      // Get peer ID from plugin
-      peerId = plugin.peerId;
-      serverPort = plugin.getServerPort();
+      // Get LAN URL from plugin
+      lanUrl = plugin.getLanUrl();
       
       // Check if vault is initialized
       isInitialized = plugin.isVaultInitialized();
@@ -130,15 +128,9 @@
     return date.toLocaleTimeString();
   }
 
-  function formatPeerId(id: string | null): string {
-    if (!id) return "Unknown";
-    // Show first 8 characters
-    return id.substring(0, 8) + "...";
-  }
-
-  function copyPeerId() {
-    if (peerId) {
-      navigator.clipboard.writeText(peerId);
+  function copyLanUrl() {
+    if (lanUrl) {
+      navigator.clipboard.writeText(lanUrl);
     }
   }
 
@@ -218,14 +210,7 @@
         <span class="p2p-sync-icon">?</span>
         <span>Sync not initialized</span>
       </div>
-      
-      <div class="p2p-sync-peer-id">
-        <span class="p2p-sync-label">Your Peer ID:</span>
-        <button class="p2p-sync-peer-id-value" on:click={copyPeerId} title="Click to copy">
-          {formatPeerId(peerId)}
-        </button>
-      </div>
-      
+
       <p class="p2p-sync-description">
         Initialize P2P sync to start syncing this vault with other devices.
       </p>
@@ -247,23 +232,17 @@
       </div>
       
       <div class="p2p-sync-details">
-        <div class="p2p-sync-detail-row">
-          <span class="p2p-sync-label">Peer ID:</span>
-          <button class="p2p-sync-peer-id-value" on:click={copyPeerId} title="Click to copy">
-            {formatPeerId(peerId)}
-          </button>
-        </div>
-        <div class="p2p-sync-detail-row">
-          <span class="p2p-sync-label">Server port:</span>
-          <span class="p2p-sync-value">{serverPort}</span>
-        </div>
+        {#if lanUrl}
+          <div class="p2p-sync-detail-row">
+            <span class="p2p-sync-label">LAN URL:</span>
+            <button class="p2p-sync-url-value" on:click={copyLanUrl} title="Click to copy">
+              {lanUrl}
+            </button>
+          </div>
+        {/if}
         <div class="p2p-sync-detail-row">
           <span class="p2p-sync-label">Last sync:</span>
           <span class="p2p-sync-value">{formatTime(lastSyncTime)}</span>
-        </div>
-        <div class="p2p-sync-detail-row">
-          <span class="p2p-sync-label">Connected peers:</span>
-          <span class="p2p-sync-value">{connectedPeers.length}</span>
         </div>
       </div>
 
@@ -287,8 +266,7 @@
           <ul class="p2p-sync-peer-list">
             {#each connectedPeers as peer}
               <li class="p2p-sync-peer-item">
-                <span class="p2p-sync-peer-name">{formatPeerId(peer.id)}</span>
-                <span class="p2p-sync-peer-direction">({peer.direction})</span>
+                <span class="p2p-sync-peer-address">{peer.address}</span>
               </li>
             {/each}
           </ul>
@@ -405,25 +383,22 @@
     margin: 0;
   }
 
-  .p2p-sync-peer-id {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 12px;
-    font-size: var(--font-ui-small);
-  }
-
-  .p2p-sync-peer-id-value {
+  .p2p-sync-url-value {
     font-family: var(--font-monospace);
+    font-size: var(--font-ui-smaller);
     background: var(--background-secondary);
     padding: 2px 6px;
     border-radius: 4px;
     border: none;
     cursor: pointer;
     color: var(--text-normal);
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .p2p-sync-peer-id-value:hover {
+  .p2p-sync-url-value:hover {
     background: var(--background-modifier-hover);
   }
 
@@ -502,12 +477,9 @@
     font-size: var(--font-ui-small);
   }
 
-  .p2p-sync-peer-name {
+  .p2p-sync-peer-address {
     font-family: var(--font-monospace);
-  }
-
-  .p2p-sync-peer-direction {
-    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
   }
 
   .p2p-sync-connect-form {

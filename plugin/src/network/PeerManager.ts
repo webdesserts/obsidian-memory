@@ -398,6 +398,33 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Get local network IP addresses for LAN connections.
+   * Returns IPv4 addresses from non-internal network interfaces.
+   */
+  getLanAddresses(): string[] {
+    if (!Platform.isDesktop) return [];
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const os = require("os");
+      const interfaces = os.networkInterfaces();
+      const addresses: string[] = [];
+
+      for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+          // Skip internal (loopback) and non-IPv4 addresses
+          if (iface.internal || iface.family !== "IPv4") continue;
+          addresses.push(iface.address);
+        }
+      }
+
+      return addresses;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Send a handshake message with our peer ID.
    */
   private sendHandshake(peerId: string, role: "server" | "client"): void {

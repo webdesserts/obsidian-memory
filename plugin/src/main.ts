@@ -313,6 +313,21 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   /**
+   * Get the LAN URL for other devices to connect to this one.
+   * Returns null on mobile or if no server is running.
+   */
+  getLanUrl(): string | null {
+    if (!this.peerManager?.isServerRunning) return null;
+
+    const addresses = this.peerManager.getLanAddresses();
+    if (addresses.length === 0) return null;
+
+    const port = this.peerManager.port;
+    // Return first LAN address (usually the primary network interface)
+    return `ws://${addresses[0]}:${port}`;
+  }
+
+  /**
    * Load peer ID from local storage, or generate a new one.
    * Uses vault-specific key so each vault has its own peer ID.
    */
