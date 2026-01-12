@@ -815,6 +815,16 @@ impl<F: FileSystem> Vault<F> {
         }
 
         let Some(node_id) = self.find_node_by_path(old_path) else {
+            // Source not in tree - this can happen when receiving FileRenamed before
+            // the registry has synced. If the new file exists on disk, just register it.
+            if self.fs.exists(new_path).await.unwrap_or(false) {
+                tracing::debug!(
+                    "rename_file: source {} not in tree, but {} exists on disk - registering target",
+                    old_path, new_path
+                );
+                self.register_file(new_path)?;
+                return Ok(());
+            }
             return Err(VaultError::Other(format!("Source file not found: {}", old_path)));
         };
 

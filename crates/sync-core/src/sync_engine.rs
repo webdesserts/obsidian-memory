@@ -445,6 +445,9 @@ impl<F: FileSystem> Vault<F> {
             self.fs.write(&sync_path, &snapshot).await.map_err(crate::vault::VaultError::from)?;
             self.fs.write(path, doc.to_markdown().as_bytes()).await.map_err(crate::vault::VaultError::from)?;
 
+            // Note: Don't register in tree here - tree sync handles that via registry.
+            // Registering here would create duplicate nodes with different IDs.
+
             // Add to cache
             self.documents.insert(path.to_string(), doc);
 
