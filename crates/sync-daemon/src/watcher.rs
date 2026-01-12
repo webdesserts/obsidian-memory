@@ -5,8 +5,10 @@
 use anyhow::Result;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent, DebouncedEventKind};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
@@ -38,6 +40,9 @@ pub struct FileWatcher {
     event_rx: mpsc::UnboundedReceiver<FileEvent>,
 }
 
+/// Track last seen mtime to filter spurious events (Docker volume bug workaround)
+type MtimeCache = Arc<Mutex<HashMap<PathBuf, SystemTime>>>;
+
 impl FileWatcher {
     /// Create a new file watcher for the vault.
     ///
@@ -47,6 +52,10 @@ impl FileWatcher {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let vault_path_clone = vault_path.clone();
 
+        // Mtime cache to filter spurious events (Docker volume workaround)
+        let mtime_cache: MtimeCache = Arc::new(Mutex::new(HashMap::new()));
+        let mtime_cache_clone = Arc::clone(&mtime_cache);
+
         // Create debouncer with callback (notify-debouncer-mini 0.6 API)
         let mut debouncer = new_debouncer(
             Duration::from_millis(200),
@@ -54,7 +63,8 @@ impl FileWatcher {
                 match result {
                     Ok(events) => {
                         for event in events {
-                            if let Some(file_event) = Self::process_event(&event, &vault_path_clone)
+                            if let Some(file_event) =
+                                Self::process_event(&event, &vault_path_clone, &mtime_cache_clone)
                             {
                                 if event_tx.send(file_event).is_err() {
                                     // Receiver dropped
@@ -83,7 +93,11 @@ impl FileWatcher {
     }
 
     /// Process a single debounced event, returning a FileEvent if relevant.
-    fn process_event(event: &DebouncedEvent, vault_path: &Path) -> Option<FileEvent> {
+    fn process_event(
+        event: &DebouncedEvent,
+        vault_path: &Path,
+        mtime_cache: &MtimeCache,
+    ) -> Option<FileEvent> {
         let path = &event.path;
 
         // Get path relative to vault
@@ -123,6 +137,32 @@ impl FileWatcher {
                 }
             }
         };
+
+        // For modifications, check mtime to filter spurious events (Docker volume workaround)
+        // Uses relative path as key so cache is bounded by vault size
+        let relative_path = relative.to_path_buf();
+        if kind == FileEventKind::Modified {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if let Ok(mtime) = metadata.modified() {
+                    let mut cache = mtime_cache
+                        .lock()
+                        .expect("mtime cache mutex poisoned");
+                    if let Some(last_mtime) = cache.get(&relative_path) {
+                        if *last_mtime == mtime {
+                            // Mtime unchanged - spurious event, skip it
+                            return None;
+                        }
+                    }
+                    cache.insert(relative_path, mtime);
+                }
+            }
+        } else if kind == FileEventKind::Deleted {
+            // Remove from cache when file is deleted
+            let mut cache = mtime_cache
+                .lock()
+                .expect("mtime cache mutex poisoned");
+            cache.remove(&relative_path);
+        }
 
         debug!("File event: {:?} - {}", kind, relative_str);
 

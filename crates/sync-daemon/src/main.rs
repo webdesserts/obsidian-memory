@@ -82,7 +82,12 @@ impl Daemon {
         if let Some(synced_version) = self.last_synced_versions.get(path) {
             match vault.get_document_version(path).await {
                 Ok(Some(current_version)) => {
-                    if Vault::<NativeFs>::version_includes(&current_version, synced_version) {
+                    let includes = Vault::<NativeFs>::version_includes(&current_version, synced_version);
+                    debug!(
+                        "Echo check for {}: synced={} bytes, current={} bytes, includes={}",
+                        path, synced_version.len(), current_version.len(), includes
+                    );
+                    if includes {
                         // Version unchanged - this is a sync echo, skip broadcast
                         debug!("Skipping broadcast for {} (sync echo)", path);
                         self.last_synced_versions.remove(path);
@@ -90,7 +95,7 @@ impl Daemon {
                     }
                 }
                 Ok(None) => {
-                    // Document doesn't exist, proceed with broadcast
+                    debug!("Echo check for {}: document not found", path);
                 }
                 Err(e) => {
                     warn!("Failed to get version for {}: {}", path, e);
