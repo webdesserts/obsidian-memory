@@ -143,11 +143,36 @@ impl Daemon {
 
                 // Send response if any
                 if let Some(response_data) = response {
-                    drop(vault); // Release lock before network I/O
                     if let Err(e) = self.server.send_by_temp_id(&msg.temp_id, &response_data).await {
                         error!("Failed to send sync response to {}: {}", peer_id, e);
                     }
                 }
+
+                // Relay updates to OTHER peers (not the sender)
+                // This is the key for hub relay mode - forward updates between peers
+                if !modified_paths.is_empty() && self.server.peer_count() > 1 {
+                    for path in &modified_paths {
+                        match vault.prepare_document_update(path).await {
+                            Ok(Some(update)) => {
+                                self.server.broadcast_except(&update, &msg.temp_id).await;
+                            }
+                            Ok(None) => {
+                                debug!("No update to relay for {}", path);
+                            }
+                            Err(e) => {
+                                error!("Failed to prepare relay update for {}: {}", path, e);
+                            }
+                        }
+                    }
+                    info!(
+                        "Relayed {} file(s) from {} to {} other peer(s)",
+                        modified_paths.len(),
+                        peer_id,
+                        self.server.peer_count() - 1
+                    );
+                }
+
+                drop(vault); // Release lock after all operations
 
                 if !modified_paths.is_empty() {
                     info!("Synced {} file(s) from {}", modified_paths.len(), peer_id);

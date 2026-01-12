@@ -189,6 +189,23 @@ impl WebSocketServer {
         }
     }
 
+    /// Broadcast data to all connected peers except one.
+    /// Used for relaying updates from one peer to others.
+    pub async fn broadcast_except(&self, data: &[u8], exclude_temp_id: &str) {
+        for (temp_id, conn) in &self.connections {
+            // Skip the excluded peer
+            if temp_id == exclude_temp_id {
+                continue;
+            }
+            // Only broadcast to peers who have completed handshake
+            if conn.real_peer_id.is_some() {
+                if let Err(e) = conn.send(data).await {
+                    warn!("Failed to relay to {}: {}", temp_id, e);
+                }
+            }
+        }
+    }
+
     /// Get the number of connected peers (with completed handshake).
     pub fn peer_count(&self) -> usize {
         self.connections
