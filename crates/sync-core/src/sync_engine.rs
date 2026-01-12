@@ -86,21 +86,25 @@ impl<F: FileSystem> Vault<F> {
 
         match msg {
             SyncMessage::SyncRequest {
-                registry_version: _,
+                registry_version,
                 document_versions,
             } => {
                 // Peer is requesting sync - respond with SyncExchange (symmetric protocol)
-                let exchange = self.prepare_sync_exchange(document_versions).await?;
+                let exchange = self.prepare_sync_exchange(&registry_version, document_versions).await?;
                 let exchange_bytes = bincode::serialize(&exchange)
                     .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
                 Ok((Some(exchange_bytes), vec![]))
             }
 
             SyncMessage::SyncResponse {
-                registry_updates: _,
+                registry_updates,
                 document_updates,
             } => {
-                // Peer sent us updates (final step of exchange) - apply them
+                // Apply registry updates first (handles deletes/renames)
+                if let Some(reg_data) = registry_updates {
+                    self.apply_registry_updates(&reg_data).await?;
+                }
+                // Then apply document updates
                 let modified = self.apply_document_updates(document_updates).await?;
                 Ok((None, modified))
             }
@@ -109,22 +113,28 @@ impl<F: FileSystem> Vault<F> {
                 // Peer responded to our SyncRequest with:
                 // - response: updates we need from them
                 // - request: their version vectors so we can send them updates
-                
-                debug!("SyncExchange: received {} document updates, {} version vectors", 
+
+                debug!("SyncExchange: received {} document updates, {} version vectors",
                     response.document_updates.len(), request.document_versions.len());
-                
+
                 // Track which files we're receiving so we don't echo them back
-                let received_files: std::collections::HashSet<String> = 
+                let received_files: std::collections::HashSet<String> =
                     response.document_updates.keys().cloned().collect();
-                
-                // First, apply their updates to us
+
+                // Apply registry updates first (handles deletes/renames)
+                if let Some(reg_data) = response.registry_updates {
+                    self.apply_registry_updates(&reg_data).await?;
+                }
+
+                // Then apply document updates
                 let modified = self.apply_document_updates(response.document_updates).await?;
                 debug!("SyncExchange: modified {} files: {:?}", modified.len(), modified);
                 
                 // Then, prepare updates they need from us (excluding files we just received)
                 let our_response = self.prepare_sync_response_data_excluding(
-                    request.document_versions, 
-                    &received_files
+                    &request.registry_version,
+                    request.document_versions,
+                    &received_files,
                 ).await?;
                 let response_msg = SyncMessage::SyncResponse {
                     registry_updates: our_response.registry_updates,
@@ -143,9 +153,10 @@ impl<F: FileSystem> Vault<F> {
             }
 
             SyncMessage::FileDeleted { path } => {
-                // TODO: Handle file deletion
+                // Handle file deletion via tree operation
                 debug!("Received file deletion for: {}", path);
-                Ok((None, vec![]))
+                self.delete_file(&path).await?;
+                Ok((None, vec![path]))
             }
         }
     }
@@ -177,20 +188,21 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Prepare a SyncExchange in response to a SyncRequest.
-    /// 
+    ///
     /// This bundles:
     /// - Our response (updates they need from us)
     /// - Our request (our version vectors so they can send us updates)
     async fn prepare_sync_exchange(
         &mut self,
+        their_registry_version: &[u8],
         their_versions: HashMap<String, Vec<u8>>,
     ) -> Result<SyncMessage> {
         // Prepare updates they need from us
-        let response = self.prepare_sync_response_data(their_versions).await?;
-        
+        let response = self.prepare_sync_response_data(their_registry_version, their_versions).await?;
+
         // Prepare our version vectors so they can send us updates
         let request = self.prepare_sync_request_data().await?;
-        
+
         Ok(SyncMessage::SyncExchange { response, request })
     }
 
@@ -215,19 +227,25 @@ impl<F: FileSystem> Vault<F> {
     /// Prepare sync response data (updates the peer is missing).
     async fn prepare_sync_response_data(
         &mut self,
+        their_registry_version: &[u8],
         their_versions: HashMap<String, Vec<u8>>,
     ) -> Result<SyncResponseData> {
-        self.prepare_sync_response_data_excluding(their_versions, &std::collections::HashSet::new()).await
+        self.prepare_sync_response_data_excluding(
+            their_registry_version,
+            their_versions,
+            &std::collections::HashSet::new(),
+        ).await
     }
-    
+
     /// Prepare sync response data, excluding specific files.
-    /// 
+    ///
     /// Used when responding to a SyncExchange - we exclude files we just received
     /// to avoid echoing them back. Loro's import creates a local change marker,
     /// so version-based comparison would incorrectly send updates for files
     /// we just imported.
     async fn prepare_sync_response_data_excluding(
         &mut self,
+        their_registry_version: &[u8],
         their_versions: HashMap<String, Vec<u8>>,
         exclude: &std::collections::HashSet<String>,
     ) -> Result<SyncResponseData> {
@@ -241,7 +259,7 @@ impl<F: FileSystem> Vault<F> {
             if exclude.contains(&path) {
                 continue;
             }
-            
+
             let doc = self.get_document(&path).await?;
             let _our_version = doc.version();
 
@@ -260,10 +278,87 @@ impl<F: FileSystem> Vault<F> {
             }
         }
 
+        // Export registry updates if they have an older version
+        let registry_updates = if !their_registry_version.is_empty() {
+            if let Ok(their_version) = loro::VersionVector::decode(their_registry_version) {
+                match self.registry.export(loro::ExportMode::updates(&their_version)) {
+                    Ok(updates) if !updates.is_empty() => Some(updates),
+                    _ => None,
+                }
+            } else {
+                // Invalid version - send full snapshot
+                self.registry.export(loro::ExportMode::snapshot()).ok()
+            }
+        } else {
+            // They don't have registry - send full snapshot
+            self.registry.export(loro::ExportMode::snapshot()).ok()
+        };
+
         Ok(SyncResponseData {
-            registry_updates: None, // TODO: implement registry sync
+            registry_updates,
             document_updates,
         })
+    }
+
+    /// Apply registry updates from a sync response.
+    ///
+    /// Imports the registry CRDT updates and rebuilds the path cache.
+    /// Syncs filesystem with tree state (deletes files marked as deleted).
+    async fn apply_registry_updates(&mut self, data: &[u8]) -> Result<()> {
+        debug!("apply_registry_updates: data_len={}", data.len());
+
+        // Import registry updates
+        self.registry
+            .import(data)
+            .map_err(|e| SyncEngineError::Deserialization(format!("Registry import failed: {}", e)))?;
+
+        // Rebuild path cache from updated tree
+        self.rebuild_path_cache();
+
+        // Sync filesystem with tree state - delete files that are deleted in tree
+        self.apply_registry_changes().await?;
+
+        // Save updated registry to disk
+        let registry_bytes = self.registry.export(loro::ExportMode::snapshot()).unwrap();
+        self.fs
+            .write(&format!("{}/registry.loro", crate::vault::SYNC_DIR), &registry_bytes)
+            .await
+            .map_err(crate::vault::VaultError::from)?;
+
+        debug!("apply_registry_updates: complete");
+        Ok(())
+    }
+
+    /// Apply registry changes to filesystem.
+    ///
+    /// Deletes files on disk that are marked as deleted in the tree.
+    async fn apply_registry_changes(&mut self) -> Result<()> {
+        let tree = self.file_tree();
+
+        // Find deleted files and clean them up
+        for node_id in tree.nodes() {
+            if tree.is_node_deleted(&node_id).unwrap_or(false) {
+                // Get the path before it was deleted (if we can reconstruct it)
+                if let Some(path) = self.get_node_path(&node_id) {
+                    // Remove from filesystem
+                    if self.fs.exists(&path).await.unwrap_or(false) {
+                        debug!("apply_registry_changes: deleting {}", path);
+                        let _ = self.fs.delete(&path).await;
+                    }
+
+                    // Remove .loro document
+                    let sync_path = self.document_sync_path(&path);
+                    if self.fs.exists(&sync_path).await.unwrap_or(false) {
+                        let _ = self.fs.delete(&sync_path).await;
+                    }
+
+                    // Remove from documents cache
+                    self.documents.remove(&path);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Apply document updates from a sync response.

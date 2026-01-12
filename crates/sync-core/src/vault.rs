@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 /// Directory for sync state
-const SYNC_DIR: &str = ".sync";
+pub(crate) const SYNC_DIR: &str = ".sync";
 /// File registry document
 const REGISTRY_FILE: &str = ".sync/registry.loro";
 
@@ -605,13 +605,13 @@ impl<F: FileSystem> Vault<F> {
     // ========== File Tree Operations (LoroTree) ==========
 
     /// Get the file tree from the registry
-    fn file_tree(&self) -> LoroTree {
+    pub(crate) fn file_tree(&self) -> LoroTree {
         self.registry.get_tree("files")
     }
 
     /// Rebuild the path cache from the current tree state.
     /// Call this after applying sync updates.
-    fn rebuild_path_cache(&mut self) {
+    pub(crate) fn rebuild_path_cache(&mut self) {
         self.path_to_node.clear();
         let tree = self.file_tree();
 
@@ -644,7 +644,7 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Get the path for a node by walking up the tree
-    fn get_node_path(&self, node_id: &TreeID) -> Option<String> {
+    pub(crate) fn get_node_path(&self, node_id: &TreeID) -> Option<String> {
         let tree = self.file_tree();
         let mut parts = vec![];
         let mut current = *node_id;
