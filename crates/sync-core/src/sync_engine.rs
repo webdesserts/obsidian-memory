@@ -13,6 +13,7 @@
 //!
 //! This symmetric protocol enables full bidirectional sync in a single round-trip.
 
+use crate::document::NoteDocument;
 use crate::fs::FileSystem;
 use crate::sync::{SyncMessage, SyncRequestData, SyncResponseData};
 use crate::vault::Vault;
@@ -285,30 +286,44 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Returns true if the document was modified.
     async fn apply_single_update(&mut self, path: &str, data: &[u8]) -> Result<bool> {
-        // Get or create the document
-        let doc = self.get_document_mut(path).await?;
-        
-        // Get version before import
-        let version_before = doc.version();
-        
         debug!("apply_single_update: {} - data_len={}", path, data.len());
-        
-        // Import the update
-        doc.import(data)?;
-        
-        // Check if version changed
-        let version_after = doc.version();
-        let modified = version_before != version_after;
-        
-        debug!("apply_single_update: {} - modified={}", path, modified);
 
-        if modified {
-            // Save the updated document to disk
-            self.save_document(path).await?;
-            debug!("apply_single_update: saved {} to disk", path);
+        // Check if document exists (in cache or on disk)
+        let sync_path = self.document_sync_path(path);
+        let exists_in_cache = self.documents.contains_key(path);
+        let exists_on_disk = self.fs.exists(&sync_path).await.map_err(crate::vault::VaultError::from)?;
+
+        if exists_in_cache || exists_on_disk {
+            // Document exists - load and import (merge)
+            let doc = self.get_document_mut(path).await?;
+            let version_before = doc.version();
+            doc.import(data)?;
+            let version_after = doc.version();
+            let modified = version_before != version_after;
+
+            debug!("apply_single_update: {} - modified={}", path, modified);
+
+            if modified {
+                self.save_document(path).await?;
+                debug!("apply_single_update: saved {} to disk", path);
+            }
+
+            Ok(modified)
+        } else {
+            // Document is new - create directly from sync data (preserves peer ID)
+            let doc = NoteDocument::from_bytes(path, data)?;
+
+            // Save to disk
+            let snapshot = doc.export_snapshot();
+            self.fs.write(&sync_path, &snapshot).await.map_err(crate::vault::VaultError::from)?;
+            self.fs.write(path, doc.to_markdown().as_bytes()).await.map_err(crate::vault::VaultError::from)?;
+
+            // Add to cache
+            self.documents.insert(path.to_string(), doc);
+
+            debug!("apply_single_update: created new {} from sync data", path);
+            Ok(true)
         }
-
-        Ok(modified)
     }
 }
 
@@ -632,5 +647,143 @@ mod tests {
 
         // Content should be updated
         assert_eq!(doc2.to_markdown(), "Hello World");
+    }
+
+    #[tokio::test]
+    async fn test_reindex_during_reconcile_no_duplication() {
+        // Regression test: reconcile() calls reindex_file() when files are modified externally.
+        // Previously this created a new peer ID, causing content duplication on sync.
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Initialize vault1 with a file
+        fs1.write("note.md", b"Original").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+
+        // Sync to vault2
+        fs2.mkdir(".sync").await.unwrap();
+        fs2.mkdir(".sync/documents").await.unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Simulate external modification on vault2 (plugin was off)
+        fs2.write("note.md", b"Modified externally").await.unwrap();
+
+        // Reload vault2 - this triggers reconcile() -> reindex_file()
+        let mut vault2_reloaded = Vault::load(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        // Sync back to vault1
+        let request2 = vault1.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault2_reloaded.process_sync_message(&request2).await.unwrap();
+        let (final_resp2, _) = vault1.process_sync_message(&exchange2.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp2 {
+            vault2_reloaded.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Verify content is NOT duplicated
+        let doc = vault1.get_document("note.md").await.unwrap();
+        let content = doc.to_markdown();
+        assert_eq!(content, "Modified externally", "Content should not be duplicated after reconcile");
+    }
+
+    #[tokio::test]
+    async fn test_cold_cache_no_duplication() {
+        // Regression test: on_file_changed() when .loro exists on disk but not in memory cache.
+        // Previously fell through to creating a new document with new peer ID.
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Initialize vault1 with a file
+        fs1.write("note.md", b"Hello").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+
+        // Sync to vault2
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Clear vault2's in-memory cache (simulate cold cache)
+        vault2.documents.clear();
+
+        // Make an edit and call on_file_changed (the .loro exists on disk but not in cache)
+        fs2.write("note.md", b"Hello World").await.unwrap();
+        vault2.on_file_changed("note.md").await.unwrap();
+
+        // Sync back to vault1
+        let request2 = vault1.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault2.process_sync_message(&request2).await.unwrap();
+        let (final_resp2, _) = vault1.process_sync_message(&exchange2.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp2 {
+            vault2.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Verify content is correct (not duplicated)
+        let doc = vault1.get_document("note.md").await.unwrap();
+        let content = doc.to_markdown();
+        assert_eq!(content, "Hello World", "Cold cache should not cause duplication");
+    }
+
+    #[tokio::test]
+    async fn test_file_migration_preserves_peer_id() {
+        // Test that file migration during reconcile preserves peer ID
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Initialize vault1 with a file
+        fs1.write("old_name.md", b"Content ABC").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+
+        // Get the peer ID count from the original document
+        let doc1 = vault1.get_document("old_name.md").await.unwrap();
+        let original_peer_count = doc1.version().len();
+
+        // Sync to vault2
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Simulate file rename on vault2 (plugin was off)
+        let content = fs2.read("old_name.md").await.unwrap();
+        fs2.write("new_name.md", &content).await.unwrap();
+        fs2.delete("old_name.md").await.unwrap();
+
+        // Reload vault2 - this triggers reconcile() -> migrate_document()
+        let mut vault2_reloaded = Vault::load(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        // The migrated document should exist
+        let doc2 = vault2_reloaded.get_document("new_name.md").await.unwrap();
+
+        // Peer ID count should only increase by 1 (the path metadata update)
+        // Previously it would add 2+ (one from new() and one from import)
+        let migrated_peer_count = doc2.version().len();
+        assert!(
+            migrated_peer_count <= original_peer_count + 1,
+            "Migration should not proliferate peer IDs: original={}, migrated={}",
+            original_peer_count,
+            migrated_peer_count
+        );
+
+        // Content should be preserved
+        assert!(doc2.to_markdown().contains("Content ABC"));
     }
 }

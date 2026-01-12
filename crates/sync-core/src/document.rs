@@ -48,6 +48,27 @@ impl NoteDocument {
         }
     }
 
+    /// Create a NoteDocument by importing from existing Loro bytes.
+    ///
+    /// This preserves the original peer ID by importing before any local operations.
+    /// The path metadata is updated after import, which creates a small operation
+    /// under the current peer ID, but this only affects metadata, not content.
+    pub fn from_bytes(path: &str, bytes: &[u8]) -> Result<Self> {
+        let doc = LoroDoc::new();
+        doc.import(bytes).map_err(|e| DocumentError::Loro(e.to_string()))?;
+
+        // Update path metadata (this is intentional - records the current path)
+        let meta = doc.get_map("_meta");
+        meta.insert("path", path)
+            .map_err(|e| DocumentError::Loro(e.to_string()))?;
+        doc.commit();
+
+        Ok(Self {
+            doc,
+            path: path.to_string(),
+        })
+    }
+
     /// Get the document path (from local cache)
     pub fn path(&self) -> &str {
         &self.path

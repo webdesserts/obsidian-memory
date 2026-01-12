@@ -177,8 +177,8 @@ impl<F: FileSystem> Vault<F> {
                 // This .loro has no matching markdown file - could be deleted or moved
                 let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
                 if let Ok(bytes) = self.fs.read(&sync_path).await {
-                    let mut doc = NoteDocument::new("");
-                    if doc.import(&bytes).is_ok() {
+                    // Use from_bytes to preserve peer ID when loading orphaned docs
+                    if let Ok(doc) = NoteDocument::from_bytes("", &bytes) {
                         orphaned_docs.push((hash.clone(), doc));
                     }
                 }
@@ -266,31 +266,28 @@ impl<F: FileSystem> Vault<F> {
     }
     
     /// Migrate a Loro document from old path hash to new path.
-    /// 
+    ///
     /// This preserves the CRDT history when a file is moved/renamed.
+    /// Uses `from_bytes` to import before setting metadata, preserving the original peer ID.
     async fn migrate_document(&mut self, old_hash: &str, new_path: &str) -> Result<()> {
         let old_sync_path = format!("{}/documents/{}.loro", SYNC_DIR, old_hash);
         let new_hash = simple_hash(new_path);
         let new_sync_path = format!("{}/documents/{}.loro", SYNC_DIR, new_hash);
-        
-        // Load the old document
+
+        // Load the old document (import first, then update path - preserves peer ID)
         let bytes = self.fs.read(&old_sync_path).await?;
-        let mut doc = NoteDocument::new(new_path);
-        doc.import(&bytes)?;
-        
-        // Update the path in metadata
-        doc.update_path(new_path)?;
-        
+        let doc = NoteDocument::from_bytes(new_path, &bytes)?;
+
         // Save to new location
         let snapshot = doc.export_snapshot();
         self.fs.write(&new_sync_path, &snapshot).await?;
-        
+
         // Delete old file
         self.fs.delete(&old_sync_path).await?;
-        
+
         // Update cache
         self.documents.insert(new_path.to_string(), doc);
-        
+
         Ok(())
     }
     
@@ -320,42 +317,50 @@ impl<F: FileSystem> Vault<F> {
         // Read markdown content
         let md_bytes = self.fs.read(md_path).await?;
         let md_content = String::from_utf8_lossy(&md_bytes);
-        
+
         // Load Loro doc and convert to markdown
         let loro_bytes = self.fs.read(loro_path).await?;
-        let mut doc = NoteDocument::new(md_path);
-        if doc.import(&loro_bytes).is_err() {
-            // Corrupted Loro doc - needs reindex
-            return Ok(true);
-        }
+        let doc = match NoteDocument::from_bytes(md_path, &loro_bytes) {
+            Ok(d) => d,
+            Err(_) => return Ok(true), // Corrupted Loro doc - needs reindex
+        };
         let loro_content = doc.to_markdown();
-        
+
         // Compare (normalize line endings)
         let md_normalized = md_content.replace("\r\n", "\n");
         let loro_normalized = loro_content.replace("\r\n", "\n");
-        
+
         Ok(md_normalized != loro_normalized)
     }
     
-    /// Re-index a file by creating a fresh Loro doc from markdown.
-    /// 
-    /// This is used when external modifications are detected.
-    /// Creates a new Loro doc with a fresh version vector.
+    /// Re-index a file by diff-merging changes into the existing Loro doc.
+    ///
+    /// This is used when external modifications are detected during reconciliation.
+    /// Preserves the peer ID by updating the existing document rather than replacing it.
     async fn reindex_file(&mut self, path: &str) -> Result<()> {
         let bytes = self.fs.read(path).await?;
         let content = String::from_utf8_lossy(&bytes);
-        
-        // Create fresh Loro doc from markdown
-        let new_doc = NoteDocument::from_markdown(path, &content)?;
-        
-        // Save to .sync
+        let parsed = crate::markdown::parse(&content);
+
+        // Load existing .loro document
         let sync_path = self.document_sync_path(path);
-        let snapshot = new_doc.export_snapshot();
-        self.fs.write(&sync_path, &snapshot).await?;
-        
+        let loro_bytes = self.fs.read(&sync_path).await?;
+        let doc = NoteDocument::from_bytes(path, &loro_bytes)?;
+
+        // Diff-merge the changes (preserves peer ID)
+        let body_changed = doc.update_body(&parsed.body)?;
+        let fm_changed = doc.update_frontmatter(parsed.frontmatter.as_ref())?;
+
+        if body_changed || fm_changed {
+            doc.commit();
+            let snapshot = doc.export_snapshot();
+            self.fs.write(&sync_path, &snapshot).await?;
+            tracing::debug!("Re-indexed document via diff: {}", path);
+        }
+
         // Update cache
-        self.documents.insert(path.to_string(), new_doc);
-        
+        self.documents.insert(path.to_string(), doc);
+
         Ok(())
     }
 
@@ -430,9 +435,8 @@ impl<F: FileSystem> Vault<F> {
         let sync_path = self.document_sync_path(path);
         if self.fs.exists(&sync_path).await? {
             let bytes = self.fs.read(&sync_path).await?;
-            let mut doc = NoteDocument::new(path);
-            doc.import(&bytes)?;
-            return Ok(doc);
+            // Use from_bytes to preserve peer ID (imports before setting metadata)
+            return Ok(NoteDocument::from_bytes(path, &bytes)?);
         }
 
         // Otherwise load from markdown file
@@ -447,7 +451,7 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Get the sync storage path for a document
-    fn document_sync_path(&self, path: &str) -> String {
+    pub(crate) fn document_sync_path(&self, path: &str) -> String {
         // Simple hash-based naming
         let hash = simple_hash(path);
         format!("{}/documents/{}.loro", SYNC_DIR, hash)
@@ -456,7 +460,7 @@ impl<F: FileSystem> Vault<F> {
     /// Handle a file change (from file watcher or Obsidian event).
     ///
     /// Uses diff-and-merge to update existing documents, preserving peer ID.
-    /// Only creates a new document if one doesn't exist yet.
+    /// Only creates a new document if no .loro file exists on disk.
     pub async fn on_file_changed(&mut self, path: &str) -> Result<()> {
         // Skip non-markdown files and .sync directory
         if !path.ends_with(".md") || path.starts_with(SYNC_DIR) {
@@ -467,19 +471,16 @@ impl<F: FileSystem> Vault<F> {
         let bytes = self.fs.read(path).await?;
         let content = String::from_utf8_lossy(&bytes);
         let parsed = crate::markdown::parse(&content);
+        let sync_path = self.document_sync_path(path);
 
-        // If document exists, diff-and-merge (preserves peer ID)
+        // If document is in cache, diff-and-merge
         if self.documents.contains_key(path) {
             let existing_doc = self.documents.get(path).unwrap();
             let body_changed = existing_doc.update_body(&parsed.body)?;
             let fm_changed = existing_doc.update_frontmatter(parsed.frontmatter.as_ref())?;
 
             if body_changed || fm_changed {
-                // Single commit for all changes
                 existing_doc.commit();
-
-                // Save updated sync state
-                let sync_path = self.document_sync_path(path);
                 let snapshot = existing_doc.export_snapshot();
                 self.fs.write(&sync_path, &snapshot).await?;
                 tracing::debug!("Updated document via diff: {}", path);
@@ -489,9 +490,30 @@ impl<F: FileSystem> Vault<F> {
             return Ok(());
         }
 
-        // Document doesn't exist - create new (this is the only time we need new peer ID)
+        // Check if .loro exists on disk but not in cache (cold cache scenario)
+        if self.fs.exists(&sync_path).await? {
+            // Load from disk and diff-merge (preserves peer ID)
+            let loro_bytes = self.fs.read(&sync_path).await?;
+            let doc = NoteDocument::from_bytes(path, &loro_bytes)?;
+
+            let body_changed = doc.update_body(&parsed.body)?;
+            let fm_changed = doc.update_frontmatter(parsed.frontmatter.as_ref())?;
+
+            if body_changed || fm_changed {
+                doc.commit();
+                let snapshot = doc.export_snapshot();
+                self.fs.write(&sync_path, &snapshot).await?;
+                tracing::debug!("Updated cold-cache document via diff: {}", path);
+            } else {
+                tracing::debug!("No changes detected (cold cache sync echo): {}", path);
+            }
+
+            self.documents.insert(path.to_string(), doc);
+            return Ok(());
+        }
+
+        // Document doesn't exist anywhere - create new (this is the only time we need new peer ID)
         let new_doc = NoteDocument::from_markdown(path, &content)?;
-        let sync_path = self.document_sync_path(path);
         let snapshot = new_doc.export_snapshot();
         self.fs.write(&sync_path, &snapshot).await?;
         self.documents.insert(path.to_string(), new_doc);
