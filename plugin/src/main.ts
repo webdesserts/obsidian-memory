@@ -35,7 +35,10 @@ export interface KnownPeer {
   label: string;
 }
 
-/** Plugin settings persisted to data.json */
+/** Path to settings file within the vault's .sync directory */
+const SETTINGS_PATH = ".sync/settings.json";
+
+/** Plugin settings persisted per-vault in .sync/settings.json */
 interface P2PSyncSettings {
   /** Peers to auto-reconnect to on plugin load */
   knownPeers: KnownPeer[];
@@ -439,11 +442,21 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   /**
-   * Load plugin settings from data.json.
+   * Load plugin settings from .sync/settings.json.
    */
   private async loadSettings(): Promise<void> {
-    const data = await this.loadData();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    try {
+      if (await this.app.vault.adapter.exists(SETTINGS_PATH)) {
+        const raw = await this.app.vault.adapter.read(SETTINGS_PATH);
+        const data = JSON.parse(raw);
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+      } else {
+        this.settings = { ...DEFAULT_SETTINGS };
+      }
+    } catch (e) {
+      log.warn("Failed to load settings, using defaults:", e);
+      this.settings = { ...DEFAULT_SETTINGS };
+    }
 
     // Validate knownPeers array
     if (!Array.isArray(this.settings.knownPeers)) {
@@ -467,10 +480,20 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   /**
-   * Save plugin settings to data.json.
+   * Save plugin settings to .sync/settings.json.
    */
   private async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    try {
+      // Ensure .sync directory exists
+      if (!await this.app.vault.adapter.exists(".sync")) {
+        await this.app.vault.adapter.mkdir(".sync");
+      }
+
+      const json = JSON.stringify(this.settings, null, 2);
+      await this.app.vault.adapter.write(SETTINGS_PATH, json);
+    } catch (e) {
+      log.error("Failed to save settings:", e);
+    }
   }
 
   /**
