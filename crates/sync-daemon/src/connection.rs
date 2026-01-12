@@ -105,6 +105,12 @@ impl PeerConnection {
                     }
 
                     // Check if this is a handshake message
+                    debug!(
+                        "Message from {}: {} bytes, starts_with_brace={}",
+                        temp_id,
+                        data.len(),
+                        data.first() == Some(&b'{')
+                    );
                     if let Some(handshake) = HandshakeMessage::from_binary(&data) {
                         debug!(
                             "Received handshake from {} (peer_id: {}, role: {})",
