@@ -453,7 +453,10 @@ impl<F: FileSystem> Vault<F> {
         format!("{}/documents/{}.loro", SYNC_DIR, hash)
     }
 
-    /// Handle a file change (from file watcher or Obsidian event)
+    /// Handle a file change (from file watcher or Obsidian event).
+    ///
+    /// Uses diff-and-merge to update existing documents, preserving peer ID.
+    /// Only creates a new document if one doesn't exist yet.
     pub async fn on_file_changed(&mut self, path: &str) -> Result<()> {
         // Skip non-markdown files and .sync directory
         if !path.ends_with(".md") || path.starts_with(SYNC_DIR) {
@@ -463,21 +466,36 @@ impl<F: FileSystem> Vault<F> {
         // Load the current file content
         let bytes = self.fs.read(path).await?;
         let content = String::from_utf8_lossy(&bytes);
+        let parsed = crate::markdown::parse(&content);
 
-        // Ensure document exists in cache (even though we'll replace it)
-        let _doc = self.get_document_mut(path).await?;
+        // If document exists, diff-and-merge (preserves peer ID)
+        if self.documents.contains_key(path) {
+            let existing_doc = self.documents.get(path).unwrap();
+            let body_changed = existing_doc.update_body(&parsed.body)?;
+            let fm_changed = existing_doc.update_frontmatter(parsed.frontmatter.as_ref())?;
 
-        // TODO: Diff and apply changes rather than replacing
-        // For now, just create a new document from the content
+            if body_changed || fm_changed {
+                // Single commit for all changes
+                existing_doc.commit();
+
+                // Save updated sync state
+                let sync_path = self.document_sync_path(path);
+                let snapshot = existing_doc.export_snapshot();
+                self.fs.write(&sync_path, &snapshot).await?;
+                tracing::debug!("Updated document via diff: {}", path);
+            } else {
+                tracing::debug!("No changes detected (sync echo): {}", path);
+            }
+            return Ok(());
+        }
+
+        // Document doesn't exist - create new (this is the only time we need new peer ID)
         let new_doc = NoteDocument::from_markdown(path, &content)?;
-
-        // Save sync state
         let sync_path = self.document_sync_path(path);
         let snapshot = new_doc.export_snapshot();
         self.fs.write(&sync_path, &snapshot).await?;
-
-        // Replace in cache
         self.documents.insert(path.to_string(), new_doc);
+        tracing::debug!("Created new document: {}", path);
 
         Ok(())
     }

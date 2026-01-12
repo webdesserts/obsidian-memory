@@ -518,4 +518,119 @@ mod tests {
         let doc = vault2.get_document("note.md").await.unwrap();
         assert!(doc.to_markdown().contains("# Content"));
     }
+
+    #[tokio::test]
+    async fn test_sync_echo_does_not_duplicate() {
+        // Regression test for content duplication bug.
+        // When a file is synced and written to disk, the file watcher triggers
+        // on_file_changed(). Previously this created a new LoroDoc with a new
+        // peer ID, causing content duplication on subsequent syncs.
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        let mut vault1 = Vault::init(fs1, "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(fs2, "peer2".to_string()).await.unwrap();
+
+        // Vault1 creates a file with specific content
+        let content = "Hello";
+        vault1.fs.write("note.md", content.as_bytes()).await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+
+        // Sync vault1 → vault2
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Simulate file watcher: vault2 calls on_file_changed after sync writes to disk.
+        // This is the bug scenario - previously created new peer ID and duplicated content.
+        vault2.on_file_changed("note.md").await.unwrap();
+
+        // Sync vault2 → vault1 (this would cause duplication before the fix)
+        let request2 = vault1.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault2.process_sync_message(&request2).await.unwrap();
+        let (final_resp2, _) = vault1.process_sync_message(&exchange2.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp2 {
+            vault2.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Verify content is exactly "Hello" (not "HelloHello" or duplicated)
+        let doc = vault1.get_document("note.md").await.unwrap();
+        let markdown = doc.to_markdown();
+        assert_eq!(markdown, content, "Content should not be duplicated");
+    }
+
+    #[tokio::test]
+    async fn test_local_edit_after_sync() {
+        // Test that local edits after sync work correctly
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        let mut vault1 = Vault::init(fs1, "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(fs2, "peer2".to_string()).await.unwrap();
+
+        // Vault1 creates initial content
+        vault1.fs.write("note.md", b"Hello").await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+
+        // Sync to vault2
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Vault2 makes a local edit
+        vault2.fs.write("note.md", b"Hello World").await.unwrap();
+        vault2.on_file_changed("note.md").await.unwrap();
+
+        // Sync back to vault1
+        let request2 = vault1.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault2.process_sync_message(&request2).await.unwrap();
+        let (final_resp2, _) = vault1.process_sync_message(&exchange2.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp2 {
+            vault2.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Vault1 should have the updated content
+        let doc = vault1.get_document("note.md").await.unwrap();
+        assert_eq!(doc.to_markdown(), "Hello World", "Edit should propagate correctly");
+    }
+
+    #[tokio::test]
+    async fn test_diff_merge_preserves_peer_id() {
+        // Test that diff-and-merge updates don't create new peer IDs
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Create initial file
+        vault.fs.write("note.md", b"Hello").await.unwrap();
+        vault.on_file_changed("note.md").await.unwrap();
+
+        // Get initial peer ID count from version vector
+        let doc = vault.get_document("note.md").await.unwrap();
+        let initial_version = doc.version();
+
+        // Make an edit via on_file_changed (diff-and-merge path)
+        vault.fs.write("note.md", b"Hello World").await.unwrap();
+        vault.on_file_changed("note.md").await.unwrap();
+
+        // Version vector should have grown but still have same number of peers
+        let doc2 = vault.get_document("note.md").await.unwrap();
+        let updated_version = doc2.version();
+
+        // Both versions should have the same number of peer entries
+        // (diff-merge doesn't create new peer IDs)
+        assert_eq!(
+            initial_version.len(),
+            updated_version.len(),
+            "Diff-merge should not create new peer IDs"
+        );
+
+        // Content should be updated
+        assert_eq!(doc2.to_markdown(), "Hello World");
+    }
 }

@@ -9,8 +9,9 @@
 
 use crate::markdown;
 use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, VersionVector};
+use similar::{ChangeTag, TextDiff};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use thiserror::Error;
 
@@ -209,6 +210,121 @@ impl NoteDocument {
     /// Commit pending changes
     pub fn commit(&self) {
         self.doc.commit();
+    }
+
+    /// Update the body text by computing and applying a diff.
+    ///
+    /// Preserves peer ID by operating on existing LoroText.
+    /// Tracks current position in the document as we apply changes.
+    /// Loro uses Unicode scalar positions (matches Rust char).
+    pub fn update_body(&self, new_body: &str) -> Result<bool> {
+        let old_body = self.body().to_string();
+        if old_body == new_body {
+            return Ok(false); // No changes
+        }
+
+        let body = self.body();
+        let diff = TextDiff::from_chars(old_body.as_str(), new_body);
+
+        // Track current position in the document as we modify it
+        let mut current_pos = 0;
+
+        for change in diff.iter_all_changes() {
+            match change.tag() {
+                ChangeTag::Equal => {
+                    // Move past equal chars
+                    current_pos += change.value().chars().count();
+                }
+                ChangeTag::Delete => {
+                    let len = change.value().chars().count();
+                    body.delete(current_pos, len)
+                        .map_err(|e| DocumentError::Loro(e.to_string()))?;
+                    // Don't advance position - next char slides into current position
+                }
+                ChangeTag::Insert => {
+                    let text = change.value();
+                    let len = text.chars().count();
+                    body.insert(current_pos, text)
+                        .map_err(|e| DocumentError::Loro(e.to_string()))?;
+                    current_pos += len; // Move past inserted text
+                }
+            }
+        }
+
+        Ok(true) // Changes applied (commit happens in caller)
+    }
+
+    /// Update frontmatter by comparing and applying changes key-by-key.
+    ///
+    /// Preserves peer ID by operating on existing LoroMap.
+    pub fn update_frontmatter(
+        &self,
+        new_fm: Option<&HashMap<String, serde_yaml::Value>>,
+    ) -> Result<bool> {
+        let fm = self.frontmatter();
+
+        // Get existing keys from LoroMap
+        let old_map = fm.get_deep_value();
+        let old_keys: HashSet<String> = match &old_map {
+            loro::LoroValue::Map(m) => m.keys().cloned().collect(),
+            _ => HashSet::new(),
+        };
+
+        let new_map = new_fm.cloned().unwrap_or_default();
+        let new_keys: HashSet<String> = new_map.keys().cloned().collect();
+
+        let mut changed = false;
+
+        // Delete removed keys
+        for key in old_keys.difference(&new_keys) {
+            fm.delete(key)
+                .map_err(|e| DocumentError::Loro(e.to_string()))?;
+            changed = true;
+        }
+
+        // Insert/update keys
+        for (key, value) in &new_map {
+            let json_value = serde_json::to_value(value)
+                .map_err(|e| DocumentError::Serialization(e.to_string()))?;
+
+            // Get old value and convert to comparable format
+            let old_json = match &old_map {
+                loro::LoroValue::Map(m) => m.get(key).and_then(|v| loro_value_to_json(v).ok()),
+                _ => None,
+            };
+
+            // Only update if value changed
+            if old_json.as_ref() != Some(&json_value) {
+                fm.insert(key, json_value)
+                    .map_err(|e| DocumentError::Loro(e.to_string()))?;
+                changed = true;
+            }
+        }
+
+        Ok(changed) // Commit happens in caller
+    }
+}
+
+/// Convert LoroValue to serde_json::Value for comparison
+fn loro_value_to_json(value: &loro::LoroValue) -> std::result::Result<serde_json::Value, ()> {
+    match value {
+        loro::LoroValue::Null => Ok(serde_json::Value::Null),
+        loro::LoroValue::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        loro::LoroValue::I64(n) => Ok(serde_json::json!(*n)),
+        loro::LoroValue::Double(n) => Ok(serde_json::json!(*n)),
+        loro::LoroValue::String(s) => Ok(serde_json::Value::String(s.to_string())),
+        loro::LoroValue::List(arr) => {
+            let items: std::result::Result<Vec<_>, _> = arr.iter().map(loro_value_to_json).collect();
+            Ok(serde_json::Value::Array(items?))
+        }
+        loro::LoroValue::Map(map) => {
+            let obj: std::result::Result<serde_json::Map<String, serde_json::Value>, _> = map
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), loro_value_to_json(v)?)))
+                .collect();
+            Ok(serde_json::Value::Object(obj?))
+        }
+        _ => Ok(serde_json::Value::Null), // Container types - treat as null
     }
 }
 
