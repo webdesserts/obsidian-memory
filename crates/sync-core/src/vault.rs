@@ -816,13 +816,50 @@ impl<F: FileSystem> Vault<F> {
 
         let Some(node_id) = self.find_node_by_path(old_path) else {
             // Source not in tree - this can happen when receiving FileRenamed before
-            // the registry has synced. If the new file exists on disk, just register it.
-            if self.fs.exists(new_path).await.unwrap_or(false) {
+            // the registry has synced. Handle the rename at filesystem level if possible.
+            if self.fs.exists(old_path).await.unwrap_or(false) {
+                // Source exists on disk but not in tree - rename on disk and register target
                 tracing::debug!(
-                    "rename_file: source {} not in tree, but {} exists on disk - registering target",
+                    "rename_file: source {} not in tree but exists on disk - renaming and registering",
+                    old_path
+                );
+
+                // Rename the actual file
+                let content = self.fs.read(old_path).await?;
+                self.fs.write(new_path, &content).await?;
+                self.fs.delete(old_path).await?;
+
+                // Move .loro file if it exists
+                let old_sync = self.document_sync_path(old_path);
+                let new_sync = self.document_sync_path(new_path);
+                if self.fs.exists(&old_sync).await.unwrap_or(false) {
+                    let sync_content = self.fs.read(&old_sync).await?;
+                    self.fs.write(&new_sync, &sync_content).await?;
+                    self.fs.delete(&old_sync).await?;
+                }
+
+                // Update documents cache
+                if let Some(doc) = self.documents.remove(old_path) {
+                    self.documents.insert(new_path.to_string(), doc);
+                }
+
+                // Register in tree
+                self.register_file(new_path)?;
+                return Ok(());
+            } else if self.fs.exists(new_path).await.unwrap_or(false) {
+                // Target already exists (rename already happened) - just register it
+                tracing::debug!(
+                    "rename_file: source {} not in tree, but {} exists - registering target",
                     old_path, new_path
                 );
                 self.register_file(new_path)?;
+
+                // Clean up orphaned .loro at old path if it exists
+                let old_sync = self.document_sync_path(old_path);
+                if self.fs.exists(&old_sync).await.unwrap_or(false) {
+                    let _ = self.fs.delete(&old_sync).await;
+                }
+
                 return Ok(());
             }
             return Err(VaultError::Other(format!("Source file not found: {}", old_path)));
