@@ -966,16 +966,38 @@ export default class P2PSyncPlugin extends Plugin {
     );
 
     this.registerEvent(
-      this.app.vault.on("delete", (file) => {
+      this.app.vault.on("delete", async (file) => {
+        if (!this.vault) return;
+        if (!(file instanceof TFile)) return;
+        if (!file.path.endsWith(".md")) return;
+
         log.debug("File deleted:", file.path);
-        // TODO: Handle file deletion in vault
+        try {
+          // Delete file from tree (CRDT operation)
+          await this.vaultQueue.run(() => this.vault!.deleteFile(file.path));
+          log.info(`Deleted ${file.path} from registry tree`);
+          // Registry change syncs automatically via normal sync protocol
+        } catch (err) {
+          log.error("Failed to handle file delete:", err);
+        }
       })
     );
 
     this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) => {
+      this.app.vault.on("rename", async (file, oldPath) => {
+        if (!this.vault) return;
+        if (!(file instanceof TFile)) return;
+        if (!file.path.endsWith(".md")) return;
+
         log.debug("File renamed:", oldPath, "->", file.path);
-        // TODO: Handle file rename in vault
+        try {
+          // Rename file in tree (CRDT operation)
+          await this.vaultQueue.run(() => this.vault!.renameFile(oldPath, file.path));
+          log.info(`Renamed ${oldPath} -> ${file.path} in registry tree`);
+          // Registry change syncs automatically via normal sync protocol
+        } catch (err) {
+          log.error("Failed to handle file rename:", err);
+        }
       })
     );
   }

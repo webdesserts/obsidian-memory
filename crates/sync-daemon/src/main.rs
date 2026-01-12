@@ -63,10 +63,26 @@ impl Daemon {
                 self.on_file_modified(&event.path).await;
             }
             FileEventKind::Deleted => {
-                debug!("File deleted: {} (deletion sync not yet implemented)", event.path);
-                // TODO: Implement deletion sync
+                self.on_file_deleted(&event.path).await;
             }
         }
+    }
+
+    /// Handle a file deletion.
+    async fn on_file_deleted(&mut self, path: &str) {
+        info!("File deleted: {}", path);
+
+        let mut vault = self.vault.lock().await;
+
+        // Delete file from tree (CRDT operation)
+        if let Err(e) = vault.delete_file(path).await {
+            error!("Failed to delete file {}: {}", path, e);
+            return;
+        }
+
+        // Registry change syncs automatically via normal sync protocol
+        // when peers reconnect or exchange version vectors
+        info!("Deleted {} from registry tree", path);
     }
 
     /// Handle a file modification.
