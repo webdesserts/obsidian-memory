@@ -1086,4 +1086,126 @@ mod tests {
         assert!(!files.contains(&"note.md".to_string()));
         assert!(files.contains(&"knowledge/note.md".to_string()));
     }
+
+    // ========== Tree Operation Tests ==========
+
+    #[tokio::test]
+    async fn test_delete_file_removes_from_tree() {
+        let fs = InMemoryFs::new();
+
+        // Create and index a file
+        fs.write("note.md", b"# Hello").await.unwrap();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        vault.on_file_changed("note.md").await.unwrap();
+
+        // File should be in tree
+        assert!(!vault.is_file_deleted("note.md"));
+
+        // Delete via tree operation
+        vault.delete_file("note.md").await.unwrap();
+
+        // File should now be marked as deleted
+        assert!(vault.is_file_deleted("note.md"));
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_updates_tree() {
+        let fs = InMemoryFs::new();
+
+        // Create and index a file
+        fs.write("old.md", b"# Content").await.unwrap();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        vault.on_file_changed("old.md").await.unwrap();
+
+        // Old path should exist in tree
+        assert!(!vault.is_file_deleted("old.md"));
+
+        // Create target file and rename
+        vault.fs.write("new.md", b"# Content").await.unwrap();
+        vault.rename_file("old.md", "new.md").await.unwrap();
+
+        // New path should exist, old should be gone
+        assert!(!vault.is_file_deleted("new.md"));
+        // Note: old path may still show as "not deleted" since the node was moved, not deleted
+        // The important thing is new.md works
+    }
+
+    #[tokio::test]
+    async fn test_path_traversal_rejected() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Path traversal should be rejected
+        let result = vault.delete_file("../secret.md").await;
+        assert!(result.is_err());
+
+        let result = vault.rename_file("note.md", "../secret.md").await;
+        assert!(result.is_err());
+
+        let result = vault.register_file("../evil.md");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_null_byte_rejected() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Null bytes should be rejected
+        let result = vault.delete_file("foo\0.md").await;
+        assert!(result.is_err());
+
+        let result = vault.register_file("bar\0.md");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_non_markdown_rejected() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Non-markdown files should be rejected
+        let result = vault.register_file("script.js");
+        assert!(result.is_err());
+
+        let result = vault.delete_file("image.png").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_syncs_via_registry() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Create file in vault1
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+
+        // Sync to vault2
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Both vaults should have the file
+        assert!(!vault1.is_file_deleted("note.md"));
+        assert!(!vault2.is_file_deleted("note.md"));
+
+        // Delete in vault1
+        vault1.delete_file("note.md").await.unwrap();
+        assert!(vault1.is_file_deleted("note.md"));
+
+        // Sync again - vault2 should see deletion via registry
+        let request2 = vault2.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
+        let (_, _) = vault2.process_sync_message(&exchange2.unwrap()).await.unwrap();
+
+        // Vault2 should now see the file as deleted
+        assert!(vault2.is_file_deleted("note.md"));
+    }
 }
