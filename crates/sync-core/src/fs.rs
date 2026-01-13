@@ -114,6 +114,8 @@ pub trait FileSystem {
 pub struct InMemoryFs {
     files: RwLock<HashMap<String, Vec<u8>>>,
     dirs: RwLock<HashMap<String, ()>>,
+    /// Tracks file modification times (path -> mtime in ms)
+    mtimes: RwLock<HashMap<String, u64>>,
 }
 
 impl InMemoryFs {
@@ -123,7 +125,24 @@ impl InMemoryFs {
         Self {
             files: RwLock::new(HashMap::new()),
             dirs: RwLock::new(dirs),
+            mtimes: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Set a specific mtime for testing "latest wins" scenarios
+    pub fn set_mtime(&self, path: &str, mtime: u64) {
+        let path = Self::normalize_path(path);
+        let mut mtimes = self.mtimes.write().unwrap();
+        mtimes.insert(path, mtime);
+    }
+
+    /// Get current time in milliseconds (monotonically increasing for tests)
+    fn current_time_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     fn normalize_path(path: &str) -> String {
@@ -170,7 +189,12 @@ impl FileSystem for InMemoryFs {
         }
 
         let mut files = self.files.write().unwrap();
-        files.insert(path, content.to_vec());
+        files.insert(path.clone(), content.to_vec());
+        drop(files);
+
+        // Update mtime
+        let mut mtimes = self.mtimes.write().unwrap();
+        mtimes.insert(path, Self::current_time_ms());
         Ok(())
     }
 
@@ -268,8 +292,10 @@ impl FileSystem for InMemoryFs {
 
         let files = self.files.read().unwrap();
         if let Some(content) = files.get(&path) {
+            let mtimes = self.mtimes.read().unwrap();
+            let mtime = mtimes.get(&path).copied().unwrap_or(0);
             return Ok(FileStat {
-                mtime_millis: 0, // In-memory fs doesn't track mtime
+                mtime_millis: mtime,
                 size: content.len() as u64,
                 is_dir: false,
             });

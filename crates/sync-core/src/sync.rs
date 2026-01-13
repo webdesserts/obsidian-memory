@@ -42,6 +42,8 @@ pub enum SyncMessage {
         path: String,
         /// Update data
         data: Vec<u8>,
+        /// File modification time (ms since epoch) for "latest wins" conflict resolution
+        mtime: Option<u64>,
     },
 
     /// Notify that a file was deleted

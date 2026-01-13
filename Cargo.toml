@@ -44,11 +44,11 @@ bincode = "1.3"
 # Error handling
 thiserror = "2"
 
-# Text diffing (for sync-core)
-similar = "2"
-
 # Cross-platform time (works in WASM)
 web-time = "1"
+
+# UUID generation (v4 random, js for WASM compatibility)
+uuid = { version = "1", features = ["v4", "js"] }
 
 # WASM (for sync-wasm)
 wasm-bindgen = "0.2"

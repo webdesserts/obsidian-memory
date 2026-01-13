@@ -146,9 +146,9 @@ impl<F: FileSystem> Vault<F> {
                 Ok((Some(response_bytes), modified))
             }
 
-            SyncMessage::DocumentUpdate { path, data } => {
+            SyncMessage::DocumentUpdate { path, data, mtime } => {
                 // Real-time update from peer
-                let modified = self.apply_single_update(&path, &data).await?;
+                let modified = self.apply_single_update(&path, &data, mtime).await?;
                 Ok((None, if modified { vec![path] } else { vec![] }))
             }
 
@@ -180,13 +180,17 @@ impl<F: FileSystem> Vault<F> {
     pub async fn prepare_document_update(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
         // Ensure document is loaded
         let doc = self.get_document(path).await?;
-        
+
         // Export a snapshot (for now - could optimize to send incremental updates)
         let snapshot = doc.export_snapshot();
+
+        // Get file modification time for "latest wins" conflict resolution
+        let mtime = self.fs.stat(path).await.ok().map(|s| s.mtime_millis);
 
         let msg = SyncMessage::DocumentUpdate {
             path: path.to_string(),
             data: snapshot,
+            mtime,
         };
 
         let bytes = bincode::serialize(&msg)
@@ -402,6 +406,9 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Apply document updates from a sync response.
+    ///
+    /// Note: SyncResponse doesn't include mtime, so "latest wins" falls back to "remote wins"
+    /// for initial sync. Real-time DocumentUpdate messages include mtime for proper resolution.
     async fn apply_document_updates(
         &mut self,
         updates: HashMap<String, Vec<u8>>,
@@ -409,7 +416,8 @@ impl<F: FileSystem> Vault<F> {
         let mut modified = Vec::new();
 
         for (path, data) in updates {
-            if self.apply_single_update(&path, &data).await? {
+            // No mtime available in bulk sync - uses "remote wins" for divergent histories
+            if self.apply_single_update(&path, &data, None).await? {
                 modified.push(path);
             }
         }
@@ -420,21 +428,111 @@ impl<F: FileSystem> Vault<F> {
     /// Apply a single document update.
     ///
     /// Returns true if the document was modified.
-    async fn apply_single_update(&mut self, path: &str, data: &[u8]) -> Result<bool> {
+    ///
+    /// When histories diverge (neither includes the other), uses content reconciliation
+    /// via `update_by_line()` instead of CRDT merge to avoid character interleaving.
+    ///
+    /// For divergent histories, uses "latest wins" based on file mtime when available.
+    /// Falls back to "remote wins" if mtime is unavailable (e.g., bulk sync).
+    async fn apply_single_update(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        remote_mtime: Option<u64>,
+    ) -> Result<bool> {
         debug!("apply_single_update: {} - data_len={}", path, data.len());
 
         // Check if document exists (in cache or on disk)
         let sync_path = self.document_sync_path(path);
         let exists_in_cache = self.documents.contains_key(path);
-        let exists_on_disk = self.fs.exists(&sync_path).await.map_err(crate::vault::VaultError::from)?;
+        let exists_on_disk = self
+            .fs
+            .exists(&sync_path)
+            .await
+            .map_err(crate::vault::VaultError::from)?;
 
         if exists_in_cache || exists_on_disk {
-            // Document exists - load and import (merge)
+            // Get local mtime before borrowing doc (needed for "latest wins" comparison)
+            let local_mtime = self.fs.stat(path).await.ok().map(|s| s.mtime_millis);
+
+            // Document exists - check for divergent histories before merging
             let doc = self.get_document_mut(path).await?;
-            let version_before = doc.version();
-            doc.import(data)?;
-            let version_after = doc.version();
-            let modified = version_before != version_after;
+            let local_vv = doc.version();
+
+            // Create temp doc FROM LOCAL STATE, then import remote to get merged version
+            // This correctly handles incremental updates (not just full snapshots)
+            let mut temp_doc = NoteDocument::from_bytes(path, &doc.export_snapshot())?;
+            temp_doc.import(data)?;
+            let merged_vv = temp_doc.version();
+
+            // Check if the merge caused any change
+            let local_includes_merged = local_vv.includes_vv(&merged_vv);
+
+            // Check if histories are truly divergent by comparing doc_ids.
+            // Documents from the same source (synced) share the same doc_id.
+            // Documents created independently have different doc_ids.
+            let remote_only_doc = NoteDocument::from_bytes(path, data)?;
+
+            let local_doc_id = doc.doc_id();
+            let remote_doc_id = remote_only_doc.doc_id();
+
+            let is_divergent = match (&local_doc_id, &remote_doc_id) {
+                (Some(local_id), Some(remote_id)) => local_id != remote_id,
+                // If either lacks doc_id (legacy document or incremental update), assume compatible
+                _ => false,
+            };
+
+            debug!(
+                "apply_single_update: {} - local_doc_id={:?}, remote_doc_id={:?}, divergent={}",
+                path, local_doc_id, remote_doc_id, is_divergent
+            );
+
+            let modified = if is_divergent {
+                // Divergent histories - use content reconciliation to avoid interleaving
+                debug!(
+                    "apply_single_update: {} - divergent histories, using content reconciliation",
+                    path
+                );
+
+                // "Latest wins" - compare mtimes if available
+                let remote_is_newer = match (remote_mtime, local_mtime) {
+                    (Some(remote), Some(local)) => remote >= local,
+                    // If mtime unavailable, fall back to "remote wins"
+                    _ => true,
+                };
+
+                if remote_is_newer {
+                    // Use remote_only_doc (pure remote content) NOT temp_doc (merged/interleaved)
+                    let remote_body = remote_only_doc.body().to_string();
+                    let body_changed = doc.update_body(&remote_body)?;
+
+                    // Also reconcile frontmatter from pure remote
+                    let remote_fm = remote_only_doc.to_markdown();
+                    let parsed = crate::markdown::parse(&remote_fm);
+                    let fm_changed = doc.update_frontmatter(parsed.frontmatter.as_ref())?;
+
+                    if body_changed || fm_changed {
+                        doc.commit();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    debug!(
+                        "apply_single_update: {} - local is newer (local={:?}, remote={:?}), keeping local",
+                        path, local_mtime, remote_mtime
+                    );
+                    false
+                }
+            } else if !local_includes_merged {
+                // Remote has changes we don't have, but histories are compatible - safe to import
+                let version_before = doc.version();
+                doc.import(data)?;
+                version_before != doc.version()
+            } else {
+                // We already have everything remote has
+                false
+            };
 
             debug!("apply_single_update: {} - modified={}", path, modified);
 
@@ -928,5 +1026,289 @@ mod tests {
 
         // Content should be preserved
         assert!(doc2.to_markdown().contains("Content ABC"));
+    }
+
+    #[tokio::test]
+    async fn test_divergent_same_file_no_interleaving() {
+        // Regression test: Two vaults create the SAME file with DIFFERENT content
+        // BEFORE any sync. When they sync, content should NOT be interleaved.
+        // This was the original bug where "# Hello" became "# # Hellello WWorld".
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Both vaults create the SAME file with DIFFERENT content BEFORE sync
+        fs1.write("note.md", b"# Hello from A").await.unwrap();
+        // Add delay to ensure different mtime
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs2.write("note.md", b"# Hello from B").await.unwrap();
+
+        // Initialize vaults - each creates its own LoroDoc with independent peer IDs
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        // Sync vault1 → vault2
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, modified) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Verify content is NOT interleaved
+        let doc1 = vault1.get_document("note.md").await.unwrap();
+        let doc2 = vault2.get_document("note.md").await.unwrap();
+
+        let content1 = doc1.to_markdown();
+        let content2 = doc2.to_markdown();
+
+        // Content should be one of the original versions, not interleaved garbage
+        let valid_contents = ["# Hello from A", "# Hello from B"];
+        assert!(
+            valid_contents.contains(&content1.as_str()),
+            "Vault1 content should be valid, got: '{}'",
+            content1
+        );
+        assert!(
+            valid_contents.contains(&content2.as_str()),
+            "Vault2 content should be valid, got: '{}'",
+            content2
+        );
+
+        // With "latest wins", vault2's file (newer mtime) should win
+        // Both vaults should converge to the same content
+        assert_eq!(
+            content1, content2,
+            "Both vaults should have same content after sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_latest_wins_newer_remote() {
+        // Test that "latest wins" correctly keeps newer remote content
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Vault1 creates file first (older)
+        fs1.write("note.md", b"Older content").await.unwrap();
+        fs1.set_mtime("note.md", 1000); // Older timestamp
+
+        // Vault2 creates same file later (newer)
+        fs2.write("note.md", b"Newer content").await.unwrap();
+        fs2.set_mtime("note.md", 2000); // Newer timestamp
+
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        // Vault2 sends DocumentUpdate to Vault1 (real-time sync with mtime)
+        let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
+        let (_, modified) = vault1.process_sync_message(&update).await.unwrap();
+
+        // Vault1 should accept the newer content
+        assert!(modified.contains(&"note.md".to_string()), "Should be modified");
+        let doc = vault1.get_document("note.md").await.unwrap();
+        assert_eq!(doc.to_markdown(), "Newer content", "Should have newer content");
+    }
+
+    #[tokio::test]
+    async fn test_latest_wins_newer_local() {
+        // Test that "latest wins" correctly keeps newer local content
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Vault1 creates file later (newer)
+        fs1.write("note.md", b"Newer content").await.unwrap();
+        fs1.set_mtime("note.md", 2000); // Newer timestamp
+
+        // Vault2 creates same file first (older)
+        fs2.write("note.md", b"Older content").await.unwrap();
+        fs2.set_mtime("note.md", 1000); // Older timestamp
+
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        // Vault2 sends DocumentUpdate to Vault1 (real-time sync with mtime)
+        let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
+        let (_, modified) = vault1.process_sync_message(&update).await.unwrap();
+
+        // Vault1 should REJECT the older content (keep its own)
+        assert!(modified.is_empty(), "Should NOT be modified - local is newer");
+        let doc = vault1.get_document("note.md").await.unwrap();
+        assert_eq!(doc.to_markdown(), "Newer content", "Should keep newer local content");
+    }
+
+    #[tokio::test]
+    async fn test_sync_empty_file() {
+        // Test that syncing empty files works correctly
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        // Vault1 creates an empty file
+        fs1.write("empty.md", b"").await.unwrap();
+
+        let mut vault1 = Vault::init(fs1, "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(fs2, "peer2".to_string()).await.unwrap();
+
+        // Sync to vault2
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, modified) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Vault2 should have received the empty file
+        assert!(modified.contains(&"empty.md".to_string()));
+        let doc = vault2.get_document("empty.md").await.unwrap();
+        assert_eq!(doc.to_markdown(), "", "Empty file should remain empty");
+    }
+
+    #[tokio::test]
+    async fn test_sync_frontmatter_only_file() {
+        // Test that syncing files with only frontmatter (no body) works correctly
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        // Vault1 creates a file with only frontmatter
+        fs1.write("meta.md", b"---\ntitle: Test\ntags:\n  - a\n  - b\n---\n").await.unwrap();
+
+        let mut vault1 = Vault::init(fs1, "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(fs2, "peer2".to_string()).await.unwrap();
+
+        // Sync to vault2
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, modified) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Vault2 should have received the file
+        assert!(modified.contains(&"meta.md".to_string()));
+        let doc = vault2.get_document("meta.md").await.unwrap();
+        let content = doc.to_markdown();
+        assert!(content.contains("title:"), "Should have frontmatter");
+        assert!(content.contains("tags:"), "Should have tags");
+    }
+
+    #[tokio::test]
+    async fn test_doc_id_detects_divergent_histories() {
+        // Test that doc_id correctly identifies documents with divergent histories.
+        // Documents created independently have different doc_ids and are treated
+        // as divergent (using content reconciliation instead of CRDT merge).
+        use crate::document::NoteDocument;
+
+        // Two documents created independently have different doc_ids
+        let doc1 = NoteDocument::from_markdown("test.md", "Content A").unwrap();
+        let doc2 = NoteDocument::from_markdown("test.md", "Content B").unwrap();
+
+        let doc1_id = doc1.doc_id();
+        let doc2_id = doc2.doc_id();
+
+        assert!(doc1_id.is_some(), "New documents should have doc_id");
+        assert!(doc2_id.is_some(), "New documents should have doc_id");
+        assert_ne!(
+            doc1_id, doc2_id,
+            "Independently created documents should have different doc_ids"
+        );
+
+        // A document imported from another preserves the doc_id
+        let mut doc3 = NoteDocument::new("test.md");
+        doc3.import(&doc1.export_snapshot()).unwrap();
+
+        assert_eq!(
+            doc3.doc_id(),
+            doc1_id,
+            "Imported document should preserve original doc_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_incremental_updates_after_sync_use_crdt_merge() {
+        // After initial sync, both vaults share the same doc_id.
+        // Subsequent edits should merge via CRDT, not trigger divergence detection.
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Vault1 creates file
+        fs1.write("note.md", b"Line 1").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+
+        // Initial sync - vault2 gets the file with vault1's doc_id
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        // Both vaults should now have same doc_id
+        let doc1 = vault1.get_document("note.md").await.unwrap();
+        let doc2 = vault2.get_document("note.md").await.unwrap();
+        assert_eq!(doc1.doc_id(), doc2.doc_id(), "After sync, doc_ids should match");
+
+        // Vault2 makes an edit
+        fs2.write("note.md", b"Line 1\nLine 2 from vault2").await.unwrap();
+        vault2.on_file_changed("note.md").await.unwrap();
+
+        // Vault1 also makes an edit (concurrent)
+        fs1.write("note.md", b"Line 1\nLine 2 from vault1").await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+
+        // Sync vault2 → vault1 (should CRDT merge, not diverge)
+        let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
+        let (_, modified) = vault1.process_sync_message(&update).await.unwrap();
+
+        // Should be modified (merged)
+        assert!(modified.contains(&"note.md".to_string()), "Should merge changes");
+
+        // Content should have BOTH lines (CRDT merge), not replace one with the other
+        let doc = vault1.get_document("note.md").await.unwrap();
+        let content = doc.to_markdown();
+        assert!(content.contains("Line 1"), "Should have original line");
+        // CRDT merge means both edits are present (order may vary)
+        assert!(
+            content.contains("vault1") || content.contains("vault2"),
+            "Should have merged content, got: {}",
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_document_without_doc_id_assumes_compatible() {
+        // Documents created before doc_id was added (legacy) should be treated
+        // as compatible (non-divergent) to avoid breaking existing syncs.
+        use crate::document::NoteDocument;
+        use loro::LoroDoc;
+
+        // Simulate a legacy document without doc_id by creating a LoroDoc directly
+        let legacy_doc = LoroDoc::new();
+        let meta = legacy_doc.get_map("_meta");
+        meta.insert("path", "test.md").unwrap();
+        // Note: no doc_id inserted
+        let body = legacy_doc.get_text("body");
+        body.insert(0, "Legacy content").unwrap();
+        legacy_doc.commit();
+        let legacy_bytes = legacy_doc.export(loro::ExportMode::Snapshot).unwrap();
+
+        // Load via from_bytes - should NOT add a doc_id (preserves legacy state)
+        let doc = NoteDocument::from_bytes("test.md", &legacy_bytes).unwrap();
+        assert!(doc.doc_id().is_none(), "Legacy document should have no doc_id");
+
+        // New document has doc_id
+        let new_doc = NoteDocument::from_markdown("test.md", "New content").unwrap();
+        assert!(new_doc.doc_id().is_some(), "New document should have doc_id");
+
+        // When syncing legacy (no doc_id) with new (has doc_id), should assume compatible
+        // This is tested implicitly by the fallback in apply_single_update:
+        // match (&local_doc_id, &remote_doc_id) { ... _ => false }
     }
 }

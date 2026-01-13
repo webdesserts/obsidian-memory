@@ -1,19 +1,20 @@
 //! NoteDocument: Loro document wrapper for a single markdown note.
 //!
 //! Each note is represented as a Loro document with:
-//! - `_meta`: LoroMap for internal sync metadata (path, content hash)
+//! - `_meta`: LoroMap for internal sync metadata (doc_id, path)
 //! - `frontmatter`: LoroMap for user's YAML frontmatter
 //! - `body`: LoroText for markdown content
 //!
+//! The `_meta.doc_id` field tracks document lineage for divergent history detection.
 //! The `_meta.path` field allows detecting file moves/renames during reconciliation.
 
 use crate::markdown;
-use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, VersionVector};
-use similar::{ChangeTag, TextDiff};
+use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, UpdateOptions, VersionVector};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum DocumentError {
@@ -33,12 +34,15 @@ pub struct NoteDocument {
 }
 
 impl NoteDocument {
-    /// Create a new empty document for a path
+    /// Create a new empty document for a path.
+    ///
+    /// Generates a unique `doc_id` to track document lineage across syncs.
     pub fn new(path: &str) -> Self {
         let doc = LoroDoc::new();
 
-        // Set internal metadata
+        // Set internal metadata with unique doc_id
         let meta = doc.get_map("_meta");
+        meta.insert("doc_id", Uuid::new_v4().to_string()).ok();
         meta.insert("path", path).ok();
         doc.commit();
 
@@ -89,6 +93,22 @@ impl NoteDocument {
         None
     }
 
+    /// Get the document's unique ID for lineage tracking.
+    ///
+    /// Documents created from the same source (via sync) share the same doc_id.
+    /// Documents created independently have different doc_ids, indicating divergent history.
+    /// Returns None for legacy documents created before doc_id was added.
+    pub fn doc_id(&self) -> Option<String> {
+        let meta = self.doc.get_map("_meta");
+        let value = meta.get_deep_value();
+        if let loro::LoroValue::Map(map) = value {
+            if let Some(loro::LoroValue::String(s)) = map.get("doc_id") {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+
     /// Update the path stored in metadata.
     ///
     /// Called when a file move is detected during reconciliation.
@@ -120,13 +140,17 @@ impl NoteDocument {
         hasher.finish()
     }
 
-    /// Load from markdown content
+    /// Load from markdown content.
+    ///
+    /// Generates a unique `doc_id` to track document lineage across syncs.
     pub fn from_markdown(path: &str, content: &str) -> Result<Self> {
         let doc = LoroDoc::new();
         let parsed = markdown::parse(content);
 
-        // Set internal metadata
+        // Set internal metadata with unique doc_id
         let meta = doc.get_map("_meta");
+        meta.insert("doc_id", Uuid::new_v4().to_string())
+            .map_err(|e| DocumentError::Loro(e.to_string()))?;
         meta.insert("path", path)
             .map_err(|e| DocumentError::Loro(e.to_string()))?;
 
@@ -233,44 +257,20 @@ impl NoteDocument {
         self.doc.commit();
     }
 
-    /// Update the body text by computing and applying a diff.
+    /// Update the body text by computing and applying a line-based diff.
     ///
-    /// Preserves peer ID by operating on existing LoroText.
-    /// Tracks current position in the document as we apply changes.
-    /// Loro uses Unicode scalar positions (matches Rust char).
+    /// Uses Loro's built-in `update_by_line()` which computes line-based diffs
+    /// efficiently. Preserves peer ID by operating on existing LoroText.
     pub fn update_body(&self, new_body: &str) -> Result<bool> {
-        let old_body = self.body().to_string();
+        let body = self.body();
+        let old_body = body.to_string();
+
         if old_body == new_body {
             return Ok(false); // No changes
         }
 
-        let body = self.body();
-        let diff = TextDiff::from_chars(old_body.as_str(), new_body);
-
-        // Track current position in the document as we modify it
-        let mut current_pos = 0;
-
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Equal => {
-                    // Move past equal chars
-                    current_pos += change.value().chars().count();
-                }
-                ChangeTag::Delete => {
-                    let len = change.value().chars().count();
-                    body.delete(current_pos, len)
-                        .map_err(|e| DocumentError::Loro(e.to_string()))?;
-                    // Don't advance position - next char slides into current position
-                }
-                ChangeTag::Insert => {
-                    let text = change.value();
-                    let len = text.chars().count();
-                    body.insert(current_pos, text)
-                        .map_err(|e| DocumentError::Loro(e.to_string()))?;
-                    current_pos += len; // Move past inserted text
-                }
-            }
-        }
+        body.update_by_line(new_body, UpdateOptions::default())
+            .map_err(|e| DocumentError::Loro(format!("{:?}", e)))?;
 
         Ok(true) // Changes applied (commit happens in caller)
     }
@@ -410,5 +410,30 @@ World"#;
         doc2.import(&snapshot).unwrap();
 
         assert_eq!(doc2.body().to_string(), "Hello");
+    }
+
+    #[test]
+    fn test_update_body_with_update_by_line() {
+        // Test that update_body (using update_by_line) works correctly
+        let doc = NoteDocument::from_markdown("test.md", "Hello World").unwrap();
+        assert_eq!(doc.body().to_string(), "Hello World");
+
+        // Update the body
+        let changed = doc.update_body("Hello Universe").unwrap();
+        doc.commit();
+
+        assert!(changed, "Should detect change");
+        assert_eq!(doc.body().to_string(), "Hello Universe");
+    }
+
+    #[test]
+    fn test_update_body_no_change() {
+        // Test that update_body returns false when content is the same
+        let doc = NoteDocument::from_markdown("test.md", "Hello").unwrap();
+
+        let changed = doc.update_body("Hello").unwrap();
+
+        assert!(!changed, "Should not detect change for same content");
+        assert_eq!(doc.body().to_string(), "Hello");
     }
 }

@@ -863,8 +863,8 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File modified:", file.path);
         try {
-          // Check if this was synced (consume flag) - must check BEFORE onFileChanged
-          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          // Check if this was synced (consume flag) - must go through queue to avoid borrow conflicts
+          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
           if (wasSynced) {
             log.debug("Skipping broadcast for synced file:", file.path);
             return;
@@ -897,8 +897,8 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File created:", file.path);
         try {
-          // Check if this is a file being created from sync (consume flag)
-          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          // Check if this is a file being created from sync (consume flag) - must go through queue
+          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
           if (wasSynced) {
             log.debug("Skipping broadcast for synced new file:", file.path);
             return;
@@ -922,8 +922,8 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File deleted:", file.path);
         try {
-          // Check if this deletion was from sync (consume flag)
-          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          // Check if this deletion was from sync (consume flag) - must go through queue
+          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
           if (wasSynced) {
             log.debug("Skipping broadcast for synced deletion:", file.path);
             return;
@@ -953,8 +953,8 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File renamed:", oldPath, "->", file.path);
         try {
-          // Check if this rename was from sync (consume flag on new path)
-          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          // Check if this rename was from sync (consume flag on new path) - must go through queue
+          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
           if (wasSynced) {
             log.debug("Skipping broadcast for synced rename:", oldPath, "->", file.path);
             return;
