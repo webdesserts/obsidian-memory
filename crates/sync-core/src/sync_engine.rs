@@ -155,6 +155,8 @@ impl<F: FileSystem> Vault<F> {
             SyncMessage::FileDeleted { path } => {
                 // Handle file deletion via tree operation
                 debug!("Received file deletion for: {}", path);
+                // Mark as synced BEFORE deleting (for echo detection)
+                self.mark_synced(&path);
                 self.delete_file(&path).await?;
                 Ok((None, vec![path]))
             }
@@ -162,6 +164,10 @@ impl<F: FileSystem> Vault<F> {
             SyncMessage::FileRenamed { old_path, new_path } => {
                 // Handle file rename via tree operation
                 debug!("Received file rename: {} -> {}", old_path, new_path);
+                // Mark both paths as synced BEFORE renaming (for echo detection)
+                // Some file watchers emit delete for old_path + create for new_path
+                self.mark_synced(&old_path);
+                self.mark_synced(&new_path);
                 self.rename_file(&old_path, &new_path).await?;
                 Ok((None, vec![new_path]))
             }
@@ -371,6 +377,8 @@ impl<F: FileSystem> Vault<F> {
                     // Remove from filesystem
                     if self.fs.exists(&path).await.unwrap_or(false) {
                         debug!("apply_registry_changes: deleting {}", path);
+                        // Mark as synced BEFORE deleting (for echo detection)
+                        self.mark_synced(&path);
                         if let Err(e) = self.fs.delete(&path).await {
                             warn!("Failed to delete {}: {}", path, e);
                         }
@@ -431,6 +439,8 @@ impl<F: FileSystem> Vault<F> {
             debug!("apply_single_update: {} - modified={}", path, modified);
 
             if modified {
+                // Mark as synced BEFORE writing to disk (for echo detection)
+                self.mark_synced(path);
                 self.save_document(path).await?;
                 debug!("apply_single_update: saved {} to disk", path);
             }
@@ -439,6 +449,9 @@ impl<F: FileSystem> Vault<F> {
         } else {
             // Document is new - create directly from sync data (preserves peer ID)
             let doc = NoteDocument::from_bytes(path, data)?;
+
+            // Mark as synced BEFORE writing to disk (for echo detection)
+            self.mark_synced(path);
 
             // Save to disk
             let snapshot = doc.export_snapshot();

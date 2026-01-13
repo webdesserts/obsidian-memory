@@ -5,7 +5,10 @@ use crate::fs::{FileSystem, FsError};
 
 use loro::{LoroDoc, LoroTree, TreeID, TreeParentId};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
+use web_time::Instant;
 
 /// Directory for sync state
 pub(crate) const SYNC_DIR: &str = ".sync";
@@ -56,10 +59,82 @@ impl ReconcileReport {
     pub fn has_changes(&self) -> bool {
         !self.indexed.is_empty() || !self.reindexed.is_empty() || !self.moved.is_empty()
     }
-    
+
     /// Total number of files processed
     pub fn total_processed(&self) -> usize {
         self.indexed.len() + self.reindexed.len() + self.moved.len()
+    }
+}
+
+/// Tracks files that were recently synced to prevent re-broadcasting.
+///
+/// When a file is received from sync, we mark it here BEFORE writing to disk.
+/// When the file watcher fires, we check and consume this flag to skip broadcast.
+///
+/// Flags expire after `FLAG_TTL` to handle cases where file watcher events are
+/// dropped (e.g., under heavy load). This prevents stale flags from incorrectly
+/// suppressing local edits.
+#[derive(Clone)]
+pub struct SyncTracker {
+    /// Map of path -> timestamp when marked as synced
+    synced_paths: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+/// Time-to-live for sync flags. Flags older than this are considered stale.
+const FLAG_TTL: Duration = Duration::from_secs(5);
+
+impl Default for SyncTracker {
+    fn default() -> Self {
+        Self {
+            synced_paths: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl SyncTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a path as having been synced (call before writing to disk)
+    pub fn mark_synced(&self, path: &str) {
+        self.synced_paths
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), Instant::now());
+    }
+
+    /// Check if path was synced and consume the flag (returns true once).
+    /// Returns false if the flag has expired (older than FLAG_TTL).
+    pub fn consume_synced(&self, path: &str) -> bool {
+        let mut paths = self.synced_paths.lock().unwrap();
+        if let Some(timestamp) = paths.remove(path) {
+            // Check if flag is still valid (not expired)
+            if timestamp.elapsed() < FLAG_TTL {
+                return true;
+            }
+            // Flag expired - treat as if it wasn't set
+        }
+        false
+    }
+
+    /// Check if path was synced (without consuming).
+    /// Returns false if the flag has expired.
+    #[allow(dead_code)]
+    pub fn is_synced(&self, path: &str) -> bool {
+        let paths = self.synced_paths.lock().unwrap();
+        if let Some(timestamp) = paths.get(path) {
+            return timestamp.elapsed() < FLAG_TTL;
+        }
+        false
+    }
+
+    /// Remove expired flags to prevent memory growth.
+    /// Called periodically during normal operations.
+    #[allow(dead_code)]
+    pub fn cleanup_expired(&self) {
+        let mut paths = self.synced_paths.lock().unwrap();
+        paths.retain(|_, timestamp| timestamp.elapsed() < FLAG_TTL);
     }
 }
 
@@ -80,6 +155,9 @@ pub struct Vault<F: FileSystem> {
 
     /// Our peer ID
     peer_id: String,
+
+    /// Tracks files that were recently synced (for echo detection)
+    sync_tracker: SyncTracker,
 }
 
 impl<F: FileSystem> Vault<F> {
@@ -104,6 +182,7 @@ impl<F: FileSystem> Vault<F> {
             documents: HashMap::new(),
             fs,
             peer_id,
+            sync_tracker: SyncTracker::new(),
         };
 
         // Scan and index all existing markdown files
@@ -143,6 +222,7 @@ impl<F: FileSystem> Vault<F> {
             documents: HashMap::new(),
             fs,
             peer_id,
+            sync_tracker: SyncTracker::new(),
         };
 
         // Build path cache from loaded tree
@@ -387,6 +467,18 @@ impl<F: FileSystem> Vault<F> {
     /// Get our peer ID
     pub fn peer_id(&self) -> &str {
         &self.peer_id
+    }
+
+    /// Mark a path as synced (call before writing to disk).
+    /// Used to prevent re-broadcasting files we just received from sync.
+    pub fn mark_synced(&self, path: &str) {
+        self.sync_tracker.mark_synced(path);
+    }
+
+    /// Check if a path was synced and consume the flag.
+    /// Returns true once (and clears the flag), false on subsequent calls.
+    pub fn consume_sync_flag(&self, path: &str) -> bool {
+        self.sync_tracker.consume_synced(path)
     }
 
     /// Get the version vector for a document as encoded bytes.
@@ -1312,5 +1404,221 @@ mod tests {
 
         // Vault2 should now see the file as deleted
         assert!(vault2.is_file_deleted("note.md"));
+    }
+
+    // ========== SyncTracker Tests ==========
+
+    #[test]
+    fn test_sync_tracker_mark_and_consume() {
+        let tracker = SyncTracker::new();
+
+        // Initially not synced
+        assert!(!tracker.is_synced("test.md"));
+
+        // Mark as synced
+        tracker.mark_synced("test.md");
+        assert!(tracker.is_synced("test.md"));
+
+        // Consume returns true once
+        assert!(tracker.consume_synced("test.md"));
+
+        // Second consume returns false (flag cleared)
+        assert!(!tracker.consume_synced("test.md"));
+        assert!(!tracker.is_synced("test.md"));
+    }
+
+    #[test]
+    fn test_sync_tracker_multiple_paths() {
+        let tracker = SyncTracker::new();
+
+        tracker.mark_synced("a.md");
+        tracker.mark_synced("b.md");
+        tracker.mark_synced("c.md");
+
+        assert!(tracker.is_synced("a.md"));
+        assert!(tracker.is_synced("b.md"));
+        assert!(tracker.is_synced("c.md"));
+
+        // Consume one doesn't affect others
+        assert!(tracker.consume_synced("b.md"));
+        assert!(tracker.is_synced("a.md"));
+        assert!(!tracker.is_synced("b.md"));
+        assert!(tracker.is_synced("c.md"));
+    }
+
+    #[test]
+    fn test_sync_tracker_clone_shares_state() {
+        let tracker1 = SyncTracker::new();
+        let tracker2 = tracker1.clone();
+
+        // Mark via tracker1
+        tracker1.mark_synced("shared.md");
+
+        // Visible via tracker2
+        assert!(tracker2.is_synced("shared.md"));
+
+        // Consume via tracker2
+        assert!(tracker2.consume_synced("shared.md"));
+
+        // Gone from tracker1 too
+        assert!(!tracker1.is_synced("shared.md"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_marks_synced_flag() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Create file in vault1
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string())
+            .await
+            .unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+
+        // Create empty vault2
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string())
+            .await
+            .unwrap();
+
+        // Sync from vault1 to vault2
+        let request = vault1.prepare_sync_request().await.unwrap();
+        let (response, _) = vault2.process_sync_message(&request).await.unwrap();
+        let (_, modified) = vault1
+            .process_sync_message(&response.unwrap())
+            .await
+            .unwrap();
+
+        // vault1 shouldn't have modified files (it has newer data)
+        assert!(modified.is_empty());
+
+        // Sync response back to vault2
+        let update = vault1.prepare_document_update("note.md").await.unwrap();
+        let (_, modified2) = vault2
+            .process_sync_message(&update.unwrap())
+            .await
+            .unwrap();
+
+        // vault2 should have the synced flag set for modified files
+        for path in &modified2 {
+            assert!(
+                vault2.consume_sync_flag(path),
+                "Synced file {} should have sync flag set",
+                path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_edit_does_not_set_sync_flag() {
+        let fs = InMemoryFs::new();
+
+        fs.write("note.md", b"# Original").await.unwrap();
+        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+
+        // Local edit
+        vault.on_file_changed("note.md").await.unwrap();
+
+        // Sync flag should NOT be set for local edits
+        assert!(
+            !vault.consume_sync_flag("note.md"),
+            "Local edit should not set sync flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_sync_sets_flag() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Create file in both vaults
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        fs2.write("note.md", b"# Hello").await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string())
+            .await
+            .unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string())
+            .await
+            .unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        vault2.on_file_changed("note.md").await.unwrap();
+
+        // Initial sync to get them in sync
+        let req1 = vault1.prepare_sync_request().await.unwrap();
+        let (resp1, _) = vault2.process_sync_message(&req1).await.unwrap();
+        if let Some(r) = resp1 {
+            vault1.process_sync_message(&r).await.unwrap();
+        }
+
+        // Delete in vault1
+        vault1.delete_file("note.md").await.unwrap();
+
+        // Prepare and send delete message
+        let delete_msg = vault1.prepare_file_deleted("note.md").unwrap();
+        let (_, modified) = vault2.process_sync_message(&delete_msg).await.unwrap();
+
+        // vault2 should have the synced flag set for the deleted file
+        assert!(modified.contains(&"note.md".to_string()));
+        assert!(
+            vault2.consume_sync_flag("note.md"),
+            "Deleted file should have sync flag set"
+        );
+    }
+
+    #[test]
+    fn test_sync_tracker_flag_within_ttl() {
+        let tracker = SyncTracker::new();
+
+        // Mark and immediately check - should be within TTL
+        tracker.mark_synced("test.md");
+        assert!(tracker.is_synced("test.md"));
+        assert!(tracker.consume_synced("test.md"));
+
+        // After consume, flag is gone
+        assert!(!tracker.is_synced("test.md"));
+        assert!(!tracker.consume_synced("test.md"));
+    }
+
+    #[test]
+    fn test_sync_tracker_cleanup_expired() {
+        let tracker = SyncTracker::new();
+
+        // Mark several paths
+        tracker.mark_synced("a.md");
+        tracker.mark_synced("b.md");
+        tracker.mark_synced("c.md");
+
+        // Cleanup shouldn't remove fresh flags
+        tracker.cleanup_expired();
+
+        // All should still be present (within TTL)
+        assert!(tracker.is_synced("a.md"));
+        assert!(tracker.is_synced("b.md"));
+        assert!(tracker.is_synced("c.md"));
+    }
+
+    #[test]
+    fn test_sync_tracker_rename_marks_both_paths() {
+        // This tests the behavior expected when a rename sync is processed
+        let tracker = SyncTracker::new();
+
+        // Simulate what sync_engine does for FileRenamed
+        let old_path = "old/note.md";
+        let new_path = "new/note.md";
+        tracker.mark_synced(old_path);
+        tracker.mark_synced(new_path);
+
+        // Both should be marked
+        assert!(tracker.is_synced(old_path));
+        assert!(tracker.is_synced(new_path));
+
+        // Consuming one doesn't affect the other
+        assert!(tracker.consume_synced(old_path));
+        assert!(!tracker.is_synced(old_path));
+        assert!(tracker.is_synced(new_path));
     }
 }

@@ -5,11 +5,10 @@
 
 use anyhow::Result;
 use clap::Parser;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 // Use library exports
@@ -51,8 +50,6 @@ struct Daemon {
     server: WebSocketServer,
     /// File watcher
     watcher: FileWatcher,
-    /// Last synced versions for race condition prevention
-    last_synced_versions: HashMap<String, Vec<u8>>,
 }
 
 impl Daemon {
@@ -73,6 +70,12 @@ impl Daemon {
         info!("File deleted: {}", path);
 
         let mut vault = self.vault.lock().await;
+
+        // Check if this deletion was from sync (consume flag)
+        if vault.consume_sync_flag(path) {
+            debug!("Skipping broadcast for synced deletion: {}", path);
+            return;
+        }
 
         // Delete file from tree (CRDT operation)
         if let Err(e) = vault.delete_file(path).await {
@@ -106,30 +109,10 @@ impl Daemon {
 
         let mut vault = self.vault.lock().await;
 
-        // Check if this is an echo from a sync we just applied
-        if let Some(synced_version) = self.last_synced_versions.get(path) {
-            match vault.get_document_version(path).await {
-                Ok(Some(current_version)) => {
-                    let includes = Vault::<NativeFs>::version_includes(&current_version, synced_version);
-                    debug!(
-                        "Echo check for {}: synced={} bytes, current={} bytes, includes={}",
-                        path, synced_version.len(), current_version.len(), includes
-                    );
-                    if includes {
-                        // Version unchanged - this is a sync echo, skip broadcast
-                        debug!("Skipping broadcast for {} (sync echo)", path);
-                        self.last_synced_versions.remove(path);
-                        return;
-                    }
-                }
-                Ok(None) => {
-                    debug!("Echo check for {}: document not found", path);
-                }
-                Err(e) => {
-                    warn!("Failed to get version for {}: {}", path, e);
-                }
-            }
-            self.last_synced_versions.remove(path);
+        // Check if this modification was from sync (consume flag)
+        if vault.consume_sync_flag(path) {
+            debug!("Skipping broadcast for synced file: {}", path);
+            return;
         }
 
         // Notify vault of the file change
@@ -170,15 +153,6 @@ impl Daemon {
 
         match vault.process_sync_message(&msg.data).await {
             Ok((response, modified_paths)) => {
-                // Track synced versions for modified files (skip for deletions)
-                for path in &modified_paths {
-                    if !vault.is_file_deleted(path) {
-                        if let Ok(Some(version)) = vault.get_document_version(path).await {
-                            self.last_synced_versions.insert(path.clone(), version);
-                        }
-                    }
-                }
-
                 // Send response if any
                 if let Some(response_data) = response {
                     if let Err(e) = self.server.send_by_temp_id(&msg.temp_id, &response_data).await {
@@ -317,7 +291,6 @@ async fn main() -> Result<()> {
         vault: Arc::new(Mutex::new(vault)),
         server,
         watcher,
-        last_synced_versions: HashMap::new(),
     };
 
     info!("Daemon running. Press Ctrl+C to stop.");

@@ -47,6 +47,9 @@ thiserror = "2"
 # Text diffing (for sync-core)
 similar = "2"
 
+# Cross-platform time (works in WASM)
+web-time = "1"
+
 # WASM (for sync-wasm)
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

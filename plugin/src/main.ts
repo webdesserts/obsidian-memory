@@ -1,6 +1,6 @@
 import { Notice, Plugin, Platform, FileSystemAdapter, Events, TFile } from "obsidian";
 import { SyncView, VIEW_TYPE_SYNC } from "./views/SyncView";
-import { initWasm, isWasmReady, generatePeerId, WasmVault, versionIncludes } from "./wasm";
+import { initWasm, isWasmReady, generatePeerId, WasmVault } from "./wasm";
 import { createFsBridge } from "./fs/ObsidianFs";
 import { PeerManager, PeerInfo } from "./network";
 import { VaultOperationQueue } from "./VaultOperationQueue";
@@ -71,16 +71,6 @@ export default class P2PSyncPlugin extends Plugin {
   /** Status bar element (desktop only) */
   private statusBarEl: HTMLElement | null = null;
 
-  /** 
-   * Version vectors of files after they were synced.
-   * Used to detect if a file modification is purely from sync (skip re-broadcast)
-   * or includes local edits (needs broadcast).
-   * 
-   * Key: file path
-   * Value: encoded version vector bytes from the last sync operation
-   */
-  private lastSyncedVersions: Map<string, Uint8Array> = new Map();
-
   /**
    * Whether the plugin is disabled due to Obsidian Sync being active.
    * When true, the plugin will not initialize vault or peer manager.
@@ -127,19 +117,8 @@ export default class P2PSyncPlugin extends Plugin {
       }
     };
 
-    // Clean non-timestamp maps (FIFO - remove oldest inserted)
-    const cleanupFifo = <K, V>(map: Map<K, V>, maxSize: number): void => {
-      if (map.size <= maxSize) return;
-      const toRemove = map.size - maxSize;
-      const keys = Array.from(map.keys());
-      for (let i = 0; i < toRemove && i < keys.length; i++) {
-        map.delete(keys[i]);
-      }
-    };
-
     cleanupTimestamps(this.lastBroadcastTime, this.MAX_MAP_ENTRIES);
     cleanupTimestamps(this.pendingBroadcasts, this.MAX_MAP_ENTRIES);
-    cleanupFifo(this.lastSyncedVersions, this.MAX_MAP_ENTRIES);
   }
 
   async onload() {
@@ -796,10 +775,7 @@ export default class P2PSyncPlugin extends Plugin {
    *
    * Called after sync writes a file to ensure Obsidian picks up the changes.
    * For new files, this creates the file in Obsidian's index.
-    * 
-    * Stores the document's version vector after sync to detect if subsequent
-    * file modifications are purely from this sync operation.
-    */
+   */
   private async reloadFileFromDisk(path: string): Promise<void> {
     // Validate path to prevent path traversal attacks
     if (!this.isValidVaultPath(path)) {
@@ -831,19 +807,6 @@ export default class P2PSyncPlugin extends Plugin {
           }
           await this.app.vault.create(path, content);
           log.debug(`Created ${path} in Obsidian`);
-        }
-      }
-
-      // Store the version vector after sync completes.
-      // This allows onFileModified to detect if subsequent modifications
-      // are purely from this sync (version unchanged) or include local edits.
-      if (this.vault) {
-        const version = await this.vaultQueue.run(() =>
-          this.vault!.getDocumentVersion(path)
-        ) as Uint8Array | null;
-        if (version) {
-          this.lastSyncedVersions.set(path, version);
-          log.debug(`Stored synced version for ${path}`);
         }
       }
     } catch (err) {
@@ -900,28 +863,15 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File modified:", file.path);
         try {
+          // Check if this was synced (consume flag) - must check BEFORE onFileChanged
+          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          if (wasSynced) {
+            log.debug("Skipping broadcast for synced file:", file.path);
+            return;
+          }
+
           // Update the Loro document with the new content
           await this.vaultQueue.run(() => this.vault!.onFileChanged(file.path));
-
-          // Check if this modification is purely from a sync operation.
-          // If the current version includes all operations from the last synced version,
-          // then no local edits were made - skip broadcasting to prevent sync loops.
-          const lastSynced = this.lastSyncedVersions.get(file.path);
-          if (lastSynced) {
-            const currentVersion = await this.vaultQueue.run(() =>
-              this.vault!.getDocumentVersion(file.path)
-            ) as Uint8Array | null;
-
-            if (currentVersion && versionIncludes(currentVersion, lastSynced)) {
-              // Version unchanged or only contains synced operations - skip broadcast
-              log.debug("Skipping broadcast for synced file:", file.path);
-              // Clear the synced version now that we've processed this event
-              this.lastSyncedVersions.delete(file.path);
-              return;
-            }
-            // Version has new local operations - clear synced version and proceed to broadcast
-            this.lastSyncedVersions.delete(file.path);
-          }
 
           // Broadcast the update to all connected peers (handles throttling internally)
           await this.broadcastDocumentUpdate(file.path);
@@ -947,11 +897,10 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File created:", file.path);
         try {
-          // Check if this is a file being created from sync
-          const lastSynced = this.lastSyncedVersions.get(file.path);
-          if (lastSynced) {
+          // Check if this is a file being created from sync (consume flag)
+          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          if (wasSynced) {
             log.debug("Skipping broadcast for synced new file:", file.path);
-            this.lastSyncedVersions.delete(file.path);
             return;
           }
 
@@ -973,6 +922,13 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File deleted:", file.path);
         try {
+          // Check if this deletion was from sync (consume flag)
+          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          if (wasSynced) {
+            log.debug("Skipping broadcast for synced deletion:", file.path);
+            return;
+          }
+
           // Delete file from tree (CRDT operation)
           await this.vaultQueue.run(() => this.vault!.deleteFile(file.path));
           log.info(`Deleted ${file.path} from registry tree`);
@@ -997,6 +953,13 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File renamed:", oldPath, "->", file.path);
         try {
+          // Check if this rename was from sync (consume flag on new path)
+          const wasSynced = this.vault!.consumeSyncFlag(file.path);
+          if (wasSynced) {
+            log.debug("Skipping broadcast for synced rename:", oldPath, "->", file.path);
+            return;
+          }
+
           // Rename file in tree (CRDT operation)
           await this.vaultQueue.run(() => this.vault!.renameFile(oldPath, file.path));
           log.info(`Renamed ${oldPath} -> ${file.path} in registry tree`);

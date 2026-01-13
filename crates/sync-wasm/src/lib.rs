@@ -305,6 +305,15 @@ mod wasm_impl {
             self.inner.is_file_deleted(path)
         }
 
+        /// Check if a file was just synced (and consume the flag).
+        ///
+        /// Returns true once if the file was synced, false on subsequent calls.
+        /// Use this in file watcher handlers to skip re-broadcasting files we just received.
+        #[wasm_bindgen(js_name = consumeSyncFlag)]
+        pub fn consume_sync_flag(&self, path: &str) -> bool {
+            self.inner.consume_sync_flag(path)
+        }
+
         /// Prepare a file deletion message to broadcast to peers.
         ///
         /// Call this after `deleteFile` to get the message to broadcast.
