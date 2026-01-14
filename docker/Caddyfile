@@ -2,7 +2,14 @@
 # TLS via Let's Encrypt, OAuth routing, forward_auth for MCP
 
 {$DOMAIN} {
-    # OAuth metadata discovery (public)
+    # OAuth metadata discovery at root (MCP spec requires this)
+    handle /.well-known/oauth-authorization-server {
+        reverse_proxy auth-service:3001 {
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # OAuth metadata discovery (legacy /auth path)
     handle /auth/.well-known/oauth-authorization-server {
         uri strip_prefix /auth
         reverse_proxy auth-service:3001 {
