@@ -40,6 +40,22 @@
         }
     }
 
+    # Login endpoint for passkey authentication
+    handle /auth/login* {
+        uri strip_prefix /auth
+        reverse_proxy auth-service:3001 {
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Logout endpoint
+    handle /auth/logout {
+        uri strip_prefix /auth
+        reverse_proxy auth-service:3001 {
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
     # Protected MCP endpoint - requires valid OAuth token or API key
     handle /mcp* {
         forward_auth auth-service:3001 {
