@@ -11,6 +11,7 @@ services:
       - RUST_LOG=info,auth_service=debug
       - AUTH_CONFIG_PATH=/config
       - AUTH_PUBLIC_URL=https://${DOMAIN:-leda.webdesserts.com}/auth
+      - AUTH_PATH_PREFIX=/auth
     expose:
       - "3001"
     restart: unless-stopped
