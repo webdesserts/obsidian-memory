@@ -156,12 +156,12 @@ impl EmbeddingManager {
         self.ensure_loaded().await?;
 
         let mut results = Vec::with_capacity(notes.len());
-        let mut to_compute: Vec<(usize, String, String)> = Vec::new();
+        let mut to_compute: Vec<(String, String, String)> = Vec::new(); // (path, content, content_hash)
 
         // Check cache for each note
         {
             let cache = self.cache.read().await;
-            for (idx, (path, content)) in notes.iter().enumerate() {
+            for (path, content) in notes.iter() {
                 let content_hash = compute_hash(content);
 
                 if let Some(entry) = cache.get(path) {
@@ -171,36 +171,44 @@ impl EmbeddingManager {
                     }
                 }
 
-                // Need to compute this one
-                to_compute.push((idx, path.clone(), content.clone()));
+                // Need to compute this one - store hash to avoid recomputing later
+                to_compute.push((path.clone(), content.clone(), content_hash));
             }
         }
 
-        // Batch compute embeddings for cache misses
+        // Batch compute embeddings for cache misses in chunks to limit memory usage
         if !to_compute.is_empty() {
-            tracing::debug!(
-                cache_hits = results.len(),
-                cache_misses = to_compute.len(),
-                "Computing embeddings for cache misses"
+            let total = to_compute.len();
+            tracing::info!(
+                "Computing {} embeddings in chunks ({} cached)",
+                total,
+                results.len()
             );
-            
-            let texts: Vec<String> = to_compute.iter().map(|(_, _, c)| c.clone()).collect();
-            let embeddings = self.embeddings.encode_batch(&texts)?;
 
-            let mut cache = self.cache.write().await;
-            for ((_, path, content), embedding) in to_compute.into_iter().zip(embeddings) {
-                let content_hash = compute_hash(&content);
-                cache.insert(
-                    path.clone(),
-                    CacheEntry {
-                        content_hash,
-                        embedding: embedding.clone(),
-                    },
-                );
-                results.push((path, embedding));
+            const CHUNK_SIZE: usize = 25;
+
+            let mut computed = 0;
+            for chunk in to_compute.chunks(CHUNK_SIZE) {
+                let texts: Vec<String> = chunk.iter().map(|(_, content, _)| content.clone()).collect();
+                let embeddings = self.embeddings.encode_batch(&texts)?;
+
+                let mut cache = self.cache.write().await;
+                for ((path, _, content_hash), embedding) in chunk.iter().zip(embeddings) {
+                    cache.insert(
+                        path.clone(),
+                        CacheEntry {
+                            content_hash: content_hash.clone(),
+                            embedding: embedding.clone(),
+                        },
+                    );
+                    results.push((path.clone(), embedding));
+                    computed += 1;
+                }
+
+                tracing::debug!("Computed {}/{} embeddings", computed, total);
             }
-            
-            tracing::debug!(cache_size = cache.len(), "Embeddings cached");
+
+            tracing::debug!(cache_size = results.len(), "Embedding computation complete");
         } else {
             tracing::debug!(cache_hits = results.len(), "All embeddings from cache");
         }
