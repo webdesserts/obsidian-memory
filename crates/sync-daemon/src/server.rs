@@ -67,7 +67,17 @@ impl WebSocketServer {
         let ws_stream = match accept_async(stream).await {
             Ok(ws) => ws,
             Err(e) => {
-                error!("WebSocket upgrade failed for {}: {}", addr, e);
+                // Health checks (like `nc -z`) connect and immediately close without
+                // completing the WebSocket handshake. Log these as debug, not error.
+                let err_str = e.to_string();
+                if err_str.contains("Handshake not finished")
+                    || err_str.contains("Connection reset")
+                    || err_str.contains("unexpected EOF")
+                {
+                    debug!("Connection closed before handshake from {}", addr);
+                } else {
+                    error!("WebSocket upgrade failed for {}: {}", addr, e);
+                }
                 return;
             }
         };
