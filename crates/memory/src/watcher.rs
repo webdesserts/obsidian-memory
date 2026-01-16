@@ -13,10 +13,10 @@
 
 use notify::RecommendedWatcher;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind, Debouncer};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, RwLock};
 use wiki_links::extract_linked_notes;
 
@@ -81,12 +81,18 @@ impl VaultWatcher {
 }
 
 /// Process file system events and update the graph index and embeddings.
+///
+/// Uses mtime tracking to avoid infinite loops on Docker bind mounts where
+/// reading files can trigger additional filesystem events (atime updates).
 async fn process_events(
     mut rx: mpsc::Receiver<Vec<notify_debouncer_mini::DebouncedEvent>>,
     vault_path: PathBuf,
     graph: Arc<RwLock<GraphIndex>>,
     embeddings: Arc<EmbeddingManager>,
 ) {
+    // Track file mtimes to detect real changes vs spurious events
+    let mut mtime_cache: HashMap<PathBuf, SystemTime> = HashMap::new();
+
     while let Some(events) = rx.recv().await {
         for event in events {
             let path = &event.path;
@@ -98,18 +104,33 @@ async fn process_events(
             {
                 continue;
             }
-            
-            // Get relative path for embedding cache key
-            let relative_path = path
-                .strip_prefix(&vault_path)
-                .unwrap_or(path);
-            
-            let relative_path_str = relative_path.to_string_lossy().to_string();
 
             match event.kind {
                 DebouncedEventKind::Any => {
-                    // File created or modified - re-index it and invalidate embedding
                     if path.exists() {
+                        // Check mtime BEFORE processing to avoid infinite loops
+                        let current_mtime = std::fs::metadata(path)
+                            .and_then(|m| m.modified())
+                            .ok();
+
+                        let cached_mtime = mtime_cache.get(path).copied();
+
+                        if current_mtime.is_some() && current_mtime == cached_mtime {
+                            tracing::trace!("Skipping {} - mtime unchanged", path.display());
+                            continue;
+                        }
+
+                        // Cache mtime BEFORE reading file (prevents race condition)
+                        if let Some(mtime) = current_mtime {
+                            mtime_cache.insert(path.clone(), mtime);
+                        }
+
+                        // Get relative path for embedding cache key
+                        let relative_path = path.strip_prefix(&vault_path).unwrap_or(path);
+                        let relative_path_str = relative_path.to_string_lossy().to_string();
+
+                        // Now process the file
+                        tracing::trace!("Processing {} - mtime changed", path.display());
                         if let Err(e) = update_file(&vault_path, path, &graph).await {
                             tracing::warn!("Failed to update index for {}: {}", path.display(), e);
                         }
@@ -117,7 +138,12 @@ async fn process_events(
                         embeddings.invalidate(&relative_path_str).await;
                         tracing::debug!("Invalidated embedding for: {}", relative_path_str);
                     } else {
-                        // File was deleted
+                        // File was deleted - clean up cache entry
+                        mtime_cache.remove(path);
+
+                        let relative_path = path.strip_prefix(&vault_path).unwrap_or(path);
+                        let relative_path_str = relative_path.to_string_lossy().to_string();
+
                         remove_file(&vault_path, path, &graph).await;
                         embeddings.invalidate(&relative_path_str).await;
                     }
