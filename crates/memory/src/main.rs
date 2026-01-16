@@ -169,8 +169,33 @@ impl SharedState {
 
         let graph = Arc::new(RwLock::new(graph));
 
-        // Create embedding manager (model download happens lazily on first search)
+        // Create embedding manager and preload model + embeddings at startup
         let embeddings = Arc::new(EmbeddingManager::new(&config.vault_path));
+
+        // Preload model and compute embeddings for all notes at startup
+        // This avoids a 45+ second delay on first search
+        {
+            let graph_read = graph.read().await;
+            let notes: Vec<(String, String)> = graph_read
+                .all_paths()
+                .filter_map(|path: &String| {
+                    let full_path = config.vault_path.join(path);
+                    std::fs::read_to_string(&full_path)
+                        .ok()
+                        .map(|content| (path.clone(), content))
+                })
+                .collect();
+            drop(graph_read);
+
+            if !notes.is_empty() {
+                tracing::info!("Preloading embeddings for {} notes...", notes.len());
+                if let Err(e) = embeddings.get_embeddings_batch(&notes).await {
+                    tracing::warn!("Failed to preload embeddings: {}. First search will be slower.", e);
+                } else {
+                    tracing::info!("Embeddings preloaded successfully");
+                }
+            }
+        }
 
         // Create storage backend
         let storage = Arc::new(FileStorage::new(config.vault_path.clone()));
