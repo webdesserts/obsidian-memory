@@ -15,7 +15,9 @@ services:
     expose:
       - "3001"
     restart: unless-stopped
-    mem_limit: 128m
+    mem_limit: 48m
+    memswap_limit: 48m
+    mem_reservation: 16m
     logging:
       driver: json-file
       options:
@@ -38,7 +40,10 @@ services:
     depends_on:
       - auth-service
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 640m
+    memswap_limit: 640m
+    mem_reservation: 128m
+    oom_score_adj: 300  # Kill first - can recover, is the memory hog
     logging:
       driver: json-file
       options:
@@ -58,7 +63,9 @@ services:
     expose:
       - "8080"
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 64m
+    memswap_limit: 64m
+    mem_reservation: 32m
     logging:
       driver: json-file
       options:
@@ -82,6 +89,10 @@ services:
       - memory
       - sync-daemon
     restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 64m
+    mem_reservation: 16m
+    oom_score_adj: -300  # Protect gateway - if it dies, nothing is reachable
     logging:
       driver: json-file
       options:
