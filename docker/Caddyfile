@@ -73,6 +73,11 @@
             # Critical: disable buffering for SSE streaming
             flush_interval -1
             header_up X-Forwarded-Proto {scheme}
+            # Extended timeouts for long-running MCP operations (embedding computation)
+            transport http {
+                read_timeout 5m
+                write_timeout 5m
+            }
         }
     }
 
