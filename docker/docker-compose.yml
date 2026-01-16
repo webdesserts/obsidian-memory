@@ -2,15 +2,12 @@ services:
   # OAuth 2.1 + API key authentication
   auth-service:
     image: ghcr.io/webdesserts/auth-service:${VERSION:-latest}
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.auth
     volumes:
       - auth-config:/config
     environment:
-      - RUST_LOG=info,auth_service=debug
+      - RUST_LOG=${RUST_LOG:-info}
       - AUTH_CONFIG_PATH=/config
-      - AUTH_PUBLIC_URL=https://${DOMAIN:-leda.webdesserts.com}/auth
+      - AUTH_PUBLIC_URL=https://${DOMAIN:?DOMAIN required}/auth
       - AUTH_PATH_PREFIX=/auth
     expose:
       - "3001"
@@ -27,14 +24,11 @@ services:
   # MCP server with HTTP transport
   memory:
     image: ghcr.io/webdesserts/memory:${VERSION:-latest}
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.memory
     volumes:
       - notes:/notes:rw
     environment:
       - OBSIDIAN_VAULT_PATH=/notes
-      - RUST_LOG=info,memory=debug
+      - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "3000"
     depends_on:
@@ -53,13 +47,10 @@ services:
   # P2P vault sync daemon
   sync-daemon:
     image: ghcr.io/webdesserts/sync-daemon:${VERSION:-latest}
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.sync
     volumes:
       - notes:/notes:rw
     environment:
-      - RUST_LOG=info,sync_daemon=debug
+      - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "8080"
     restart: unless-stopped
@@ -83,7 +74,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      - DOMAIN=${DOMAIN:-leda.webdesserts.com}
+      - DOMAIN=${DOMAIN:?DOMAIN required}
     depends_on:
       - auth-service
       - memory
