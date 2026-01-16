@@ -40,8 +40,8 @@ services:
     depends_on:
       - auth-service
     restart: unless-stopped
-    mem_limit: 640m
-    memswap_limit: 640m
+    mem_limit: 768m
+    memswap_limit: 768m
     mem_reservation: 128m
     oom_score_adj: 300  # Kill first - can recover, is the memory hog
     logging:
