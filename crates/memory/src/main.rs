@@ -552,11 +552,9 @@ async fn run_http_server(
     })?;
     let addr = std::net::SocketAddr::from((bind_addr, port));
 
-    // Warn if binding to all interfaces without auth
     if bind_addr.is_unspecified() {
-        tracing::warn!(
-            "Binding to all interfaces ({}). This server has NO AUTHENTICATION. \
-             Do not expose to untrusted networks.",
+        tracing::info!(
+            "Binding to all interfaces ({}). Ensure a reverse proxy handles authentication.",
             bind
         );
     }
