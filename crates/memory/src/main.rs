@@ -178,29 +178,38 @@ impl SharedState {
         // Create embedding manager and preload model + embeddings at startup
         let embeddings = Arc::new(EmbeddingManager::new(&config.vault_path));
 
-        // Preload model and compute embeddings for all notes at startup
-        // This avoids a 45+ second delay on first search
+        // Spawn background task to preload embeddings
+        // Server starts immediately - search will wait for model but not for preload
         {
-            let graph_read = graph.read().await;
-            let notes: Vec<(String, String)> = graph_read
-                .all_paths()
-                .filter_map(|path: &String| {
-                    let full_path = config.vault_path.join(path);
-                    std::fs::read_to_string(&full_path)
-                        .ok()
-                        .map(|content| (path.clone(), content))
-                })
-                .collect();
-            drop(graph_read);
+            let graph_clone = graph.clone();
+            let embeddings_clone = embeddings.clone();
+            let vault_path = config.vault_path.clone();
 
-            if !notes.is_empty() {
-                tracing::info!("Preloading embeddings for {} notes...", notes.len());
-                if let Err(e) = embeddings.get_embeddings_batch(&notes).await {
-                    tracing::warn!("Failed to preload embeddings: {}. First search will be slower.", e);
-                } else {
-                    tracing::info!("Embeddings preloaded successfully");
+            tokio::spawn(async move {
+                // Collect paths first, then drop lock before doing I/O
+                let paths: Vec<String> = {
+                    let graph_read = graph_clone.read().await;
+                    graph_read.all_paths().cloned().collect()
+                };
+
+                // Read files asynchronously without holding lock
+                let mut notes = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let full_path = vault_path.join(&path);
+                    if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
+                        notes.push((path, content));
+                    }
                 }
-            }
+
+                if !notes.is_empty() {
+                    tracing::info!("Preloading embeddings for {} notes in background...", notes.len());
+                    if let Err(e) = embeddings_clone.get_embeddings_batch(&notes).await {
+                        tracing::warn!("Failed to preload embeddings: {}. First search will be slower.", e);
+                    } else {
+                        tracing::info!("Embeddings preloaded successfully");
+                    }
+                }
+            });
         }
 
         // Create storage backend
