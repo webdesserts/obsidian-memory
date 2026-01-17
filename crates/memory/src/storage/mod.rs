@@ -7,10 +7,10 @@
 //! The Storage layer operates on memory URIs (e.g., "knowledge/My Note") and returns
 //! raw content. Higher-level concerns like wiki-link resolution stay in the MCP tools.
 
+mod content_hash;
 mod file;
 mod traits;
-mod whitelist;
 
+pub use content_hash::ContentHash;
 pub use file::FileStorage;
 pub use traits::{Storage, StorageError};
-pub use whitelist::{ClientId, ContentHash, ReadWhitelist};

@@ -131,7 +131,13 @@ pub async fn resolve_note_uri<S: Storage>(
         return Ok((uri, true));
     }
 
-    // Not found - return the normalized path
+    // Not in graph - check storage directly as fallback
+    // This handles cases where a file was created but graph index hasn't been updated yet
+    if storage.exists(&normalized.path).await? {
+        return Ok((normalized.path, true));
+    }
+
+    // Not found anywhere - return the normalized path for new file creation
     Ok((normalized.path, false))
 }
 

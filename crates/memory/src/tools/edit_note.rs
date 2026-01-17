@@ -3,14 +3,14 @@
 //! Based on the MCP filesystem server's edit_file implementation,
 //! this tool uses oldText/newText pairs for precise edits.
 
-use obsidian_fs::{ensure_markdown_extension, normalize_note_reference};
+use obsidian_fs::ensure_markdown_extension;
 use rmcp::model::{CallToolResult, Content, ErrorData};
-use std::path::{Path, PathBuf};
-use tokio::sync::RwLock;
+use serde::Serialize;
+use std::path::Path;
 
 use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
-use crate::storage::{ClientId, ContentHash, ReadWhitelist, Storage};
+use crate::storage::{ContentHash, Storage, StorageError};
 
 /// A single edit operation.
 #[derive(Debug, Clone)]
@@ -19,6 +19,34 @@ pub struct Edit {
     pub old_text: String,
     /// Text to replace with
     pub new_text: String,
+}
+
+/// Response from EditNote tool.
+#[derive(Serialize)]
+pub struct EditNoteResponse {
+    /// The memory URI of the note
+    pub uri: String,
+    /// The file path relative to vault
+    pub path: String,
+    /// New content hash after edit - use this for subsequent edits
+    pub content_hash: String,
+    /// Number of edits applied
+    pub edits_applied: usize,
+}
+
+/// Response from EditNote dry run.
+#[derive(Serialize)]
+pub struct EditNoteDryRunResponse {
+    /// The memory URI of the note
+    pub uri: String,
+    /// The file path relative to vault
+    pub path: String,
+    /// Hash that would result from applying edits
+    pub would_produce_hash: String,
+    /// Number of edits that would be applied
+    pub edits_count: usize,
+    /// Description of changes
+    pub changes: String,
 }
 
 /// Apply edits to content, returning the modified content and a diff.
@@ -76,15 +104,14 @@ fn truncate_for_display(s: &str, max_len: usize) -> String {
 ///
 /// Makes surgical text replacements using oldText/newText pairs.
 /// Each oldText must appear exactly once in the note.
-/// Requires that ReadNote was called first.
+/// Requires content_hash from a previous ReadNote call.
 pub async fn execute<S: Storage>(
-    vault_path: &Path,
+    _vault_path: &Path,
     storage: &S,
     graph: &GraphIndex,
-    read_whitelist: &RwLock<ReadWhitelist>,
-    client_id: ClientId,
     note: &str,
     edits: Vec<Edit>,
+    content_hash: &str,
     dry_run: bool,
 ) -> Result<CallToolResult, ErrorData> {
     // Resolve the note reference using the same logic as read_note
@@ -99,28 +126,23 @@ pub async fn execute<S: Storage>(
         ));
     }
 
-    let normalized = normalize_note_reference(note);
-
     // Read current content (note existence already verified by resolve_note_uri)
     let (content, _metadata) = storage.read(&uri).await.map_err(|e| {
         ErrorData::internal_error(format!("Failed to read note: {}", e), None)
     })?;
 
-    // Check whitelist using content hash (must read before edit, and file must not have changed)
+    // Validate content_hash matches current content
     let current_hash = ContentHash::from_content(&content);
-    {
-        let whitelist = read_whitelist.read().await;
-        if !whitelist.can_write(&client_id, &PathBuf::from(&uri), &current_hash) {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "Must read note before editing: {}\n\n\
-                     Use ReadNote first to see the current content, then retry EditNote.\n\
-                     (If you already read it, the file may have been modified externally.)",
-                    note
-                ),
-                None,
-            ));
-        }
+    if current_hash.as_str() != content_hash {
+        return Err(ErrorData::invalid_params(
+            format!(
+                "Note modified since last read (expected hash: {}, actual: {}). \
+                 Read note again to get current content and hash.",
+                content_hash,
+                current_hash.as_str()
+            ),
+            None,
+        ));
     }
 
     // Apply edits
@@ -128,73 +150,104 @@ pub async fn execute<S: Storage>(
         ErrorData::invalid_params(format!("Edit failed: {}", e), None)
     })?;
 
-    let file_path = vault_path
-        .join(ensure_markdown_extension(&uri))
-        .to_string_lossy()
-        .to_string();
+    let file_path = ensure_markdown_extension(&uri);
+    let new_hash = ContentHash::from_content(&modified);
 
     if dry_run {
-        let text = format!(
-            "Dry run - changes would be made to: {}\n\n\
-             **URI:** memory:{}\n\
-             **File:** {}\n\n\
-             ## Changes\n\n{}\n\n\
-             Use dryRun: false to apply these changes.",
-            normalized.name, uri, file_path, diff
-        );
-        return Ok(CallToolResult::success(vec![Content::text(text)]));
+        let response = EditNoteDryRunResponse {
+            uri: format!("memory:{}", uri),
+            path: file_path,
+            would_produce_hash: new_hash.as_str().to_string(),
+            edits_count: edits.len(),
+            changes: diff,
+        };
+        let json = serde_json::to_string(&response)
+            .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+        return Ok(CallToolResult::success(vec![Content::text(json)]));
     }
 
     // Write the modified content with optimistic locking (TOCTOU protection)
-    storage.write(&uri, &modified, Some(current_hash.as_str())).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to write note: {}", e), None)
+    storage.write(&uri, &modified, Some(content_hash)).await.map_err(|e| match e {
+        StorageError::HashMismatch { expected, actual, .. } => ErrorData::invalid_params(
+            format!(
+                "Note modified since last read (expected hash: {}, actual: {}). \
+                 Read note again to get current content and hash.",
+                expected, actual
+            ),
+            None,
+        ),
+        _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
     })?;
 
-    // Update whitelist with new content hash (client knows the new content)
-    {
-        let new_hash = ContentHash::from_content(&modified);
-        let mut whitelist = read_whitelist.write().await;
-        whitelist.mark_read(client_id, PathBuf::from(&uri), new_hash);
-    }
+    let response = EditNoteResponse {
+        uri: format!("memory:{}", uri),
+        path: file_path,
+        content_hash: new_hash.as_str().to_string(),
+        edits_applied: edits.len(),
+    };
 
-    let text = format!(
-        "Edited note: {}\n\n\
-         **URI:** memory:{}\n\
-         **File:** {}\n\n\
-         ## Changes\n\n{}",
-        normalized.name, &uri, file_path, diff
-    );
+    let json = serde_json::to_string(&response)
+        .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
 
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::FileStorage;
+    use serde::Deserialize;
     use std::collections::HashSet;
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::fs;
 
-    async fn create_test_env() -> (TempDir, FileStorage, GraphIndex, RwLock<ReadWhitelist>) {
+    #[derive(Deserialize)]
+    struct TestResponse {
+        uri: String,
+        path: String,
+        content_hash: String,
+        edits_applied: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct TestDryRunResponse {
+        uri: String,
+        would_produce_hash: String,
+        edits_count: usize,
+        changes: String,
+    }
+
+    async fn create_test_env() -> (TempDir, FileStorage, GraphIndex) {
         let temp_dir = TempDir::new().unwrap();
         let storage = FileStorage::new(temp_dir.path().to_path_buf());
         let graph = GraphIndex::new();
-        let whitelist = RwLock::new(ReadWhitelist::new());
-        (temp_dir, storage, graph, whitelist)
+        (temp_dir, storage, graph)
     }
 
-    /// Mark a note as readable with a specific content for testing.
-    /// Uses the actual content to compute the hash, simulating a proper ReadNote call.
-    async fn mark_readable_with_content(whitelist: &RwLock<ReadWhitelist>, uri: &str, content: &str) {
-        let mut wl = whitelist.write().await;
-        let hash = ContentHash::from_content(content);
-        wl.mark_read(ClientId::stdio(), PathBuf::from(uri), hash);
+    fn parse_response(result: &CallToolResult) -> TestResponse {
+        let text = result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+        serde_json::from_str(&text).expect("Expected valid JSON")
+    }
+
+    fn parse_dry_run_response(result: &CallToolResult) -> TestDryRunResponse {
+        let text = result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+        serde_json::from_str(&text).expect("Expected valid JSON")
     }
 
     #[tokio::test]
-    async fn test_edit_requires_read_first() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+    async fn test_edit_with_wrong_hash() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         fs::write(temp_dir.path().join("test.md"), "Hello, world!")
             .await
@@ -206,34 +259,34 @@ mod tests {
             new_text: "Rust".to_string(),
         }];
 
-        // Should fail without reading first
+        // Should fail with wrong hash
         let result = execute(
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "test",
             edits,
+            "wrong_hash",
             false,
         )
         .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("Must read note before editing"));
+        assert!(err.message.contains("Note modified since last read"));
     }
 
     #[tokio::test]
     async fn test_edit_single_replacement() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "Hello, world!";
         fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable_with_content(&whitelist, "test", content).await;
+
+        let content_hash = ContentHash::from_content(content);
 
         let edits = vec![Edit {
             old_text: "world".to_string(),
@@ -244,25 +297,18 @@ mod tests {
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "test",
             edits,
+            content_hash.as_str(),
             false,
         )
         .await
         .expect("should succeed");
 
-        let text = result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text")
-            .text
-            .clone();
-
-        assert!(text.contains("Edited note"));
-        // Hash should NOT be exposed
-        assert!(!text.contains("hash"));
+        let response = parse_response(&result);
+        assert_eq!(response.uri, "memory:test");
+        assert_eq!(response.edits_applied, 1);
+        assert!(!response.content_hash.is_empty());
 
         // Verify content changed
         let content = fs::read_to_string(temp_dir.path().join("test.md"))
@@ -273,14 +319,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_multiple_replacements() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "Hello, world! Goodbye, world!";
         fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable_with_content(&whitelist, "test", content).await;
+
+        let content_hash = ContentHash::from_content(content);
 
         let edits = vec![
             Edit {
@@ -297,23 +344,16 @@ mod tests {
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "test",
             edits,
+            content_hash.as_str(),
             false,
         )
         .await
         .expect("should succeed");
 
-        let text = result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text")
-            .text
-            .clone();
-
-        assert!(text.contains("Edited note"));
+        let response = parse_response(&result);
+        assert_eq!(response.edits_applied, 2);
 
         // Verify content changed
         let content = fs::read_to_string(temp_dir.path().join("test.md"))
@@ -324,14 +364,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_fails_if_text_not_found() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "Hello, world!";
         fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable_with_content(&whitelist, "test", content).await;
+
+        let content_hash = ContentHash::from_content(content);
 
         let edits = vec![Edit {
             old_text: "nonexistent".to_string(),
@@ -342,10 +383,9 @@ mod tests {
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "test",
             edits,
+            content_hash.as_str(),
             false,
         )
         .await;
@@ -357,14 +397,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_fails_if_text_ambiguous() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "foo bar foo";
         fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable_with_content(&whitelist, "test", content).await;
+
+        let content_hash = ContentHash::from_content(content);
 
         let edits = vec![Edit {
             old_text: "foo".to_string(),
@@ -375,10 +416,9 @@ mod tests {
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "test",
             edits,
+            content_hash.as_str(),
             false,
         )
         .await;
@@ -390,14 +430,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_dry_run() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "Hello, world!";
         fs::write(temp_dir.path().join("test.md"), content)
             .await
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
-        mark_readable_with_content(&whitelist, "test", content).await;
+
+        let content_hash = ContentHash::from_content(content);
 
         let edits = vec![Edit {
             old_text: "world".to_string(),
@@ -408,24 +449,19 @@ mod tests {
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "test",
             edits,
+            content_hash.as_str(),
             true,
         )
         .await
         .expect("should succeed");
 
-        let text = result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text")
-            .text
-            .clone();
-
-        assert!(text.contains("Dry run"));
-        assert!(text.contains("Replaced"));
+        let response = parse_dry_run_response(&result);
+        assert_eq!(response.uri, "memory:test");
+        assert!(!response.would_produce_hash.is_empty());
+        assert_eq!(response.edits_count, 1);
+        assert!(response.changes.contains("Replaced"));
 
         // Verify content was NOT changed
         let content = fs::read_to_string(temp_dir.path().join("test.md"))
@@ -436,9 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_nonexistent_note() {
-        let (temp_dir, storage, graph, whitelist) = create_test_env().await;
-        // Even with a whitelist entry, the note doesn't exist
-        mark_readable_with_content(&whitelist, "nonexistent", "").await;
+        let (_temp_dir, storage, graph) = create_test_env().await;
 
         let edits = vec![Edit {
             old_text: "foo".to_string(),
@@ -446,13 +480,12 @@ mod tests {
         }];
 
         let result = execute(
-            temp_dir.path(),
+            _temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            ClientId::stdio(),
             "nonexistent",
             edits,
+            "some_hash",
             false,
         )
         .await;
@@ -462,12 +495,71 @@ mod tests {
         assert!(err.message.contains("Note not found"));
     }
 
+    #[tokio::test]
+    async fn test_edit_returns_hash_for_chained_edits() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        let content = "Hello, world!";
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let content_hash = ContentHash::from_content(content);
+
+        // First edit
+        let edits1 = vec![Edit {
+            old_text: "world".to_string(),
+            new_text: "Rust".to_string(),
+        }];
+
+        let result1 = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits1,
+            content_hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
+
+        let response1 = parse_response(&result1);
+
+        // Second edit using hash from first edit
+        let edits2 = vec![Edit {
+            old_text: "Hello".to_string(),
+            new_text: "Goodbye".to_string(),
+        }];
+
+        let result2 = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits2,
+            &response1.content_hash,
+            false,
+        )
+        .await
+        .expect("should succeed");
+
+        let response2 = parse_response(&result2);
+        assert_ne!(response1.content_hash, response2.content_hash);
+
+        // Verify final content
+        let content = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "Goodbye, Rust!");
+    }
+
     // Integration tests - test the actual ReadNote→EditNote flow
 
     #[tokio::test]
-    async fn test_read_then_edit_subdirectory_note_by_name() {
-        // This is the bug scenario: note in subdirectory, referenced by name only
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
+    async fn test_read_then_edit_flow() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
 
         // Create note in subdirectory
         fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
@@ -483,28 +575,23 @@ mod tests {
             HashSet::new(),
         );
 
-        let client = ClientId::stdio();
-
-        // Step 1: ReadNote by name only (not full path)
+        // Step 1: ReadNote
         let read_result = super::super::read_note::execute(
             &storage,
             &graph,
-            &whitelist,
-            client.clone(),
-            "My Note", // Just the name, not "knowledge/My Note"
+            "My Note",
         )
         .await
         .expect("ReadNote should succeed");
 
-        let text = read_result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text")
-            .text
-            .clone();
-        assert_eq!(text, "Hello, world!");
+        let read_json: serde_json::Value = serde_json::from_str(
+            &read_result.content[0].raw.as_text().unwrap().text
+        ).unwrap();
 
-        // Step 2: EditNote by name only (should use same resolution as ReadNote)
+        let content_hash = read_json["content_hash"].as_str().unwrap();
+        assert_eq!(read_json["content"].as_str().unwrap(), "Hello, world!");
+
+        // Step 2: EditNote with hash from read
         let edits = vec![Edit {
             old_text: "world".to_string(),
             new_text: "Rust".to_string(),
@@ -514,83 +601,21 @@ mod tests {
             temp_dir.path(),
             &storage,
             &graph,
-            &whitelist,
-            client,
-            "My Note", // Same name-only reference
+            "My Note",
             edits,
+            content_hash,
             false,
         )
         .await
-        .expect("EditNote should succeed after ReadNote");
+        .expect("EditNote should succeed");
 
-        let edit_text = edit_result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text")
-            .text
-            .clone();
-        assert!(edit_text.contains("Edited note"));
+        let response = parse_response(&edit_result);
+        assert_eq!(response.uri, "memory:knowledge/My Note");
 
         // Verify the file was actually modified
         let content = fs::read_to_string(temp_dir.path().join("knowledge/My Note.md"))
             .await
             .unwrap();
         assert_eq!(content, "Hello, Rust!");
-    }
-
-    #[tokio::test]
-    async fn test_read_then_edit_with_wiki_link_syntax() {
-        let (temp_dir, storage, mut graph, whitelist) = create_test_env().await;
-
-        // Create note in subdirectory
-        fs::create_dir(temp_dir.path().join("projects")).await.unwrap();
-        fs::write(
-            temp_dir.path().join("projects/foo-bar.md"),
-            "Original content",
-        )
-        .await
-        .unwrap();
-        graph.update_note(
-            "foo-bar",
-            PathBuf::from("projects/foo-bar.md"),
-            HashSet::new(),
-        );
-
-        let client = ClientId::stdio();
-
-        // ReadNote with wiki-link syntax
-        super::super::read_note::execute(
-            &storage,
-            &graph,
-            &whitelist,
-            client.clone(),
-            "[[foo-bar]]",
-        )
-        .await
-        .expect("ReadNote should succeed");
-
-        // EditNote with wiki-link syntax
-        let edits = vec![Edit {
-            old_text: "Original".to_string(),
-            new_text: "Modified".to_string(),
-        }];
-
-        execute(
-            temp_dir.path(),
-            &storage,
-            &graph,
-            &whitelist,
-            client,
-            "[[foo-bar]]",
-            edits,
-            false,
-        )
-        .await
-        .expect("EditNote should succeed with wiki-link syntax");
-
-        let content = fs::read_to_string(temp_dir.path().join("projects/foo-bar.md"))
-            .await
-            .unwrap();
-        assert_eq!(content, "Modified content");
     }
 }

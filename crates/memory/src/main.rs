@@ -27,7 +27,7 @@ mod watcher;
 use config::Config;
 use embeddings::EmbeddingManager;
 use graph::GraphIndex;
-use storage::{ClientId, FileStorage, ReadWhitelist};
+use storage::FileStorage;
 use watcher::VaultWatcher;
 
 /// Parameters for the Log tool
@@ -48,10 +48,12 @@ pub struct GetNoteInfoParams {
 /// Parameters for the UpdateFrontmatter tool
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateFrontmatterParams {
-    /// Path to the note relative to vault root
-    pub path: String,
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
     /// Frontmatter fields to update
     pub updates: std::collections::HashMap<String, serde_json::Value>,
+    /// Content hash from ReadNote - required to verify note hasn't changed
+    pub content_hash: String,
 }
 
 /// Parameters for the Search tool
@@ -106,6 +108,8 @@ pub struct WriteNoteParams {
     pub note: String,
     /// The content to write to the note
     pub content: String,
+    /// Content hash from ReadNote - required for existing notes, omit for new notes
+    pub content_hash: Option<String>,
 }
 
 /// A single edit operation for the EditNote tool
@@ -126,6 +130,8 @@ pub struct EditNoteParams {
     pub note: String,
     /// Array of edit operations. Each oldText must appear exactly once in the note.
     pub edits: Vec<EditOperation>,
+    /// Content hash from ReadNote - required to verify note hasn't changed
+    pub content_hash: String,
     /// Preview changes without applying them (default: false)
     #[serde(default, rename = "dryRun")]
     pub dry_run: bool,
@@ -231,12 +237,6 @@ impl SharedState {
 pub struct MemoryServer {
     /// Shared state (graph, embeddings, storage, config) - same across all sessions
     shared: SharedState,
-    /// Tracks which notes have been read, enabling "must read before write" checks.
-    /// Per-session state - not shared between HTTP clients.
-    read_whitelist: Arc<RwLock<ReadWhitelist>>,
-    /// Unique identifier for this client session.
-    /// For stdio: always "stdio". For HTTP: unique per session.
-    client_id: ClientId,
     tool_router: ToolRouter<Self>,
 }
 
@@ -245,16 +245,13 @@ impl MemoryServer {
     /// Create a new server for stdio transport (single client).
     pub async fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let shared = SharedState::new(config).await?;
-        Ok(Self::from_shared(shared, ClientId::stdio()))
+        Ok(Self::from_shared(shared))
     }
 
     /// Create a server from pre-initialized shared state (sync, for HTTP factory).
-    /// Each HTTP session gets its own read_whitelist and client_id.
-    pub fn from_shared(shared: SharedState, client_id: ClientId) -> Self {
+    pub fn from_shared(shared: SharedState) -> Self {
         Self {
             shared,
-            read_whitelist: Arc::new(RwLock::new(ReadWhitelist::new())),
-            client_id,
             tool_router: Self::tool_router(),
         }
     }
@@ -309,12 +306,15 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Update frontmatter metadata in a note")]
+    #[tool(description = "Update frontmatter metadata in a note. Requires content_hash from ReadNote. Returns JSON with new content_hash.")]
     async fn update_frontmatter(&self, params: Parameters<UpdateFrontmatterParams>) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph().read().await;
         tools::update_frontmatter::execute(
-            &self.config().vault_path,
-            &params.0.path,
+            &*self.storage(),
+            &graph,
+            &params.0.note,
             params.0.updates,
+            &params.0.content_hash,
         )
         .await
     }
@@ -360,35 +360,32 @@ impl MemoryServer {
         tools::load_private_memory::execute(&self.config().vault_path, &params.0.reason).await
     }
 
-    #[tool(description = "Read the complete contents of a note. Marks the note as readable for subsequent writes. Use this before WriteNote or EditNote to see current content.")]
+    #[tool(description = "Read the complete contents of a note. Returns JSON with content and content_hash. Use content_hash when calling WriteNote or EditNote.")]
     async fn read_note(&self, params: Parameters<ReadNoteParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::read_note::execute(
             self.storage(),
             &graph,
-            &self.read_whitelist,
-            self.client_id.clone(),
             &params.0.note,
         )
         .await
     }
 
-    #[tool(description = "Create a new note or overwrite an existing note. For existing notes, you must call ReadNote first to see the current content and confirm the overwrite. Uses atomic writes for safety.")]
+    #[tool(description = "Create a new note or overwrite an existing note. For existing notes, include content_hash from ReadNote. Returns JSON with new content_hash for chained writes.")]
     async fn write_note(&self, params: Parameters<WriteNoteParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::write_note::execute(
             &self.config().vault_path,
             self.storage(),
             &graph,
-            &self.read_whitelist,
-            self.client_id.clone(),
             &params.0.note,
             &params.0.content,
+            params.0.content_hash.as_deref(),
         )
         .await
     }
 
-    #[tool(description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. You must call ReadNote first. Use dryRun to preview changes without modifying the file.")]
+    #[tool(description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits.")]
     async fn edit_note(&self, params: Parameters<EditNoteParams>) -> Result<CallToolResult, ErrorData> {
         let edits: Vec<tools::edit_note::Edit> = params.0.edits
             .into_iter()
@@ -403,10 +400,9 @@ impl MemoryServer {
             &self.config().vault_path,
             self.storage(),
             &graph,
-            &self.read_whitelist,
-            self.client_id.clone(),
             &params.0.note,
             edits,
+            &params.0.content_hash,
             params.0.dry_run,
         )
         .await
@@ -528,16 +524,12 @@ async fn run_http_server(
     let shared = Arc::new(SharedState::new(config).await?);
 
     // The StreamableHttpService creates a new MemoryServer for each session.
-    // Each session gets its own read_whitelist and client_id.
     let service = StreamableHttpService::new(
         {
             let shared = shared.clone();
             move || {
                 // Sync factory: create server from pre-initialized shared state
-                Ok(MemoryServer::from_shared(
-                    (*shared).clone(),
-                    ClientId::generate(),
-                ))
+                Ok(MemoryServer::from_shared((*shared).clone()))
             }
         },
         LocalSessionManager::default().into(),
