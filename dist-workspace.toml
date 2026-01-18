@@ -29,3 +29,5 @@ default-features = false
 github-build-setup = "../build-setup.yml"
 # Post-announce jobs to run in CI
 post-announce-jobs = ["./docker"]
+# Grant packages:write to docker job for GHCR push
+github-custom-job-permissions = { "./docker" = { packages = "write" } }

@@ -361,6 +361,9 @@ jobs:
     needs:
       - plan
       - announce
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/docker.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
