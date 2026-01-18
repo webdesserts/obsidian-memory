@@ -3,6 +3,10 @@ name: Docker Images
 on:
   # Called by cargo-dist after successful release
   workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
   # Manual trigger for testing
   workflow_dispatch:
     inputs:
