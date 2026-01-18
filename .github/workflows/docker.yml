@@ -3,16 +3,15 @@ name: Docker Images
 on:
   # Called by cargo-dist after successful release
   workflow_call:
+    # Schema: https://docs.rs/cargo-dist-schema/latest/cargo_dist_schema/struct.DistManifest.html
     inputs:
+      # Release manifest (dist-manifest.json) with fields:
+      #   - announcement_tag: git tag (e.g., "v0.2.8") - use for GitHub Release URLs
+      #   - releases[].app_version: semver without prefix (e.g., "0.2.8")
+      #   - releases[].app_name: binary name (e.g., "memory", "sync-daemon")
       plan:
-        required: false
-        type: string
-  # Manual trigger for testing
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version (e.g., v0.2.9)'
         required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -27,22 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine version
+      - name: Extract version from plan
         id: version
-        run: |
-          VERSION="${{ github.ref_name }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Validate version
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "::error::Invalid version format: $VERSION (expected v*.*.*)"
-            exit 1
-          fi
+        run: echo "version=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -85,22 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine version
+      - name: Extract version from plan
         id: version
-        run: |
-          VERSION="${{ github.ref_name }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Validate version
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "::error::Invalid version format: $VERSION (expected v*.*.*)"
-            exit 1
-          fi
+        run: echo "version=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -143,22 +116,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine version
+      - name: Extract version from plan
         id: version
-        run: |
-          VERSION="${{ github.ref_name }}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Validate version
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "::error::Invalid version format: $VERSION (expected v*.*.*)"
-            exit 1
-          fi
+        run: echo "version=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
