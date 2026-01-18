@@ -22,7 +22,7 @@ install-updater = false
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Features to pass to cargo build
-features = ["embedded-model"]
+features = ["embedded-model", "http"]
 # Whether default-features should be enabled with cargo build
 default-features = false
 # Custom build setup to download model before building
