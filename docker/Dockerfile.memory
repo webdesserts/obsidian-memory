@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 ARG VERSION
 RUN for i in 1 2 3 4 5; do \
     curl -fsSL "https://github.com/webdesserts/obsidian-memory/releases/download/${VERSION}/memory-installer.sh" \
-    | MEMORY_UNMANAGED_INSTALL=/opt/memory sh && break || sleep 10; \
+    | MEMORY_INSTALL_DIR=/opt/memory sh && break || sleep 10; \
 done && test -x /opt/memory/bin/memory || exit 1
 ENV PATH="/opt/memory/bin:$PATH"
 

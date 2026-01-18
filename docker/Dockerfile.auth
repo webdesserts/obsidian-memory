@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 ARG VERSION
 RUN for i in 1 2 3 4 5; do \
     curl -fsSL "https://github.com/webdesserts/obsidian-memory/releases/download/${VERSION}/auth-service-installer.sh" \
-    | AUTH_SERVICE_UNMANAGED_INSTALL=/opt/auth-service sh && break || sleep 10; \
+    | AUTH_SERVICE_INSTALL_DIR=/opt/auth-service sh && break || sleep 10; \
 done && test -x /opt/auth-service/bin/auth-service || exit 1
 ENV PATH="/opt/auth-service/bin:$PATH"
 
