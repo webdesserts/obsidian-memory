@@ -16,6 +16,8 @@ thiserror.workspace = true
 tracing.workspace = true
 web-time.workspace = true
 uuid.workspace = true
+rand.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

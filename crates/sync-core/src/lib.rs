@@ -9,6 +9,7 @@
 pub mod document;
 pub mod fs;
 pub mod markdown;
+pub mod peer_id;
 pub mod sync;
 pub mod sync_engine;
 pub mod transport;
@@ -16,6 +17,7 @@ pub mod vault;
 
 pub use document::NoteDocument;
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
+pub use peer_id::{PeerId, PeerIdError};
 pub use sync::SyncMessage;
 pub use transport::{PeerConnection, PeerInfo, SyncTransport};
 pub use vault::Vault;

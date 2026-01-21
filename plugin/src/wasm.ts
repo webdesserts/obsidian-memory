@@ -10,6 +10,7 @@ import {
   init as wasmInit,
   health_check,
   version,
+  generatePeerId as wasmGeneratePeerId,
   JsFileSystemBridge,
   WasmVault,
 } from "../pkg/sync_wasm.js";
@@ -91,8 +92,12 @@ export function wasmVersion(): string {
 /**
  * Generate a random peer ID.
  *
- * Uses crypto.randomUUID() for a unique identifier.
+ * Returns a 16-character hex string that uniquely identifies this peer.
+ * Existing vaults with legacy UUID peer IDs will continue to work.
  */
 export function generatePeerId(): string {
-  return crypto.randomUUID();
+  if (!initialized) {
+    throw new Error("WASM not initialized. Call initWasm() first.");
+  }
+  return wasmGeneratePeerId();
 }

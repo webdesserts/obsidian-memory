@@ -61,6 +61,15 @@ mod wasm_impl {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
+    /// Generate a new random peer ID.
+    ///
+    /// Returns a 16-character hex string that uniquely identifies this peer.
+    /// Store this in settings and pass to `init()` or `load()`.
+    #[wasm_bindgen(js_name = generatePeerId)]
+    pub fn generate_peer_id() -> String {
+        sync_core::PeerId::generate().to_string()
+    }
+
     #[wasm_bindgen]
     extern "C" {
         #[wasm_bindgen(js_namespace = console)]
@@ -86,8 +95,13 @@ mod wasm_impl {
         /// Initialize a new vault (creates .sync directory).
         ///
         /// Call this when the user clicks "Initialize Sync" for the first time.
+        /// The `peer_id` should be a hex string from `generatePeerId()` or a legacy UUID.
         #[wasm_bindgen]
         pub async fn init(fs: fs_bridge::JsFileSystemBridge, peer_id: String) -> Result<WasmVault, JsError> {
+            let peer_id: sync_core::PeerId = peer_id
+                .parse()
+                .map_err(|e| JsError::new(&format!("Invalid peer ID: {}", e)))?;
+
             let inner = sync_core::Vault::init(fs, peer_id)
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
@@ -99,10 +113,15 @@ mod wasm_impl {
         ///
         /// Call this on plugin startup if vault is already initialized.
         /// Reconciliation detects files added/modified/deleted while plugin was off.
-        /// 
+        /// The `peer_id` should be a hex string from `generatePeerId()` or a legacy UUID.
+        ///
         /// Returns a report of what was reconciled.
         #[wasm_bindgen]
         pub async fn load(fs: fs_bridge::JsFileSystemBridge, peer_id: String) -> Result<WasmVault, JsError> {
+            let peer_id: sync_core::PeerId = peer_id
+                .parse()
+                .map_err(|e| JsError::new(&format!("Invalid peer ID: {}", e)))?;
+
             let inner = sync_core::Vault::load(fs, peer_id)
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;

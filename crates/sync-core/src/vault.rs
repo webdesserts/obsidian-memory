@@ -2,6 +2,7 @@
 
 use crate::document::NoteDocument;
 use crate::fs::{FileSystem, FsError};
+use crate::PeerId;
 
 use loro::{LoroDoc, LoroTree, TreeID, TreeParentId};
 use std::collections::HashMap;
@@ -153,8 +154,8 @@ pub struct Vault<F: FileSystem> {
     /// Filesystem abstraction
     pub(crate) fs: F,
 
-    /// Our peer ID
-    peer_id: String,
+    /// Our peer ID (set on all Loro documents for consistent version vectors)
+    peer_id: PeerId,
 
     /// Tracks files that were recently synced (for echo detection)
     sync_tracker: SyncTracker,
@@ -162,12 +163,14 @@ pub struct Vault<F: FileSystem> {
 
 impl<F: FileSystem> Vault<F> {
     /// Initialize a new vault (creates .sync directory)
-    pub async fn init(fs: F, peer_id: String) -> Result<Self> {
+    pub async fn init(fs: F, peer_id: PeerId) -> Result<Self> {
         // Create .sync directory
         fs.mkdir(SYNC_DIR).await?;
         fs.mkdir(&format!("{}/documents", SYNC_DIR)).await?;
 
         let registry = LoroDoc::new();
+        // Set peer ID before any operations for consistent version vectors
+        registry.set_peer_id(peer_id.as_u64()).ok();
         // Initialize the file tree (LoroTree inside registry)
         // The tree is created on first access via get_tree()
         let _file_tree = registry.get_tree("files");
@@ -197,7 +200,7 @@ impl<F: FileSystem> Vault<F> {
     /// - New files (no .loro) → index them
     /// - Modified files (markdown ≠ Loro) → re-index from markdown
     /// - Orphaned .loro files → logged for future cleanup
-    pub async fn load(fs: F, peer_id: String) -> Result<Self> {
+    pub async fn load(fs: F, peer_id: PeerId) -> Result<Self> {
         // Check if vault is initialized
         if !fs.exists(SYNC_DIR).await? {
             return Err(VaultError::NotInitialized);
@@ -207,10 +210,14 @@ impl<F: FileSystem> Vault<F> {
         let registry = if fs.exists(REGISTRY_FILE).await? {
             let bytes = fs.read(REGISTRY_FILE).await?;
             let doc = LoroDoc::new();
+            // Set peer ID before import so any new operations use our ID
+            doc.set_peer_id(peer_id.as_u64()).ok();
             doc.import(&bytes).ok();
             doc
         } else {
             let doc = LoroDoc::new();
+            // Set peer ID before any operations for consistent version vectors
+            doc.set_peer_id(peer_id.as_u64()).ok();
             // Initialize file tree for new registries
             let _file_tree = doc.get_tree("files");
             doc
@@ -273,7 +280,7 @@ impl<F: FileSystem> Vault<F> {
                 let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
                 if let Ok(bytes) = self.fs.read(&sync_path).await {
                     // Use from_bytes to preserve peer ID when loading orphaned docs
-                    if let Ok(doc) = NoteDocument::from_bytes("", &bytes) {
+                    if let Ok(doc) = NoteDocument::from_bytes("", &bytes, self.peer_id) {
                         orphaned_docs.push((hash.clone(), doc));
                     }
                 }
@@ -302,7 +309,7 @@ impl<F: FileSystem> Vault<F> {
                 // Read new file content and compute hash
                 if let Ok(bytes) = self.fs.read(new_path).await {
                     let content = String::from_utf8_lossy(&bytes);
-                    if let Ok(new_doc) = NoteDocument::from_markdown(new_path, &content) {
+                    if let Ok(new_doc) = NoteDocument::from_markdown(new_path, &content, self.peer_id) {
                         if new_doc.content_hash() == orphaned_content_hash {
                             // Content matches - this is a move!
                             tracing::info!("File move detected: {} -> {}", old_path, new_path);
@@ -373,7 +380,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Load the old document (import first, then update path - preserves peer ID)
         let bytes = self.fs.read(&old_sync_path).await?;
-        let doc = NoteDocument::from_bytes(new_path, &bytes)?;
+        let doc = NoteDocument::from_bytes(new_path, &bytes, self.peer_id)?;
 
         // Save to new location
         let snapshot = doc.export_snapshot();
@@ -420,7 +427,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Load Loro doc and convert to markdown
         let loro_bytes = self.fs.read(loro_path).await?;
-        let doc = match NoteDocument::from_bytes(md_path, &loro_bytes) {
+        let doc = match NoteDocument::from_bytes(md_path, &loro_bytes, self.peer_id) {
             Ok(d) => d,
             Err(_) => return Ok(true), // Corrupted Loro doc - needs reindex
         };
@@ -445,7 +452,7 @@ impl<F: FileSystem> Vault<F> {
         // Load existing .loro document
         let sync_path = self.document_sync_path(path);
         let loro_bytes = self.fs.read(&sync_path).await?;
-        let doc = NoteDocument::from_bytes(path, &loro_bytes)?;
+        let doc = NoteDocument::from_bytes(path, &loro_bytes, self.peer_id)?;
 
         // Diff-merge the changes (preserves peer ID)
         let body_changed = doc.update_body(&parsed.body)?;
@@ -465,8 +472,8 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Get our peer ID
-    pub fn peer_id(&self) -> &str {
-        &self.peer_id
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
     }
 
     /// Mark a path as synced (call before writing to disk).
@@ -548,18 +555,18 @@ impl<F: FileSystem> Vault<F> {
         if self.fs.exists(&sync_path).await? {
             let bytes = self.fs.read(&sync_path).await?;
             // Use from_bytes to preserve peer ID (imports before setting metadata)
-            return Ok(NoteDocument::from_bytes(path, &bytes)?);
+            return Ok(NoteDocument::from_bytes(path, &bytes, self.peer_id)?);
         }
 
         // Otherwise load from markdown file
         if self.fs.exists(path).await? {
             let bytes = self.fs.read(path).await?;
             let content = String::from_utf8_lossy(&bytes);
-            return Ok(NoteDocument::from_markdown(path, &content)?);
+            return Ok(NoteDocument::from_markdown(path, &content, self.peer_id)?);
         }
 
-        // New document
-        Ok(NoteDocument::new(path))
+        // New document - use from_markdown with empty content to get a doc_id
+        Ok(NoteDocument::from_markdown(path, "", self.peer_id)?)
     }
 
     /// Get the sync storage path for a document
@@ -606,7 +613,7 @@ impl<F: FileSystem> Vault<F> {
         if self.fs.exists(&sync_path).await? {
             // Load from disk and diff-merge (preserves peer ID)
             let loro_bytes = self.fs.read(&sync_path).await?;
-            let doc = NoteDocument::from_bytes(path, &loro_bytes)?;
+            let doc = NoteDocument::from_bytes(path, &loro_bytes, self.peer_id)?;
 
             let body_changed = doc.update_body(&parsed.body)?;
             let fm_changed = doc.update_frontmatter(parsed.frontmatter.as_ref())?;
@@ -625,7 +632,7 @@ impl<F: FileSystem> Vault<F> {
         }
 
         // Document doesn't exist anywhere - create new (this is the only time we need new peer ID)
-        let new_doc = NoteDocument::from_markdown(path, &content)?;
+        let new_doc = NoteDocument::from_markdown(path, &content, self.peer_id)?;
         let snapshot = new_doc.export_snapshot();
         self.fs.write(&sync_path, &snapshot).await?;
         self.documents.insert(path.to_string(), new_doc);
@@ -1093,10 +1100,18 @@ mod tests {
     use super::*;
     use crate::fs::InMemoryFs;
 
+    fn test_peer_id() -> PeerId {
+        PeerId::from(12345u64)
+    }
+
+    fn test_peer_id_2() -> PeerId {
+        PeerId::from(67890u64)
+    }
+
     #[tokio::test]
     async fn test_vault_init() {
         let fs = InMemoryFs::new();
-        let vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         assert!(vault.is_initialized().await.unwrap());
     }
@@ -1109,7 +1124,7 @@ mod tests {
         fs.write("test.md", b"# Hello\n\nWorld").await.unwrap();
 
         // Init vault
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Handle file change
         vault.on_file_changed("test.md").await.unwrap();
@@ -1127,13 +1142,13 @@ mod tests {
         
         // Initialize vault with one file
         fs.write("existing.md", b"# Existing").await.unwrap();
-        let _vault = Vault::init(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // Simulate adding a new file while plugin was off
         fs.write("new_file.md", b"# New File").await.unwrap();
         
         // Load vault - should detect and index the new file
-        let mut vault = Vault::load(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The new file should be accessible
         let doc = vault.get_document("new_file.md").await.unwrap();
@@ -1148,13 +1163,13 @@ mod tests {
         
         // Initialize vault with one file
         fs.write("note.md", b"# Original Content").await.unwrap();
-        let _vault = Vault::init(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // Simulate modifying the file while plugin was off
         fs.write("note.md", b"# Modified Content").await.unwrap();
         
         // Load vault - should detect modification and re-index
-        let mut vault = Vault::load(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The document should have the new content
         let doc = vault.get_document("note.md").await.unwrap();
@@ -1170,13 +1185,13 @@ mod tests {
         // Initialize vault with two files
         fs.write("keep.md", b"# Keep this").await.unwrap();
         fs.write("delete.md", b"# Delete this").await.unwrap();
-        let _vault = Vault::init(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // Simulate deleting a file while plugin was off
         fs.delete("delete.md").await.unwrap();
         
         // Load vault - should detect orphaned .loro file
-        let vault = Vault::load(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // list_files should not include the deleted file
         let files = vault.list_files().await.unwrap();
@@ -1192,7 +1207,7 @@ mod tests {
         
         // Initialize vault with a file
         fs.write("old_name.md", b"# Unique Content ABC123").await.unwrap();
-        let _vault = Vault::init(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // Simulate renaming the file while plugin was off
         let content = fs.read("old_name.md").await.unwrap();
@@ -1200,7 +1215,7 @@ mod tests {
         fs.delete("old_name.md").await.unwrap();
         
         // Load vault - should detect move and migrate .loro file
-        let mut vault = Vault::load(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The new file should be accessible with the same content
         let doc = vault.get_document("new_name.md").await.unwrap();
@@ -1226,7 +1241,7 @@ mod tests {
         
         // Initialize vault with a file at root
         fs.write("note.md", b"# My Note XYZ789").await.unwrap();
-        let _vault = Vault::init(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // Simulate moving file to subfolder while plugin was off
         let content = fs.read("note.md").await.unwrap();
@@ -1235,7 +1250,7 @@ mod tests {
         fs.delete("note.md").await.unwrap();
         
         // Load vault - should detect move
-        let mut vault = Vault::load(Arc::clone(&fs), "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The moved file should be accessible
         let doc = vault.get_document("knowledge/note.md").await.unwrap();
@@ -1255,7 +1270,7 @@ mod tests {
 
         // Create and index a file
         fs.write("note.md", b"# Hello").await.unwrap();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("note.md").await.unwrap();
 
         // File should be in tree
@@ -1274,7 +1289,7 @@ mod tests {
 
         // Create and index a file
         fs.write("old.md", b"# Content").await.unwrap();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("old.md").await.unwrap();
 
         // Old path should exist in tree
@@ -1293,7 +1308,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_traversal_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Path traversal should be rejected
         let result = vault.delete_file("../secret.md").await;
@@ -1309,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn test_null_byte_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Null bytes should be rejected
         let result = vault.delete_file("foo\0.md").await;
@@ -1322,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn test_non_markdown_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Non-markdown files should be rejected
         let result = vault.register_file("script.js");
@@ -1335,7 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_path_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Empty path should be rejected
         let result = vault.register_file("");
@@ -1348,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_segment_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Empty path segments (a//b.md) should be rejected
         let result = vault.register_file("a//b.md");
@@ -1361,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_too_long_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Path over 1024 chars should be rejected
         let long_path = format!("{}.md", "a".repeat(1025));
@@ -1378,10 +1393,10 @@ mod tests {
 
         // Create file in vault1
         fs1.write("note.md", b"# Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string()).await.unwrap();
+        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
 
         // Sync to vault2
-        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string()).await.unwrap();
+        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
         let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
@@ -1473,13 +1488,13 @@ mod tests {
 
         // Create file in vault1
         fs1.write("note.md", b"# Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string())
+        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
             .await
             .unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
 
         // Create empty vault2
-        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string())
+        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
             .await
             .unwrap();
 
@@ -1516,7 +1531,7 @@ mod tests {
         let fs = InMemoryFs::new();
 
         fs.write("note.md", b"# Original").await.unwrap();
-        let mut vault = Vault::init(fs, "peer1".to_string()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Local edit
         vault.on_file_changed("note.md").await.unwrap();
@@ -1538,10 +1553,10 @@ mod tests {
         // Create file in both vaults
         fs1.write("note.md", b"# Hello").await.unwrap();
         fs2.write("note.md", b"# Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), "peer1".to_string())
+        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
             .await
             .unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), "peer2".to_string())
+        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
             .await
             .unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
