@@ -263,6 +263,18 @@ impl NoteDocument {
         self.doc.commit();
     }
 
+    // ========== Debug API Methods ==========
+
+    /// Get the number of changes in the document's oplog.
+    pub fn len_changes(&self) -> usize {
+        self.doc.len_changes()
+    }
+
+    /// Get the number of operations in the document's oplog.
+    pub fn len_ops(&self) -> usize {
+        self.doc.len_ops()
+    }
+
     /// Update the body text by computing and applying a line-based diff.
     ///
     /// Uses Loro's built-in `update_by_line()` which computes line-based diffs

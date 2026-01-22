@@ -4,12 +4,60 @@ use crate::document::NoteDocument;
 use crate::fs::{FileSystem, FsError};
 use crate::PeerId;
 
-use loro::{LoroDoc, LoroTree, TreeID, TreeParentId};
+use loro::{LoroDoc, LoroTree, TreeID, TreeParentId, VersionVector};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use web_time::Instant;
+
+// ========== Debug API Types ==========
+
+/// Convert VersionVector to HashMap<String, i32> for JSON serialization.
+/// Peer IDs are formatted as 16-character hex strings.
+fn version_vector_to_map(vv: &VersionVector) -> HashMap<String, i32> {
+    let mut map = HashMap::new();
+    for (peer_id, counter) in vv.iter() {
+        map.insert(format!("{:016x}", peer_id), *counter);
+    }
+    map
+}
+
+/// Registry oplog statistics
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryStats {
+    pub change_count: usize,
+    pub op_count: usize,
+}
+
+/// Cheap metadata from .loro blob header (no document content access).
+/// Returned by `decode_import_blob_meta()` - just parses header bytes.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobMeta {
+    pub change_count: u32,
+    pub start_timestamp: i64,
+    pub end_timestamp: i64,
+    pub mode: String,
+    pub start_version: HashMap<String, i32>,
+    pub end_version: HashMap<String, i32>,
+}
+
+/// Full document info (requires loading the document).
+/// Includes content metadata that BlobMeta doesn't have.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentInfo {
+    pub path: String,
+    pub version: HashMap<String, i32>,
+    pub doc_id: Option<String>,
+    pub stored_path: Option<String>,
+    pub change_count: usize,
+    pub op_count: usize,
+    pub body_length: usize,
+    pub has_frontmatter: bool,
+}
 
 /// Directory for sync state
 pub(crate) const SYNC_DIR: &str = ".sync";
@@ -1079,6 +1127,76 @@ impl<F: FileSystem> Vault<F> {
 
         Ok(TreeParentId::Node(node_id))
     }
+
+    // ========== Debug API Methods ==========
+    //
+    // These methods expose internal CRDT state for debugging and dashboard UIs.
+    // - `get_registry_*` methods are cheap (in-memory registry state)
+    // - `get_document_blob_meta` is cheap (reads .loro file header only)
+    // - `get_document_info` is expensive (loads full document if not cached)
+
+    /// Get the registry version vector as a map of peer ID hex strings to counters.
+    pub fn get_registry_version(&self) -> HashMap<String, i32> {
+        version_vector_to_map(&self.registry.state_vv())
+    }
+
+    /// Get registry oplog statistics.
+    pub fn get_registry_stats(&self) -> RegistryStats {
+        RegistryStats {
+            change_count: self.registry.len_changes(),
+            op_count: self.registry.len_ops(),
+        }
+    }
+
+    /// Get cheap metadata from the .loro blob header without loading the full document.
+    ///
+    /// Returns `None` if the document doesn't exist. Uses `decode_import_blob_meta()`
+    /// which only parses the blob header, not the full document content.
+    pub async fn get_document_blob_meta(&self, path: &str) -> Result<Option<BlobMeta>> {
+        let sync_path = self.document_sync_path(path);
+        if !self.fs.exists(&sync_path).await? {
+            return Ok(None);
+        }
+
+        let bytes = self.fs.read(&sync_path).await?;
+        let meta = LoroDoc::decode_import_blob_meta(&bytes, false)
+            .map_err(|e| VaultError::Other(format!("Failed to decode blob meta: {}", e)))?;
+
+        Ok(Some(BlobMeta {
+            change_count: meta.change_num,
+            start_timestamp: meta.start_timestamp,
+            end_timestamp: meta.end_timestamp,
+            mode: format!("{:?}", meta.mode),
+            start_version: version_vector_to_map(&meta.partial_start_vv),
+            end_version: version_vector_to_map(&meta.partial_end_vv),
+        }))
+    }
+
+    /// Get full document info (requires loading the document).
+    ///
+    /// Returns `None` if the document doesn't exist. Loads the document if not
+    /// already cached, which includes content metadata not available from blob headers.
+    pub async fn get_document_info(&mut self, path: &str) -> Result<Option<DocumentInfo>> {
+        let sync_path = self.document_sync_path(path);
+        if !self.fs.exists(&sync_path).await? {
+            return Ok(None);
+        }
+
+        let doc = self.get_document(path).await?;
+        let fm = doc.frontmatter().get_deep_value();
+        let has_frontmatter = matches!(fm, loro::LoroValue::Map(m) if !m.is_empty());
+
+        Ok(Some(DocumentInfo {
+            path: path.to_string(),
+            version: version_vector_to_map(&doc.version()),
+            doc_id: doc.doc_id(),
+            stored_path: doc.stored_path(),
+            change_count: doc.len_changes(),
+            op_count: doc.len_ops(),
+            body_length: doc.body().len_unicode(),
+            has_frontmatter,
+        }))
+    }
 }
 
 /// FNV-1a hash for deterministic file naming.
@@ -1635,5 +1753,98 @@ mod tests {
         assert!(tracker.consume_synced(old_path));
         assert!(!tracker.is_synced(old_path));
         assert!(tracker.is_synced(new_path));
+    }
+
+    // ========== Debug API Tests ==========
+
+    #[tokio::test]
+    async fn test_get_registry_version() {
+        let fs = InMemoryFs::new();
+        fs.write("note.md", b"# Hello").await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        vault.on_file_changed("note.md").await.unwrap();
+
+        let version = vault.get_registry_version();
+        // Vault with a registered file should have our peer in version vector
+        assert!(
+            version.contains_key(&test_peer_id().to_string()),
+            "Expected peer {} in version {:?}",
+            test_peer_id(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_registry_stats() {
+        let fs = InMemoryFs::new();
+        fs.write("note.md", b"# Hello").await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        vault.on_file_changed("note.md").await.unwrap();
+
+        let stats = vault.get_registry_stats();
+        // op_count should be non-zero after registering a file
+        // (Loro batches changes, so change_count may still be 0 before commit)
+        assert!(
+            stats.op_count > 0 || stats.change_count > 0,
+            "Expected at least some operations, got op_count={}, change_count={}",
+            stats.op_count,
+            stats.change_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_document_blob_meta_not_found() {
+        let fs = InMemoryFs::new();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let meta = vault.get_document_blob_meta("nonexistent.md").await.unwrap();
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_document_blob_meta() {
+        let fs = InMemoryFs::new();
+        fs.write("test.md", b"# Hello").await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        vault.on_file_changed("test.md").await.unwrap();
+
+        let meta = vault.get_document_blob_meta("test.md").await.unwrap().unwrap();
+        assert!(meta.change_count > 0);
+        // Version vectors should contain our peer
+        assert!(!meta.end_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_document_info_not_found() {
+        let fs = InMemoryFs::new();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let info = vault.get_document_info("nonexistent.md").await.unwrap();
+        assert!(info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_document_info() {
+        let fs = InMemoryFs::new();
+        fs.write("test.md", b"# Hello").await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        vault.on_file_changed("test.md").await.unwrap();
+
+        let info = vault.get_document_info("test.md").await.unwrap().unwrap();
+        assert_eq!(info.path, "test.md");
+        assert!(info.body_length > 0);
+        assert!(info.change_count > 0);
+        assert!(info.doc_id.is_some());
+        assert!(!info.version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_document_info_with_frontmatter() {
+        let fs = InMemoryFs::new();
+        let content = "---\ntitle: Test\n---\n\n# Hello";
+        fs.write("test.md", content.as_bytes()).await.unwrap();
+        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        vault.on_file_changed("test.md").await.unwrap();
+
+        let info = vault.get_document_info("test.md").await.unwrap().unwrap();
+        assert!(info.has_frontmatter);
     }
 }

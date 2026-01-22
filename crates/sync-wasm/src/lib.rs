@@ -360,6 +360,58 @@ mod wasm_impl {
             let array = js_sys::Uint8Array::from(bytes.as_slice());
             Ok(array.into())
         }
+
+        // ========== Debug API Methods ==========
+
+        /// Get the registry version vector.
+        ///
+        /// Returns an object mapping peer ID hex strings to counter values.
+        #[wasm_bindgen(js_name = getRegistryVersion)]
+        pub fn get_registry_version(&self) -> Result<JsValue, JsError> {
+            let version = self.inner.get_registry_version();
+            serde_wasm_bindgen::to_value(&version)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Get registry oplog statistics.
+        ///
+        /// Returns `{ changeCount, opCount }`.
+        #[wasm_bindgen(js_name = getRegistryStats)]
+        pub fn get_registry_stats(&self) -> Result<JsValue, JsError> {
+            let stats = self.inner.get_registry_stats();
+            serde_wasm_bindgen::to_value(&stats)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Get cheap metadata from the .loro blob header.
+        ///
+        /// Returns blob metadata (version vectors, timestamps, change count) without
+        /// loading the full document. Returns `null` if the document doesn't exist.
+        #[wasm_bindgen(js_name = getDocumentBlobMeta)]
+        pub async fn get_document_blob_meta(&self, path: &str) -> Result<JsValue, JsError> {
+            let meta = self.inner.get_document_blob_meta(path).await
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            match meta {
+                Some(m) => serde_wasm_bindgen::to_value(&m)
+                    .map_err(|e| JsError::new(&e.to_string())),
+                None => Ok(JsValue::NULL),
+            }
+        }
+
+        /// Get full document info (requires loading the document).
+        ///
+        /// Returns content metadata including body length, frontmatter status, and doc_id.
+        /// Returns `null` if the document doesn't exist.
+        #[wasm_bindgen(js_name = getDocumentInfo)]
+        pub async fn get_document_info(&mut self, path: &str) -> Result<JsValue, JsError> {
+            let info = self.inner.get_document_info(path).await
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            match info {
+                Some(i) => serde_wasm_bindgen::to_value(&i)
+                    .map_err(|e| JsError::new(&e.to_string())),
+                None => Ok(JsValue::NULL),
+            }
+        }
     }
 
     /// Result from processing a sync message

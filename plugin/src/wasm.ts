@@ -23,6 +23,39 @@ import { log } from "./logger";
 // Re-export types
 export { JsFileSystemBridge, WasmVault };
 
+// ========== Debug API Types ==========
+
+/** Version vector as a map of peer ID hex strings to counter values */
+export type VersionVector = Record<string, number>;
+
+/** Registry oplog statistics */
+export interface RegistryStats {
+  changeCount: number;
+  opCount: number;
+}
+
+/** Cheap metadata from .loro blob header (no document load required) */
+export interface BlobMeta {
+  changeCount: number;
+  startTimestamp: number;
+  endTimestamp: number;
+  mode: string;
+  startVersion: VersionVector;
+  endVersion: VersionVector;
+}
+
+/** Full document info (requires document load) */
+export interface DocumentInfo {
+  path: string;
+  version: VersionVector;
+  docId: string | null;
+  storedPath: string | null;
+  changeCount: number;
+  opCount: number;
+  bodyLength: number;
+  hasFrontmatter: boolean;
+}
+
 /**
  * Check if a document's current version includes all operations from a synced version.
  *

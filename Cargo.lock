@@ -4065,6 +4065,7 @@ version = "0.2.12"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
+ "getrandom 0.3.4",
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
