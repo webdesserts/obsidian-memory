@@ -50,6 +50,26 @@ pub enum SyncEvent {
         /// When the operation occurred, in milliseconds since Unix epoch.
         timestamp: f64,
     },
+    /// A peer connected (handshake complete).
+    PeerConnected {
+        /// Peer's unique identifier (from handshake).
+        #[serde(rename = "peerId")]
+        peer_id: String,
+        /// Connection address (IP:port or URL).
+        address: String,
+        /// Connection direction ("incoming" or "outgoing").
+        direction: String,
+        /// When the connection completed, in milliseconds since Unix epoch.
+        timestamp: f64,
+    },
+    /// A peer disconnected.
+    PeerDisconnected {
+        /// Peer's unique identifier.
+        #[serde(rename = "peerId")]
+        peer_id: String,
+        /// When the disconnection occurred, in milliseconds since Unix epoch.
+        timestamp: f64,
+    },
 }
 
 // ============================================================================

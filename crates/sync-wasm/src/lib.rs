@@ -434,6 +434,67 @@ mod wasm_impl {
             }
         }
 
+        // ========== Peer Management Methods ==========
+
+        /// Notify that a peer has connected (call after handshake completes).
+        ///
+        /// Updates the registry and emits a `PeerConnected` event.
+        /// Returns the `ConnectedPeer` info.
+        #[wasm_bindgen(js_name = peerConnected)]
+        pub fn peer_connected(
+            &self,
+            peer_id: String,
+            address: String,
+            direction: String,
+        ) -> Result<JsValue, JsError> {
+            let dir = match direction.as_str() {
+                "incoming" => sync_core::peers::ConnectionDirection::Incoming,
+                "outgoing" => sync_core::peers::ConnectionDirection::Outgoing,
+                _ => return Err(JsError::new("direction must be 'incoming' or 'outgoing'")),
+            };
+
+            let peer = self.inner.peer_connected(peer_id, address, dir)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            serde_wasm_bindgen::to_value(&peer)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Notify that a peer has disconnected.
+        ///
+        /// Updates the registry and emits a `PeerDisconnected` event if known.
+        #[wasm_bindgen(js_name = peerDisconnected)]
+        pub fn peer_disconnected(&self, peer_id: String) {
+            self.inner.peer_disconnected(&peer_id);
+        }
+
+        /// Get all peers seen this session (connected and disconnected).
+        #[wasm_bindgen(js_name = getKnownPeers)]
+        pub fn get_known_peers(&self) -> Result<JsValue, JsError> {
+            let peers = self.inner.get_known_peers();
+            serde_wasm_bindgen::to_value(&peers)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Get info for a specific peer.
+        ///
+        /// Returns `null` if the peer is not known.
+        #[wasm_bindgen(js_name = getPeerInfo)]
+        pub fn get_peer_info(&self, peer_id: String) -> Result<JsValue, JsError> {
+            match self.inner.get_peer_info(&peer_id) {
+                Some(peer) => serde_wasm_bindgen::to_value(&peer)
+                    .map_err(|e| JsError::new(&e.to_string())),
+                None => Ok(JsValue::NULL),
+            }
+        }
+
+        /// Get currently connected peers only.
+        #[wasm_bindgen(js_name = getConnectedPeers)]
+        pub fn get_connected_peers(&self) -> Result<JsValue, JsError> {
+            let peers = self.inner.get_connected_peers();
+            serde_wasm_bindgen::to_value(&peers)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
         // ========== Sync Event Subscriptions ==========
 
         /// Subscribe to sync events for real-time monitoring.

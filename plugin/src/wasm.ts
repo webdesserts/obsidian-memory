@@ -25,6 +25,29 @@ import { log } from "./logger";
 export { JsFileSystemBridge, WasmVault };
 export type { WasmSubscriptionImpl as WasmSubscription };
 
+// ========== Peer Types ==========
+
+/** Connection direction from our perspective */
+export type ConnectionDirection = "incoming" | "outgoing";
+
+/** Tracked state for a peer in the registry */
+export interface ConnectedPeer {
+  /** Peer's unique identifier (from handshake) */
+  id: string;
+  /** Connection address (IP:port or URL) */
+  address: string;
+  /** Connection direction */
+  direction: ConnectionDirection;
+  /** Currently connected? */
+  connected: boolean;
+  /** When first seen this session (ms since epoch) */
+  firstSeen: number;
+  /** When last activity observed (ms since epoch) */
+  lastSeen: number;
+  /** Times this peer has connected this session */
+  connectionCount: number;
+}
+
 // ========== Debug API Types ==========
 
 /** Version vector as a map of peer ID hex strings to counter values */
@@ -96,6 +119,24 @@ export type SyncEvent =
       /** New path (for rename operations only). */
       newPath?: string;
       /** When the operation occurred, in milliseconds since Unix epoch. */
+      timestamp: number;
+    }
+  | {
+      type: "peerConnected";
+      /** Peer's unique identifier (from handshake). */
+      peerId: string;
+      /** Connection address (IP:port or URL). */
+      address: string;
+      /** Connection direction ("incoming" or "outgoing"). */
+      direction: ConnectionDirection;
+      /** When the connection completed, in milliseconds since Unix epoch. */
+      timestamp: number;
+    }
+  | {
+      type: "peerDisconnected";
+      /** Peer's unique identifier. */
+      peerId: string;
+      /** When the disconnection occurred, in milliseconds since Unix epoch. */
       timestamp: number;
     };
 
