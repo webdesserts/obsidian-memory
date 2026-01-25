@@ -45,7 +45,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Returns serialized bytes of a SyncRequest containing our version vectors
     /// for all known documents.
-    pub async fn prepare_sync_request(&mut self) -> Result<Vec<u8>> {
+    pub async fn prepare_sync_request(&self) -> Result<Vec<u8>> {
         // Get registry version
         let registry_version = self.registry_version();
 
@@ -87,7 +87,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Also returns paths of documents that were modified.
     pub async fn process_sync_message(
-        &mut self,
+        &self,
         data: &[u8],
     ) -> Result<(Option<Vec<u8>>, Vec<String>)> {
         self.emit(SyncEvent::MessageReceived {
@@ -233,7 +233,7 @@ impl<F: FileSystem> Vault<F> {
     /// Prepare a document update to broadcast after a file change.
     ///
     /// Returns None if the document hasn't been loaded/modified.
-    pub async fn prepare_document_update(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+    pub async fn prepare_document_update(&self, path: &str) -> Result<Option<Vec<u8>>> {
         // Ensure document is loaded
         let doc = self.get_document(path).await?;
 
@@ -302,7 +302,7 @@ impl<F: FileSystem> Vault<F> {
 
     /// Get the registry version vector as bytes.
     fn registry_version(&self) -> Vec<u8> {
-        self.registry.state_vv().encode()
+        self.registry().state_vv().encode()
     }
 
     /// Prepare a SyncExchange in response to a SyncRequest.
@@ -311,7 +311,7 @@ impl<F: FileSystem> Vault<F> {
     /// - Our response (updates they need from us)
     /// - Our request (our version vectors so they can send us updates)
     async fn prepare_sync_exchange(
-        &mut self,
+        &self,
         their_registry_version: &[u8],
         their_versions: HashMap<String, Vec<u8>>,
     ) -> Result<SyncMessage> {
@@ -325,7 +325,7 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Prepare sync request data (our version vectors).
-    async fn prepare_sync_request_data(&mut self) -> Result<SyncRequestData> {
+    async fn prepare_sync_request_data(&self) -> Result<SyncRequestData> {
         let registry_version = self.registry_version();
         let mut document_versions = HashMap::new();
         
@@ -344,7 +344,7 @@ impl<F: FileSystem> Vault<F> {
 
     /// Prepare sync response data (updates the peer is missing).
     async fn prepare_sync_response_data(
-        &mut self,
+        &self,
         their_registry_version: &[u8],
         their_versions: HashMap<String, Vec<u8>>,
     ) -> Result<SyncResponseData> {
@@ -362,7 +362,7 @@ impl<F: FileSystem> Vault<F> {
     /// so version-based comparison would incorrectly send updates for files
     /// we just imported.
     async fn prepare_sync_response_data_excluding(
-        &mut self,
+        &self,
         their_registry_version: &[u8],
         their_versions: HashMap<String, Vec<u8>>,
         exclude: &std::collections::HashSet<String>,
@@ -399,17 +399,17 @@ impl<F: FileSystem> Vault<F> {
         // Export registry updates if they have an older version
         let registry_updates = if !their_registry_version.is_empty() {
             if let Ok(their_version) = loro::VersionVector::decode(their_registry_version) {
-                match self.registry.export(loro::ExportMode::updates(&their_version)) {
+                match self.registry().export(loro::ExportMode::updates(&their_version)) {
                     Ok(updates) if !updates.is_empty() => Some(updates),
                     _ => None,
                 }
             } else {
                 // Invalid version - send full snapshot
-                self.registry.export(loro::ExportMode::snapshot()).ok()
+                self.registry().export(loro::ExportMode::snapshot()).ok()
             }
         } else {
             // They don't have registry - send full snapshot
-            self.registry.export(loro::ExportMode::snapshot()).ok()
+            self.registry().export(loro::ExportMode::snapshot()).ok()
         };
 
         Ok(SyncResponseData {
@@ -422,11 +422,11 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Imports the registry CRDT updates and rebuilds the path cache.
     /// Syncs filesystem with tree state (deletes files marked as deleted).
-    async fn apply_registry_updates(&mut self, data: &[u8]) -> Result<()> {
+    async fn apply_registry_updates(&self, data: &[u8]) -> Result<()> {
         debug!("apply_registry_updates: data_len={}", data.len());
 
         // Import registry updates
-        self.registry
+        self.registry_mut()
             .import(data)
             .map_err(|e| SyncEngineError::Deserialization(format!("Registry import failed: {}", e)))?;
 
@@ -437,7 +437,7 @@ impl<F: FileSystem> Vault<F> {
         self.apply_registry_changes().await?;
 
         // Save updated registry to disk
-        let registry_bytes = self.registry.export(loro::ExportMode::snapshot()).unwrap();
+        let registry_bytes = self.registry().export(loro::ExportMode::snapshot()).unwrap();
         self.fs
             .write(&format!("{}/registry.loro", crate::vault::SYNC_DIR), &registry_bytes)
             .await
@@ -450,7 +450,7 @@ impl<F: FileSystem> Vault<F> {
     /// Apply registry changes to filesystem.
     ///
     /// Deletes files on disk that are marked as deleted in the tree.
-    async fn apply_registry_changes(&mut self) -> Result<()> {
+    async fn apply_registry_changes(&self) -> Result<()> {
         let tree = self.file_tree();
 
         // Find deleted files and clean them up
@@ -477,7 +477,7 @@ impl<F: FileSystem> Vault<F> {
                     }
 
                     // Remove from documents cache
-                    self.documents.remove(&path);
+                    self.documents_mut().remove(&path);
                 }
             }
         }
@@ -490,7 +490,7 @@ impl<F: FileSystem> Vault<F> {
     /// Note: SyncResponse doesn't include mtime, so "latest wins" falls back to "remote wins"
     /// for initial sync. Real-time DocumentUpdate messages include mtime for proper resolution.
     async fn apply_document_updates(
-        &mut self,
+        &self,
         updates: HashMap<String, Vec<u8>>,
     ) -> Result<Vec<String>> {
         let mut modified = Vec::new();
@@ -515,7 +515,7 @@ impl<F: FileSystem> Vault<F> {
     /// For divergent histories, uses "latest wins" based on file mtime when available.
     /// Falls back to "remote wins" if mtime is unavailable (e.g., bulk sync).
     async fn apply_single_update(
-        &mut self,
+        &self,
         path: &str,
         data: &[u8],
         remote_mtime: Option<u64>,
@@ -524,7 +524,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Check if document exists (in cache or on disk)
         let sync_path = self.document_sync_path(path);
-        let exists_in_cache = self.documents.contains_key(path);
+        let exists_in_cache = self.documents().contains_key(path);
         let exists_on_disk = self
             .fs
             .exists(&sync_path)
@@ -537,7 +537,7 @@ impl<F: FileSystem> Vault<F> {
             let peer_id = self.peer_id();
 
             // Document exists - check for divergent histories before merging
-            let doc = self.get_document_mut(path).await?;
+            let mut doc = self.get_document_mut(path).await?;
             let local_vv = doc.version();
 
             // Create temp doc FROM LOCAL STATE, then import remote to get merged version
@@ -618,6 +618,8 @@ impl<F: FileSystem> Vault<F> {
             debug!("apply_single_update: {} - modified={}", path, modified);
 
             if modified {
+                // Update the document in cache before saving
+                self.update_document(path, doc);
                 // Mark as synced BEFORE writing to disk (for echo detection)
                 self.mark_synced(path);
                 self.save_document(path).await?;
@@ -641,7 +643,7 @@ impl<F: FileSystem> Vault<F> {
             // Registering here would create duplicate nodes with different IDs.
 
             // Add to cache
-            self.documents.insert(path.to_string(), doc);
+            self.documents_mut().insert(path.to_string(), doc);
 
             debug!("apply_single_update: created new {} from sync data", path);
             Ok(true)
@@ -676,8 +678,8 @@ mod tests {
         fs2.write("file2.md", b"# From Vault 2").await.unwrap();
 
         // Initialize both vaults (this indexes existing files)
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Vault 1 sends sync request to Vault 2
         let request = vault1.prepare_sync_request().await.unwrap();
@@ -715,8 +717,8 @@ mod tests {
         fs1.write("note1.md", b"# Note 1").await.unwrap();
         fs1.write("note2.md", b"# Note 2").await.unwrap();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Empty vault sends sync request
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -744,8 +746,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Create and sync initial content
         vault1.fs.write("note.md", b"Initial content").await.unwrap();
@@ -807,8 +809,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Vault1 creates a file
         vault1.fs.write("note.md", b"# Original").await.unwrap();
@@ -842,8 +844,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Vault1 creates a file
         vault1.fs.write("note.md", b"# Content").await.unwrap();
@@ -874,8 +876,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Vault1 creates a file with specific content
         let content = "Hello";
@@ -914,8 +916,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Vault1 creates initial content
         vault1.fs.write("note.md", b"Hello").await.unwrap();
@@ -950,7 +952,7 @@ mod tests {
     async fn test_diff_merge_preserves_peer_id() {
         // Test that diff-and-merge updates don't create new peer IDs
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Create initial file
         vault.fs.write("note.md", b"Hello").await.unwrap();
@@ -991,12 +993,12 @@ mod tests {
 
         // Initialize vault1 with a file
         fs1.write("note.md", b"Original").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
 
         // Sync to vault2
         fs2.mkdir(".sync").await.unwrap();
         fs2.mkdir(".sync/documents").await.unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
@@ -1009,7 +1011,7 @@ mod tests {
         fs2.write("note.md", b"Modified externally").await.unwrap();
 
         // Reload vault2 - this triggers reconcile() -> reindex_file()
-        let mut vault2_reloaded = Vault::load(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2_reloaded = Vault::load(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         // Sync back to vault1
         let request2 = vault1.prepare_sync_request().await.unwrap();
@@ -1036,10 +1038,10 @@ mod tests {
 
         // Initialize vault1 with a file
         fs1.write("note.md", b"Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
 
         // Sync to vault2
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
         let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
@@ -1048,7 +1050,7 @@ mod tests {
         }
 
         // Clear vault2's in-memory cache (simulate cold cache)
-        vault2.documents.clear();
+        vault2.documents_mut().clear();
 
         // Make an edit and call on_file_changed (the .loro exists on disk but not in cache)
         fs2.write("note.md", b"Hello World").await.unwrap();
@@ -1078,14 +1080,14 @@ mod tests {
 
         // Initialize vault1 with a file
         fs1.write("old_name.md", b"Content ABC").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
 
         // Get the peer ID count from the original document
         let doc1 = vault1.get_document("old_name.md").await.unwrap();
         let original_peer_count = doc1.version().len();
 
         // Sync to vault2
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
         let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
@@ -1099,7 +1101,7 @@ mod tests {
         fs2.delete("old_name.md").await.unwrap();
 
         // Reload vault2 - this triggers reconcile() -> migrate_document()
-        let mut vault2_reloaded = Vault::load(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2_reloaded = Vault::load(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         // The migrated document should exist
         let doc2 = vault2_reloaded.get_document("new_name.md").await.unwrap();
@@ -1135,8 +1137,8 @@ mod tests {
         fs2.write("note.md", b"# Hello from B").await.unwrap();
 
         // Initialize vaults - each creates its own LoroDoc with independent peer IDs
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         // Sync vault1 → vault2
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1190,8 +1192,8 @@ mod tests {
         fs2.write("note.md", b"Newer content").await.unwrap();
         fs2.set_mtime("note.md", 2000); // Newer timestamp
 
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         // Vault2 sends DocumentUpdate to Vault1 (real-time sync with mtime)
         let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
@@ -1219,8 +1221,8 @@ mod tests {
         fs2.write("note.md", b"Older content").await.unwrap();
         fs2.set_mtime("note.md", 1000); // Older timestamp
 
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         // Vault2 sends DocumentUpdate to Vault1 (real-time sync with mtime)
         let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
@@ -1241,8 +1243,8 @@ mod tests {
         // Vault1 creates an empty file
         fs1.write("empty.md", b"").await.unwrap();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Sync to vault2
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1267,8 +1269,8 @@ mod tests {
         // Vault1 creates a file with only frontmatter
         fs1.write("meta.md", b"---\ntitle: Test\ntags:\n  - a\n  - b\n---\n").await.unwrap();
 
-        let mut vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(fs1, test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_peer_id_2()).await.unwrap();
 
         // Sync to vault2
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1330,8 +1332,8 @@ mod tests {
 
         // Vault1 creates file
         fs1.write("note.md", b"Line 1").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
 
         // Initial sync - vault2 gets the file with vault1's doc_id
         let request = vault2.prepare_sync_request().await.unwrap();

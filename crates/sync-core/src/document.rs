@@ -29,6 +29,7 @@ pub enum DocumentError {
 pub type Result<T> = std::result::Result<T, DocumentError>;
 
 /// A single note (markdown file) as a Loro document
+#[derive(Clone)]
 pub struct NoteDocument {
     doc: LoroDoc,
     path: String,

@@ -1,3 +1,6 @@
+// Deny holding RefCell borrows across await points - causes WASM panics
+#![deny(clippy::await_holding_refcell_ref)]
+
 //! sync-core: Shared Rust library for P2P vault synchronization using Loro CRDTs.
 //!
 //! This crate provides the core functionality for:

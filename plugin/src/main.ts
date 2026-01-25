@@ -1,6 +1,7 @@
 import { Notice, Plugin, Platform, FileSystemAdapter, Events, TFile } from "obsidian";
 import { SyncView, VIEW_TYPE_SYNC } from "./views/SyncView";
-import { initWasm, isWasmReady, generatePeerId, WasmVault } from "./wasm";
+import { DebugModal } from "./views/DebugModal";
+import { initWasm, isWasmReady, generatePeerId, WasmVault, WasmSubscription, SyncEvent } from "./wasm";
 import { createFsBridge } from "./fs/ObsidianFs";
 import { PeerManager, PeerInfo } from "./network";
 import { VaultOperationQueue } from "./VaultOperationQueue";
@@ -20,6 +21,9 @@ const DEFAULT_PORT = 8765;
 
 /** Maximum file size to sync (10MB). Files larger than this are skipped. */
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+/** Maximum number of sync events to keep in the debug buffer */
+const MAX_DEBUG_EVENTS = 50;
 
 /** Maximum sync message size (50MB). Messages larger than this are rejected. */
 const MAX_SYNC_MESSAGE_SIZE = 50 * 1024 * 1024;
@@ -76,6 +80,18 @@ export default class P2PSyncPlugin extends Plugin {
    * When true, the plugin will not initialize vault or peer manager.
    */
   disabledReason: string | null = null;
+
+  /**
+   * Rolling buffer of recent sync events for the debug panel.
+   * Events are captured at the plugin level so they persist across modal opens.
+   */
+  debugEvents: Array<{ event: SyncEvent; id: number }> = [];
+
+  /** Counter for unique event IDs */
+  private debugEventIdCounter = 0;
+
+  /** Subscription to WASM sync events for debug buffer */
+  private debugEventSubscription: WasmSubscription | null = null;
 
   /**
    * Operation queue to serialize all WASM vault calls.
@@ -195,6 +211,14 @@ export default class P2PSyncPlugin extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: "p2p-sync-debug",
+      name: "Open Debug Panel",
+      callback: () => {
+        new DebugModal(this.app, this).open();
+      },
+    });
+
     // Try to load existing vault and start peer manager on startup
     this.app.workspace.onLayoutReady(async () => {
       await this.tryLoadVault();
@@ -223,6 +247,12 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    // Stop debug event subscription
+    if (this.debugEventSubscription) {
+      this.debugEventSubscription.dispose();
+      this.debugEventSubscription = null;
+    }
+
     // Stop peer manager
     if (this.peerManager) {
       await this.peerManager.stop();
@@ -235,6 +265,40 @@ export default class P2PSyncPlugin extends Plugin {
       this.vault = null;
     }
     log.info("Plugin unloaded");
+  }
+
+  /**
+   * Subscribe to WASM sync events for the debug buffer.
+   * Called after vault is initialized/loaded.
+   */
+  private subscribeToDebugEvents(): void {
+    if (!this.vault || this.debugEventSubscription) return;
+
+    this.debugEventSubscription = this.vault.subscribeSyncEvents((event: SyncEvent) => {
+      // Add to front of buffer
+      this.debugEvents.unshift({
+        event,
+        id: this.debugEventIdCounter++,
+      });
+
+      // Trim to max size
+      if (this.debugEvents.length > MAX_DEBUG_EVENTS) {
+        this.debugEvents.length = MAX_DEBUG_EVENTS;
+      }
+
+      // Emit state change so debug panel can update
+      this.events.trigger("state-changed");
+    });
+
+    log.debug("Subscribed to sync events for debug buffer");
+  }
+
+  /**
+   * Clear the debug event buffer.
+   */
+  clearDebugEvents(): void {
+    this.debugEvents = [];
+    this.debugEventIdCounter = 0;
   }
 
   /**
@@ -252,6 +316,15 @@ export default class P2PSyncPlugin extends Plugin {
       this.updateStatusBar(`${this.peerManager?.peerCount ?? 0} peers`);
       this.events.trigger("state-changed");
 
+      // Notify WASM PeerRegistry (emits SyncEvent::PeerConnected)
+      if (this.vault) {
+        try {
+          this.vault.peerConnected(peer.id, peer.address, peer.direction);
+        } catch (e) {
+          log.warn(`Failed to register peer in WASM: ${e}`);
+        }
+      }
+
       // Send sync request to the new peer
       await this.sendSyncRequest(peer.id);
     });
@@ -260,6 +333,11 @@ export default class P2PSyncPlugin extends Plugin {
       log.info(`Peer disconnected: ${peerId}`);
       this.updateStatusBar(`${this.peerManager?.peerCount ?? 0} peers`);
       this.events.trigger("state-changed");
+
+      // Notify WASM PeerRegistry (emits SyncEvent::PeerDisconnected)
+      if (this.vault) {
+        this.vault.peerDisconnected(peerId);
+      }
     });
 
     this.peerManager.on("message", async (peerId: string, data: Uint8Array) => {
@@ -543,6 +621,7 @@ export default class P2PSyncPlugin extends Plugin {
         this.vault = await WasmVault.load(fsBridge, this.peerId);
         log.info("Vault loaded");
         this.updateStatusBar("loaded");
+        this.subscribeToDebugEvents();
         this.events.trigger("state-changed");
       } else {
         log.info("No existing vault found (.sync directory missing)");
@@ -571,6 +650,7 @@ export default class P2PSyncPlugin extends Plugin {
     this.vault = await WasmVault.init(fsBridge, this.peerId);
     log.info("Vault initialized");
     this.updateStatusBar("initialized");
+    this.subscribeToDebugEvents();
     this.events.trigger("state-changed");
   }
 

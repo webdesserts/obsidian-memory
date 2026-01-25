@@ -154,7 +154,7 @@ mod wasm_impl {
         /// This is automatically called during `load()`, but can be called again
         /// if needed (e.g., after detecting external filesystem changes).
         #[wasm_bindgen]
-        pub async fn reconcile(&mut self) -> Result<JsValue, JsError> {
+        pub async fn reconcile(&self) -> Result<JsValue, JsError> {
             let report = self.inner
                 .reconcile()
                 .await
@@ -189,7 +189,7 @@ mod wasm_impl {
         /// Call this when Obsidian fires modify/create events for markdown files.
         /// Updates the Loro document to match the file content.
         #[wasm_bindgen(js_name = onFileChanged)]
-        pub async fn on_file_changed(&mut self, path: &str) -> Result<(), JsError> {
+        pub async fn on_file_changed(&self, path: &str) -> Result<(), JsError> {
             self.inner
                 .on_file_changed(path)
                 .await
@@ -202,7 +202,7 @@ mod wasm_impl {
         /// Use this to track the synced version and detect if subsequent
         /// modifications are purely from sync or include local edits.
         #[wasm_bindgen(js_name = getDocumentVersion)]
-        pub async fn get_document_version(&mut self, path: &str) -> Result<JsValue, JsError> {
+        pub async fn get_document_version(&self, path: &str) -> Result<JsValue, JsError> {
             let version = self
                 .inner
                 .get_document_version(path)
@@ -247,7 +247,7 @@ mod wasm_impl {
         /// Returns serialized bytes containing our version vectors for all documents.
         /// Send this to the peer immediately after connection.
         #[wasm_bindgen(js_name = prepareSyncRequest)]
-        pub async fn prepare_sync_request(&mut self) -> Result<Vec<u8>, JsError> {
+        pub async fn prepare_sync_request(&self) -> Result<Vec<u8>, JsError> {
             self.inner
                 .prepare_sync_request()
                 .await
@@ -262,7 +262,7 @@ mod wasm_impl {
         ///
         /// Call this when you receive a message from a peer.
         #[wasm_bindgen(js_name = processSyncMessage)]
-        pub async fn process_sync_message(&mut self, data: &[u8]) -> Result<JsValue, JsError> {
+        pub async fn process_sync_message(&self, data: &[u8]) -> Result<JsValue, JsError> {
             log(&format!("processSyncMessage: received {} bytes", data.len()));
 
             let (response, modified_paths) = self
@@ -295,7 +295,7 @@ mod wasm_impl {
         ///
         /// Call this after `onFileChanged` to get the update to broadcast.
         #[wasm_bindgen(js_name = prepareDocumentUpdate)]
-        pub async fn prepare_document_update(&mut self, path: &str) -> Result<JsValue, JsError> {
+        pub async fn prepare_document_update(&self, path: &str) -> Result<JsValue, JsError> {
             let update = self
                 .inner
                 .prepare_document_update(path)
@@ -318,7 +318,7 @@ mod wasm_impl {
         /// Call this when Obsidian fires a delete event for a markdown file.
         /// The deletion is tracked in the registry LoroTree and syncs to peers.
         #[wasm_bindgen(js_name = deleteFile)]
-        pub async fn delete_file(&mut self, path: &str) -> Result<(), JsError> {
+        pub async fn delete_file(&self, path: &str) -> Result<(), JsError> {
             self.inner
                 .delete_file(path)
                 .await
@@ -330,7 +330,7 @@ mod wasm_impl {
         /// Call this when Obsidian fires a rename event for a markdown file.
         /// The rename is tracked in the registry LoroTree and syncs to peers.
         #[wasm_bindgen(js_name = renameFile)]
-        pub async fn rename_file(&mut self, old_path: &str, new_path: &str) -> Result<(), JsError> {
+        pub async fn rename_file(&self, old_path: &str, new_path: &str) -> Result<(), JsError> {
             self.inner
                 .rename_file(old_path, new_path)
                 .await
@@ -424,7 +424,7 @@ mod wasm_impl {
         /// Returns content metadata including body length, frontmatter status, and doc_id.
         /// Returns `null` if the document doesn't exist.
         #[wasm_bindgen(js_name = getDocumentInfo)]
-        pub async fn get_document_info(&mut self, path: &str) -> Result<JsValue, JsError> {
+        pub async fn get_document_info(&self, path: &str) -> Result<JsValue, JsError> {
             let info = self.inner.get_document_info(path).await
                 .map_err(|e| JsError::new(&e.to_string()))?;
             match info {

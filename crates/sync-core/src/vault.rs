@@ -14,6 +14,8 @@ use thiserror::Error;
 use web_time::Instant;
 
 #[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
 
 // ========== Debug API Types ==========
@@ -192,17 +194,32 @@ impl SyncTracker {
     }
 }
 
-/// Manages a vault of documents
+/// Manages a vault of documents.
+///
+/// Uses interior mutability for core state to allow `&self` methods in WASM.
+/// This prevents RefCell borrow conflicts when JavaScript interleaves calls during
+/// async operations (WASM async methods hold their borrows across await points).
 pub struct Vault<F: FileSystem> {
     /// File registry (tracks all files in vault via LoroTree)
-    pub(crate) registry: LoroDoc,
+    /// WASM: RefCell for single-threaded browser
+    /// Native: Mutex for multi-threaded Tokio
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) registry: RefCell<LoroDoc>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) registry: Mutex<LoroDoc>,
 
     /// Path lookup cache (LoroTree has no path-based lookup)
     /// Rebuilt after sync and updated inline for local operations
-    path_to_node: HashMap<String, TreeID>,
+    #[cfg(target_arch = "wasm32")]
+    path_to_node: RefCell<HashMap<String, TreeID>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    path_to_node: Mutex<HashMap<String, TreeID>>,
 
     /// Loaded documents
-    pub(crate) documents: HashMap<String, NoteDocument>,
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) documents: RefCell<HashMap<String, NoteDocument>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) documents: Mutex<HashMap<String, NoteDocument>>,
 
     /// Filesystem abstraction
     pub(crate) fs: F,
@@ -231,6 +248,84 @@ pub struct Vault<F: FileSystem> {
 }
 
 impl<F: FileSystem> Vault<F> {
+    // ========== Interior Mutability Accessors ==========
+    //
+    // These methods provide access to fields wrapped in RefCell (WASM) or Mutex (native).
+    // IMPORTANT: Never hold a borrow guard across an await point!
+    // Clippy lint `await_holding_refcell_ref` will catch violations.
+
+    /// Borrow the registry for reading (WASM)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn registry(&self) -> std::cell::Ref<'_, LoroDoc> {
+        self.registry.borrow()
+    }
+
+    /// Borrow the registry for reading (native)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn registry(&self) -> std::sync::MutexGuard<'_, LoroDoc> {
+        self.registry.lock().unwrap()
+    }
+
+    /// Borrow the registry for mutation (WASM)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn registry_mut(&self) -> std::cell::RefMut<'_, LoroDoc> {
+        self.registry.borrow_mut()
+    }
+
+    /// Borrow the registry for mutation (native)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn registry_mut(&self) -> std::sync::MutexGuard<'_, LoroDoc> {
+        self.registry.lock().unwrap()
+    }
+
+    /// Borrow path_to_node for reading (WASM)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn path_to_node(&self) -> std::cell::Ref<'_, HashMap<String, TreeID>> {
+        self.path_to_node.borrow()
+    }
+
+    /// Borrow path_to_node for reading (native)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn path_to_node(&self) -> std::sync::MutexGuard<'_, HashMap<String, TreeID>> {
+        self.path_to_node.lock().unwrap()
+    }
+
+    /// Borrow path_to_node for mutation (WASM)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn path_to_node_mut(&self) -> std::cell::RefMut<'_, HashMap<String, TreeID>> {
+        self.path_to_node.borrow_mut()
+    }
+
+    /// Borrow path_to_node for mutation (native)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn path_to_node_mut(&self) -> std::sync::MutexGuard<'_, HashMap<String, TreeID>> {
+        self.path_to_node.lock().unwrap()
+    }
+
+    /// Borrow documents for reading (WASM)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn documents(&self) -> std::cell::Ref<'_, HashMap<String, NoteDocument>> {
+        self.documents.borrow()
+    }
+
+    /// Borrow documents for reading (native)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn documents(&self) -> std::sync::MutexGuard<'_, HashMap<String, NoteDocument>> {
+        self.documents.lock().unwrap()
+    }
+
+    /// Borrow documents for mutation (WASM)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn documents_mut(&self) -> std::cell::RefMut<'_, HashMap<String, NoteDocument>> {
+        self.documents.borrow_mut()
+    }
+
+    /// Borrow documents for mutation (native)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn documents_mut(&self) -> std::sync::MutexGuard<'_, HashMap<String, NoteDocument>> {
+        self.documents.lock().unwrap()
+    }
+
     /// Initialize a new vault (creates .sync directory)
     pub async fn init(fs: F, peer_id: PeerId) -> Result<Self> {
         // Create .sync directory
@@ -258,10 +353,23 @@ impl<F: FileSystem> Vault<F> {
         #[cfg(target_arch = "wasm32")]
         let peers = Rc::new(PeerRegistry::new());
 
-        let mut vault = Self {
-            registry,
-            path_to_node: HashMap::new(),
-            documents: HashMap::new(),
+        // Wrap fields in interior mutability containers
+        #[cfg(target_arch = "wasm32")]
+        let vault = Self {
+            registry: RefCell::new(registry),
+            path_to_node: RefCell::new(HashMap::new()),
+            documents: RefCell::new(HashMap::new()),
+            fs,
+            peer_id,
+            sync_tracker: SyncTracker::new(),
+            events,
+            peers,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let vault = Self {
+            registry: Mutex::new(registry),
+            path_to_node: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
             fs,
             peer_id,
             sync_tracker: SyncTracker::new(),
@@ -314,10 +422,23 @@ impl<F: FileSystem> Vault<F> {
         #[cfg(target_arch = "wasm32")]
         let peers = Rc::new(PeerRegistry::new());
 
-        let mut vault = Self {
-            registry,
-            path_to_node: HashMap::new(),
-            documents: HashMap::new(),
+        // Wrap fields in interior mutability containers
+        #[cfg(target_arch = "wasm32")]
+        let vault = Self {
+            registry: RefCell::new(registry),
+            path_to_node: RefCell::new(HashMap::new()),
+            documents: RefCell::new(HashMap::new()),
+            fs,
+            peer_id,
+            sync_tracker: SyncTracker::new(),
+            events,
+            peers,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let vault = Self {
+            registry: Mutex::new(registry),
+            path_to_node: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
             fs,
             peer_id,
             sync_tracker: SyncTracker::new(),
@@ -343,7 +464,7 @@ impl<F: FileSystem> Vault<F> {
     /// - External file deletions → orphaned .loro files (logged, not deleted)
     /// 
     /// The filesystem (markdown) is always the source of truth.
-    pub async fn reconcile(&mut self) -> Result<ReconcileReport> {
+    pub async fn reconcile(&self) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         
         // Get all markdown files in the vault
@@ -466,7 +587,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// This preserves the CRDT history when a file is moved/renamed.
     /// Uses `from_bytes` to import before setting metadata, preserving the original peer ID.
-    async fn migrate_document(&mut self, old_hash: &str, new_path: &str) -> Result<()> {
+    async fn migrate_document(&self, old_hash: &str, new_path: &str) -> Result<()> {
         let old_sync_path = format!("{}/documents/{}.loro", SYNC_DIR, old_hash);
         let new_hash = simple_hash(new_path);
         let new_sync_path = format!("{}/documents/{}.loro", SYNC_DIR, new_hash);
@@ -483,7 +604,7 @@ impl<F: FileSystem> Vault<F> {
         self.fs.delete(&old_sync_path).await?;
 
         // Update cache
-        self.documents.insert(new_path.to_string(), doc);
+        self.documents_mut().insert(new_path.to_string(), doc);
 
         // Register in tree (the old path's node was already processed as orphaned)
         self.register_file(new_path)?;
@@ -537,7 +658,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// This is used when external modifications are detected during reconciliation.
     /// Preserves the peer ID by updating the existing document rather than replacing it.
-    async fn reindex_file(&mut self, path: &str) -> Result<()> {
+    async fn reindex_file(&self, path: &str) -> Result<()> {
         let bytes = self.fs.read(path).await?;
         let content = String::from_utf8_lossy(&bytes);
         let parsed = crate::markdown::parse(&content);
@@ -559,7 +680,7 @@ impl<F: FileSystem> Vault<F> {
         }
 
         // Update cache
-        self.documents.insert(path.to_string(), doc);
+        self.documents_mut().insert(path.to_string(), doc);
 
         Ok(())
     }
@@ -615,18 +736,18 @@ impl<F: FileSystem> Vault<F> {
     /// Returns None if the document hasn't been loaded.
     /// Use this for tracking which version was synced to detect if a local
     /// modification contains only changes we just received from sync.
-    pub async fn get_document_version(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
-        if !self.documents.contains_key(path) {
+    pub async fn get_document_version(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        if !self.documents().contains_key(path) {
             // Try to load the document
             let sync_path = self.document_sync_path(path);
             if !self.fs.exists(&sync_path).await? {
                 return Ok(None);
             }
             let doc = self.load_document(path).await?;
-            self.documents.insert(path.to_string(), doc);
+            self.documents_mut().insert(path.to_string(), doc);
         }
 
-        Ok(self.documents.get(path).map(|doc| doc.version().encode()))
+        Ok(self.documents().get(path).map(|doc| doc.version().encode()))
     }
 
     /// Check if a document's current version includes all operations from a previous version.
@@ -652,22 +773,42 @@ impl<F: FileSystem> Vault<F> {
         Ok(self.fs.exists(SYNC_DIR).await?)
     }
 
-    /// Get or load a document
-    pub async fn get_document(&mut self, path: &str) -> Result<&NoteDocument> {
-        if !self.documents.contains_key(path) {
+    /// Get or load a document.
+    ///
+    /// Returns a clone of the document. With interior mutability, we can't return
+    /// references into the documents HashMap since the borrow guard would be dropped.
+    /// NoteDocument clones are cheap (LoroDoc uses Arc internally).
+    pub async fn get_document(&self, path: &str) -> Result<NoteDocument> {
+        if !self.documents().contains_key(path) {
             let doc = self.load_document(path).await?;
-            self.documents.insert(path.to_string(), doc);
+            self.documents_mut().insert(path.to_string(), doc.clone());
+            return Ok(doc);
         }
-        Ok(self.documents.get(path).unwrap())
+        Ok(self.documents().get(path).unwrap().clone())
     }
 
-    /// Get a mutable reference to a document
-    pub async fn get_document_mut(&mut self, path: &str) -> Result<&mut NoteDocument> {
-        if !self.documents.contains_key(path) {
+    /// Get a mutable reference to a cached document.
+    ///
+    /// This returns a clone that can be modified. After modification, call
+    /// `update_document()` to persist changes back to the cache, then `save_document()`
+    /// to write to disk.
+    ///
+    /// Unlike `get_document()`, this loads the document first if not cached.
+    pub async fn get_document_mut(&self, path: &str) -> Result<NoteDocument> {
+        if !self.documents().contains_key(path) {
             let doc = self.load_document(path).await?;
-            self.documents.insert(path.to_string(), doc);
+            self.documents_mut().insert(path.to_string(), doc.clone());
+            return Ok(doc);
         }
-        Ok(self.documents.get_mut(path).unwrap())
+        Ok(self.documents().get(path).unwrap().clone())
+    }
+
+    /// Update a document in the cache after modification.
+    ///
+    /// Call this after modifying a document obtained from `get_document_mut()`,
+    /// then call `save_document()` to persist to disk.
+    pub fn update_document(&self, path: &str, doc: NoteDocument) {
+        self.documents_mut().insert(path.to_string(), doc);
     }
 
     /// Load a document from disk
@@ -702,7 +843,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Uses diff-and-merge to update existing documents, preserving peer ID.
     /// Only creates a new document if no .loro file exists on disk.
-    pub async fn on_file_changed(&mut self, path: &str) -> Result<()> {
+    pub async fn on_file_changed(&self, path: &str) -> Result<()> {
         // Skip non-markdown files and .sync directory
         if !path.ends_with(".md") || path.starts_with(SYNC_DIR) {
             return Ok(());
@@ -715,14 +856,15 @@ impl<F: FileSystem> Vault<F> {
         let sync_path = self.document_sync_path(path);
 
         // If document is in cache, diff-and-merge
-        if self.documents.contains_key(path) {
-            let existing_doc = self.documents.get(path).unwrap();
+        if self.documents().contains_key(path) {
+            let existing_doc = self.documents().get(path).unwrap().clone();
             let body_changed = existing_doc.update_body(&parsed.body)?;
             let fm_changed = existing_doc.update_frontmatter(parsed.frontmatter.as_ref())?;
 
             if body_changed || fm_changed {
                 existing_doc.commit();
                 let snapshot = existing_doc.export_snapshot();
+                self.documents_mut().insert(path.to_string(), existing_doc);
                 self.fs.write(&sync_path, &snapshot).await?;
                 tracing::debug!("Updated document via diff: {}", path);
             } else {
@@ -749,7 +891,7 @@ impl<F: FileSystem> Vault<F> {
                 tracing::debug!("No changes detected (cold cache sync echo): {}", path);
             }
 
-            self.documents.insert(path.to_string(), doc);
+            self.documents_mut().insert(path.to_string(), doc);
             return Ok(());
         }
 
@@ -757,7 +899,7 @@ impl<F: FileSystem> Vault<F> {
         let new_doc = NoteDocument::from_markdown(path, &content, self.peer_id)?;
         let snapshot = new_doc.export_snapshot();
         self.fs.write(&sync_path, &snapshot).await?;
-        self.documents.insert(path.to_string(), new_doc);
+        self.documents_mut().insert(path.to_string(), new_doc);
 
         // Register in tree for delete/rename tracking
         self.register_file(path)?;
@@ -769,7 +911,9 @@ impl<F: FileSystem> Vault<F> {
 
     /// Save a document to disk (both markdown and sync state)
     pub async fn save_document(&self, path: &str) -> Result<()> {
-        if let Some(doc) = self.documents.get(path) {
+        // Clone document out before async operations to avoid holding lock across await
+        let doc = self.documents().get(path).cloned();
+        if let Some(doc) = doc {
             // Save markdown
             let markdown = doc.to_markdown();
             self.fs.write(path, markdown.as_bytes()).await?;
@@ -817,7 +961,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Called during initialization to ensure all files are tracked
     /// by the CRDT before any sync operations.
-    async fn index_existing_files(&mut self) -> Result<()> {
+    async fn index_existing_files(&self) -> Result<()> {
         let files = self.list_files().await?;
 
         for path in files {
@@ -836,13 +980,13 @@ impl<F: FileSystem> Vault<F> {
 
     /// Get the file tree from the registry
     pub(crate) fn file_tree(&self) -> LoroTree {
-        self.registry.get_tree("files")
+        self.registry().get_tree("files")
     }
 
     /// Rebuild the path cache from the current tree state.
     /// Call this after applying sync updates.
-    pub(crate) fn rebuild_path_cache(&mut self) {
-        self.path_to_node.clear();
+    pub(crate) fn rebuild_path_cache(&self) {
+        self.path_to_node_mut().clear();
         let tree = self.file_tree();
 
         // Iterate over all non-deleted nodes
@@ -864,13 +1008,13 @@ impl<F: FileSystem> Vault<F> {
 
                 if node_type.as_deref() == Some("file") {
                     if let Some(path) = self.get_node_path(&node_id) {
-                        self.path_to_node.insert(path, node_id);
+                        self.path_to_node_mut().insert(path, node_id);
                     }
                 }
             }
         }
 
-        tracing::debug!("Rebuilt path cache with {} entries", self.path_to_node.len());
+        tracing::debug!("Rebuilt path cache with {} entries", self.path_to_node().len());
     }
 
     /// Get the path for a node by walking up the tree
@@ -907,7 +1051,7 @@ impl<F: FileSystem> Vault<F> {
 
     /// Find a node by path using the cache
     fn find_node_by_path(&self, path: &str) -> Option<TreeID> {
-        self.path_to_node.get(path).copied()
+        self.path_to_node().get(path).copied()
     }
 
     /// Validate a sync path for security
@@ -957,7 +1101,7 @@ impl<F: FileSystem> Vault<F> {
 
     /// Register a new file in the tree (creates parent folders as needed).
     /// Returns the TreeID of the created file node.
-    pub fn register_file(&mut self, path: &str) -> Result<TreeID> {
+    pub fn register_file(&self, path: &str) -> Result<TreeID> {
         Self::validate_sync_path(path)?;
 
         // Check if file already registered
@@ -991,7 +1135,7 @@ impl<F: FileSystem> Vault<F> {
             .map_err(|e| VaultError::Other(format!("Failed to set doc_id: {}", e)))?;
 
         // Update cache
-        self.path_to_node.insert(path.to_string(), node_id);
+        self.path_to_node_mut().insert(path.to_string(), node_id);
 
         tracing::debug!("Registered file in tree: {}", path);
         Ok(node_id)
@@ -999,7 +1143,7 @@ impl<F: FileSystem> Vault<F> {
 
     /// Delete a file from the tree (CRDT operation - tracked, reversible).
     /// Also cleans up the .loro document file.
-    pub async fn delete_file(&mut self, path: &str) -> Result<()> {
+    pub async fn delete_file(&self, path: &str) -> Result<()> {
         Self::validate_sync_path(path)?;
 
         if let Some(node_id) = self.find_node_by_path(path) {
@@ -1008,7 +1152,7 @@ impl<F: FileSystem> Vault<F> {
                 .map_err(|e| VaultError::Other(format!("Failed to delete file node: {}", e)))?;
 
             // Remove from cache
-            self.path_to_node.remove(path);
+            self.path_to_node_mut().remove(path);
 
             // Clean up .loro document
             let sync_path = self.document_sync_path(path);
@@ -1017,7 +1161,7 @@ impl<F: FileSystem> Vault<F> {
             }
 
             // Remove from documents cache
-            self.documents.remove(path);
+            self.documents_mut().remove(path);
 
             tracing::info!("Deleted file from tree: {}", path);
         }
@@ -1026,7 +1170,7 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Rename/move a file in the tree (CRDT operation via tree move).
-    pub async fn rename_file(&mut self, old_path: &str, new_path: &str) -> Result<()> {
+    pub async fn rename_file(&self, old_path: &str, new_path: &str) -> Result<()> {
         Self::validate_sync_path(old_path)?;
         Self::validate_sync_path(new_path)?;
 
@@ -1059,9 +1203,10 @@ impl<F: FileSystem> Vault<F> {
                     self.fs.delete(&old_sync).await?;
                 }
 
-                // Update documents cache
-                if let Some(doc) = self.documents.remove(old_path) {
-                    self.documents.insert(new_path.to_string(), doc);
+                // Update documents cache - extract first to release mutex before re-acquiring
+                let doc = self.documents_mut().remove(old_path);
+                if let Some(doc) = doc {
+                    self.documents_mut().insert(new_path.to_string(), doc);
                 }
 
                 // Register in tree
@@ -1116,8 +1261,8 @@ impl<F: FileSystem> Vault<F> {
             .map_err(|e| VaultError::Other(format!("Failed to update doc_id: {}", e)))?;
 
         // Update caches
-        self.path_to_node.remove(old_path);
-        self.path_to_node.insert(new_path.to_string(), node_id);
+        self.path_to_node_mut().remove(old_path);
+        self.path_to_node_mut().insert(new_path.to_string(), node_id);
 
         // Move .loro document file
         let old_sync_path = self.document_sync_path(old_path);
@@ -1128,9 +1273,10 @@ impl<F: FileSystem> Vault<F> {
             self.fs.delete(&old_sync_path).await?;
         }
 
-        // Update documents cache
-        if let Some(doc) = self.documents.remove(old_path) {
-            self.documents.insert(new_path.to_string(), doc);
+        // Update documents cache - extract first to release mutex before re-acquiring
+        let doc = self.documents_mut().remove(old_path);
+        if let Some(doc) = doc {
+            self.documents_mut().insert(new_path.to_string(), doc);
         }
 
         tracing::info!("Renamed file in tree: {} -> {}", old_path, new_path);
@@ -1149,7 +1295,7 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Get or create a folder node
-    fn get_or_create_folder(&mut self, parent: TreeParentId, name: &str) -> Result<TreeParentId> {
+    fn get_or_create_folder(&self, parent: TreeParentId, name: &str) -> Result<TreeParentId> {
         let tree = self.file_tree();
 
         // Look for existing folder with this name under parent
@@ -1211,14 +1357,20 @@ impl<F: FileSystem> Vault<F> {
 
     /// Get the registry version vector as a map of peer ID hex strings to counters.
     pub fn get_registry_version(&self) -> HashMap<String, i32> {
-        version_vector_to_map(&self.registry.state_vv())
+        // Use oplog_vv() instead of state_vv() to show all received operations,
+        // not just the operations that contributed to current state
+        version_vector_to_map(&self.registry().oplog_vv())
     }
 
     /// Get registry oplog statistics.
     pub fn get_registry_stats(&self) -> RegistryStats {
+        // Note: Must extract values before struct initialization to ensure
+        // MutexGuards are dropped in predictable order
+        let change_count = self.registry().len_changes();
+        let op_count = self.registry().len_ops();
         RegistryStats {
-            change_count: self.registry.len_changes(),
-            op_count: self.registry.len_ops(),
+            change_count,
+            op_count,
         }
     }
 
@@ -1250,7 +1402,7 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Returns `None` if the document doesn't exist. Loads the document if not
     /// already cached, which includes content metadata not available from blob headers.
-    pub async fn get_document_info(&mut self, path: &str) -> Result<Option<DocumentInfo>> {
+    pub async fn get_document_info(&self, path: &str) -> Result<Option<DocumentInfo>> {
         let sync_path = self.document_sync_path(path);
         if !self.fs.exists(&sync_path).await? {
             return Ok(None);
@@ -1375,7 +1527,7 @@ mod tests {
         fs.write("test.md", b"# Hello\n\nWorld").await.unwrap();
 
         // Init vault
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Handle file change
         vault.on_file_changed("test.md").await.unwrap();
@@ -1399,7 +1551,7 @@ mod tests {
         fs.write("new_file.md", b"# New File").await.unwrap();
         
         // Load vault - should detect and index the new file
-        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The new file should be accessible
         let doc = vault.get_document("new_file.md").await.unwrap();
@@ -1420,7 +1572,7 @@ mod tests {
         fs.write("note.md", b"# Modified Content").await.unwrap();
         
         // Load vault - should detect modification and re-index
-        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The document should have the new content
         let doc = vault.get_document("note.md").await.unwrap();
@@ -1466,7 +1618,7 @@ mod tests {
         fs.delete("old_name.md").await.unwrap();
         
         // Load vault - should detect move and migrate .loro file
-        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The new file should be accessible with the same content
         let doc = vault.get_document("new_name.md").await.unwrap();
@@ -1501,7 +1653,7 @@ mod tests {
         fs.delete("note.md").await.unwrap();
         
         // Load vault - should detect move
-        let mut vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         
         // The moved file should be accessible
         let doc = vault.get_document("knowledge/note.md").await.unwrap();
@@ -1521,7 +1673,7 @@ mod tests {
 
         // Create and index a file
         fs.write("note.md", b"# Hello").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("note.md").await.unwrap();
 
         // File should be in tree
@@ -1540,7 +1692,7 @@ mod tests {
 
         // Create and index a file
         fs.write("old.md", b"# Content").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("old.md").await.unwrap();
 
         // Old path should exist in tree
@@ -1559,7 +1711,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_traversal_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Path traversal should be rejected
         let result = vault.delete_file("../secret.md").await;
@@ -1575,7 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn test_null_byte_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Null bytes should be rejected
         let result = vault.delete_file("foo\0.md").await;
@@ -1588,7 +1740,7 @@ mod tests {
     #[tokio::test]
     async fn test_non_markdown_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Non-markdown files should be rejected
         let result = vault.register_file("script.js");
@@ -1601,7 +1753,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_path_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Empty path should be rejected
         let result = vault.register_file("");
@@ -1614,7 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_segment_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Empty path segments (a//b.md) should be rejected
         let result = vault.register_file("a//b.md");
@@ -1627,7 +1779,7 @@ mod tests {
     #[tokio::test]
     async fn test_path_too_long_rejected() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Path over 1024 chars should be rejected
         let long_path = format!("{}.md", "a".repeat(1025));
@@ -1644,10 +1796,10 @@ mod tests {
 
         // Create file in vault1
         fs1.write("note.md", b"# Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
 
         // Sync to vault2
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
         let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
@@ -1739,13 +1891,13 @@ mod tests {
 
         // Create file in vault1
         fs1.write("note.md", b"# Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
             .await
             .unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
 
         // Create empty vault2
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
             .await
             .unwrap();
 
@@ -1782,7 +1934,7 @@ mod tests {
         let fs = InMemoryFs::new();
 
         fs.write("note.md", b"# Original").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
 
         // Local edit
         vault.on_file_changed("note.md").await.unwrap();
@@ -1804,10 +1956,10 @@ mod tests {
         // Create file in both vaults
         fs1.write("note.md", b"# Hello").await.unwrap();
         fs2.write("note.md", b"# Hello").await.unwrap();
-        let mut vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
             .await
             .unwrap();
-        let mut vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
             .await
             .unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
@@ -1894,7 +2046,7 @@ mod tests {
     async fn test_get_registry_version() {
         let fs = InMemoryFs::new();
         fs.write("note.md", b"# Hello").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("note.md").await.unwrap();
 
         let version = vault.get_registry_version();
@@ -1911,7 +2063,7 @@ mod tests {
     async fn test_get_registry_stats() {
         let fs = InMemoryFs::new();
         fs.write("note.md", b"# Hello").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("note.md").await.unwrap();
 
         let stats = vault.get_registry_stats();
@@ -1937,7 +2089,7 @@ mod tests {
     async fn test_get_document_blob_meta() {
         let fs = InMemoryFs::new();
         fs.write("test.md", b"# Hello").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("test.md").await.unwrap();
 
         let meta = vault.get_document_blob_meta("test.md").await.unwrap().unwrap();
@@ -1949,7 +2101,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_document_info_not_found() {
         let fs = InMemoryFs::new();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         let info = vault.get_document_info("nonexistent.md").await.unwrap();
         assert!(info.is_none());
     }
@@ -1958,7 +2110,7 @@ mod tests {
     async fn test_get_document_info() {
         let fs = InMemoryFs::new();
         fs.write("test.md", b"# Hello").await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("test.md").await.unwrap();
 
         let info = vault.get_document_info("test.md").await.unwrap().unwrap();
@@ -1974,7 +2126,7 @@ mod tests {
         let fs = InMemoryFs::new();
         let content = "---\ntitle: Test\n---\n\n# Hello";
         fs.write("test.md", content.as_bytes()).await.unwrap();
-        let mut vault = Vault::init(fs, test_peer_id()).await.unwrap();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("test.md").await.unwrap();
 
         let info = vault.get_document_info("test.md").await.unwrap().unwrap();
