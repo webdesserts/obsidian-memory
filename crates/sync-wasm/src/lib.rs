@@ -40,6 +40,7 @@ pub use fs_bridge::JsFileSystemBridge;
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use super::*;
+    use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
 
     /// Initialize the WASM module (sets up panic hook for better error messages)
@@ -80,6 +81,25 @@ mod wasm_impl {
 
         #[wasm_bindgen(js_namespace = console)]
         pub fn error(s: &str);
+    }
+
+    // ========== WASM Subscription Handle ==========
+
+    /// Subscription handle exposed to JavaScript.
+    ///
+    /// Call `dispose()` to unsubscribe, or let the JS garbage collector
+    /// collect it (the Rust Drop will run via FinalizationRegistry).
+    #[wasm_bindgen]
+    pub struct WasmSubscription {
+        inner: RefCell<Option<sync_core::Subscription>>,
+    }
+
+    #[wasm_bindgen]
+    impl WasmSubscription {
+        /// Unsubscribe from events. Safe to call multiple times.
+        pub fn dispose(&self) {
+            self.inner.borrow_mut().take(); // Drop the inner Subscription
+        }
     }
 
     /// Vault manager exposed to TypeScript.
@@ -244,7 +264,7 @@ mod wasm_impl {
         #[wasm_bindgen(js_name = processSyncMessage)]
         pub async fn process_sync_message(&mut self, data: &[u8]) -> Result<JsValue, JsError> {
             log(&format!("processSyncMessage: received {} bytes", data.len()));
-            
+
             let (response, modified_paths) = self
                 .inner
                 .process_sync_message(data)
@@ -254,8 +274,8 @@ mod wasm_impl {
                     JsError::new(&e.to_string())
                 })?;
 
-            log(&format!("processSyncMessage: response={}, modified={:?}", 
-                response.as_ref().map(|r| r.len()).unwrap_or(0), 
+            log(&format!("processSyncMessage: response={}, modified={:?}",
+                response.as_ref().map(|r| r.len()).unwrap_or(0),
                 modified_paths));
 
             // Return as a JS object: { response: Uint8Array | null, modifiedPaths: string[] }
@@ -264,7 +284,8 @@ mod wasm_impl {
                 modified_paths,
             };
 
-            serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&e.to_string()))
+            serde_wasm_bindgen::to_value(&result)
+                .map_err(|e| JsError::new(&e.to_string()))
         }
 
         /// Prepare a document update to broadcast after a local file change.
@@ -410,6 +431,25 @@ mod wasm_impl {
                 Some(i) => serde_wasm_bindgen::to_value(&i)
                     .map_err(|e| JsError::new(&e.to_string())),
                 None => Ok(JsValue::NULL),
+            }
+        }
+
+        // ========== Sync Event Subscriptions ==========
+
+        /// Subscribe to sync events for real-time monitoring.
+        ///
+        /// Returns a `WasmSubscription` handle. Call `dispose()` on it to unsubscribe,
+        /// or let the JS garbage collector clean it up.
+        #[wasm_bindgen(js_name = subscribeSyncEvents)]
+        pub fn subscribe_sync_events(&self, callback: js_sys::Function) -> WasmSubscription {
+            let rust_closure = move |event: sync_core::SyncEvent| {
+                if let Ok(js_event) = serde_wasm_bindgen::to_value(&event) {
+                    let _ = callback.call1(&wasm_bindgen::JsValue::NULL, &js_event);
+                }
+            };
+
+            WasmSubscription {
+                inner: RefCell::new(Some(self.inner.subscribe(rust_closure))),
             }
         }
     }

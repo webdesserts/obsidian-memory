@@ -7,6 +7,7 @@
 //! - FileSystem and SyncTransport trait abstractions
 
 pub mod document;
+pub mod events;
 pub mod fs;
 pub mod markdown;
 pub mod peer_id;
@@ -16,6 +17,7 @@ pub mod transport;
 pub mod vault;
 
 pub use document::NoteDocument;
+pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use peer_id::{PeerId, PeerIdError};
 pub use sync::SyncMessage;

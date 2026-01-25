@@ -1,6 +1,7 @@
 //! Vault: Manages a collection of NoteDocuments and syncs with peers.
 
 use crate::document::NoteDocument;
+use crate::events::{EventBus, SyncEvent, Subscription};
 use crate::fs::{FileSystem, FsError};
 use crate::PeerId;
 
@@ -10,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use web_time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 
 // ========== Debug API Types ==========
 
@@ -207,6 +211,14 @@ pub struct Vault<F: FileSystem> {
 
     /// Tracks files that were recently synced (for echo detection)
     sync_tracker: SyncTracker,
+
+    /// Event bus for sync events (native: Arc for multi-threaded Tokio)
+    #[cfg(not(target_arch = "wasm32"))]
+    events: Arc<EventBus>,
+
+    /// Event bus for sync events (WASM: Rc for single-threaded browser)
+    #[cfg(target_arch = "wasm32")]
+    events: Rc<EventBus>,
 }
 
 impl<F: FileSystem> Vault<F> {
@@ -227,6 +239,11 @@ impl<F: FileSystem> Vault<F> {
         let registry_bytes = registry.export(loro::ExportMode::Snapshot).unwrap();
         fs.write(REGISTRY_FILE, &registry_bytes).await?;
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let events = Arc::new(EventBus::new());
+        #[cfg(target_arch = "wasm32")]
+        let events = Rc::new(EventBus::new());
+
         let mut vault = Self {
             registry,
             path_to_node: HashMap::new(),
@@ -234,6 +251,7 @@ impl<F: FileSystem> Vault<F> {
             fs,
             peer_id,
             sync_tracker: SyncTracker::new(),
+            events,
         };
 
         // Scan and index all existing markdown files
@@ -271,6 +289,11 @@ impl<F: FileSystem> Vault<F> {
             doc
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let events = Arc::new(EventBus::new());
+        #[cfg(target_arch = "wasm32")]
+        let events = Rc::new(EventBus::new());
+
         let mut vault = Self {
             registry,
             path_to_node: HashMap::new(),
@@ -278,6 +301,7 @@ impl<F: FileSystem> Vault<F> {
             fs,
             peer_id,
             sync_tracker: SyncTracker::new(),
+            events,
         };
 
         // Build path cache from loaded tree
@@ -288,7 +312,7 @@ impl<F: FileSystem> Vault<F> {
 
         Ok(vault)
     }
-    
+
     /// Reconcile filesystem state with Loro documents.
     /// 
     /// This is called on load to handle changes made while the plugin was off:
@@ -522,6 +546,35 @@ impl<F: FileSystem> Vault<F> {
     /// Get our peer ID
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// Subscribe to sync events. Returns `Subscription` that unsubscribes on drop.
+    ///
+    /// The callback receives `SyncEvent` objects for real-time monitoring.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn subscribe(&self, callback: impl Fn(SyncEvent) + Send + Sync + 'static) -> Subscription {
+        self.events.subscribe(callback)
+    }
+
+    /// Subscribe to sync events. Returns `Subscription` that unsubscribes on drop.
+    ///
+    /// The callback receives `SyncEvent` objects for real-time monitoring.
+    #[cfg(target_arch = "wasm32")]
+    pub fn subscribe(&self, callback: impl Fn(SyncEvent) + 'static) -> Subscription {
+        self.events.subscribe(callback)
+    }
+
+    /// Emit a sync event to all subscribers.
+    pub(crate) fn emit(&self, event: SyncEvent) {
+        self.events.emit(event);
+    }
+
+    /// Get current timestamp in milliseconds.
+    pub(crate) fn now_ms(&self) -> f64 {
+        web_time::SystemTime::now()
+            .duration_since(web_time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0)
     }
 
     /// Mark a path as synced (call before writing to disk).

@@ -13,6 +13,7 @@ import {
   generatePeerId as wasmGeneratePeerId,
   JsFileSystemBridge,
   WasmVault,
+  WasmSubscription as WasmSubscriptionImpl,
 } from "../pkg/sync_wasm.js";
 
 // Import WASM binary as base64-encoded ArrayBuffer (via esbuild plugin)
@@ -22,6 +23,7 @@ import { log } from "./logger";
 
 // Re-export types
 export { JsFileSystemBridge, WasmVault };
+export type { WasmSubscriptionImpl as WasmSubscription };
 
 // ========== Debug API Types ==========
 
@@ -55,6 +57,48 @@ export interface DocumentInfo {
   bodyLength: number;
   hasFrontmatter: boolean;
 }
+
+// ========== Sync Event Types ==========
+
+/** Sync events emitted during sync operations for real-time monitoring. */
+export type SyncEvent =
+  | {
+      type: "messageReceived";
+      /** Protocol message type (e.g., "SyncRequest", "SyncResponse"). */
+      messageType: string;
+      /** Message size in bytes. */
+      size: number;
+      /** When the message was received, in milliseconds since Unix epoch. */
+      timestamp: number;
+    }
+  | {
+      type: "messageSent";
+      /** Protocol message type (e.g., "SyncRequest", "DocumentUpdate"). */
+      messageType: string;
+      /** Message size in bytes. */
+      size: number;
+      /** When the message was prepared, in milliseconds since Unix epoch. */
+      timestamp: number;
+    }
+  | {
+      type: "documentUpdated";
+      /** Path to the modified document. */
+      path: string;
+      /** When the document was updated, in milliseconds since Unix epoch. */
+      timestamp: number;
+    }
+  | {
+      type: "fileOp";
+      /** Operation type: "delete" or "rename". */
+      operation: string;
+      /** Path affected by the operation. */
+      path: string;
+      /** New path (for rename operations only). */
+      newPath?: string;
+      /** When the operation occurred, in milliseconds since Unix epoch. */
+      timestamp: number;
+    };
+
 
 /**
  * Check if a document's current version includes all operations from a synced version.

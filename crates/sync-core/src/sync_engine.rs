@@ -14,6 +14,7 @@
 //! This symmetric protocol enables full bidirectional sync in a single round-trip.
 
 use crate::document::NoteDocument;
+use crate::events::SyncEvent;
 use crate::fs::FileSystem;
 use crate::sync::{SyncMessage, SyncRequestData, SyncResponseData};
 use crate::vault::Vault;
@@ -50,7 +51,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Get versions for all loaded documents
         let mut document_versions = HashMap::new();
-        
+
         // Load all files to get their versions
         let files = self.list_files().await?;
         for path in files {
@@ -65,8 +66,16 @@ impl<F: FileSystem> Vault<F> {
             document_versions,
         };
 
-        bincode::serialize(&msg)
-            .map_err(|e| SyncEngineError::Serialization(e.to_string()))
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
+
+        self.emit(SyncEvent::MessageSent {
+            message_type: "SyncRequest".into(),
+            size: bytes.len(),
+            timestamp: self.now_ms(),
+        });
+
+        Ok(bytes)
     }
 
     /// Process an incoming sync message and return any outgoing response.
@@ -81,6 +90,12 @@ impl<F: FileSystem> Vault<F> {
         &mut self,
         data: &[u8],
     ) -> Result<(Option<Vec<u8>>, Vec<String>)> {
+        self.emit(SyncEvent::MessageReceived {
+            message_type: "SyncMessage".into(),
+            size: data.len(),
+            timestamp: self.now_ms(),
+        });
+
         let msg: SyncMessage = bincode::deserialize(data)
             .map_err(|e| SyncEngineError::Deserialization(e.to_string()))?;
 
@@ -106,6 +121,15 @@ impl<F: FileSystem> Vault<F> {
                 }
                 // Then apply document updates
                 let modified = self.apply_document_updates(document_updates).await?;
+
+                // Emit DocumentUpdated for each modified path
+                for path in &modified {
+                    self.emit(SyncEvent::DocumentUpdated {
+                        path: path.clone(),
+                        timestamp: self.now_ms(),
+                    });
+                }
+
                 Ok((None, modified))
             }
 
@@ -129,7 +153,15 @@ impl<F: FileSystem> Vault<F> {
                 // Then apply document updates
                 let modified = self.apply_document_updates(response.document_updates).await?;
                 debug!("SyncExchange: modified {} files: {:?}", modified.len(), modified);
-                
+
+                // Emit DocumentUpdated for each modified path
+                for path in &modified {
+                    self.emit(SyncEvent::DocumentUpdated {
+                        path: path.clone(),
+                        timestamp: self.now_ms(),
+                    });
+                }
+
                 // Then, prepare updates they need from us (excluding files we just received)
                 let our_response = self.prepare_sync_response_data_excluding(
                     &request.registry_version,
@@ -142,19 +174,35 @@ impl<F: FileSystem> Vault<F> {
                 };
                 let response_bytes = bincode::serialize(&response_msg)
                     .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
-                
+
                 Ok((Some(response_bytes), modified))
             }
 
             SyncMessage::DocumentUpdate { path, data, mtime } => {
                 // Real-time update from peer
                 let modified = self.apply_single_update(&path, &data, mtime).await?;
+
+                if modified {
+                    self.emit(SyncEvent::DocumentUpdated {
+                        path: path.clone(),
+                        timestamp: self.now_ms(),
+                    });
+                }
+
                 Ok((None, if modified { vec![path] } else { vec![] }))
             }
 
             SyncMessage::FileDeleted { path } => {
                 // Handle file deletion via tree operation
                 debug!("Received file deletion for: {}", path);
+
+                self.emit(SyncEvent::FileOp {
+                    operation: "delete".into(),
+                    path: path.clone(),
+                    new_path: None,
+                    timestamp: self.now_ms(),
+                });
+
                 // Mark as synced BEFORE deleting (for echo detection)
                 self.mark_synced(&path);
                 self.delete_file(&path).await?;
@@ -164,6 +212,14 @@ impl<F: FileSystem> Vault<F> {
             SyncMessage::FileRenamed { old_path, new_path } => {
                 // Handle file rename via tree operation
                 debug!("Received file rename: {} -> {}", old_path, new_path);
+
+                self.emit(SyncEvent::FileOp {
+                    operation: "rename".into(),
+                    path: old_path.clone(),
+                    new_path: Some(new_path.clone()),
+                    timestamp: self.now_ms(),
+                });
+
                 // Mark both paths as synced BEFORE renaming (for echo detection)
                 // Some file watchers emit delete for old_path + create for new_path
                 self.mark_synced(&old_path);
@@ -196,6 +252,12 @@ impl<F: FileSystem> Vault<F> {
         let bytes = bincode::serialize(&msg)
             .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
 
+        self.emit(SyncEvent::MessageSent {
+            message_type: "DocumentUpdate".into(),
+            size: bytes.len(),
+            timestamp: self.now_ms(),
+        });
+
         Ok(Some(bytes))
     }
 
@@ -205,8 +267,17 @@ impl<F: FileSystem> Vault<F> {
             path: path.to_string(),
         };
 
-        bincode::serialize(&msg)
-            .map_err(|e| SyncEngineError::Serialization(e.to_string()))
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
+
+        self.emit(SyncEvent::FileOp {
+            operation: "delete".into(),
+            path: path.to_string(),
+            new_path: None,
+            timestamp: self.now_ms(),
+        });
+
+        Ok(bytes)
     }
 
     /// Prepare a file renamed message to broadcast.
@@ -216,8 +287,17 @@ impl<F: FileSystem> Vault<F> {
             new_path: new_path.to_string(),
         };
 
-        bincode::serialize(&msg)
-            .map_err(|e| SyncEngineError::Serialization(e.to_string()))
+        let bytes = bincode::serialize(&msg)
+            .map_err(|e| SyncEngineError::Serialization(e.to_string()))?;
+
+        self.emit(SyncEvent::FileOp {
+            operation: "rename".into(),
+            path: old_path.to_string(),
+            new_path: Some(new_path.to_string()),
+            timestamp: self.now_ms(),
+        });
+
+        Ok(bytes)
     }
 
     /// Get the registry version vector as bytes.

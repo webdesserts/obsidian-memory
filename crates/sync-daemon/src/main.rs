@@ -3,7 +3,7 @@
 //! Uses the same sync-core as the Obsidian plugin, but runs as a native binary
 //! with native filesystem and networking.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -257,12 +257,15 @@ async fn main() -> Result<()> {
     info!("Vault path: {:?}", args.vault);
     info!("Listen address: {}", args.listen);
 
-    // Generate peer ID if not provided
-    let peer_id = args.peer_id.unwrap_or_else(|| {
-        let id = uuid::Uuid::new_v4().to_string();
-        info!("Generated peer ID: {}", id);
-        id
-    });
+    // Generate or parse peer ID
+    let peer_id: sync_core::PeerId = match args.peer_id {
+        Some(id_str) => id_str.parse().context("Invalid peer ID")?,
+        None => {
+            let id = sync_core::PeerId::generate();
+            info!("Generated peer ID: {}", id);
+            id
+        }
+    };
 
     // Create filesystem
     let fs = NativeFs::new(args.vault.clone());
@@ -270,16 +273,16 @@ async fn main() -> Result<()> {
     // Initialize or load vault
     let vault = if fs.exists(".sync").await? {
         info!("Loading existing vault");
-        Vault::load(fs, peer_id.clone()).await?
+        Vault::load(fs, peer_id).await?
     } else {
         info!("Initializing new vault");
-        Vault::init(fs, peer_id.clone()).await?
+        Vault::init(fs, peer_id).await?
     };
 
     info!("Vault loaded, peer ID: {}", vault.peer_id());
 
-    // Create WebSocket server
-    let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id);
+    // Create WebSocket server (takes string peer_id for protocol messages)
+    let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id.to_string());
     let listener = WebSocketServer::bind(&args.listen).await?;
 
     // Create file watcher
