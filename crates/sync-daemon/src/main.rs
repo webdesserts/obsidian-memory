@@ -69,7 +69,7 @@ impl Daemon {
     async fn on_file_deleted(&mut self, path: &str) {
         info!("File deleted: {}", path);
 
-        let mut vault = self.vault.lock().await;
+        let vault = self.vault.lock().await;
 
         // Check if this deletion was from sync (consume flag)
         if vault.consume_sync_flag(path) {
@@ -107,7 +107,7 @@ impl Daemon {
             return;
         }
 
-        let mut vault = self.vault.lock().await;
+        let vault = self.vault.lock().await;
 
         // Check if this modification was from sync (consume flag)
         if vault.consume_sync_flag(path) {
@@ -149,7 +149,7 @@ impl Daemon {
         // Check if this is a FileDeleted or FileRenamed message that should be relayed directly
         let should_relay_raw = self.is_file_lifecycle_message(&msg.data);
 
-        let mut vault = self.vault.lock().await;
+        let vault = self.vault.lock().await;
 
         match vault.process_sync_message(&msg.data).await {
             Ok((response, modified_paths)) => {
@@ -221,7 +221,7 @@ impl Daemon {
     async fn on_peer_connected(&mut self, peer_id: String) {
         info!("Peer connected: {}", peer_id);
 
-        let mut vault = self.vault.lock().await;
+        let vault = self.vault.lock().await;
 
         // Prepare and send sync request (bidirectional init)
         match vault.prepare_sync_request().await {
