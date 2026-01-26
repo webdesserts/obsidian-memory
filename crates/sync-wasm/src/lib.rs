@@ -40,6 +40,7 @@ pub use fs_bridge::JsFileSystemBridge;
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use super::*;
+    use serde::Serialize;
     use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
 
@@ -390,7 +391,9 @@ mod wasm_impl {
         #[wasm_bindgen(js_name = getRegistryVersion)]
         pub fn get_registry_version(&self) -> Result<JsValue, JsError> {
             let version = self.inner.get_registry_version();
-            serde_wasm_bindgen::to_value(&version)
+            // Use serialize_maps_as_objects to return a plain JS object instead of Map
+            let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            version.serialize(&serializer)
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
