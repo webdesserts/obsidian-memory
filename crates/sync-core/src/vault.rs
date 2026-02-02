@@ -1468,6 +1468,54 @@ impl<F: FileSystem> Vault<F> {
         }
     }
 
+    /// Called when WebSocket opens (before handshake).
+    /// Creates peer in Connecting state, indexed by connection ID.
+    pub fn peer_connecting(
+        &self,
+        connection_id: String,
+        address: String,
+        direction: ConnectionDirection,
+    ) -> ConnectedPeer {
+        let timestamp = self.now_ms();
+        self.peers
+            .peer_connecting(connection_id, address, direction, timestamp)
+    }
+
+    /// Called when handshake completes. Maps connection_id to real peer_id.
+    /// Returns error if connection_id unknown.
+    pub fn peer_handshake_complete(
+        &self,
+        connection_id: &str,
+        peer_id: String,
+    ) -> std::result::Result<ConnectedPeer, PeerError> {
+        let timestamp = self.now_ms();
+        let peer = self
+            .peers
+            .peer_handshake_complete(connection_id, peer_id.clone(), timestamp)?;
+
+        self.emit(SyncEvent::PeerConnected {
+            peer_id: peer.id.clone(),
+            address: peer.address.clone(),
+            direction: match peer.direction {
+                ConnectionDirection::Incoming => "incoming".into(),
+                ConnectionDirection::Outgoing => "outgoing".into(),
+            },
+            timestamp,
+        });
+
+        Ok(peer)
+    }
+
+    /// Get peer by connection ID (for pre-handshake lookups).
+    pub fn get_peer_by_connection_id(&self, connection_id: &str) -> Option<ConnectedPeer> {
+        self.peers.get_peer_by_connection_id(connection_id)
+    }
+
+    /// Resolve connection ID to peer ID (returns connection_id if no mapping).
+    pub fn resolve_peer_id(&self, connection_id: &str) -> String {
+        self.peers.resolve_peer_id(connection_id)
+    }
+
     /// Get all peers seen this session (connected and disconnected).
     pub fn get_known_peers(&self) -> Vec<ConnectedPeer> {
         self.peers.get_known_peers()

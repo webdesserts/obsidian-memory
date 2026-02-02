@@ -478,6 +478,57 @@ mod wasm_impl {
             Ok(())
         }
 
+        /// Called when WebSocket opens (before handshake).
+        /// Creates peer in Connecting state, indexed by connection ID.
+        #[wasm_bindgen(js_name = peerConnecting)]
+        pub fn peer_connecting(
+            &self,
+            connection_id: String,
+            address: String,
+            direction: String,
+        ) -> Result<JsValue, JsError> {
+            let dir = match direction.as_str() {
+                "incoming" => sync_core::peers::ConnectionDirection::Incoming,
+                "outgoing" => sync_core::peers::ConnectionDirection::Outgoing,
+                _ => return Err(JsError::new("direction must be 'incoming' or 'outgoing'")),
+            };
+
+            let peer = self.inner.peer_connecting(connection_id, address, dir);
+            serde_wasm_bindgen::to_value(&peer)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Called when handshake completes. Maps connection_id to real peer_id.
+        /// Returns error if connection_id unknown.
+        #[wasm_bindgen(js_name = peerHandshakeComplete)]
+        pub fn peer_handshake_complete(
+            &self,
+            connection_id: String,
+            peer_id: String,
+        ) -> Result<JsValue, JsError> {
+            let peer = self.inner.peer_handshake_complete(&connection_id, peer_id)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            serde_wasm_bindgen::to_value(&peer)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Get peer by connection ID (for pre-handshake lookups).
+        /// Returns null if not found.
+        #[wasm_bindgen(js_name = getPeerByConnectionId)]
+        pub fn get_peer_by_connection_id(&self, connection_id: String) -> Result<JsValue, JsError> {
+            match self.inner.get_peer_by_connection_id(&connection_id) {
+                Some(peer) => serde_wasm_bindgen::to_value(&peer)
+                    .map_err(|e| JsError::new(&e.to_string())),
+                None => Ok(JsValue::NULL),
+            }
+        }
+
+        /// Resolve connection ID to peer ID (returns connection_id if no mapping).
+        #[wasm_bindgen(js_name = resolvePeerId)]
+        pub fn resolve_peer_id(&self, connection_id: String) -> String {
+            self.inner.resolve_peer_id(&connection_id)
+        }
+
         /// Get all peers seen this session (connected and disconnected).
         #[wasm_bindgen(js_name = getKnownPeers)]
         pub fn get_known_peers(&self) -> Result<JsValue, JsError> {
