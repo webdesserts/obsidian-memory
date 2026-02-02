@@ -260,12 +260,7 @@ async fn test_message_broadcast() {
 }
 
 /// Test file watcher detects changes.
-///
-/// Note: FSEvents on macOS has known issues with temp directories in /var/folders/.
-/// This test is ignored by default. Run manually against a real directory to verify:
-/// `cargo test -p sync-daemon test_file_watcher -- --ignored`
 #[tokio::test]
-#[ignore = "FSEvents unreliable with temp directories on macOS"]
 async fn test_file_watcher_detects_changes() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let vault_path = temp_dir.path().to_path_buf();
@@ -295,10 +290,7 @@ async fn test_file_watcher_detects_changes() {
 }
 
 /// Test that file watcher ignores .sync directory.
-///
-/// Note: FSEvents on macOS has known issues with temp directories.
 #[tokio::test]
-#[ignore = "FSEvents unreliable with temp directories on macOS"]
 async fn test_file_watcher_ignores_sync_directory() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let vault_path = temp_dir.path().to_path_buf();
@@ -336,10 +328,7 @@ async fn test_file_watcher_ignores_sync_directory() {
 }
 
 /// Test that file watcher only processes .md files.
-///
-/// Note: FSEvents on macOS has known issues with temp directories.
 #[tokio::test]
-#[ignore = "FSEvents unreliable with temp directories on macOS"]
 async fn test_file_watcher_only_md_files() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let vault_path = temp_dir.path().to_path_buf();

@@ -48,6 +48,10 @@ impl FileWatcher {
     ///
     /// Uses 200ms debounce period to avoid rapid-fire events during saves.
     pub fn new(vault_path: PathBuf) -> Result<Self> {
+        // Canonicalize the path to resolve symlinks. On macOS, /var/folders/...
+        // is actually /private/var/folders/..., and FSEvents needs the real path.
+        let vault_path = vault_path.canonicalize().unwrap_or(vault_path);
+
         // Create tokio channel for async event delivery
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let vault_path_clone = vault_path.clone();
