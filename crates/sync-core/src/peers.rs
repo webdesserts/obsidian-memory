@@ -160,11 +160,23 @@ mod platform {
         }
 
         /// Mark peer as disconnected (keeps in registry, sets state to Disconnected).
-        pub fn peer_disconnected(&self, id: &str, timestamp: f64) -> bool {
+        ///
+        /// Can disconnect by either peer ID or connection ID (for pre-handshake disconnects).
+        pub fn peer_disconnected(
+            &self,
+            id: &str,
+            reason: DisconnectReason,
+            timestamp: f64,
+        ) -> bool {
             let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            let connections = self.connections.read().unwrap_or_else(|e| e.into_inner());
 
-            if let Some(peer) = peers.get_mut(id) {
+            // Try to resolve connection ID to peer ID
+            let peer_id = connections.get(id).map(|s| s.as_str()).unwrap_or(id);
+
+            if let Some(peer) = peers.get_mut(peer_id) {
                 peer.state = ConnectionState::Disconnected;
+                peer.disconnect_reason = Some(reason);
                 peer.last_seen = timestamp;
                 true
             } else {
@@ -388,11 +400,23 @@ mod platform {
         }
 
         /// Mark peer as disconnected (keeps in registry, sets state to Disconnected).
-        pub fn peer_disconnected(&self, id: &str, timestamp: f64) -> bool {
+        ///
+        /// Can disconnect by either peer ID or connection ID (for pre-handshake disconnects).
+        pub fn peer_disconnected(
+            &self,
+            id: &str,
+            reason: DisconnectReason,
+            timestamp: f64,
+        ) -> bool {
             let mut peers = self.peers.borrow_mut();
+            let connections = self.connections.borrow();
 
-            if let Some(peer) = peers.get_mut(id) {
+            // Try to resolve connection ID to peer ID
+            let peer_id = connections.get(id).map(|s| s.as_str()).unwrap_or(id);
+
+            if let Some(peer) = peers.get_mut(peer_id) {
                 peer.state = ConnectionState::Disconnected;
+                peer.disconnect_reason = Some(reason);
                 peer.last_seen = timestamp;
                 true
             } else {
@@ -554,11 +578,12 @@ mod tests {
             )
             .unwrap();
 
-        let result = registry.peer_disconnected("peer1", 2000.0);
+        let result = registry.peer_disconnected("peer1", DisconnectReason::NetworkError, 2000.0);
         assert!(result);
 
         let peer = registry.get_peer("peer1").unwrap();
         assert_eq!(peer.state, ConnectionState::Disconnected);
+        assert_eq!(peer.disconnect_reason, Some(DisconnectReason::NetworkError));
         assert_eq!(peer.last_seen, 2000.0);
         assert_eq!(peer.first_seen, 1000.0); // Preserved
         assert_eq!(peer.connection_count, 1); // Unchanged
@@ -579,7 +604,7 @@ mod tests {
             .unwrap();
 
         // Disconnect
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
 
         // Reconnect with different address
         let peer = registry
@@ -634,7 +659,7 @@ mod tests {
     #[test]
     fn test_disconnect_unknown_peer_returns_false() {
         let registry = PeerRegistry::new();
-        let result = registry.peer_disconnected("unknown", 1000.0);
+        let result = registry.peer_disconnected("unknown", DisconnectReason::NetworkError, 1000.0);
         assert!(!result);
 
         // Should not create an entry
@@ -657,7 +682,7 @@ mod tests {
         assert!(registry.is_connected("peer1"));
 
         // Disconnect
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
         assert!(!registry.is_connected("peer1"));
 
         // Reconnect
@@ -687,10 +712,10 @@ mod tests {
                 1000.0,
             )
             .unwrap();
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
 
         // Disconnect again
-        let result = registry.peer_disconnected("peer1", 3000.0);
+        let result = registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 3000.0);
         assert!(result); // Returns true (peer exists)
 
         let peer = registry.get_peer("peer1").unwrap();
@@ -718,7 +743,7 @@ mod tests {
                 1000.0,
             )
             .unwrap();
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
 
         let connected = registry.get_connected_peers();
         assert_eq!(connected.len(), 1);
@@ -745,7 +770,7 @@ mod tests {
                 1000.0,
             )
             .unwrap();
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
 
         let known = registry.get_known_peers();
         assert_eq!(known.len(), 2);
@@ -824,7 +849,7 @@ mod tests {
                 1000.0,
             )
             .unwrap();
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
 
         let peer = registry
             .peer_connected(
@@ -850,7 +875,7 @@ mod tests {
                 1000.0,
             )
             .unwrap();
-        registry.peer_disconnected("peer1", 2000.0);
+        registry.peer_disconnected("peer1", DisconnectReason::UserRequested, 2000.0);
 
         let peer = registry
             .peer_connected(
@@ -965,8 +990,50 @@ mod tests {
         assert_eq!(peer.id, "real-id");
 
         // Disconnected
-        registry.peer_disconnected("real-id", 3000.0);
+        registry.peer_disconnected("real-id", DisconnectReason::NetworkError, 3000.0);
         let peer = registry.get_peer("real-id").unwrap();
         assert_eq!(peer.state, ConnectionState::Disconnected);
+        assert_eq!(peer.disconnect_reason, Some(DisconnectReason::NetworkError));
+    }
+
+    #[test]
+    fn test_disconnect_by_connection_id() {
+        let registry = PeerRegistry::new();
+
+        // Start connecting
+        registry.peer_connecting(
+            "conn-1".into(),
+            "addr".into(),
+            ConnectionDirection::Outgoing,
+            1000.0,
+        );
+
+        // Disconnect before handshake using connection ID
+        let result =
+            registry.peer_disconnected("conn-1", DisconnectReason::NetworkError, 2000.0);
+        assert!(result);
+
+        let peer = registry.get_peer("conn-1").unwrap();
+        assert_eq!(peer.state, ConnectionState::Disconnected);
+        assert_eq!(peer.disconnect_reason, Some(DisconnectReason::NetworkError));
+    }
+
+    #[test]
+    fn test_disconnect_records_reason() {
+        let registry = PeerRegistry::new();
+        registry.peer_connecting(
+            "conn-1".into(),
+            "addr".into(),
+            ConnectionDirection::Outgoing,
+            1000.0,
+        );
+        registry
+            .peer_handshake_complete("conn-1", "peer-1".into(), 2000.0)
+            .unwrap();
+
+        registry.peer_disconnected("peer-1", DisconnectReason::UserRequested, 3000.0);
+
+        let peer = registry.get_peer("peer-1").unwrap();
+        assert_eq!(peer.disconnect_reason, Some(DisconnectReason::UserRequested));
     }
 }

@@ -466,8 +466,16 @@ mod wasm_impl {
         ///
         /// Updates the registry and emits a `PeerDisconnected` event if known.
         #[wasm_bindgen(js_name = peerDisconnected)]
-        pub fn peer_disconnected(&self, peer_id: String) {
-            self.inner.peer_disconnected(&peer_id);
+        pub fn peer_disconnected(&self, peer_id: String, reason: String) -> Result<(), JsError> {
+            let reason = match reason.as_str() {
+                "userRequested" => sync_core::peers::DisconnectReason::UserRequested,
+                "networkError" => sync_core::peers::DisconnectReason::NetworkError,
+                "remoteClosed" => sync_core::peers::DisconnectReason::RemoteClosed,
+                "protocolError" => sync_core::peers::DisconnectReason::ProtocolError,
+                _ => return Err(JsError::new("reason must be 'userRequested', 'networkError', 'remoteClosed', or 'protocolError'")),
+            };
+            self.inner.peer_disconnected(&peer_id, reason);
+            Ok(())
         }
 
         /// Get all peers seen this session (connected and disconnected).

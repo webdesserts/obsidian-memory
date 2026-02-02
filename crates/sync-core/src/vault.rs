@@ -3,7 +3,7 @@
 use crate::document::NoteDocument;
 use crate::events::{EventBus, SyncEvent, Subscription};
 use crate::fs::{FileSystem, FsError};
-use crate::peers::{ConnectedPeer, ConnectionDirection, PeerError, PeerRegistry};
+use crate::peers::{ConnectedPeer, ConnectionDirection, DisconnectReason, PeerError, PeerRegistry};
 use crate::PeerId;
 
 use loro::{LoroDoc, LoroTree, TreeID, TreeParentId, VersionVector};
@@ -1458,9 +1458,9 @@ impl<F: FileSystem> Vault<F> {
     /// Notify that a peer has disconnected.
     ///
     /// Updates the registry and emits a `PeerDisconnected` event if the peer was known.
-    pub fn peer_disconnected(&self, id: &str) {
+    pub fn peer_disconnected(&self, id: &str, reason: DisconnectReason) {
         let timestamp = self.now_ms();
-        if self.peers.peer_disconnected(id, timestamp) {
+        if self.peers.peer_disconnected(id, reason, timestamp) {
             self.emit(SyncEvent::PeerDisconnected {
                 peer_id: id.to_string(),
                 timestamp,
