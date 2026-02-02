@@ -54,11 +54,14 @@ interface Connection {
   peerId?: string; // Cached after handshake for message routing
 }
 
-/** Information about a connected peer (for events) */
+/** Information about a connected peer (for events and display) */
 export interface PeerInfo {
   id: string;
   address: string;
   direction: "incoming" | "outgoing";
+  state: "connecting" | "connected" | "disconnected";
+  disconnectReason?: "userRequested" | "networkError" | "remoteClosed" | "protocolError";
+  connectionCount: number;
   connectedAt: Date;
   lastActivityAt: Date;
 }
@@ -446,6 +449,9 @@ export class PeerManager extends EventEmitter {
       id: peer.id,
       address: peer.address,
       direction: peer.direction,
+      state: peer.state,
+      disconnectReason: peer.disconnectReason,
+      connectionCount: peer.connectionCount,
       connectedAt: new Date(peer.firstSeen),
       lastActivityAt: new Date(peer.lastSeen),
     }));

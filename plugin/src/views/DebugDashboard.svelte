@@ -3,8 +3,13 @@
   import type { PeerInfo } from "../network";
   import type { SyncEvent, RegistryStats, VersionVector } from "../wasm";
   import type { EventRef } from "obsidian";
-  import { Platform } from "obsidian";
+  import { Platform, setIcon } from "obsidian";
   import { onMount, onDestroy } from "svelte";
+
+  /** Svelte action to render a Lucide icon */
+  function icon(node: HTMLElement, name: string) {
+    setIcon(node, name);
+  }
 
   export let plugin: P2PSyncPlugin;
 
@@ -234,7 +239,7 @@
           </div>
           {#each sortedVersionEntries(versionVector) as [pId, counter]}
             <div class="debug-version-row">
-              <code class="debug-peer-id" title={pId}>{truncatePeerId(pId)}</code>
+              <code class="debug-peer-id">{pId}</code>
               <span class="debug-counter">{counter}</span>
             </div>
           {/each}
@@ -252,12 +257,16 @@
           {#each connectedPeers as peer}
             <div class="debug-peer-item">
               <div class="debug-peer-main">
-                <span class="debug-direction-badge" class:incoming={peer.direction === "incoming"}>
-                  {peer.direction}
-                </span>
-                <code class="debug-peer-id" title={peer.id}>{truncatePeerId(peer.id)}</code>
+                <span class="debug-state-dot" class:connected={peer.state === "connected"} class:connecting={peer.state === "connecting"} class:failed={peer.state === "disconnected" && (peer.disconnectReason === "networkError" || peer.disconnectReason === "protocolError")} title={peer.state}></span>
+                <code class="debug-peer-id">{peer.id}</code>
+                {#if peer.connectionCount > 1}
+                  <span class="debug-reconnect-count">reconnects: {peer.connectionCount - 1}</span>
+                {/if}
               </div>
-              <div class="debug-peer-address">{peer.address}</div>
+              <div class="debug-peer-address">
+                <span class="debug-direction-icon" use:icon={peer.direction === "outgoing" ? "arrow-right-from-line" : "arrow-left-to-line"}></span>
+                {peer.address}
+              </div>
             </div>
           {/each}
         </div>
@@ -484,21 +493,47 @@
     margin-bottom: 4px;
   }
 
-  .debug-direction-badge {
-    font-size: 10px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: var(--text-success);
-    color: var(--text-on-accent);
-    text-transform: uppercase;
-    font-weight: 600;
+  .debug-direction-icon {
+    display: flex;
+    align-items: center;
+    color: var(--text-muted);
   }
 
-  .debug-direction-badge.incoming {
-    background: var(--text-accent);
+  .debug-direction-icon :global(svg) {
+    width: 12px;
+    height: 12px;
+  }
+
+  .debug-state-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .debug-state-dot.connected {
+    background: var(--text-success);
+  }
+
+  .debug-state-dot.connecting {
+    background: var(--text-warning);
+  }
+
+  .debug-state-dot.failed {
+    background: var(--text-error);
+  }
+
+  .debug-reconnect-count {
+    margin-left: auto;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
   }
 
   .debug-peer-address {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     font-family: var(--font-monospace);
     font-size: var(--font-ui-smaller);
     color: var(--text-muted);
