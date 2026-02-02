@@ -181,11 +181,29 @@ export class PeerManager extends EventEmitter {
         connectedAt: now,
         lastActivityAt: now,
       };
+
+      // Clear stale ID mappings from previous connection (if reconnecting)
+      const oldRealId = this.tempToRealId.get(peerId);
+      if (oldRealId) {
+        this.tempToRealId.delete(peerId);
+        this.realToTempId.delete(oldRealId);
+      }
+
       this.peers.set(peerId, peerInfo);
+
+      // Re-add client to outgoingConnections - critical for reconnection.
+      // Without this, sendHandshake() cannot find the client after reconnect.
+      this.outgoingConnections.set(peerId, client);
+
       this.emit("peer-connected", peerInfo);
 
-      // Send our peer ID as handshake
-      this.sendHandshake(peerId, "client");
+      // Send handshake with error handling to prevent silent failures
+      try {
+        this.sendHandshake(peerId, "client");
+      } catch (err) {
+        log.error(`Failed to send handshake to ${peerId}:`, err);
+        this.emit("error", err);
+      }
     });
 
     client.on("message", (data) => {
@@ -263,11 +281,29 @@ export class PeerManager extends EventEmitter {
         connectedAt: now,
         lastActivityAt: now,
       };
+
+      // Clear stale ID mappings from previous connection (if reconnecting)
+      const oldRealId = this.tempToRealId.get(peerId);
+      if (oldRealId) {
+        this.tempToRealId.delete(peerId);
+        this.realToTempId.delete(oldRealId);
+      }
+
       this.peers.set(peerId, peerInfo);
+
+      // Re-add client to outgoingConnections - critical for reconnection.
+      // Without this, sendHandshake() cannot find the client after reconnect.
+      this.outgoingConnections.set(peerId, client);
+
       this.emit("peer-connected", peerInfo);
 
-      // Send our peer ID as handshake
-      this.sendHandshake(peerId, "client");
+      // Send handshake with error handling to prevent silent failures
+      try {
+        this.sendHandshake(peerId, "client");
+      } catch (err) {
+        log.error(`Failed to send handshake to ${peerId}:`, err);
+        this.emit("error", err);
+      }
     });
 
     client.on("message", (data) => {

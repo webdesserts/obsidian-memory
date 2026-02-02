@@ -44,9 +44,10 @@ export class MockWebSocket {
   }
 
   simulateMessage(data: Uint8Array): void {
-    this.onmessage?.({
-      data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
-    });
+    // Create a proper ArrayBuffer copy to avoid SharedArrayBuffer type issues
+    const buffer = new ArrayBuffer(data.byteLength);
+    new Uint8Array(buffer).set(data);
+    this.onmessage?.({ data: buffer });
   }
 
   simulateClose(code = 1000, reason = ""): void {
