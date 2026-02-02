@@ -89,12 +89,15 @@ mod platform {
     /// Wrap in `Arc` for shared ownership.
     pub struct PeerRegistry {
         peers: RwLock<HashMap<String, ConnectedPeer>>,
+        /// Maps connection IDs to peer IDs (for pre-handshake → post-handshake resolution)
+        connections: RwLock<HashMap<String, String>>,
     }
 
     impl Default for PeerRegistry {
         fn default() -> Self {
             Self {
                 peers: RwLock::new(HashMap::new()),
+                connections: RwLock::new(HashMap::new()),
             }
         }
     }
@@ -216,6 +219,86 @@ mod platform {
                 .map(|p| p.state == ConnectionState::Connected)
                 .unwrap_or(false)
         }
+
+        /// Called when WebSocket opens (before handshake).
+        /// Creates peer in Connecting state, indexed by connection ID.
+        pub fn peer_connecting(
+            &self,
+            connection_id: String,
+            address: String,
+            direction: ConnectionDirection,
+            timestamp: f64,
+        ) -> ConnectedPeer {
+            let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            let mut connections = self.connections.write().unwrap_or_else(|e| e.into_inner());
+
+            // Map connection_id to itself initially (before handshake)
+            connections.insert(connection_id.clone(), connection_id.clone());
+
+            let peer = ConnectedPeer {
+                id: connection_id.clone(),
+                address,
+                direction,
+                state: ConnectionState::Connecting,
+                disconnect_reason: None,
+                first_seen: timestamp,
+                last_seen: timestamp,
+                connection_count: 1,
+            };
+            peers.insert(connection_id, peer.clone());
+            peer
+        }
+
+        /// Called when handshake completes. Maps connection_id to real peer_id.
+        /// Returns error if connection_id unknown.
+        pub fn peer_handshake_complete(
+            &self,
+            connection_id: &str,
+            peer_id: String,
+            timestamp: f64,
+        ) -> Result<ConnectedPeer, super::PeerError> {
+            let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            let mut connections = self.connections.write().unwrap_or_else(|e| e.into_inner());
+
+            // Get the existing connecting peer
+            let mut peer = peers
+                .remove(connection_id)
+                .ok_or_else(|| super::PeerError::UnknownConnection(connection_id.to_string()))?;
+
+            // Update to connected state with real peer ID
+            peer.id = peer_id.clone();
+            peer.state = ConnectionState::Connected;
+            peer.last_seen = timestamp;
+
+            // Update connection mapping
+            connections.insert(connection_id.to_string(), peer_id.clone());
+
+            // Re-insert under real peer ID
+            peers.insert(peer_id, peer.clone());
+
+            Ok(peer)
+        }
+
+        /// Get peer by connection ID (for pre-handshake lookups).
+        pub fn get_peer_by_connection_id(&self, connection_id: &str) -> Option<ConnectedPeer> {
+            let connections = self.connections.read().unwrap_or_else(|e| e.into_inner());
+            let peer_id = connections.get(connection_id)?;
+            self.peers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(peer_id)
+                .cloned()
+        }
+
+        /// Resolve connection ID to peer ID (returns connection_id if no mapping).
+        pub fn resolve_peer_id(&self, connection_id: &str) -> String {
+            self.connections
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(connection_id)
+                .cloned()
+                .unwrap_or_else(|| connection_id.to_string())
+        }
     }
 }
 
@@ -234,12 +317,15 @@ mod platform {
     /// Wrap in `Rc` for shared ownership.
     pub struct PeerRegistry {
         peers: RefCell<HashMap<String, ConnectedPeer>>,
+        /// Maps connection IDs to peer IDs (for pre-handshake → post-handshake resolution)
+        connections: RefCell<HashMap<String, String>>,
     }
 
     impl Default for PeerRegistry {
         fn default() -> Self {
             Self {
                 peers: RefCell::new(HashMap::new()),
+                connections: RefCell::new(HashMap::new()),
             }
         }
     }
@@ -349,6 +435,81 @@ mod platform {
                 .get(id)
                 .map(|p| p.state == ConnectionState::Connected)
                 .unwrap_or(false)
+        }
+
+        /// Called when WebSocket opens (before handshake).
+        /// Creates peer in Connecting state, indexed by connection ID.
+        pub fn peer_connecting(
+            &self,
+            connection_id: String,
+            address: String,
+            direction: ConnectionDirection,
+            timestamp: f64,
+        ) -> ConnectedPeer {
+            let mut peers = self.peers.borrow_mut();
+            let mut connections = self.connections.borrow_mut();
+
+            // Map connection_id to itself initially (before handshake)
+            connections.insert(connection_id.clone(), connection_id.clone());
+
+            let peer = ConnectedPeer {
+                id: connection_id.clone(),
+                address,
+                direction,
+                state: ConnectionState::Connecting,
+                disconnect_reason: None,
+                first_seen: timestamp,
+                last_seen: timestamp,
+                connection_count: 1,
+            };
+            peers.insert(connection_id, peer.clone());
+            peer
+        }
+
+        /// Called when handshake completes. Maps connection_id to real peer_id.
+        /// Returns error if connection_id unknown.
+        pub fn peer_handshake_complete(
+            &self,
+            connection_id: &str,
+            peer_id: String,
+            timestamp: f64,
+        ) -> Result<ConnectedPeer, super::PeerError> {
+            let mut peers = self.peers.borrow_mut();
+            let mut connections = self.connections.borrow_mut();
+
+            // Get the existing connecting peer
+            let mut peer = peers
+                .remove(connection_id)
+                .ok_or_else(|| super::PeerError::UnknownConnection(connection_id.to_string()))?;
+
+            // Update to connected state with real peer ID
+            peer.id = peer_id.clone();
+            peer.state = ConnectionState::Connected;
+            peer.last_seen = timestamp;
+
+            // Update connection mapping
+            connections.insert(connection_id.to_string(), peer_id.clone());
+
+            // Re-insert under real peer ID
+            peers.insert(peer_id, peer.clone());
+
+            Ok(peer)
+        }
+
+        /// Get peer by connection ID (for pre-handshake lookups).
+        pub fn get_peer_by_connection_id(&self, connection_id: &str) -> Option<ConnectedPeer> {
+            let connections = self.connections.borrow();
+            let peer_id = connections.get(connection_id)?;
+            self.peers.borrow().get(peer_id).cloned()
+        }
+
+        /// Resolve connection ID to peer ID (returns connection_id if no mapping).
+        pub fn resolve_peer_id(&self, connection_id: &str) -> String {
+            self.connections
+                .borrow()
+                .get(connection_id)
+                .cloned()
+                .unwrap_or_else(|| connection_id.to_string())
         }
     }
 }
@@ -701,5 +862,111 @@ mod tests {
             .unwrap();
 
         assert_eq!(peer.direction, ConnectionDirection::Outgoing);
+    }
+
+    // ========== Connection ID mapping tests ==========
+
+    #[test]
+    fn test_peer_connecting_creates_connecting_state() {
+        let registry = PeerRegistry::new();
+        let peer = registry.peer_connecting(
+            "conn-1".into(),
+            "192.168.1.1:8765".into(),
+            ConnectionDirection::Outgoing,
+            1000.0,
+        );
+
+        assert_eq!(peer.id, "conn-1");
+        assert_eq!(peer.state, ConnectionState::Connecting);
+        assert_eq!(peer.disconnect_reason, None);
+        assert_eq!(peer.connection_count, 1);
+    }
+
+    #[test]
+    fn test_peer_handshake_complete_transitions_to_connected() {
+        let registry = PeerRegistry::new();
+
+        // Start connecting
+        registry.peer_connecting(
+            "conn-1".into(),
+            "192.168.1.1:8765".into(),
+            ConnectionDirection::Outgoing,
+            1000.0,
+        );
+
+        // Complete handshake
+        let peer = registry
+            .peer_handshake_complete("conn-1", "real-peer-id".into(), 2000.0)
+            .unwrap();
+
+        assert_eq!(peer.id, "real-peer-id");
+        assert_eq!(peer.state, ConnectionState::Connected);
+        assert_eq!(peer.last_seen, 2000.0);
+    }
+
+    #[test]
+    fn test_connection_id_to_peer_id_mapping() {
+        let registry = PeerRegistry::new();
+
+        // Before handshake, peer indexed by connection ID
+        registry.peer_connecting(
+            "conn-1".into(),
+            "addr".into(),
+            ConnectionDirection::Outgoing,
+            1000.0,
+        );
+        assert!(registry.get_peer_by_connection_id("conn-1").is_some());
+        assert!(registry.get_peer("conn-1").is_some()); // Accessible by connection ID
+        assert!(registry.get_peer("peer-abc").is_none()); // Not by real ID yet
+
+        // After handshake, accessible by both
+        registry
+            .peer_handshake_complete("conn-1", "peer-abc".into(), 2000.0)
+            .unwrap();
+        assert!(registry.get_peer("peer-abc").is_some());
+        assert!(registry.get_peer_by_connection_id("conn-1").is_some());
+        assert_eq!(registry.resolve_peer_id("conn-1"), "peer-abc");
+    }
+
+    #[test]
+    fn test_handshake_unknown_connection_fails() {
+        let registry = PeerRegistry::new();
+        let result = registry.peer_handshake_complete("unknown", "peer-1".into(), 1000.0);
+        assert!(matches!(
+            result.unwrap_err(),
+            PeerError::UnknownConnection(_)
+        ));
+    }
+
+    #[test]
+    fn test_resolve_peer_id_returns_input_if_unknown() {
+        let registry = PeerRegistry::new();
+        assert_eq!(registry.resolve_peer_id("unknown-conn"), "unknown-conn");
+    }
+
+    #[test]
+    fn test_connection_state_transitions() {
+        let registry = PeerRegistry::new();
+
+        // Connecting state
+        let peer = registry.peer_connecting(
+            "temp-1".into(),
+            "addr".into(),
+            ConnectionDirection::Outgoing,
+            1000.0,
+        );
+        assert_eq!(peer.state, ConnectionState::Connecting);
+
+        // Connected after handshake
+        let peer = registry
+            .peer_handshake_complete("temp-1", "real-id".into(), 2000.0)
+            .unwrap();
+        assert_eq!(peer.state, ConnectionState::Connected);
+        assert_eq!(peer.id, "real-id");
+
+        // Disconnected
+        registry.peer_disconnected("real-id", 3000.0);
+        let peer = registry.get_peer("real-id").unwrap();
+        assert_eq!(peer.state, ConnectionState::Disconnected);
     }
 }
