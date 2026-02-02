@@ -490,6 +490,11 @@ export class PeerManager extends EventEmitter {
 
   /**
    * Send a handshake message with our peer ID.
+   *
+   * Wire format matches `sync_core::handshake::HandshakeMessage` in Rust:
+   * ```json
+   * { "type": "handshake", "peerId": "abc-123", "role": "client" }
+   * ```
    */
   private sendHandshake(peerId: string, role: "server" | "client"): void {
     const handshake = JSON.stringify({
