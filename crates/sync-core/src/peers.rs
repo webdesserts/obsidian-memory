@@ -14,6 +14,34 @@ use thiserror::Error;
 pub enum PeerError {
     #[error("Peer ID cannot be empty")]
     EmptyId,
+    #[error("Unknown connection ID: {0}")]
+    UnknownConnection(String),
+}
+
+/// Connection state for a peer.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionState {
+    /// WebSocket open, awaiting handshake
+    Connecting,
+    /// Handshake complete, fully connected
+    Connected,
+    /// Connection closed
+    Disconnected,
+}
+
+/// Reason for disconnection.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DisconnectReason {
+    /// disconnect() called by user
+    UserRequested,
+    /// WebSocket error
+    NetworkError,
+    /// Remote peer closed the connection
+    RemoteClosed,
+    /// Invalid handshake or protocol violation
+    ProtocolError,
 }
 
 /// Connection direction from our perspective.
@@ -34,8 +62,10 @@ pub struct ConnectedPeer {
     pub address: String,
     /// Connection direction
     pub direction: ConnectionDirection,
-    /// Currently connected?
-    pub connected: bool,
+    /// Connection state
+    pub state: ConnectionState,
+    /// Reason for disconnection (if disconnected)
+    pub disconnect_reason: Option<DisconnectReason>,
     /// When first seen this session (ms since epoch)
     pub first_seen: f64,
     /// When last activity observed (ms since epoch)
@@ -92,14 +122,15 @@ mod platform {
 
             let peer = if let Some(peer) = peers.get_mut(&id) {
                 // Existing peer
-                if peer.connected {
+                if peer.state == ConnectionState::Connected {
                     // Duplicate connect - idempotent, just update activity
                     peer.last_seen = timestamp;
                     peer.address = address;
                     peer.direction = direction;
                 } else {
                     // Reconnection
-                    peer.connected = true;
+                    peer.state = ConnectionState::Connected;
+                    peer.disconnect_reason = None;
                     peer.connection_count += 1;
                     peer.last_seen = timestamp;
                     peer.address = address;
@@ -112,7 +143,8 @@ mod platform {
                     id: id.clone(),
                     address,
                     direction,
-                    connected: true,
+                    state: ConnectionState::Connected,
+                    disconnect_reason: None,
                     first_seen: timestamp,
                     last_seen: timestamp,
                     connection_count: 1,
@@ -124,12 +156,12 @@ mod platform {
             Ok(peer)
         }
 
-        /// Mark peer as disconnected (keeps in registry, sets connected=false).
+        /// Mark peer as disconnected (keeps in registry, sets state to Disconnected).
         pub fn peer_disconnected(&self, id: &str, timestamp: f64) -> bool {
             let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
 
             if let Some(peer) = peers.get_mut(id) {
-                peer.connected = false;
+                peer.state = ConnectionState::Disconnected;
                 peer.last_seen = timestamp;
                 true
             } else {
@@ -170,7 +202,7 @@ mod platform {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
-                .filter(|p| p.connected)
+                .filter(|p| p.state == ConnectionState::Connected)
                 .cloned()
                 .collect()
         }
@@ -181,7 +213,7 @@ mod platform {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(id)
-                .map(|p| p.connected)
+                .map(|p| p.state == ConnectionState::Connected)
                 .unwrap_or(false)
         }
     }
@@ -235,14 +267,15 @@ mod platform {
 
             let peer = if let Some(peer) = peers.get_mut(&id) {
                 // Existing peer
-                if peer.connected {
+                if peer.state == ConnectionState::Connected {
                     // Duplicate connect - idempotent, just update activity
                     peer.last_seen = timestamp;
                     peer.address = address;
                     peer.direction = direction;
                 } else {
                     // Reconnection
-                    peer.connected = true;
+                    peer.state = ConnectionState::Connected;
+                    peer.disconnect_reason = None;
                     peer.connection_count += 1;
                     peer.last_seen = timestamp;
                     peer.address = address;
@@ -255,7 +288,8 @@ mod platform {
                     id: id.clone(),
                     address,
                     direction,
-                    connected: true,
+                    state: ConnectionState::Connected,
+                    disconnect_reason: None,
                     first_seen: timestamp,
                     last_seen: timestamp,
                     connection_count: 1,
@@ -267,12 +301,12 @@ mod platform {
             Ok(peer)
         }
 
-        /// Mark peer as disconnected (keeps in registry, sets connected=false).
+        /// Mark peer as disconnected (keeps in registry, sets state to Disconnected).
         pub fn peer_disconnected(&self, id: &str, timestamp: f64) -> bool {
             let mut peers = self.peers.borrow_mut();
 
             if let Some(peer) = peers.get_mut(id) {
-                peer.connected = false;
+                peer.state = ConnectionState::Disconnected;
                 peer.last_seen = timestamp;
                 true
             } else {
@@ -303,7 +337,7 @@ mod platform {
             self.peers
                 .borrow()
                 .values()
-                .filter(|p| p.connected)
+                .filter(|p| p.state == ConnectionState::Connected)
                 .cloned()
                 .collect()
         }
@@ -313,7 +347,7 @@ mod platform {
             self.peers
                 .borrow()
                 .get(id)
-                .map(|p| p.connected)
+                .map(|p| p.state == ConnectionState::Connected)
                 .unwrap_or(false)
         }
     }
@@ -340,14 +374,15 @@ mod tests {
         assert_eq!(peer.id, "peer1");
         assert_eq!(peer.address, "192.168.1.1:8080");
         assert_eq!(peer.direction, ConnectionDirection::Incoming);
-        assert!(peer.connected);
+        assert_eq!(peer.state, ConnectionState::Connected);
+        assert_eq!(peer.disconnect_reason, None);
         assert_eq!(peer.first_seen, 1000.0);
         assert_eq!(peer.last_seen, 1000.0);
         assert_eq!(peer.connection_count, 1);
     }
 
     #[test]
-    fn test_disconnect_sets_connected_false() {
+    fn test_disconnect_sets_state_to_disconnected() {
         let registry = PeerRegistry::new();
         registry
             .peer_connected(
@@ -362,7 +397,7 @@ mod tests {
         assert!(result);
 
         let peer = registry.get_peer("peer1").unwrap();
-        assert!(!peer.connected);
+        assert_eq!(peer.state, ConnectionState::Disconnected);
         assert_eq!(peer.last_seen, 2000.0);
         assert_eq!(peer.first_seen, 1000.0); // Preserved
         assert_eq!(peer.connection_count, 1); // Unchanged
@@ -395,7 +430,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(peer.connected);
+        assert_eq!(peer.state, ConnectionState::Connected);
+        assert_eq!(peer.disconnect_reason, None);
         assert_eq!(peer.connection_count, 2);
         assert_eq!(peer.first_seen, 1000.0); // Preserved
         assert_eq!(peer.last_seen, 3000.0);
@@ -427,7 +463,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(peer.connected);
+        assert_eq!(peer.state, ConnectionState::Connected);
         assert_eq!(peer.connection_count, 1); // NOT incremented
         assert_eq!(peer.last_seen, 2000.0); // Updated
         assert_eq!(peer.address, "addr2"); // Updated
@@ -497,7 +533,7 @@ mod tests {
         assert!(result); // Returns true (peer exists)
 
         let peer = registry.get_peer("peer1").unwrap();
-        assert!(!peer.connected);
+        assert_eq!(peer.state, ConnectionState::Disconnected);
         assert_eq!(peer.last_seen, 3000.0); // Updated
     }
 
