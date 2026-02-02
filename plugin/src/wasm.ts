@@ -30,6 +30,12 @@ export type { WasmSubscriptionImpl as WasmSubscription };
 /** Connection direction from our perspective */
 export type ConnectionDirection = "incoming" | "outgoing";
 
+/** Connection state for a peer */
+export type ConnectionState = "connecting" | "connected" | "disconnected";
+
+/** Reason for disconnection */
+export type DisconnectReason = "userRequested" | "networkError" | "remoteClosed" | "protocolError";
+
 /** Tracked state for a peer in the registry */
 export interface ConnectedPeer {
   /** Peer's unique identifier (from handshake) */
@@ -38,8 +44,10 @@ export interface ConnectedPeer {
   address: string;
   /** Connection direction */
   direction: ConnectionDirection;
-  /** Currently connected? */
-  connected: boolean;
+  /** Connection state */
+  state: ConnectionState;
+  /** Reason for disconnection (if disconnected) */
+  disconnectReason?: DisconnectReason;
   /** When first seen this session (ms since epoch) */
   firstSeen: number;
   /** When last activity observed (ms since epoch) */

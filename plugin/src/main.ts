@@ -1,9 +1,18 @@
 import { Notice, Plugin, Platform, FileSystemAdapter, Events, TFile } from "obsidian";
 import { SyncView, VIEW_TYPE_SYNC } from "./views/SyncView";
 import { DebugModal } from "./views/DebugModal";
-import { initWasm, isWasmReady, generatePeerId, WasmVault, WasmSubscription, SyncEvent } from "./wasm";
+import {
+  initWasm,
+  isWasmReady,
+  generatePeerId,
+  WasmVault,
+  WasmSubscription,
+  SyncEvent,
+  ConnectedPeer,
+  DisconnectReason,
+} from "./wasm";
 import { createFsBridge } from "./fs/ObsidianFs";
-import { PeerManager, PeerInfo } from "./network";
+import { PeerManager, PeerInfo, VaultPeerManager } from "./network";
 import { VaultOperationQueue } from "./VaultOperationQueue";
 import { log } from "./logger";
 
@@ -311,19 +320,17 @@ export default class P2PSyncPlugin extends Plugin {
     const pluginDir = this.getPluginDir();
     this.peerManager = new PeerManager(this.peerId, pluginDir);
 
-    this.peerManager.on("peer-connected", async (peer: PeerInfo) => {
+    // Set vault adapter for Rust-driven peer state management
+    if (this.vault) {
+      this.peerManager.setVault(this.createVaultPeerManager(this.vault));
+    }
+
+    // peer-connected is now emitted after handshake (not on socket open)
+    // and provides full ConnectedPeer info from Rust
+    this.peerManager.on("peer-connected", async (peer: ConnectedPeer) => {
       log.info(`Peer connected: ${peer.id} (${peer.direction})`);
       this.updateStatusBar(`${this.peerManager?.peerCount ?? 0} peers`);
       this.events.trigger("state-changed");
-
-      // Notify WASM PeerRegistry (emits SyncEvent::PeerConnected)
-      if (this.vault) {
-        try {
-          this.vault.peerConnected(peer.id, peer.address, peer.direction);
-        } catch (e) {
-          log.warn(`Failed to register peer in WASM: ${e}`);
-        }
-      }
 
       // Send sync request to the new peer
       await this.sendSyncRequest(peer.id);
@@ -333,11 +340,7 @@ export default class P2PSyncPlugin extends Plugin {
       log.info(`Peer disconnected: ${peerId}`);
       this.updateStatusBar(`${this.peerManager?.peerCount ?? 0} peers`);
       this.events.trigger("state-changed");
-
-      // Notify WASM PeerRegistry (emits SyncEvent::PeerDisconnected)
-      if (this.vault) {
-        this.vault.peerDisconnected(peerId);
-      }
+      // Rust state is already updated by PeerManager - no need to call vault here
     });
 
     this.peerManager.on("message", async (peerId: string, data: Uint8Array) => {
@@ -365,6 +368,32 @@ export default class P2PSyncPlugin extends Plugin {
 
     // Auto-reconnect to known peers (fire-and-forget, don't block startup)
     this.reconnectToKnownPeers();
+  }
+
+  /**
+   * Create a VaultPeerManager adapter for the WASM vault.
+   */
+  private createVaultPeerManager(vault: WasmVault): VaultPeerManager {
+    return {
+      peerConnecting: (connectionId: string, address: string, direction: string): ConnectedPeer => {
+        return vault.peerConnecting(connectionId, address, direction) as ConnectedPeer;
+      },
+      peerHandshakeComplete: (connectionId: string, peerId: string): ConnectedPeer => {
+        return vault.peerHandshakeComplete(connectionId, peerId) as ConnectedPeer;
+      },
+      peerDisconnected: (id: string, reason: DisconnectReason): void => {
+        vault.peerDisconnected(id, reason);
+      },
+      resolvePeerId: (connectionId: string): string => {
+        return vault.resolvePeerId(connectionId);
+      },
+      getKnownPeers: (): ConnectedPeer[] => {
+        return vault.getKnownPeers() as ConnectedPeer[];
+      },
+      getConnectedPeers: (): ConnectedPeer[] => {
+        return vault.getConnectedPeers() as ConnectedPeer[];
+      },
+    };
   }
 
   /**

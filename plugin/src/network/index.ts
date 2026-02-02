@@ -6,4 +6,4 @@
  */
 
 export { SyncWebSocketClient } from "./WebSocketClient";
-export { PeerManager, type PeerInfo } from "./PeerManager";
+export { PeerManager, type PeerInfo, type VaultPeerManager } from "./PeerManager";

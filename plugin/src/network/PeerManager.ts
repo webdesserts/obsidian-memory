@@ -5,12 +5,18 @@
  * - Starts a WebSocket server to accept incoming connections
  * - Connects to other peers as a client
  * - Routes messages between peers and the WASM sync engine
+ *
+ * State management is delegated to Rust (PeerRegistry via WasmVault).
+ * PeerManager only holds:
+ * - WebSocket handles (can't cross WASM boundary)
+ * - Cached peer IDs for message routing (avoids WASM call per message)
  */
 
 import { EventEmitter } from "events";
 import { Platform } from "obsidian";
 import { SyncWebSocketClient } from "./WebSocketClient";
 import { log } from "../logger";
+import type { ConnectedPeer, DisconnectReason } from "../wasm";
 
 // Type for dynamically loaded WebSocket server
 interface SyncWebSocketServer extends EventEmitter {
@@ -26,7 +32,29 @@ interface SyncWebSocketServer extends EventEmitter {
 /** Default port for the WebSocket server */
 const DEFAULT_PORT = 8765;
 
-/** Information about a connected peer */
+/**
+ * Interface for vault peer management methods.
+ * PeerManager uses this to notify Rust of connection events.
+ */
+export interface VaultPeerManager {
+  peerConnecting(connectionId: string, address: string, direction: string): ConnectedPeer;
+  peerHandshakeComplete(connectionId: string, peerId: string): ConnectedPeer;
+  peerDisconnected(id: string, reason: DisconnectReason): void;
+  resolvePeerId(connectionId: string): string;
+  getKnownPeers(): ConnectedPeer[];
+  getConnectedPeers(): ConnectedPeer[];
+}
+
+/**
+ * A connection entry holding socket and cached peer ID.
+ * peerId is cached after handshake to avoid WASM calls per message.
+ */
+interface Connection {
+  socket: SyncWebSocketClient | null; // null for incoming (server manages)
+  peerId?: string; // Cached after handshake for message routing
+}
+
+/** Information about a connected peer (for events) */
 export interface PeerInfo {
   id: string;
   address: string;
@@ -37,31 +65,18 @@ export interface PeerInfo {
 
 /**
  * Events emitted by PeerManager:
- * - 'peer-connected': New peer connected (PeerInfo)
+ * - 'peer-connected': New peer connected (ConnectedPeer)
  * - 'peer-disconnected': Peer disconnected (peerId: string)
  * - 'message': Message received from peer (peerId: string, data: Uint8Array)
  * - 'error': Error occurred (Error)
  */
 export class PeerManager extends EventEmitter {
   private server: SyncWebSocketServer | null = null;
-  private outgoingConnections: Map<string, SyncWebSocketClient> = new Map();
-  private peers: Map<string, PeerInfo> = new Map();
+  private connections: Map<string, Connection> = new Map();
   private serverPort: number = DEFAULT_PORT;
   private ownPeerId: string;
   private pluginDir: string | null;
-
-  /**
-   * Maps temporary connection IDs to their real peer ID.
-   * tempId -> realPeerId (e.g., "peer-1" -> "abc-123-def")
-   */
-  private tempToRealId: Map<string, string> = new Map();
-  
-  /**
-   * Maps real peer IDs back to their temp connection ID.
-   * realPeerId -> tempId (e.g., "abc-123-def" -> "peer-1")
-   * Used for server.send() which only knows temp IDs.
-   */
-  private realToTempId: Map<string, string> = new Map();
+  private vault: VaultPeerManager | null = null;
 
   /**
    * @param peerId - Our unique peer identifier
@@ -74,8 +89,16 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Set the vault for peer state management.
+   * Must be called before connecting to peers.
+   */
+  setVault(vault: VaultPeerManager): void {
+    this.vault = vault;
+  }
+
+  /**
    * Start the peer manager (starts WebSocket server on desktop).
-   * 
+   *
    * Returns the actual port the server is listening on (may differ from
    * requested port if it was in use).
    */
@@ -94,16 +117,13 @@ export class PeerManager extends EventEmitter {
       this.server = server;
 
       server.on("connection", (conn: { id: string; remoteAddress: string }) => {
-        const now = new Date();
-        const peerInfo: PeerInfo = {
-          id: conn.id,
-          address: conn.remoteAddress,
-          direction: "incoming",
-          connectedAt: now,
-          lastActivityAt: now,
-        };
-        this.peers.set(conn.id, peerInfo);
-        this.emit("peer-connected", peerInfo);
+        // Store connection entry (server manages the socket)
+        this.connections.set(conn.id, { socket: null });
+
+        // Notify Rust of connecting state
+        if (this.vault) {
+          this.vault.peerConnecting(conn.id, conn.remoteAddress, "incoming");
+        }
 
         // Send our peer ID as handshake
         this.sendHandshake(conn.id, "server");
@@ -113,14 +133,22 @@ export class PeerManager extends EventEmitter {
         this.handleMessage(peerId, data);
       });
 
-      server.on("close", (tempPeerId: string) => {
-        // Clean up both temp and real peer IDs
-        const realPeerId = this.tempToRealId.get(tempPeerId) ?? tempPeerId;
-        this.peers.delete(tempPeerId);
-        this.peers.delete(realPeerId);
-        this.tempToRealId.delete(tempPeerId);
-        this.realToTempId.delete(realPeerId);
-        this.emit("peer-disconnected", realPeerId);
+      server.on("close", (connectionId: string) => {
+        const conn = this.connections.get(connectionId);
+        const peerId = conn?.peerId ?? connectionId;
+
+        // Clean up
+        this.connections.delete(connectionId);
+        if (conn?.peerId && conn.peerId !== connectionId) {
+          this.connections.delete(conn.peerId);
+        }
+
+        // Notify Rust
+        if (this.vault) {
+          this.vault.peerDisconnected(peerId, "remoteClosed");
+        }
+
+        this.emit("peer-disconnected", peerId);
       });
 
       server.on("error", (err) => {
@@ -139,18 +167,18 @@ export class PeerManager extends EventEmitter {
    */
   async stop(): Promise<void> {
     // Close all outgoing connections
-    for (const client of this.outgoingConnections.values()) {
-      client.disconnect();
+    for (const [, conn] of this.connections) {
+      if (conn.socket) {
+        conn.socket.disconnect();
+      }
     }
-    this.outgoingConnections.clear();
+    this.connections.clear();
 
     // Stop server
     if (this.server) {
       await this.server.stop();
       this.server = null;
     }
-
-    this.peers.clear();
   }
 
   /**
@@ -161,65 +189,55 @@ export class PeerManager extends EventEmitter {
    */
   async connectToPeer(address: string, port: number = DEFAULT_PORT): Promise<string> {
     const url = `ws://${address}:${port}`;
-    const peerId = `client-${address}:${port}`;
+    const connectionId = `client-${address}:${port}`;
 
-    if (this.outgoingConnections.has(peerId)) {
+    if (this.connections.has(connectionId)) {
       throw new Error(`Already connected to ${address}:${port}`);
     }
 
     const client = new SyncWebSocketClient();
 
-    // Add client to map BEFORE connecting so it's available when 'open' fires
-    this.outgoingConnections.set(peerId, client);
+    // Add connection entry BEFORE connecting so it's available when 'open' fires
+    this.connections.set(connectionId, { socket: client });
 
     client.on("open", () => {
-      const now = new Date();
-      const peerInfo: PeerInfo = {
-        id: peerId,
-        address: `${address}:${port}`,
-        direction: "outgoing",
-        connectedAt: now,
-        lastActivityAt: now,
-      };
+      // Re-add connection on reconnect (client persists across reconnects)
+      this.connections.set(connectionId, { socket: client });
 
-      // Clear stale ID mappings from previous connection (if reconnecting)
-      const oldRealId = this.tempToRealId.get(peerId);
-      if (oldRealId) {
-        this.tempToRealId.delete(peerId);
-        this.realToTempId.delete(oldRealId);
+      // Notify Rust of connecting state
+      if (this.vault) {
+        this.vault.peerConnecting(connectionId, `${address}:${port}`, "outgoing");
       }
-
-      this.peers.set(peerId, peerInfo);
-
-      // Re-add client to outgoingConnections - critical for reconnection.
-      // Without this, sendHandshake() cannot find the client after reconnect.
-      this.outgoingConnections.set(peerId, client);
-
-      this.emit("peer-connected", peerInfo);
 
       // Send handshake with error handling to prevent silent failures
       try {
-        this.sendHandshake(peerId, "client");
+        this.sendHandshake(connectionId, "client");
       } catch (err) {
-        log.error(`Failed to send handshake to ${peerId}:`, err);
+        log.error(`Failed to send handshake to ${connectionId}:`, err);
         this.emit("error", err);
       }
     });
 
     client.on("message", (data) => {
-      this.handleMessage(peerId, data);
+      this.handleMessage(connectionId, data);
     });
 
     client.on("close", () => {
-      // Clean up both temp and real peer IDs
-      const realPeerId = this.tempToRealId.get(peerId) ?? peerId;
-      this.outgoingConnections.delete(peerId);
-      this.outgoingConnections.delete(realPeerId);
-      this.peers.delete(peerId);
-      this.peers.delete(realPeerId);
-      this.tempToRealId.delete(peerId);
-      this.realToTempId.delete(realPeerId);
-      this.emit("peer-disconnected", realPeerId);
+      const conn = this.connections.get(connectionId);
+      const peerId = conn?.peerId ?? connectionId;
+
+      // Clean up both connection ID and real peer ID entries
+      this.connections.delete(connectionId);
+      if (conn?.peerId && conn.peerId !== connectionId) {
+        this.connections.delete(conn.peerId);
+      }
+
+      // Notify Rust
+      if (this.vault) {
+        this.vault.peerDisconnected(peerId, "networkError");
+      }
+
+      this.emit("peer-disconnected", peerId);
     });
 
     client.on("error", (err) => {
@@ -228,7 +246,7 @@ export class PeerManager extends EventEmitter {
 
     await client.connect({ url, reconnect: true, reconnectDelay: 5000 });
 
-    return peerId;
+    return connectionId;
   }
 
   /**
@@ -238,13 +256,15 @@ export class PeerManager extends EventEmitter {
   private normalizeUrl(url: string): string {
     const parsed = new URL(url);
     // Remove default ports
-    if ((parsed.protocol === 'wss:' && parsed.port === '443') ||
-        (parsed.protocol === 'ws:' && parsed.port === '80')) {
-      parsed.port = '';
+    if (
+      (parsed.protocol === "wss:" && parsed.port === "443") ||
+      (parsed.protocol === "ws:" && parsed.port === "80")
+    ) {
+      parsed.port = "";
     }
-    parsed.search = '';
-    parsed.hash = '';
-    return parsed.href.replace(/\/$/, '');
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.href.replace(/\/$/, "");
   }
 
   /**
@@ -261,65 +281,55 @@ export class PeerManager extends EventEmitter {
       throw new Error(`Invalid URL: ${url}`);
     }
 
-    const peerId = `url-${normalized}`;
+    const connectionId = `url-${normalized}`;
 
-    if (this.outgoingConnections.has(peerId)) {
+    if (this.connections.has(connectionId)) {
       throw new Error(`Already connected to ${url}`);
     }
 
     const client = new SyncWebSocketClient();
 
-    // Add client to map BEFORE connecting so it's available when 'open' fires
-    this.outgoingConnections.set(peerId, client);
+    // Add connection entry BEFORE connecting so it's available when 'open' fires
+    this.connections.set(connectionId, { socket: client });
 
     client.on("open", () => {
-      const now = new Date();
-      const peerInfo: PeerInfo = {
-        id: peerId,
-        address: normalized,
-        direction: "outgoing",
-        connectedAt: now,
-        lastActivityAt: now,
-      };
+      // Re-add connection on reconnect (client persists across reconnects)
+      this.connections.set(connectionId, { socket: client });
 
-      // Clear stale ID mappings from previous connection (if reconnecting)
-      const oldRealId = this.tempToRealId.get(peerId);
-      if (oldRealId) {
-        this.tempToRealId.delete(peerId);
-        this.realToTempId.delete(oldRealId);
+      // Notify Rust of connecting state
+      if (this.vault) {
+        this.vault.peerConnecting(connectionId, normalized, "outgoing");
       }
-
-      this.peers.set(peerId, peerInfo);
-
-      // Re-add client to outgoingConnections - critical for reconnection.
-      // Without this, sendHandshake() cannot find the client after reconnect.
-      this.outgoingConnections.set(peerId, client);
-
-      this.emit("peer-connected", peerInfo);
 
       // Send handshake with error handling to prevent silent failures
       try {
-        this.sendHandshake(peerId, "client");
+        this.sendHandshake(connectionId, "client");
       } catch (err) {
-        log.error(`Failed to send handshake to ${peerId}:`, err);
+        log.error(`Failed to send handshake to ${connectionId}:`, err);
         this.emit("error", err);
       }
     });
 
     client.on("message", (data) => {
-      this.handleMessage(peerId, data);
+      this.handleMessage(connectionId, data);
     });
 
     client.on("close", () => {
-      // Clean up both temp and real peer IDs
-      const realPeerId = this.tempToRealId.get(peerId) ?? peerId;
-      this.outgoingConnections.delete(peerId);
-      this.outgoingConnections.delete(realPeerId);
-      this.peers.delete(peerId);
-      this.peers.delete(realPeerId);
-      this.tempToRealId.delete(peerId);
-      this.realToTempId.delete(realPeerId);
-      this.emit("peer-disconnected", realPeerId);
+      const conn = this.connections.get(connectionId);
+      const peerId = conn?.peerId ?? connectionId;
+
+      // Clean up both connection ID and real peer ID entries
+      this.connections.delete(connectionId);
+      if (conn?.peerId && conn.peerId !== connectionId) {
+        this.connections.delete(conn.peerId);
+      }
+
+      // Notify Rust
+      if (this.vault) {
+        this.vault.peerDisconnected(peerId, "networkError");
+      }
+
+      this.emit("peer-disconnected", peerId);
     });
 
     client.on("error", (err) => {
@@ -328,70 +338,75 @@ export class PeerManager extends EventEmitter {
 
     await client.connect({ url: normalized, reconnect: true, reconnectDelay: 5000 });
 
-    return peerId;
+    return connectionId;
   }
 
   /**
    * Disconnect from a specific peer.
    */
   disconnectPeer(peerId: string): void {
-    // Check outgoing connections
-    const client = this.outgoingConnections.get(peerId);
-    if (client) {
-      client.disconnect();
-      this.outgoingConnections.delete(peerId);
-      this.peers.delete(peerId);
-      // Clean up ID maps
-      const tempId = this.realToTempId.get(peerId);
-      if (tempId) {
-        this.tempToRealId.delete(tempId);
-        this.realToTempId.delete(peerId);
-      }
-      this.emit("peer-disconnected", peerId);
-      return;
+    // Try to find connection by peer ID or connection ID
+    let connectionId = peerId;
+    let conn = this.connections.get(peerId);
+
+    // If not found, vault might know the mapping
+    if (!conn && this.vault) {
+      connectionId = this.vault.resolvePeerId(peerId);
+      conn = this.connections.get(connectionId);
     }
 
-    // Check incoming connections - server uses temp IDs
-    if (this.server) {
-      const tempId = this.realToTempId.get(peerId) ?? peerId;
-      this.server.disconnect(tempId);
-      this.peers.delete(peerId);
-      // Clean up ID maps
-      this.tempToRealId.delete(tempId);
-      this.realToTempId.delete(peerId);
-      this.emit("peer-disconnected", peerId);
+    if (conn?.socket) {
+      // Outgoing connection
+      conn.socket.disconnect();
+      this.connections.delete(connectionId);
+      if (conn.peerId && conn.peerId !== connectionId) {
+        this.connections.delete(conn.peerId);
+      }
+    } else if (this.server) {
+      // Incoming connection - server uses connection IDs
+      this.server.disconnect(connectionId);
+      this.connections.delete(connectionId);
+      if (conn?.peerId && conn.peerId !== connectionId) {
+        this.connections.delete(conn.peerId);
+      }
     }
+
+    // Notify Rust
+    if (this.vault) {
+      this.vault.peerDisconnected(peerId, "userRequested");
+    }
+
+    this.emit("peer-disconnected", peerId);
   }
 
   /**
    * Send data to a specific peer.
    */
   send(peerId: string, data: Uint8Array): void {
-    // Try outgoing connection first (check both real ID and temp ID)
-    let client = this.outgoingConnections.get(peerId);
-    if (!client) {
-      // peerId might be a temp ID, try to get real ID
-      const realId = this.tempToRealId.get(peerId);
-      if (realId) {
-        client = this.outgoingConnections.get(realId);
-      }
+    // Try to find connection by peer ID
+    let conn = this.connections.get(peerId);
+    let connectionId = peerId;
+
+    // If not found directly, resolve via vault
+    if (!conn && this.vault) {
+      connectionId = this.vault.resolvePeerId(peerId);
+      conn = this.connections.get(connectionId);
     }
-    if (client && client.isConnected) {
-      client.send(data);
+
+    // Try outgoing connection
+    if (conn?.socket?.isConnected) {
+      conn.socket.send(data);
       return;
     }
 
     // Try incoming connection via server
     if (this.server) {
-      // Server uses temp IDs (peer-1, peer-2, etc.)
-      // If we have a real peer ID, look up the temp ID
-      const tempId = this.realToTempId.get(peerId) ?? peerId;
       try {
-        this.server.send(tempId, data);
+        this.server.send(connectionId, data);
         return;
       } catch {
-        // Also try the original peerId in case it's already a temp ID
-        if (tempId !== peerId) {
+        // Also try the original peerId in case it's the connection ID
+        if (connectionId !== peerId) {
           try {
             this.server.send(peerId, data);
             return;
@@ -410,9 +425,9 @@ export class PeerManager extends EventEmitter {
    */
   broadcast(data: Uint8Array): void {
     // Send to all outgoing connections
-    for (const client of this.outgoingConnections.values()) {
-      if (client.isConnected) {
-        client.send(data);
+    for (const conn of this.connections.values()) {
+      if (conn.socket?.isConnected) {
+        conn.socket.send(data);
       }
     }
 
@@ -423,28 +438,33 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
-   * Get list of connected peers.
+   * Get list of connected peers from Rust state.
    */
   getConnectedPeers(): PeerInfo[] {
-    return Array.from(this.peers.values());
+    if (!this.vault) return [];
+    return this.vault.getConnectedPeers().map((peer) => ({
+      id: peer.id,
+      address: peer.address,
+      direction: peer.direction,
+      connectedAt: new Date(peer.firstSeen),
+      lastActivityAt: new Date(peer.lastSeen),
+    }));
   }
 
   /**
    * Update the last activity timestamp for a peer and emit event.
    */
   updatePeerActivity(peerId: string): void {
-    const peer = this.peers.get(peerId);
-    if (peer) {
-      peer.lastActivityAt = new Date();
-      this.emit("peer-activity", peerId);
-    }
+    // Activity is now tracked in Rust via touch() if needed
+    this.emit("peer-activity", peerId);
   }
 
   /**
    * Get the number of connected peers.
    */
   get peerCount(): number {
-    return this.peers.size;
+    if (!this.vault) return 0;
+    return this.vault.getConnectedPeers().length;
   }
 
   /**
@@ -496,20 +516,20 @@ export class PeerManager extends EventEmitter {
    * { "type": "handshake", "peerId": "abc-123", "role": "client" }
    * ```
    */
-  private sendHandshake(peerId: string, role: "server" | "client"): void {
+  private sendHandshake(connectionId: string, role: "server" | "client"): void {
     const handshake = JSON.stringify({
       type: "handshake",
       peerId: this.ownPeerId,
       role,
     });
     const data = new TextEncoder().encode(handshake);
-    this.send(peerId, data);
+    this.send(connectionId, data);
   }
 
   /**
    * Handle an incoming message.
    */
-  private handleMessage(tempPeerId: string, data: Uint8Array): void {
+  private handleMessage(connectionId: string, data: Uint8Array): void {
     // Try to parse as JSON handshake first
     try {
       const text = new TextDecoder().decode(data);
@@ -517,26 +537,24 @@ export class PeerManager extends EventEmitter {
 
       if (msg.type === "handshake") {
         log.debug(`Received handshake from ${msg.peerId} (${msg.role})`);
-        // Update peer info with their real peer ID
-        const peerInfo = this.peers.get(tempPeerId);
-        if (peerInfo) {
-          peerInfo.id = msg.peerId;
 
-          // Remove temp ID entry to avoid duplicates in getConnectedPeers()
-          this.peers.delete(tempPeerId);
-          // Store under real ID only
-          this.peers.set(msg.peerId, peerInfo);
+        // Cache the real peer ID locally for message routing
+        const conn = this.connections.get(connectionId);
+        if (conn) {
+          conn.peerId = msg.peerId;
+          // Also index by real peer ID for lookups
+          this.connections.set(msg.peerId, conn);
+        }
 
-          // Map both directions for ID resolution (needed for send/disconnect)
-          this.tempToRealId.set(tempPeerId, msg.peerId);
-          this.realToTempId.set(msg.peerId, tempPeerId);
+        // Notify Rust of handshake completion
+        let peer: ConnectedPeer | undefined;
+        if (this.vault) {
+          peer = this.vault.peerHandshakeComplete(connectionId, msg.peerId);
+        }
 
-          // Also update outgoing connections map if this was an outgoing connection
-          const client = this.outgoingConnections.get(tempPeerId);
-          if (client) {
-            this.outgoingConnections.delete(tempPeerId);
-            this.outgoingConnections.set(msg.peerId, client);
-          }
+        // Emit peer-connected event (now fired after handshake, not on socket open)
+        if (peer) {
+          this.emit("peer-connected", peer);
         }
         return;
       }
@@ -544,9 +562,10 @@ export class PeerManager extends EventEmitter {
       // Not JSON, treat as binary sync message
     }
 
-    // Resolve the peer ID (might be aliased after handshake)
-    const resolvedPeerId = this.tempToRealId.get(tempPeerId) ?? tempPeerId;
-    
+    // Resolve the peer ID using cached value
+    const conn = this.connections.get(connectionId);
+    const resolvedPeerId = conn?.peerId ?? connectionId;
+
     // Forward to listeners (sync engine)
     this.emit("message", resolvedPeerId, data);
   }
