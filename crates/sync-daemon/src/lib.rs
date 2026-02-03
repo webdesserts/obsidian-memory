@@ -6,6 +6,7 @@
 pub mod connection;
 pub mod message;
 pub mod native_fs;
+pub mod outgoing;
 pub mod server;
 pub mod watcher;
 
@@ -13,5 +14,6 @@ pub mod watcher;
 pub use connection::{ConnectionEvent, IncomingMessage, PeerConnection};
 pub use message::{HandshakeMessage, MAX_MESSAGE_SIZE};
 pub use native_fs::NativeFs;
+pub use outgoing::{OutgoingConnection, OutgoingState, ReconnectConfig, ReconnectState};
 pub use server::WebSocketServer;
 pub use watcher::{FileEvent, FileEventKind, FileWatcher};
