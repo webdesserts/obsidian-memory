@@ -4069,6 +4069,7 @@ dependencies = [
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "sync-core",
  "thiserror 2.0.17",
  "tracing",

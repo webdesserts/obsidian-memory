@@ -614,6 +614,153 @@ mod wasm_impl {
             }
         }
     }
+
+    // ========== SWIM Gossip Protocol ==========
+
+    /// WASM wrapper for SWIM membership list.
+    ///
+    /// Tracks known peers and their states (Alive, Suspected, Dead, Removed).
+    /// Used for gossip-based peer discovery.
+    #[wasm_bindgen]
+    pub struct WasmMembership {
+        inner: RefCell<sync_core::swim::MembershipList>,
+    }
+
+    #[wasm_bindgen]
+    impl WasmMembership {
+        /// Create a new membership list for this peer.
+        ///
+        /// @param peerId - Our peer ID (hex string)
+        /// @param address - Our address for incoming connections (null for client-only)
+        #[wasm_bindgen(constructor)]
+        pub fn new(peer_id: String, address: Option<String>) -> Result<WasmMembership, JsError> {
+            let pid = peer_id.parse()
+                .map_err(|e: sync_core::peer_id::PeerIdError| JsError::new(&e.to_string()))?;
+            Ok(WasmMembership {
+                inner: RefCell::new(sync_core::swim::MembershipList::new(pid, address)),
+            })
+        }
+
+        /// Process received gossip updates from a peer.
+        ///
+        /// @param gossipJson - JSON array of GossipUpdate objects
+        /// @param fromPeerId - Peer ID who sent the gossip
+        /// @returns JSON array of newly discovered PeerInfo objects
+        #[wasm_bindgen(js_name = processGossip)]
+        pub fn process_gossip(&self, gossip_json: String, from_peer_id: String) -> Result<JsValue, JsError> {
+            let updates: Vec<sync_core::swim::GossipUpdate> = serde_json::from_str(&gossip_json)
+                .map_err(|e| JsError::new(&format!("Invalid gossip JSON: {}", e)))?;
+            let from_pid = from_peer_id.parse()
+                .map_err(|e: sync_core::peer_id::PeerIdError| JsError::new(&e.to_string()))?;
+
+            let new_peers = self.inner.borrow_mut().process_gossip(&updates, from_pid);
+
+            serde_wasm_bindgen::to_value(&new_peers)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Generate full gossip for initial sync with a new peer.
+        ///
+        /// @returns JSON array of GossipUpdate objects (Alive for all known members)
+        #[wasm_bindgen(js_name = generateFullGossip)]
+        pub fn generate_full_gossip(&self) -> Result<String, JsError> {
+            let gossip = self.inner.borrow().generate_full_gossip();
+            serde_json::to_string(&gossip)
+                .map_err(|e: serde_json::Error| JsError::new(&e.to_string()))
+        }
+
+        /// Drain pending gossip updates for piggybacking on messages.
+        ///
+        /// @returns JSON array of GossipUpdate objects
+        #[wasm_bindgen(js_name = drainGossip)]
+        pub fn drain_gossip(&self) -> Result<String, JsError> {
+            let gossip = self.inner.borrow_mut().drain_gossip();
+            serde_json::to_string(&gossip)
+                .map_err(|e: serde_json::Error| JsError::new(&e.to_string()))
+        }
+
+        /// Get count of known members (excluding ourselves).
+        #[wasm_bindgen(js_name = memberCount)]
+        pub fn member_count(&self) -> usize {
+            self.inner.borrow().len()
+        }
+
+        /// Get list of alive members.
+        ///
+        /// @returns JSON array of member objects with peer info and state
+        #[wasm_bindgen(js_name = getAliveMembers)]
+        pub fn get_alive_members(&self) -> Result<JsValue, JsError> {
+            let members: Vec<_> = self.inner.borrow()
+                .alive_members()
+                .map(|m| MemberInfo {
+                    peer_id: m.info.peer_id.to_string(),
+                    address: m.info.address.clone(),
+                    incarnation: m.incarnation,
+                })
+                .collect();
+
+            serde_wasm_bindgen::to_value(&members)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Get list of server members (have addresses).
+        ///
+        /// @returns JSON array of member objects
+        #[wasm_bindgen(js_name = getServerMembers)]
+        pub fn get_server_members(&self) -> Result<JsValue, JsError> {
+            let members: Vec<_> = self.inner.borrow()
+                .server_members()
+                .map(|m| MemberInfo {
+                    peer_id: m.info.peer_id.to_string(),
+                    address: m.info.address.clone(),
+                    incarnation: m.incarnation,
+                })
+                .collect();
+
+            serde_wasm_bindgen::to_value(&members)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Check if a specific peer is known and alive.
+        #[wasm_bindgen(js_name = isAlive)]
+        pub fn is_alive(&self, peer_id: String) -> bool {
+            let Ok(pid) = peer_id.parse() else { return false };
+            self.inner.borrow()
+                .get(&pid)
+                .map(|m| m.state == sync_core::swim::MemberState::Alive)
+                .unwrap_or(false)
+        }
+
+        /// Check if we have a peer in our membership list.
+        #[wasm_bindgen(js_name = contains)]
+        pub fn contains(&self, peer_id: String) -> bool {
+            let Ok(pid) = peer_id.parse() else { return false };
+            self.inner.borrow().contains(&pid)
+        }
+
+        /// Mark a peer as dead (for failure detection).
+        #[wasm_bindgen(js_name = markDead)]
+        pub fn mark_dead(&self, peer_id: String) -> bool {
+            let Ok(pid) = peer_id.parse() else { return false };
+            self.inner.borrow_mut().mark_dead(pid)
+        }
+
+        /// Mark a peer as removed (collective forgetting).
+        #[wasm_bindgen(js_name = markRemoved)]
+        pub fn mark_removed(&self, peer_id: String) -> bool {
+            let Ok(pid) = peer_id.parse() else { return false };
+            self.inner.borrow_mut().mark_removed(pid)
+        }
+    }
+
+    /// Member info for JS serialization
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MemberInfo {
+        peer_id: String,
+        address: Option<String>,
+        incarnation: u64,
+    }
 }
 
 // Re-export wasm_impl contents at crate root for wasm32 targets
