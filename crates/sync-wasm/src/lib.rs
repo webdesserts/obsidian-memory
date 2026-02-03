@@ -632,13 +632,26 @@ mod wasm_impl {
         ///
         /// @param peerId - Our peer ID (hex string)
         /// @param address - Our address for incoming connections (null for client-only)
+        /// @param incarnation - Our incarnation number (use saved value or 1 for new peers)
         #[wasm_bindgen(constructor)]
-        pub fn new(peer_id: String, address: Option<String>) -> Result<WasmMembership, JsError> {
+        pub fn new(
+            peer_id: String,
+            address: Option<String>,
+            incarnation: u64,
+        ) -> Result<WasmMembership, JsError> {
             let pid = peer_id.parse()
                 .map_err(|e: sync_core::peer_id::PeerIdError| JsError::new(&e.to_string()))?;
             Ok(WasmMembership {
-                inner: RefCell::new(sync_core::swim::MembershipList::new(pid, address)),
+                inner: RefCell::new(sync_core::swim::MembershipList::with_incarnation(
+                    pid, address, incarnation,
+                )),
             })
+        }
+
+        /// Get our local incarnation number for persistence.
+        #[wasm_bindgen(js_name = localIncarnation)]
+        pub fn local_incarnation(&self) -> u64 {
+            self.inner.borrow().local_incarnation()
         }
 
         /// Process received gossip updates from a peer.
