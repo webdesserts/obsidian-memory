@@ -8,6 +8,7 @@ pub mod manager;
 pub mod message;
 pub mod native_fs;
 pub mod outgoing;
+pub mod persistence;
 pub mod server;
 pub mod watcher;
 
@@ -17,5 +18,6 @@ pub use manager::{ConnectionManager, ManagerEvent};
 pub use message::{HandshakeMessage, MAX_MESSAGE_SIZE};
 pub use native_fs::NativeFs;
 pub use outgoing::{OutgoingConnection, OutgoingState, ReconnectConfig, ReconnectState};
+pub use persistence::{PeerStorage, PersistedPeer, PersistedPeers};
 pub use server::WebSocketServer;
 pub use watcher::{FileEvent, FileEventKind, FileWatcher};
