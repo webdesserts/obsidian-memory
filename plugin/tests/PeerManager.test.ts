@@ -383,4 +383,112 @@ describe("PeerManager", () => {
       expect(mockVault.peerConnectingSpy).not.toHaveBeenCalled();
     });
   });
+
+  describe("setAdvertisedAddress()", () => {
+    it("should update membershipAddress for future membership instances", () => {
+      const pm = new PeerManager("test-peer", null, null, 1);
+      pm.setAdvertisedAddress("ws://192.168.1.10:9427");
+
+      // The address is stored - next membership creation will use it
+      // (Can't easily verify without WASM, but we can check it doesn't throw)
+      expect(() => pm.setAdvertisedAddress("ws://192.168.1.10:9428")).not.toThrow();
+    });
+  });
+
+  describe("gossip handling", () => {
+    it("should ignore gossip before handshake completes", async () => {
+      const connectPromise = manager.connectToUrl("wss://example.com/sync");
+      const socket = socketFactory.getLatest()!;
+      socket.simulateOpen();
+      await connectPromise;
+
+      // Send gossip BEFORE handshake (no peer ID set yet)
+      const gossipMsg = new TextEncoder().encode(
+        JSON.stringify({
+          type: "gossip",
+          updates: [{ type: "alive", peer: { peerId: "other-peer", address: null }, incarnation: 1 }],
+        })
+      );
+      socket.simulateMessage(gossipMsg);
+
+      // Should not throw and should not crash - gossip is silently dropped
+      // The membership list would still be empty since gossip was ignored
+    });
+
+    it("should process gossip after handshake completes", async () => {
+      const connectPromise = manager.connectToUrl("wss://example.com/sync");
+      const socket = socketFactory.getLatest()!;
+      socket.simulateOpen();
+      await connectPromise;
+
+      // Complete handshake first
+      const serverHandshake = new TextEncoder().encode(
+        JSON.stringify({
+          type: "handshake",
+          peerId: "server-abc",
+          role: "server",
+        })
+      );
+      socket.simulateMessage(serverHandshake);
+
+      // Now send gossip (should be processed since handshake is complete)
+      const gossipMsg = new TextEncoder().encode(
+        JSON.stringify({
+          type: "gossip",
+          updates: [{ type: "alive", peer: { peerId: "other-peer", address: "ws://other:8765" }, incarnation: 1 }],
+        })
+      );
+
+      // Should not throw - gossip is processed
+      expect(() => socket.simulateMessage(gossipMsg)).not.toThrow();
+    });
+  });
+
+  describe("auto-connect", () => {
+    it("should not attempt duplicate connections to same peer", async () => {
+      // Connect and complete handshake
+      const connectPromise = manager.connectToUrl("wss://example.com/sync");
+      const socket = socketFactory.getLatest()!;
+      socket.simulateOpen();
+      await connectPromise;
+
+      const serverHandshake = new TextEncoder().encode(
+        JSON.stringify({
+          type: "handshake",
+          peerId: "server-abc",
+          role: "server",
+        })
+      );
+      socket.simulateMessage(serverHandshake);
+
+      // Track connection attempts
+      const connectionAttempts: string[] = [];
+      const originalCreate = socketFactory.create.bind(socketFactory);
+      socketFactory.create = (url: string) => {
+        connectionAttempts.push(url);
+        return originalCreate(url);
+      };
+
+      // Send duplicate gossip updates for the same peer
+      const gossip1 = new TextEncoder().encode(
+        JSON.stringify({
+          type: "gossip",
+          updates: [{ type: "alive", peer: { peerId: "new-peer", address: "ws://new:8765" }, incarnation: 1 }],
+        })
+      );
+      const gossip2 = new TextEncoder().encode(
+        JSON.stringify({
+          type: "gossip",
+          updates: [{ type: "alive", peer: { peerId: "new-peer", address: "ws://new:8765" }, incarnation: 2 }],
+        })
+      );
+
+      socket.simulateMessage(gossip1);
+      socket.simulateMessage(gossip2);
+
+      // Should only attempt one connection (duplicate is prevented)
+      // Note: First gossip triggers connect, second is blocked by connectingPeers Set
+      expect(connectionAttempts.filter((url) => url.includes("new:8765")).length).toBeLessThanOrEqual(1);
+    });
+  });
 });

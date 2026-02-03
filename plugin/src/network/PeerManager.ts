@@ -83,6 +83,7 @@ interface MembershipLike {
   drainGossip(): string;
   generateFullGossip(): string;
   markDead(peerId: string): boolean;
+  setLocalAddress(address: string): void;
 }
 
 export class PeerManager extends EventEmitter {
@@ -97,6 +98,9 @@ export class PeerManager extends EventEmitter {
   private _membership: MembershipLike | null = null;
   private membershipAddress: string | null;
   private membershipIncarnation: number;
+
+  /** Peers currently being connected to (prevents duplicate connection attempts) */
+  private connectingPeers: Set<string> = new Set();
 
   /**
    * @param peerId - Our unique peer identifier
@@ -586,6 +590,19 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Set our advertised address for peer discovery.
+   *
+   * Call this after the server starts to advertise our address in gossip.
+   */
+  setAdvertisedAddress(address: string): void {
+    this.membershipAddress = address;
+    // Update existing membership if already created
+    if (this._membership) {
+      this._membership.setLocalAddress(address);
+    }
+  }
+
+  /**
    * Get SWIM membership count (excluding ourselves).
    */
   get memberCount(): number {
@@ -629,11 +646,17 @@ export class PeerManager extends EventEmitter {
 
     // Auto-connect to newly discovered server peers
     for (const peer of newPeers) {
-      if (peer.address && !this.isConnectedTo(peer.peerId)) {
+      // Skip if already connected or connection in progress
+      if (peer.address && !this.isConnectedTo(peer.peerId) && !this.connectingPeers.has(peer.peerId)) {
         log.info(`Discovered peer via gossip: ${peer.peerId} at ${peer.address}`);
-        this.connectToUrl(peer.address).catch((err) => {
-          log.warn(`Failed to auto-connect to discovered peer ${peer.peerId}:`, err);
-        });
+        this.connectingPeers.add(peer.peerId);
+        this.connectToUrl(peer.address)
+          .catch((err) => {
+            log.warn(`Failed to auto-connect to discovered peer ${peer.peerId}:`, err);
+          })
+          .finally(() => {
+            this.connectingPeers.delete(peer.peerId);
+          });
       }
     }
 
@@ -817,9 +840,13 @@ export class PeerManager extends EventEmitter {
       // Handle gossip message
       if (msg.type === "gossip" && Array.isArray(msg.updates)) {
         const conn = this.connections.get(connectionId);
-        const fromPeerId = conn?.peerId ?? connectionId;
-        log.debug(`Received gossip from ${fromPeerId}: ${msg.updates.length} updates`);
-        this.handleGossip(msg.updates as GossipUpdate[], fromPeerId);
+        // Ignore gossip before handshake completes (peerId not yet set)
+        if (!conn?.peerId) {
+          log.debug("Ignoring gossip before handshake complete");
+          return;
+        }
+        log.debug(`Received gossip from ${conn.peerId}: ${msg.updates.length} updates`);
+        this.handleGossip(msg.updates as GossipUpdate[], conn.peerId);
         return;
       }
 
@@ -828,8 +855,8 @@ export class PeerManager extends EventEmitter {
         const conn = this.connections.get(connectionId);
         const fromPeerId = conn?.peerId ?? connectionId;
 
-        // Process piggybacked gossip if present
-        if (Array.isArray(msg.gossip) && msg.gossip.length > 0) {
+        // Process piggybacked gossip if present (only after handshake)
+        if (conn?.peerId && Array.isArray(msg.gossip) && msg.gossip.length > 0) {
           log.debug(`Received sync with ${msg.gossip.length} piggybacked gossip from ${fromPeerId}`);
           this.handleGossip(msg.gossip as GossipUpdate[], fromPeerId);
         }

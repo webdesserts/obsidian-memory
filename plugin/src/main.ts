@@ -373,6 +373,17 @@ export default class P2PSyncPlugin extends Plugin {
     try {
       const actualPort = await this.peerManager.start(DEFAULT_PORT);
       log.info(`Peer manager started on port ${actualPort}`);
+
+      // Advertise our LAN address for peer discovery via gossip
+      if (Platform.isDesktop && this.peerManager.isServerRunning) {
+        const addresses = this.peerManager.getLanAddresses();
+        if (addresses.length > 0) {
+          const advertisedAddress = `ws://${addresses[0]}:${actualPort}`;
+          this.peerManager.setAdvertisedAddress(advertisedAddress);
+          log.info(`Advertising address: ${advertisedAddress}`);
+        }
+      }
+
       this.events.trigger("state-changed");
     } catch (err) {
       log.error("Failed to start peer manager:", err);
