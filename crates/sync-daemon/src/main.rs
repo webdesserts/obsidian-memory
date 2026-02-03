@@ -25,6 +25,9 @@ use sync_core::Vault;
 #[command(name = "sync-daemon")]
 #[command(about = "P2P vault sync daemon")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to the vault directory
     #[arg(short, long)]
     vault: PathBuf,
@@ -54,6 +57,15 @@ struct Args {
     /// Enable verbose logging
     #[arg(long)]
     verbose: bool,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Connect to a peer and add them to the mesh
+    AddPeer {
+        /// WebSocket address of the peer (e.g., ws://peer.example.com:8080)
+        address: String,
+    },
 }
 
 /// Daemon state holding all components.
@@ -266,6 +278,15 @@ async fn main() -> Result<()> {
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // Handle subcommands
+    if let Some(Command::AddPeer { address }) = args.command {
+        info!("add-peer command: {}", address);
+        // TODO: Connect to running daemon via IPC and add peer
+        eprintln!("add-peer subcommand not yet implemented");
+        eprintln!("For now, use --bootstrap {} on daemon startup", address);
+        return Ok(());
+    }
 
     info!("Starting sync-daemon");
     info!("Vault path: {:?}", args.vault);
