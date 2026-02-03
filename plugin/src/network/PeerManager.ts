@@ -195,6 +195,9 @@ export class PeerManager extends EventEmitter {
           this.connections.delete(conn.peerId);
         }
 
+        // Mark dead in SWIM membership (queues Dead gossip)
+        this.onPeerDisconnected(peerId);
+
         // Notify Rust
         if (this.vault) {
           this.vault.peerDisconnected(peerId, "remoteClosed");
@@ -283,6 +286,9 @@ export class PeerManager extends EventEmitter {
       if (conn?.peerId && conn.peerId !== connectionId) {
         this.connections.delete(conn.peerId);
       }
+
+      // Mark dead in SWIM membership (queues Dead gossip)
+      this.onPeerDisconnected(peerId);
 
       // Notify Rust
       if (this.vault) {
@@ -376,6 +382,9 @@ export class PeerManager extends EventEmitter {
         this.connections.delete(conn.peerId);
       }
 
+      // Mark dead in SWIM membership (queues Dead gossip)
+      this.onPeerDisconnected(peerId);
+
       // Notify Rust
       if (this.vault) {
         this.vault.peerDisconnected(peerId, "networkError");
@@ -422,6 +431,9 @@ export class PeerManager extends EventEmitter {
         this.connections.delete(conn.peerId);
       }
     }
+
+    // Mark dead in SWIM membership (queues Dead gossip)
+    this.onPeerDisconnected(peerId);
 
     // Notify Rust
     if (this.vault) {
@@ -701,6 +713,21 @@ export class PeerManager extends EventEmitter {
       return peers.some((p) => p.id === peerId && p.state === "connected");
     }
     return false;
+  }
+
+  /**
+   * Called when a peer disconnects. Marks the peer as Dead in SWIM membership
+   * and queues gossip to spread the failure news.
+   */
+  private onPeerDisconnected(peerId: string): void {
+    const membership = this.getMembership();
+    if (!membership) return;
+
+    // Mark peer as dead - this queues Dead gossip for propagation
+    const changed = membership.markDead(peerId);
+    if (changed) {
+      log.debug(`Marked ${peerId} as Dead in SWIM membership`);
+    }
   }
 
   /**
