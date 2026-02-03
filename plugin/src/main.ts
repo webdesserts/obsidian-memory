@@ -55,10 +55,13 @@ const SETTINGS_PATH = ".sync/settings.json";
 interface P2PSyncSettings {
   /** Peers to auto-reconnect to on plugin load */
   knownPeers: KnownPeer[];
+  /** SWIM incarnation number for gossip protocol ordering */
+  swimIncarnation: number;
 }
 
 const DEFAULT_SETTINGS: P2PSyncSettings = {
   knownPeers: [],
+  swimIncarnation: 1,
 };
 
 /**
@@ -262,6 +265,12 @@ export default class P2PSyncPlugin extends Plugin {
       this.debugEventSubscription = null;
     }
 
+    // Save current incarnation for next session (increment to ensure ordering)
+    if (this.peerManager) {
+      this.settings.swimIncarnation = this.peerManager.localIncarnation + 1;
+      await this.saveSettings();
+    }
+
     // Stop peer manager
     if (this.peerManager) {
       await this.peerManager.stop();
@@ -318,7 +327,11 @@ export default class P2PSyncPlugin extends Plugin {
 
     // Get the plugin directory for loading ws-server.js on desktop
     const pluginDir = this.getPluginDir();
-    this.peerManager = new PeerManager(this.peerId, pluginDir);
+
+    // On desktop, we'll advertise our LAN address once server starts
+    // For now, pass null - address will be updated after server starts
+    const incarnation = this.settings.swimIncarnation;
+    this.peerManager = new PeerManager(this.peerId, pluginDir, null, incarnation);
 
     // Set vault adapter for Rust-driven peer state management
     if (this.vault) {
