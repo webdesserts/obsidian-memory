@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 // Use library exports
 use sync_daemon::connection::ConnectionEvent;
+use sync_daemon::manager::{ConnectionManager, ManagerEvent};
 use sync_daemon::native_fs::NativeFs;
 use sync_daemon::server::WebSocketServer;
 use sync_daemon::watcher::{FileEvent, FileEventKind, FileWatcher};
@@ -72,8 +73,10 @@ enum Command {
 struct Daemon {
     /// The sync vault (behind mutex for async access)
     vault: Arc<Mutex<Vault<NativeFs>>>,
-    /// WebSocket server
+    /// WebSocket server (for incoming connections)
     server: WebSocketServer,
+    /// Connection manager (for outgoing connections)
+    outgoing: ConnectionManager,
     /// File watcher
     watcher: FileWatcher,
 }
@@ -327,6 +330,12 @@ async fn main() -> Result<()> {
     // Create WebSocket server (takes string peer_id for protocol messages)
     let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id.to_string());
 
+    // Create connection manager for outgoing connections
+    let (outgoing, mut outgoing_rx) = ConnectionManager::new(
+        peer_id.to_string(),
+        args.advertise.clone(),
+    );
+
     // Only listen for incoming connections if not in client-only mode
     let listener = if !args.client_only {
         Some(WebSocketServer::bind(&args.listen).await?)
@@ -342,15 +351,16 @@ async fn main() -> Result<()> {
     let mut daemon = Daemon {
         vault: Arc::new(Mutex::new(vault)),
         server,
+        outgoing,
         watcher,
     };
 
     // Connect to bootstrap peers
     for bootstrap_addr in &args.bootstrap {
         info!("Connecting to bootstrap peer: {}", bootstrap_addr);
-        // TODO: Use ConnectionManager for outgoing connections
-        // For now, just log the intent
-        info!("Bootstrap connection to {} (not yet implemented)", bootstrap_addr);
+        if let Err(e) = daemon.outgoing.connect_to(bootstrap_addr).await {
+            error!("Failed to connect to bootstrap peer {}: {}", bootstrap_addr, e);
+        }
     }
 
     info!("Daemon running. Press Ctrl+C to stop.");
@@ -404,6 +414,26 @@ async fn main() -> Result<()> {
             // Handle peer connected notifications (for sync init)
             Some(peer_id) = peer_connected_rx.recv() => {
                 daemon.on_peer_connected(peer_id).await;
+            }
+
+            // Handle outgoing connection events
+            Some(event) = outgoing_rx.recv() => {
+                match event {
+                    ManagerEvent::Message(msg) => {
+                        daemon.on_sync_message(msg).await;
+                    }
+                    ManagerEvent::HandshakeComplete { peer_id, .. } => {
+                        info!("Outgoing connection established to {}", peer_id);
+                        daemon.on_peer_connected(peer_id).await;
+                    }
+                    ManagerEvent::ConnectionClosed { peer_id, reason } => {
+                        info!("Outgoing connection closed: {} ({:?})", peer_id, reason);
+                    }
+                    ManagerEvent::PeerDiscovered { peer_id, address } => {
+                        info!("Discovered peer {} at {}", peer_id, address);
+                        // TODO: Auto-connect to discovered peers
+                    }
+                }
             }
 
             // Handle graceful shutdown
