@@ -71,6 +71,17 @@ enum Command {
     },
 }
 
+/// Parsed JSON message from plugin.
+enum JsonMessage {
+    /// Pure gossip message
+    Gossip(Vec<GossipUpdate>),
+    /// Sync message with optional piggybacked gossip
+    Sync {
+        data: Vec<u8>,
+        gossip: Vec<GossipUpdate>,
+    },
+}
+
 /// Daemon state holding all components.
 struct Daemon {
     /// The sync vault (behind mutex for async access)
@@ -180,16 +191,21 @@ impl Daemon {
         debug!("Processing message from {} ({} bytes)", peer_id, msg.data.len());
 
         // Try to parse as JSON first (handles gossip, sync-with-gossip, etc.)
-        let sync_data = match self.try_handle_json_message(&msg.data, &peer_id) {
-            Some(data) => data,     // Extracted sync data from JSON envelope
-            None => {
-                // Either handled as pure gossip (returns None), or not JSON at all
-                // If not JSON, treat as raw binary sync message
-                if msg.data.first() == Some(&b'{') {
-                    // Was JSON but returned None - already handled (pure gossip)
-                    return;
+        let sync_data = match Self::try_parse_json_message(&msg.data) {
+            Some(JsonMessage::Gossip(updates)) => {
+                // Pure gossip message - process and relay
+                self.handle_gossip_updates(&updates, &peer_id, &msg.temp_id).await;
+                return;
+            }
+            Some(JsonMessage::Sync { data, gossip }) => {
+                // Sync message with optional piggybacked gossip
+                if !gossip.is_empty() {
+                    self.handle_gossip_updates(&gossip, &peer_id, &msg.temp_id).await;
                 }
-                // Raw binary sync message
+                data
+            }
+            None => {
+                // Not JSON - treat as raw binary sync message
                 msg.data.clone()
             }
         };
@@ -333,12 +349,10 @@ impl Daemon {
         }
     }
 
-    /// Try to parse a message as JSON and handle gossip.
+    /// Try to parse a message as JSON.
     ///
-    /// Returns Some(sync_data) if this is a sync message with embedded data,
-    /// or None if the message was handled (pure gossip) or not JSON.
-    fn try_handle_json_message(&mut self, data: &[u8], from_peer_id: &str) -> Option<Vec<u8>> {
-        // Try to parse as UTF-8 JSON
+    /// Returns parsed message type, or None if not JSON.
+    fn try_parse_json_message(data: &[u8]) -> Option<JsonMessage> {
         let text = std::str::from_utf8(data).ok()?;
         let msg: Value = serde_json::from_str(text).ok()?;
 
@@ -346,58 +360,78 @@ impl Daemon {
 
         match msg_type {
             "gossip" => {
-                // Pure gossip message
-                if let Some(updates) = msg.get("updates").and_then(|u| u.as_array()) {
-                    self.handle_gossip_updates(updates, from_peer_id);
-                }
-                None // Handled, no sync data
+                let updates = msg.get("updates").and_then(|u| u.as_array())?;
+                let parsed: Vec<GossipUpdate> = updates
+                    .iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect();
+                Some(JsonMessage::Gossip(parsed))
             }
             "sync" => {
-                // Sync message with potential piggybacked gossip
-                if let Some(gossip) = msg.get("gossip").and_then(|g| g.as_array()) {
-                    if !gossip.is_empty() {
-                        self.handle_gossip_updates(gossip, from_peer_id);
-                    }
-                }
-                // Extract the sync data
-                if let Some(data_array) = msg.get("data").and_then(|d| d.as_array()) {
-                    let bytes: Vec<u8> = data_array
-                        .iter()
+                // Extract piggybacked gossip
+                let gossip: Vec<GossipUpdate> = msg
+                    .get("gossip")
+                    .and_then(|g| g.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Extract sync data
+                let data = msg.get("data").and_then(|d| d.as_array()).map(|arr| {
+                    arr.iter()
                         .filter_map(|v| v.as_u64().map(|n| n as u8))
-                        .collect();
-                    Some(bytes)
-                } else {
-                    None
-                }
+                        .collect()
+                })?;
+
+                Some(JsonMessage::Sync { data, gossip })
             }
-            _ => None, // Unknown type, try binary
+            _ => None,
         }
     }
 
-    /// Handle gossip updates from a peer.
-    fn handle_gossip_updates(&mut self, updates: &[Value], from_peer_id: &str) {
-        let parsed: Vec<GossipUpdate> = updates
-            .iter()
-            .filter_map(|v| serde_json::from_value(v.clone()).ok())
-            .collect();
-
-        if parsed.is_empty() {
+    /// Handle gossip updates from a peer and relay to others.
+    async fn handle_gossip_updates(
+        &mut self,
+        updates: &[GossipUpdate],
+        from_peer_id: &str,
+        from_temp_id: &str,
+    ) {
+        if updates.is_empty() {
             return;
         }
 
         if let Ok(from_pid) = from_peer_id.parse::<PeerId>() {
-            let new_peers = self.membership.process_gossip(&parsed, from_pid);
+            let new_peers = self.membership.process_gossip(updates, from_pid);
             debug!(
                 "Processed {} gossip updates from {}, discovered {} new peers",
-                parsed.len(),
+                updates.len(),
                 from_peer_id,
                 new_peers.len()
             );
 
+            // Relay gossip to other peers (exclude sender)
+            if self.server.peer_count() > 1 {
+                let relay_msg = serde_json::json!({ "type": "gossip", "updates": updates });
+                self.server
+                    .broadcast_except(relay_msg.to_string().as_bytes(), from_temp_id)
+                    .await;
+                debug!(
+                    "Relayed {} gossip updates to {} other peer(s)",
+                    updates.len(),
+                    self.server.peer_count() - 1
+                );
+            }
+
             // TODO: Auto-connect to newly discovered server peers
             for peer in new_peers {
                 if let Some(addr) = &peer.address {
-                    info!("Discovered peer {} at {} (auto-connect TODO)", peer.peer_id, addr);
+                    info!(
+                        "Discovered peer {} at {} (auto-connect TODO)",
+                        peer.peer_id, addr
+                    );
                 }
             }
         }
