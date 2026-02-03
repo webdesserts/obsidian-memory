@@ -645,6 +645,36 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Called after handshake completes. Adds the peer to SWIM membership and
+   * exchanges full gossip for peer discovery.
+   */
+  private onHandshakeComplete(
+    connectionId: string,
+    peerId: string,
+    address?: string
+  ): void {
+    const membership = this.getMembership();
+    if (!membership) return;
+
+    // Add peer to membership as Alive with incarnation 1 (will be updated via gossip)
+    const gossipJson = JSON.stringify([
+      { type: "alive", peer: { peerId, address: address ?? null }, incarnation: 1 },
+    ]);
+    membership.processGossip(gossipJson, peerId);
+
+    // Send our full peer list to the new peer
+    try {
+      const fullGossip = membership.generateFullGossip();
+      const updates = JSON.parse(fullGossip);
+      const gossipMsg = JSON.stringify({ type: "gossip", updates });
+      this.send(connectionId, new TextEncoder().encode(gossipMsg));
+      log.debug(`Sent full gossip to ${peerId}: ${updates.length} updates`);
+    } catch (err) {
+      log.warn(`Failed to send gossip to ${peerId}:`, err);
+    }
+  }
+
+  /**
    * Send a handshake message with our peer ID.
    *
    * Wire format matches `sync_core::handshake::HandshakeMessage` in Rust:
@@ -688,10 +718,22 @@ export class PeerManager extends EventEmitter {
           peer = this.vault.peerHandshakeComplete(connectionId, msg.peerId);
         }
 
+        // Add peer to SWIM membership as Alive and exchange gossip
+        this.onHandshakeComplete(connectionId, msg.peerId, peer?.address);
+
         // Emit peer-connected event (now fired after handshake, not on socket open)
         if (peer) {
           this.emit("peer-connected", peer);
         }
+        return;
+      }
+
+      // Handle gossip message
+      if (msg.type === "gossip" && Array.isArray(msg.updates)) {
+        const conn = this.connections.get(connectionId);
+        const fromPeerId = conn?.peerId ?? connectionId;
+        log.debug(`Received gossip from ${fromPeerId}: ${msg.updates.length} updates`);
+        this.handleGossip(msg.updates as GossipUpdate[], fromPeerId);
         return;
       }
     } catch {
