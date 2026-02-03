@@ -33,6 +33,20 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0:8080")]
     listen: String,
 
+    /// Address to advertise to other peers (how they connect back to us)
+    /// Example: ws://my.server.com:8080
+    #[arg(long)]
+    advertise: Option<String>,
+
+    /// Bootstrap peer(s) to connect to on startup
+    /// Can be specified multiple times
+    #[arg(long)]
+    bootstrap: Vec<String>,
+
+    /// Run in client-only mode (don't listen for incoming connections)
+    #[arg(long)]
+    client_only: bool,
+
     /// Peer ID (generated if not provided)
     #[arg(long)]
     peer_id: Option<String>,
@@ -255,7 +269,15 @@ async fn main() -> Result<()> {
 
     info!("Starting sync-daemon");
     info!("Vault path: {:?}", args.vault);
-    info!("Listen address: {}", args.listen);
+    if !args.client_only {
+        info!("Listen address: {}", args.listen);
+    }
+    if let Some(ref advertise) = args.advertise {
+        info!("Advertised address: {}", advertise);
+    }
+    if args.client_only {
+        info!("Running in client-only mode (no incoming connections)");
+    }
 
     // Generate or parse peer ID
     let peer_id: sync_core::PeerId = match args.peer_id {
@@ -283,7 +305,13 @@ async fn main() -> Result<()> {
 
     // Create WebSocket server (takes string peer_id for protocol messages)
     let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id.to_string());
-    let listener = WebSocketServer::bind(&args.listen).await?;
+
+    // Only listen for incoming connections if not in client-only mode
+    let listener = if !args.client_only {
+        Some(WebSocketServer::bind(&args.listen).await?)
+    } else {
+        None
+    };
 
     // Create file watcher
     let watcher = FileWatcher::new(args.vault.clone())?;
@@ -296,13 +324,30 @@ async fn main() -> Result<()> {
         watcher,
     };
 
+    // Connect to bootstrap peers
+    for bootstrap_addr in &args.bootstrap {
+        info!("Connecting to bootstrap peer: {}", bootstrap_addr);
+        // TODO: Use ConnectionManager for outgoing connections
+        // For now, just log the intent
+        info!("Bootstrap connection to {} (not yet implemented)", bootstrap_addr);
+    }
+
     info!("Daemon running. Press Ctrl+C to stop.");
 
     // Main event loop
     loop {
+        // Create accept future only if we have a listener
+        let accept_future = async {
+            if let Some(ref l) = listener {
+                Some(l.accept().await)
+            } else {
+                std::future::pending::<Option<std::io::Result<_>>>().await
+            }
+        };
+
         tokio::select! {
-            // Accept new WebSocket connections
-            result = listener.accept() => {
+            // Accept new WebSocket connections (if listening)
+            Some(result) = accept_future => {
                 match result {
                     Ok((stream, addr)) => {
                         daemon.server.accept_connection(stream, addr).await;
