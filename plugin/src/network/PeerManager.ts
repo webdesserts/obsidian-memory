@@ -16,7 +16,7 @@ import { EventEmitter } from "events";
 import { Platform } from "obsidian";
 import { SyncWebSocketClient } from "./WebSocketClient";
 import { log } from "../logger";
-import type { ConnectedPeer, DisconnectReason } from "../wasm";
+import type { ConnectedPeer, DisconnectReason, GossipUpdate, SwimPeerInfo, SwimMember } from "../wasm";
 
 // Type for dynamically loaded WebSocket server
 interface SyncWebSocketServer extends EventEmitter {
@@ -73,6 +73,18 @@ export interface PeerInfo {
  * - 'message': Message received from peer (peerId: string, data: Uint8Array)
  * - 'error': Error occurred (Error)
  */
+/** Type for lazily-loaded WasmMembership */
+interface MembershipLike {
+  localIncarnation(): bigint;
+  memberCount(): number;
+  getAliveMembers(): unknown;
+  contains(peerId: string): boolean;
+  processGossip(gossipJson: string, fromPeerId: string): unknown;
+  drainGossip(): string;
+  generateFullGossip(): string;
+  markDead(peerId: string): boolean;
+}
+
 export class PeerManager extends EventEmitter {
   private server: SyncWebSocketServer | null = null;
   private connections: Map<string, Connection> = new Map();
@@ -81,14 +93,51 @@ export class PeerManager extends EventEmitter {
   private pluginDir: string | null;
   private vault: VaultPeerManager | null = null;
 
+  /** SWIM membership list for gossip-based peer discovery (lazy-loaded) */
+  private _membership: MembershipLike | null = null;
+  private membershipAddress: string | null;
+  private membershipIncarnation: number;
+
   /**
    * @param peerId - Our unique peer identifier
    * @param pluginDir - Absolute path to the plugin directory (for loading ws-server.js on desktop)
+   * @param address - Our advertised address for incoming connections (null for client-only)
+   * @param incarnation - Our incarnation number (use saved value or 1 for new peers)
    */
-  constructor(peerId: string, pluginDir: string | null = null) {
+  constructor(
+    peerId: string,
+    pluginDir: string | null = null,
+    address: string | null = null,
+    incarnation: number = 1
+  ) {
     super();
     this.ownPeerId = peerId;
     this.pluginDir = pluginDir;
+    this.membershipAddress = address;
+    this.membershipIncarnation = incarnation;
+  }
+
+  /**
+   * Get the SWIM membership list, creating it lazily on first access.
+   * Returns null if WASM is not available (e.g., in tests).
+   */
+  private getMembership(): MembershipLike | null {
+    if (this._membership) return this._membership;
+
+    try {
+      // Dynamic import to avoid loading WASM at module initialization
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { WasmMembership } = require("../wasm");
+      this._membership = new WasmMembership(
+        this.ownPeerId,
+        this.membershipAddress ?? undefined,
+        BigInt(this.membershipIncarnation)
+      );
+      return this._membership;
+    } catch {
+      log.warn("WASM membership not available - gossip disabled");
+      return null;
+    }
   }
 
   /**
@@ -512,6 +561,87 @@ export class PeerManager extends EventEmitter {
     } catch {
       return [];
     }
+  }
+
+  // ========== SWIM Gossip Methods ==========
+
+  /**
+   * Get our local incarnation number for persistence.
+   */
+  get localIncarnation(): number {
+    const membership = this.getMembership();
+    return membership ? Number(membership.localIncarnation()) : this.membershipIncarnation;
+  }
+
+  /**
+   * Get SWIM membership count (excluding ourselves).
+   */
+  get memberCount(): number {
+    const membership = this.getMembership();
+    return membership?.memberCount() ?? 0;
+  }
+
+  /**
+   * Get list of SWIM members for debug display.
+   */
+  getSwimMembers(): SwimMember[] {
+    const membership = this.getMembership();
+    if (!membership) return [];
+    try {
+      return membership.getAliveMembers() as SwimMember[];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Check if a peer is known in the SWIM membership.
+   */
+  isKnownPeer(peerId: string): boolean {
+    const membership = this.getMembership();
+    return membership?.contains(peerId) ?? false;
+  }
+
+  /**
+   * Process incoming gossip updates from a peer.
+   *
+   * Automatically triggers connection to newly discovered server peers.
+   * Returns list of newly discovered peers.
+   */
+  handleGossip(updates: GossipUpdate[], fromPeerId: string): SwimPeerInfo[] {
+    const membership = this.getMembership();
+    if (!membership || updates.length === 0) return [];
+
+    const gossipJson = JSON.stringify(updates);
+    const newPeers = membership.processGossip(gossipJson, fromPeerId) as SwimPeerInfo[];
+
+    // Auto-connect to newly discovered server peers
+    for (const peer of newPeers) {
+      if (peer.address && !this.isConnectedTo(peer.peerId)) {
+        log.info(`Discovered peer via gossip: ${peer.peerId} at ${peer.address}`);
+        this.connectToUrl(peer.address).catch((err) => {
+          log.warn(`Failed to auto-connect to discovered peer ${peer.peerId}:`, err);
+        });
+      }
+    }
+
+    return newPeers;
+  }
+
+  /**
+   * Check if we are already connected to a peer.
+   */
+  private isConnectedTo(peerId: string): boolean {
+    // Check local connections map
+    const conn = this.connections.get(peerId);
+    if (conn?.socket?.isConnected) return true;
+
+    // Check via vault
+    if (this.vault) {
+      const peers = this.vault.getConnectedPeers();
+      return peers.some((p) => p.id === peerId && p.state === "connected");
+    }
+    return false;
   }
 
   /**
