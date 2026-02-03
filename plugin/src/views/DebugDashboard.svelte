@@ -1,7 +1,7 @@
 <script lang="ts">
   import type P2PSyncPlugin from "../main";
   import type { PeerInfo } from "../network";
-  import type { SyncEvent, RegistryStats, VersionVector } from "../wasm";
+  import type { SyncEvent, RegistryStats, VersionVector, SwimMember } from "../wasm";
   import type { EventRef } from "obsidian";
   import { Platform, setIcon } from "obsidian";
   import { onMount, onDestroy } from "svelte";
@@ -30,6 +30,10 @@
 
   // Connected peers (from TypeScript PeerManager)
   let connectedPeers: PeerInfo[] = [];
+
+  // SWIM membership
+  let swimMemberCount: number = 0;
+  let swimMembers: SwimMember[] = [];
 
   // Events are read from plugin.debugEvents (persists across modal opens)
   $: recentEvents = plugin.debugEvents;
@@ -135,6 +139,10 @@
 
       // TypeScript API: connected peers
       connectedPeers = plugin.peerManager?.getConnectedPeers() ?? [];
+
+      // TypeScript API: SWIM membership
+      swimMemberCount = plugin.peerManager?.memberCount ?? 0;
+      swimMembers = plugin.peerManager?.getSwimMembers() ?? [];
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       console.error("p2p-sync: Error loading debug data", e);
@@ -169,6 +177,9 @@
       recentEvents = plugin.debugEvents;
       // Also refresh peer data (in case peers changed)
       connectedPeers = plugin.peerManager?.getConnectedPeers() ?? [];
+      // Refresh SWIM membership data
+      swimMemberCount = plugin.peerManager?.memberCount ?? 0;
+      swimMembers = plugin.peerManager?.getSwimMembers() ?? [];
     });
   });
 
@@ -272,6 +283,28 @@
         </div>
       {:else}
         <div class="debug-empty">No peers connected</div>
+      {/if}
+    </section>
+
+    <!-- SWIM Membership Section -->
+    <section class="debug-section">
+      <h3 class="debug-section-title">SWIM Membership</h3>
+      <div class="debug-row">
+        <span class="debug-label">Known Members</span>
+        <span class="debug-value">{swimMemberCount}</span>
+      </div>
+      {#if swimMembers.length > 0}
+        <div class="debug-swim-list">
+          {#each swimMembers as member}
+            <div class="debug-swim-member">
+              <span class="debug-state-dot swim-alive" title="Alive"></span>
+              <code class="debug-peer-id">{truncatePeerId(member.peerId)}</code>
+              <span class="debug-swim-address">{member.address ?? 'client-only'}</span>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="debug-empty">No members discovered via gossip</div>
       {/if}
     </section>
 
@@ -522,6 +555,34 @@
 
   .debug-state-dot.failed {
     background: var(--text-error);
+  }
+
+  .debug-state-dot.swim-alive {
+    background: var(--text-success);
+  }
+
+  /* SWIM Membership List */
+  .debug-swim-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+
+  .debug-swim-member {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    background: var(--background-secondary);
+    border-radius: 4px;
+  }
+
+  .debug-swim-address {
+    margin-left: auto;
+    font-family: var(--font-monospace);
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
   }
 
   .debug-reconnect-count {
