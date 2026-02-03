@@ -16,6 +16,7 @@ pub mod handshake;
 pub mod markdown;
 pub mod peer_id;
 pub mod peers;
+pub mod protocol;
 pub mod swim;
 pub mod sync;
 pub mod sync_engine;
