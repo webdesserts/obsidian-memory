@@ -92,11 +92,23 @@ pub struct MembershipList {
 }
 
 impl MembershipList {
-    /// Create a new membership list.
+    /// Create a new membership list with default incarnation (1).
     pub fn new(local_peer_id: PeerId, local_address: Option<String>) -> Self {
+        Self::with_incarnation(local_peer_id, local_address, 1)
+    }
+
+    /// Create a new membership list with a specific incarnation number.
+    ///
+    /// Use this when restoring from persisted state to maintain incarnation
+    /// continuity across restarts.
+    pub fn with_incarnation(
+        local_peer_id: PeerId,
+        local_address: Option<String>,
+        incarnation: u64,
+    ) -> Self {
         Self {
             local_peer_id,
-            local_incarnation: 1,
+            local_incarnation: incarnation,
             local_address,
             members: HashMap::new(),
             pending_gossip: Vec::new(),
@@ -468,6 +480,16 @@ mod tests {
         assert_eq!(list.local_incarnation(), 1);
         assert!(list.is_empty());
         assert_eq!(list.len(), 0);
+    }
+
+    #[test]
+    fn test_membership_list_with_incarnation() {
+        let list =
+            MembershipList::with_incarnation(local_id(), Some("ws://localhost:8080".into()), 42);
+
+        assert_eq!(list.local_peer_id(), local_id());
+        assert_eq!(list.local_incarnation(), 42);
+        assert!(list.is_empty());
     }
 
     #[test]
