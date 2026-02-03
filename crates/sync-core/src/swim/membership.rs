@@ -136,6 +136,13 @@ impl MembershipList {
         self.gossip_fanout = fanout;
     }
 
+    /// Update our local address after construction.
+    ///
+    /// Use this when the server port is only known after startup.
+    pub fn set_local_address(&mut self, address: String) {
+        self.local_address = Some(address);
+    }
+
     /// Add a member to the list.
     ///
     /// Returns true if this is a new member or state changed.
@@ -490,6 +497,18 @@ mod tests {
         assert_eq!(list.local_peer_id(), local_id());
         assert_eq!(list.local_incarnation(), 42);
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_set_local_address() {
+        let mut list = MembershipList::new(local_id(), None);
+        assert!(list.local_info().address.is_none());
+
+        list.set_local_address("ws://192.168.1.10:9427".to_string());
+        assert_eq!(
+            list.local_info().address,
+            Some("ws://192.168.1.10:9427".to_string())
+        );
     }
 
     #[test]

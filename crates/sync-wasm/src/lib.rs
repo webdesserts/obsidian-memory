@@ -654,6 +654,14 @@ mod wasm_impl {
             self.inner.borrow().local_incarnation()
         }
 
+        /// Update our local address after construction.
+        ///
+        /// Use this when the server port is only known after startup.
+        #[wasm_bindgen(js_name = setLocalAddress)]
+        pub fn set_local_address(&self, address: String) {
+            self.inner.borrow_mut().set_local_address(address);
+        }
+
         /// Process received gossip updates from a peer.
         ///
         /// @param gossipJson - JSON array of GossipUpdate objects
