@@ -5,10 +5,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Use library exports
@@ -20,7 +21,8 @@ use sync_daemon::watcher::{FileEvent, FileEventKind, FileWatcher};
 use sync_daemon::IncomingMessage;
 
 use sync_core::fs::FileSystem;
-use sync_core::Vault;
+use sync_core::swim::{GossipUpdate, MembershipList, PeerInfo};
+use sync_core::{PeerId, Vault};
 
 #[derive(Parser, Debug)]
 #[command(name = "sync-daemon")]
@@ -79,6 +81,8 @@ struct Daemon {
     outgoing: ConnectionManager,
     /// File watcher
     watcher: FileWatcher,
+    /// SWIM membership list for gossip-based peer discovery
+    membership: MembershipList,
 }
 
 impl Daemon {
@@ -173,14 +177,29 @@ impl Daemon {
             .resolve_peer_id(&msg.temp_id)
             .unwrap_or_else(|| msg.temp_id.clone());
 
-        debug!("Processing sync message from {} ({} bytes)", peer_id, msg.data.len());
+        debug!("Processing message from {} ({} bytes)", peer_id, msg.data.len());
+
+        // Try to parse as JSON first (handles gossip, sync-with-gossip, etc.)
+        let sync_data = match self.try_handle_json_message(&msg.data, &peer_id) {
+            Some(data) => data,     // Extracted sync data from JSON envelope
+            None => {
+                // Either handled as pure gossip (returns None), or not JSON at all
+                // If not JSON, treat as raw binary sync message
+                if msg.data.first() == Some(&b'{') {
+                    // Was JSON but returned None - already handled (pure gossip)
+                    return;
+                }
+                // Raw binary sync message
+                msg.data.clone()
+            }
+        };
 
         // Check if this is a FileDeleted or FileRenamed message that should be relayed directly
-        let should_relay_raw = self.is_file_lifecycle_message(&msg.data);
+        let should_relay_raw = self.is_file_lifecycle_message(&sync_data);
 
         let vault = self.vault.lock().await;
 
-        match vault.process_sync_message(&msg.data).await {
+        match vault.process_sync_message(&sync_data).await {
             Ok((response, modified_paths)) => {
                 // Send response if any
                 if let Some(response_data) = response {
@@ -193,7 +212,7 @@ impl Daemon {
                 if !modified_paths.is_empty() && self.server.peer_count() > 1 {
                     if should_relay_raw {
                         // FileDeleted/FileRenamed: relay the original message directly
-                        self.server.broadcast_except(&msg.data, &msg.temp_id).await;
+                        self.server.broadcast_except(&sync_data, &msg.temp_id).await;
                         info!(
                             "Relayed file lifecycle event for {} to {} other peer(s)",
                             modified_paths.join(", "),
@@ -247,15 +266,40 @@ impl Daemon {
     }
 
     /// Handle a newly connected peer (after handshake).
-    async fn on_peer_connected(&mut self, peer_id: String) {
+    async fn on_peer_connected(&mut self, peer_id: String, address: Option<String>) {
         info!("Peer connected: {}", peer_id);
 
-        let vault = self.vault.lock().await;
+        // Add peer to SWIM membership
+        if let Ok(pid) = peer_id.parse::<PeerId>() {
+            let peer_info = PeerInfo::new(pid, address);
+            self.membership.add(peer_info.clone(), 1);
 
-        // Prepare and send sync request (bidirectional init)
+            // Send full gossip to the new peer
+            let full_gossip = self.membership.generate_full_gossip();
+            let gossip_msg = serde_json::json!({ "type": "gossip", "updates": full_gossip });
+            if let Err(e) = self
+                .server
+                .send(&peer_id, gossip_msg.to_string().as_bytes())
+                .await
+            {
+                warn!("Failed to send gossip to {}: {}", peer_id, e);
+            } else {
+                debug!("Sent full gossip ({} updates) to {}", full_gossip.len(), peer_id);
+            }
+
+            // Broadcast the new peer to existing peers
+            let alive_update = GossipUpdate::alive(peer_info, 1);
+            let broadcast_msg = serde_json::json!({ "type": "gossip", "updates": [alive_update] });
+            self.server
+                .broadcast_except(broadcast_msg.to_string().as_bytes(), &peer_id)
+                .await;
+        }
+
+        // Send sync request
+        let vault = self.vault.lock().await;
         match vault.prepare_sync_request().await {
             Ok(request) => {
-                drop(vault); // Release lock before network I/O
+                drop(vault);
                 if let Err(e) = self.server.send(&peer_id, &request).await {
                     error!("Failed to send sync request to {}: {}", peer_id, e);
                 } else {
@@ -264,6 +308,97 @@ impl Daemon {
             }
             Err(e) => {
                 error!("Failed to prepare sync request for {}: {}", peer_id, e);
+            }
+        }
+    }
+
+    /// Handle peer disconnection.
+    fn on_peer_disconnected(&mut self, peer_id: &str) {
+        if let Ok(pid) = peer_id.parse::<PeerId>() {
+            if self.membership.mark_dead(pid) {
+                debug!("Marked {} as Dead in SWIM membership", peer_id);
+            }
+        }
+    }
+
+    /// Broadcast dead gossip for a disconnected peer.
+    async fn broadcast_dead_gossip(&mut self, peer_id: &str) {
+        if let Ok(pid) = peer_id.parse::<PeerId>() {
+            if let Some(member) = self.membership.get(&pid) {
+                let dead_update = GossipUpdate::dead(pid, member.incarnation);
+                let msg = serde_json::json!({ "type": "gossip", "updates": [dead_update] });
+                self.server.broadcast(msg.to_string().as_bytes()).await;
+                info!("Broadcast dead gossip for {}", peer_id);
+            }
+        }
+    }
+
+    /// Try to parse a message as JSON and handle gossip.
+    ///
+    /// Returns Some(sync_data) if this is a sync message with embedded data,
+    /// or None if the message was handled (pure gossip) or not JSON.
+    fn try_handle_json_message(&mut self, data: &[u8], from_peer_id: &str) -> Option<Vec<u8>> {
+        // Try to parse as UTF-8 JSON
+        let text = std::str::from_utf8(data).ok()?;
+        let msg: Value = serde_json::from_str(text).ok()?;
+
+        let msg_type = msg.get("type")?.as_str()?;
+
+        match msg_type {
+            "gossip" => {
+                // Pure gossip message
+                if let Some(updates) = msg.get("updates").and_then(|u| u.as_array()) {
+                    self.handle_gossip_updates(updates, from_peer_id);
+                }
+                None // Handled, no sync data
+            }
+            "sync" => {
+                // Sync message with potential piggybacked gossip
+                if let Some(gossip) = msg.get("gossip").and_then(|g| g.as_array()) {
+                    if !gossip.is_empty() {
+                        self.handle_gossip_updates(gossip, from_peer_id);
+                    }
+                }
+                // Extract the sync data
+                if let Some(data_array) = msg.get("data").and_then(|d| d.as_array()) {
+                    let bytes: Vec<u8> = data_array
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect();
+                    Some(bytes)
+                } else {
+                    None
+                }
+            }
+            _ => None, // Unknown type, try binary
+        }
+    }
+
+    /// Handle gossip updates from a peer.
+    fn handle_gossip_updates(&mut self, updates: &[Value], from_peer_id: &str) {
+        let parsed: Vec<GossipUpdate> = updates
+            .iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+
+        if parsed.is_empty() {
+            return;
+        }
+
+        if let Ok(from_pid) = from_peer_id.parse::<PeerId>() {
+            let new_peers = self.membership.process_gossip(&parsed, from_pid);
+            debug!(
+                "Processed {} gossip updates from {}, discovered {} new peers",
+                parsed.len(),
+                from_peer_id,
+                new_peers.len()
+            );
+
+            // TODO: Auto-connect to newly discovered server peers
+            for peer in new_peers {
+                if let Some(addr) = &peer.address {
+                    info!("Discovered peer {} at {} (auto-connect TODO)", peer.peer_id, addr);
+                }
             }
         }
     }
@@ -347,12 +482,16 @@ async fn main() -> Result<()> {
     let watcher = FileWatcher::new(args.vault.clone())?;
     info!("File watcher started");
 
+    // Create SWIM membership list for gossip-based peer discovery
+    let membership = MembershipList::new(peer_id, args.advertise.clone());
+
     // Create daemon state
     let mut daemon = Daemon {
         vault: Arc::new(Mutex::new(vault)),
         server,
         outgoing,
         watcher,
+        membership,
     };
 
     // Connect to bootstrap peers
@@ -405,7 +544,14 @@ async fn main() -> Result<()> {
                         daemon.server.register_peer(&temp_id, peer_id);
                     }
                     ConnectionEvent::Closed { temp_id } => {
-                        info!("Peer disconnected: {}", temp_id);
+                        // Get real peer_id before removing (for SWIM tracking)
+                        if let Some(peer_id) = daemon.server.resolve_peer_id(&temp_id) {
+                            info!("Peer disconnected: {} (was {})", peer_id, temp_id);
+                            daemon.on_peer_disconnected(&peer_id);
+                            daemon.broadcast_dead_gossip(&peer_id).await;
+                        } else {
+                            info!("Connection closed before handshake: {}", temp_id);
+                        }
                         daemon.server.remove_peer(&temp_id);
                     }
                 }
@@ -413,7 +559,7 @@ async fn main() -> Result<()> {
 
             // Handle peer connected notifications (for sync init)
             Some(peer_id) = peer_connected_rx.recv() => {
-                daemon.on_peer_connected(peer_id).await;
+                daemon.on_peer_connected(peer_id, None).await;
             }
 
             // Handle outgoing connection events
@@ -424,10 +570,12 @@ async fn main() -> Result<()> {
                     }
                     ManagerEvent::HandshakeComplete { peer_id, .. } => {
                         info!("Outgoing connection established to {}", peer_id);
-                        daemon.on_peer_connected(peer_id).await;
+                        daemon.on_peer_connected(peer_id, None).await;
                     }
                     ManagerEvent::ConnectionClosed { peer_id, reason } => {
                         info!("Outgoing connection closed: {} ({:?})", peer_id, reason);
+                        daemon.on_peer_disconnected(&peer_id);
+                        daemon.broadcast_dead_gossip(&peer_id).await;
                     }
                     ManagerEvent::PeerDiscovered { peer_id, address } => {
                         info!("Discovered peer {} at {}", peer_id, address);
