@@ -42,6 +42,70 @@ pub enum DisconnectReason {
     RemoteClosed,
     /// Invalid handshake or protocol violation
     ProtocolError,
+    /// Duplicate connection detected (simultaneous connect)
+    DuplicateConnection,
+}
+
+/// Result of checking for duplicate connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplicateCheckResult {
+    /// No duplicate - proceed with connection
+    NoDuplicate,
+    /// Duplicate detected - close this connection (we have lower peer_id, keep outgoing)
+    CloseThis,
+    /// Duplicate detected - close the other connection (we have higher peer_id, keep incoming)
+    CloseOther { connection_id: String },
+}
+
+/// Check if we should close a connection due to simultaneous connect.
+///
+/// When two peers connect to each other simultaneously, we need to close one:
+/// - Lower peer_id keeps their outgoing connection
+/// - Higher peer_id keeps the incoming connection
+///
+/// This ensures both sides agree on which connection to keep.
+pub fn check_duplicate_connection(
+    our_peer_id: &str,
+    their_peer_id: &str,
+    new_direction: ConnectionDirection,
+    existing_direction: Option<ConnectionDirection>,
+) -> DuplicateCheckResult {
+    // No existing connection = no duplicate
+    let existing_dir = match existing_direction {
+        Some(dir) => dir,
+        None => return DuplicateCheckResult::NoDuplicate,
+    };
+
+    // Same direction = not a simultaneous connect, handle as reconnect
+    if new_direction == existing_dir {
+        return DuplicateCheckResult::NoDuplicate;
+    }
+
+    // Different directions = simultaneous connect
+    // Lower peer_id wins with outgoing, higher peer_id wins with incoming
+    if our_peer_id < their_peer_id {
+        // We have lower ID - we keep outgoing
+        if new_direction == ConnectionDirection::Incoming {
+            // This is the incoming we should reject
+            DuplicateCheckResult::CloseThis
+        } else {
+            // This is our outgoing - close the incoming
+            DuplicateCheckResult::CloseOther {
+                connection_id: their_peer_id.to_string(),
+            }
+        }
+    } else {
+        // We have higher ID - we keep incoming
+        if new_direction == ConnectionDirection::Outgoing {
+            // This is our outgoing we should close
+            DuplicateCheckResult::CloseThis
+        } else {
+            // This is incoming - close our outgoing
+            DuplicateCheckResult::CloseOther {
+                connection_id: their_peer_id.to_string(),
+            }
+        }
+    }
 }
 
 /// Connection direction from our perspective.
@@ -1035,5 +1099,149 @@ mod tests {
 
         let peer = registry.get_peer("peer-1").unwrap();
         assert_eq!(peer.disconnect_reason, Some(DisconnectReason::UserRequested));
+    }
+
+    // ========== Connection deduplication tests ==========
+
+    #[test]
+    fn test_dedup_no_existing_connection() {
+        let result = check_duplicate_connection(
+            "aaaa",
+            "bbbb",
+            ConnectionDirection::Incoming,
+            None, // No existing connection
+        );
+        assert_eq!(result, DuplicateCheckResult::NoDuplicate);
+    }
+
+    #[test]
+    fn test_dedup_same_direction_not_duplicate() {
+        // Both incoming = not simultaneous connect (it's a reconnect scenario)
+        let result = check_duplicate_connection(
+            "aaaa",
+            "bbbb",
+            ConnectionDirection::Incoming,
+            Some(ConnectionDirection::Incoming),
+        );
+        assert_eq!(result, DuplicateCheckResult::NoDuplicate);
+
+        // Both outgoing = also not simultaneous connect
+        let result = check_duplicate_connection(
+            "aaaa",
+            "bbbb",
+            ConnectionDirection::Outgoing,
+            Some(ConnectionDirection::Outgoing),
+        );
+        assert_eq!(result, DuplicateCheckResult::NoDuplicate);
+    }
+
+    #[test]
+    fn test_dedup_lower_peer_keeps_outgoing() {
+        // We are "aaaa" (lower), they are "bbbb" (higher)
+        // We should keep our outgoing connection
+
+        // New incoming from bbbb, we already have outgoing to bbbb
+        let result = check_duplicate_connection(
+            "aaaa",
+            "bbbb",
+            ConnectionDirection::Incoming, // New connection
+            Some(ConnectionDirection::Outgoing), // Existing connection
+        );
+        // We should close the new incoming
+        assert_eq!(result, DuplicateCheckResult::CloseThis);
+    }
+
+    #[test]
+    fn test_dedup_lower_peer_with_outgoing_closes_incoming() {
+        // We are "aaaa" (lower), new connection is outgoing
+        // We already have incoming from bbbb
+        let result = check_duplicate_connection(
+            "aaaa",
+            "bbbb",
+            ConnectionDirection::Outgoing, // New connection
+            Some(ConnectionDirection::Incoming), // Existing connection
+        );
+        // We should close the other (incoming)
+        assert!(matches!(result, DuplicateCheckResult::CloseOther { .. }));
+    }
+
+    #[test]
+    fn test_dedup_higher_peer_keeps_incoming() {
+        // We are "bbbb" (higher), they are "aaaa" (lower)
+        // We should keep the incoming connection
+
+        // New outgoing to aaaa, we already have incoming from aaaa
+        let result = check_duplicate_connection(
+            "bbbb",
+            "aaaa",
+            ConnectionDirection::Outgoing, // New connection
+            Some(ConnectionDirection::Incoming), // Existing connection
+        );
+        // We should close our outgoing
+        assert_eq!(result, DuplicateCheckResult::CloseThis);
+    }
+
+    #[test]
+    fn test_dedup_higher_peer_with_incoming_closes_outgoing() {
+        // We are "bbbb" (higher), new connection is incoming
+        // We already have outgoing to aaaa
+        let result = check_duplicate_connection(
+            "bbbb",
+            "aaaa",
+            ConnectionDirection::Incoming, // New connection
+            Some(ConnectionDirection::Outgoing), // Existing connection
+        );
+        // We should close the other (outgoing)
+        assert!(matches!(result, DuplicateCheckResult::CloseOther { .. }));
+    }
+
+    #[test]
+    fn test_dedup_symmetric_agreement() {
+        // Both sides should agree on which connection to keep
+        // Simulate simultaneous connect: A(aaaa) and B(bbbb) connect to each other
+
+        // From A's perspective: B sent incoming, A has outgoing to B
+        let a_perspective = check_duplicate_connection(
+            "aaaa", // A is lower
+            "bbbb",
+            ConnectionDirection::Incoming, // B's connection to A
+            Some(ConnectionDirection::Outgoing), // A's connection to B
+        );
+        // A keeps outgoing, closes incoming
+        assert_eq!(a_perspective, DuplicateCheckResult::CloseThis);
+
+        // From B's perspective: A sent incoming, B has outgoing to A
+        let b_perspective = check_duplicate_connection(
+            "bbbb", // B is higher
+            "aaaa",
+            ConnectionDirection::Incoming, // A's connection to B
+            Some(ConnectionDirection::Outgoing), // B's connection to A
+        );
+        // B keeps incoming (from A), closes their outgoing
+        assert!(matches!(b_perspective, DuplicateCheckResult::CloseOther { .. }));
+
+        // Result: A's outgoing to B survives = B's incoming from A survives
+        // Both sides keep the same connection!
+    }
+
+    #[test]
+    fn test_disconnect_reason_duplicate() {
+        let registry = PeerRegistry::new();
+        registry
+            .peer_connected(
+                "peer-1".into(),
+                "addr".into(),
+                ConnectionDirection::Outgoing,
+                1000.0,
+            )
+            .unwrap();
+
+        registry.peer_disconnected("peer-1", DisconnectReason::DuplicateConnection, 2000.0);
+
+        let peer = registry.get_peer("peer-1").unwrap();
+        assert_eq!(
+            peer.disconnect_reason,
+            Some(DisconnectReason::DuplicateConnection)
+        );
     }
 }
