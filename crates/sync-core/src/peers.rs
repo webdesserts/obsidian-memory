@@ -53,8 +53,9 @@ pub enum DuplicateCheckResult {
     NoDuplicate,
     /// Duplicate detected - close this connection (we have lower peer_id, keep outgoing)
     CloseThis,
-    /// Duplicate detected - close the other connection (we have higher peer_id, keep incoming)
-    CloseOther { connection_id: String },
+    /// Duplicate detected - close the other connection (we have higher peer_id, keep incoming).
+    /// The caller should look up the existing connection_id from its peer-to-connection mapping.
+    CloseOther,
 }
 
 /// Check if we should close a connection due to simultaneous connect.
@@ -90,9 +91,7 @@ pub fn check_duplicate_connection(
             DuplicateCheckResult::CloseThis
         } else {
             // This is our outgoing - close the incoming
-            DuplicateCheckResult::CloseOther {
-                connection_id: their_peer_id.to_string(),
-            }
+            DuplicateCheckResult::CloseOther
         }
     } else {
         // We have higher ID - we keep incoming
@@ -101,9 +100,7 @@ pub fn check_duplicate_connection(
             DuplicateCheckResult::CloseThis
         } else {
             // This is incoming - close our outgoing
-            DuplicateCheckResult::CloseOther {
-                connection_id: their_peer_id.to_string(),
-            }
+            DuplicateCheckResult::CloseOther
         }
     }
 }
@@ -1162,7 +1159,7 @@ mod tests {
             Some(ConnectionDirection::Incoming), // Existing connection
         );
         // We should close the other (incoming)
-        assert!(matches!(result, DuplicateCheckResult::CloseOther { .. }));
+        assert_eq!(result, DuplicateCheckResult::CloseOther);
     }
 
     #[test]
@@ -1192,7 +1189,7 @@ mod tests {
             Some(ConnectionDirection::Outgoing), // Existing connection
         );
         // We should close the other (outgoing)
-        assert!(matches!(result, DuplicateCheckResult::CloseOther { .. }));
+        assert_eq!(result, DuplicateCheckResult::CloseOther);
     }
 
     #[test]
@@ -1218,7 +1215,7 @@ mod tests {
             Some(ConnectionDirection::Outgoing), // B's connection to A
         );
         // B keeps incoming (from A), closes their outgoing
-        assert!(matches!(b_perspective, DuplicateCheckResult::CloseOther { .. }));
+        assert_eq!(b_perspective, DuplicateCheckResult::CloseOther);
 
         // Result: A's outgoing to B survives = B's incoming from A survives
         // Both sides keep the same connection!

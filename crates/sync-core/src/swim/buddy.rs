@@ -33,6 +33,8 @@ pub struct BuddyAssignment {
     pub sent_at: u64,
     /// Whether we've received a response
     pub responded: bool,
+    /// Whether target was alive (only valid when responded is true)
+    pub alive: bool,
 }
 
 /// Result of buddy verification.
@@ -69,6 +71,7 @@ impl BuddyTracker {
                 buddy,
                 sent_at: now_ms,
                 responded: false,
+                alive: false,
             },
         );
 
@@ -123,10 +126,11 @@ impl BuddyTracker {
     /// Record a buddy response.
     ///
     /// Returns the suspected peer if valid, None if buddy wasn't assigned.
-    pub fn record_response(&mut self, buddy: PeerId, target: PeerId) -> Option<PeerId> {
+    pub fn record_response(&mut self, buddy: PeerId, target: PeerId, alive: bool) -> Option<PeerId> {
         if let Some(assignment) = self.assignments.get_mut(&target) {
             if assignment.buddy == buddy {
                 assignment.responded = true;
+                assignment.alive = alive;
                 return Some(target);
             }
         }
@@ -136,7 +140,13 @@ impl BuddyTracker {
     /// Check verification status for a suspected peer.
     pub fn verification_status(&self, suspected: &PeerId) -> BuddyVerification {
         match self.assignments.get(suspected) {
-            Some(assignment) if assignment.responded => BuddyVerification::Pending, // Response recorded but result not stored here
+            Some(assignment) if assignment.responded => {
+                if assignment.alive {
+                    BuddyVerification::Alive
+                } else {
+                    BuddyVerification::Dead
+                }
+            }
             Some(_) => BuddyVerification::Pending,
             None => BuddyVerification::NoBuddy,
         }
@@ -322,11 +332,12 @@ mod tests {
 
         tracker.assign(peer_a(), peer_b(), 1000);
 
-        let result = tracker.record_response(peer_b(), peer_a());
+        let result = tracker.record_response(peer_b(), peer_a(), true);
         assert_eq!(result, Some(peer_a()));
 
         let assignment = tracker.get_assignment(&peer_a()).unwrap();
         assert!(assignment.responded);
+        assert!(assignment.alive);
     }
 
     #[test]
@@ -336,7 +347,7 @@ mod tests {
         tracker.assign(peer_a(), peer_b(), 1000);
 
         // peer_c wasn't assigned as buddy
-        let result = tracker.record_response(peer_c(), peer_a());
+        let result = tracker.record_response(peer_c(), peer_a(), true);
         assert!(result.is_none());
     }
 
@@ -344,8 +355,39 @@ mod tests {
     fn test_record_response_no_assignment() {
         let mut tracker = BuddyTracker::new();
 
-        let result = tracker.record_response(peer_b(), peer_a());
+        let result = tracker.record_response(peer_b(), peer_a(), true);
         assert!(result.is_none());
+    }
+
+    // ==================== Verification status ====================
+
+    #[test]
+    fn test_verification_status_no_buddy() {
+        let tracker = BuddyTracker::new();
+        assert_eq!(tracker.verification_status(&peer_a()), BuddyVerification::NoBuddy);
+    }
+
+    #[test]
+    fn test_verification_status_pending() {
+        let mut tracker = BuddyTracker::new();
+        tracker.assign(peer_a(), peer_b(), 1000);
+        assert_eq!(tracker.verification_status(&peer_a()), BuddyVerification::Pending);
+    }
+
+    #[test]
+    fn test_verification_status_alive() {
+        let mut tracker = BuddyTracker::new();
+        tracker.assign(peer_a(), peer_b(), 1000);
+        tracker.record_response(peer_b(), peer_a(), true);
+        assert_eq!(tracker.verification_status(&peer_a()), BuddyVerification::Alive);
+    }
+
+    #[test]
+    fn test_verification_status_dead() {
+        let mut tracker = BuddyTracker::new();
+        tracker.assign(peer_a(), peer_b(), 1000);
+        tracker.record_response(peer_b(), peer_a(), false);
+        assert_eq!(tracker.verification_status(&peer_a()), BuddyVerification::Dead);
     }
 
     // ==================== Timeout detection ====================
@@ -372,7 +414,7 @@ mod tests {
         let mut tracker = BuddyTracker::new();
 
         tracker.assign(peer_a(), peer_b(), 1000);
-        tracker.record_response(peer_b(), peer_a());
+        tracker.record_response(peer_b(), peer_a(), true);
 
         // Response received, so not timed out
         let timed_out = tracker.timed_out(5000, 2000);

@@ -61,6 +61,10 @@ pub struct Suspicion {
 }
 
 /// Event emitted by the failure detector.
+///
+/// Note: Events don't include incarnation numbers because the failure detector
+/// doesn't have access to the membership list. Callers should look up incarnations
+/// from the membership list when processing these events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureEvent {
     /// Need to send a ping to this peer
@@ -72,11 +76,11 @@ pub enum FailureEvent {
         seq: u64,
     },
     /// Peer is now suspected (not responding)
-    PeerSuspected { peer_id: PeerId, incarnation: u64 },
+    PeerSuspected { peer_id: PeerId },
     /// Peer confirmed dead (failed to refute suspicion)
     PeerDead { peer_id: PeerId },
-    /// Peer is alive (refuted suspicion)
-    PeerAlive { peer_id: PeerId, incarnation: u64 },
+    /// Peer is alive (refuted suspicion via indirect probe)
+    PeerAlive { peer_id: PeerId },
 }
 
 /// Failure detector for SWIM protocol.
@@ -167,23 +171,16 @@ impl FailureDetector {
             if alive {
                 // Target responded via indirect - clear suspicion
                 self.pending_pings.remove(&seq);
-                if let Some(suspicion) = self.suspicions.remove(&target) {
-                    events.push(FailureEvent::PeerAlive {
-                        peer_id: target,
-                        incarnation: suspicion.incarnation + 1,
-                    });
+                if self.suspicions.remove(&target).is_some() {
+                    events.push(FailureEvent::PeerAlive { peer_id: target });
                 }
             } else {
                 pending.indirect_responses += 1;
 
                 // If all indirect probes failed, suspect the peer
                 if pending.indirect_responses >= pending.indirect_peers.len() {
-                    let incarnation = 0; // Will be updated by caller
                     self.pending_pings.remove(&seq);
-                    events.push(FailureEvent::PeerSuspected {
-                        peer_id: target,
-                        incarnation,
-                    });
+                    events.push(FailureEvent::PeerSuspected { peer_id: target });
                 }
             }
         }
@@ -226,10 +223,7 @@ impl FailureDetector {
         // Suspect peers whose indirect probes timed out
         for (seq, target) in suspect {
             self.pending_pings.remove(&seq);
-            events.push(FailureEvent::PeerSuspected {
-                peer_id: target,
-                incarnation: 0,
-            });
+            events.push(FailureEvent::PeerSuspected { peer_id: target });
         }
 
         // Check for expired suspicions → dead
@@ -622,7 +616,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            FailureEvent::PeerAlive { peer_id, incarnation } if peer_id == peer_a() && incarnation == 6
+            FailureEvent::PeerAlive { peer_id } if peer_id == peer_a()
         ));
 
         assert!(!detector.is_suspected(&peer_a()));

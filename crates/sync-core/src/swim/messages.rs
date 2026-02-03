@@ -168,6 +168,8 @@ pub enum GossipUpdate {
     Dead {
         /// Peer's ID
         peer_id: PeerId,
+        /// Incarnation number at time of death (prevents stale dead messages)
+        incarnation: u64,
     },
 
     /// Peer explicitly removed (collective forgetting).
@@ -195,8 +197,8 @@ impl GossipUpdate {
     }
 
     /// Create a Dead update.
-    pub fn dead(peer_id: PeerId) -> Self {
-        Self::Dead { peer_id }
+    pub fn dead(peer_id: PeerId, incarnation: u64) -> Self {
+        Self::Dead { peer_id, incarnation }
     }
 
     /// Create a Removed update.
@@ -209,7 +211,7 @@ impl GossipUpdate {
         match self {
             Self::Alive { peer, .. } => peer.peer_id,
             Self::Suspect { peer_id, .. } => *peer_id,
-            Self::Dead { peer_id } => *peer_id,
+            Self::Dead { peer_id, .. } => *peer_id,
             Self::Removed { peer_id } => *peer_id,
         }
     }
@@ -326,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_gossip_dead_serialization() {
-        let gossip = GossipUpdate::dead(test_peer_id());
+        let gossip = GossipUpdate::dead(test_peer_id(), 1);
 
         let json = serde_json::to_vec(&gossip).unwrap();
         let parsed: GossipUpdate = serde_json::from_slice(&json).unwrap();
@@ -390,7 +392,7 @@ mod tests {
         let suspect = GossipUpdate::suspect(peer_id_2, 1);
         assert_eq!(suspect.peer_id(), peer_id_2);
 
-        let dead = GossipUpdate::dead(peer_id);
+        let dead = GossipUpdate::dead(peer_id, 1);
         assert_eq!(dead.peer_id(), peer_id);
 
         let removed = GossipUpdate::removed(peer_id_2);

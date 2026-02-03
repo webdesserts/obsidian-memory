@@ -9,6 +9,9 @@ use super::{GossipUpdate, PeerInfo};
 use crate::PeerId;
 use std::collections::HashMap;
 
+/// Maximum number of pending gossip updates before oldest are dropped
+const MAX_GOSSIP_QUEUE_SIZE: usize = 100;
+
 /// State of a member in the membership list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberState {
@@ -142,6 +145,11 @@ impl MembershipList {
         }
 
         if let Some(existing) = self.members.get_mut(&peer_id) {
+            // Never resurrect Removed peers via gossip - they must reconnect directly
+            if existing.state == MemberState::Removed {
+                return false;
+            }
+
             // Update if incarnation is higher
             if incarnation > existing.incarnation {
                 existing.info = info;
@@ -265,7 +273,8 @@ impl MembershipList {
     pub fn suspect(&mut self, peer_id: PeerId, incarnation: u64) -> bool {
         if peer_id == self.local_peer_id {
             // We're being suspected - refute by increasing incarnation
-            self.local_incarnation = self.local_incarnation.max(incarnation) + 1;
+            // Use saturating_add to prevent overflow attacks
+            self.local_incarnation = self.local_incarnation.max(incarnation).saturating_add(1);
             self.queue_gossip(GossipUpdate::alive(self.local_info(), self.local_incarnation));
             return false;
         }
@@ -298,6 +307,26 @@ impl MembershipList {
         false
     }
 
+    /// Mark a peer as dead, only if incarnation matches or is newer.
+    ///
+    /// This prevents stale dead messages from incorrectly marking alive peers.
+    /// Returns true if state changed.
+    pub fn mark_dead_with_incarnation(&mut self, peer_id: PeerId, incarnation: u64) -> bool {
+        if peer_id == self.local_peer_id {
+            return false;
+        }
+
+        if let Some(member) = self.members.get_mut(&peer_id) {
+            // Only accept if incarnation matches or is newer, and not already dead
+            if incarnation >= member.incarnation && member.state != MemberState::Dead {
+                member.state = MemberState::Dead;
+                member.incarnation = incarnation;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Mark a peer as explicitly removed (collective forgetting).
     ///
     /// Returns true if state changed.
@@ -317,6 +346,10 @@ impl MembershipList {
 
     /// Queue a gossip update for propagation.
     pub fn queue_gossip(&mut self, update: GossipUpdate) {
+        // Drop oldest if queue is full (FIFO eviction)
+        if self.pending_gossip.len() >= MAX_GOSSIP_QUEUE_SIZE {
+            self.pending_gossip.remove(0);
+        }
         self.pending_gossip.push(update);
     }
 
@@ -348,8 +381,8 @@ impl MembershipList {
                 } => {
                     self.suspect(*peer_id, *incarnation);
                 }
-                GossipUpdate::Dead { peer_id } => {
-                    self.mark_dead(*peer_id);
+                GossipUpdate::Dead { peer_id, incarnation } => {
+                    self.mark_dead_with_incarnation(*peer_id, *incarnation);
                 }
                 GossipUpdate::Removed { peer_id } => {
                     self.mark_removed(*peer_id);
@@ -714,7 +747,7 @@ mod tests {
 
         list.add(PeerInfo::new(peer_a(), None), 1);
 
-        let updates = vec![GossipUpdate::dead(peer_a())];
+        let updates = vec![GossipUpdate::dead(peer_a(), 1)];
         list.process_gossip(&updates, peer_b());
 
         let member = list.get(&peer_a()).unwrap();
@@ -977,5 +1010,75 @@ mod tests {
         let reconnectable: Vec<_> = list.reconnectable_peers().collect();
         assert_eq!(reconnectable.len(), 1);
         assert_eq!(reconnectable[0].info.peer_id, peer_b());
+    }
+
+    // ==================== Bug fix regression tests ====================
+
+    #[test]
+    fn test_removed_not_resurrected_by_alive_gossip() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer and mark as removed (collective forgetting)
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.mark_removed(peer_a());
+        assert!(list.is_removed(&peer_a()));
+
+        // Try to resurrect via Alive gossip with higher incarnation
+        let changed = list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 5);
+
+        // Should NOT be resurrected
+        assert!(!changed);
+        assert!(list.is_removed(&peer_a()));
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Removed);
+        assert_eq!(member.incarnation, 1); // Incarnation unchanged
+    }
+
+    #[test]
+    fn test_removed_not_resurrected_by_gossip_processing() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer and mark as removed
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.mark_removed(peer_a());
+
+        // Process Alive gossip about the removed peer
+        let updates = vec![GossipUpdate::alive(
+            PeerInfo::new(peer_a(), Some("ws://new:8080".into())),
+            10,
+        )];
+        let new_peers = list.process_gossip(&updates, peer_b());
+
+        // Should not report as new peer and should remain removed
+        assert!(new_peers.is_empty());
+        assert!(list.is_removed(&peer_a()));
+    }
+
+    #[test]
+    fn test_gossip_queue_bounded() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Queue more than MAX_GOSSIP_QUEUE_SIZE updates
+        for i in 0..150 {
+            let peer_id = format!("{:016x}", i).parse().unwrap();
+            list.queue_gossip(GossipUpdate::alive(PeerInfo::client_only(peer_id), 1));
+        }
+
+        // Drain all gossip (set high fanout to get everything)
+        list.set_gossip_fanout(200);
+        let gossip = list.drain_gossip();
+
+        // Should be capped at MAX_GOSSIP_QUEUE_SIZE
+        assert_eq!(gossip.len(), MAX_GOSSIP_QUEUE_SIZE);
+
+        // Should have dropped oldest entries (first 50)
+        // The remaining entries should be from index 50-149
+        if let GossipUpdate::Alive { peer, .. } = &gossip[0] {
+            // First entry should be peer 50 (0x32)
+            let expected: PeerId = format!("{:016x}", 50).parse().unwrap();
+            assert_eq!(peer.peer_id, expected);
+        } else {
+            panic!("Expected Alive gossip");
+        }
     }
 }

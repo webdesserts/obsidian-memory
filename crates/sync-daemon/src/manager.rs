@@ -250,14 +250,16 @@ impl ConnectionManager {
                     .await;
                 None
             }
-            DuplicateCheckResult::CloseOther { connection_id } => {
-                // Close the other connection
-                info!(
-                    "Duplicate connection detected, closing {} (keeping new)",
-                    connection_id
-                );
-                self.close_connection(&connection_id, DisconnectReason::DuplicateConnection)
-                    .await;
+            DuplicateCheckResult::CloseOther => {
+                // Close the other connection - look up its connection_id from peer_to_conn
+                if let Some(existing_conn_id) = self.peer_to_conn.get(peer_id).cloned() {
+                    info!(
+                        "Duplicate connection detected, closing {} (keeping new)",
+                        existing_conn_id
+                    );
+                    self.close_connection(&existing_conn_id, DisconnectReason::DuplicateConnection)
+                        .await;
+                }
 
                 // Register the new connection
                 self.peer_to_conn
