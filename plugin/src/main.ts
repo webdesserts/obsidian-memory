@@ -724,10 +724,11 @@ export default class P2PSyncPlugin extends Plugin {
 
     try {
       // Queue the WASM call to prevent concurrent &mut self borrows
-      const request = await this.vaultQueue.run(() => 
+      const request = await this.vaultQueue.run(() =>
         this.vault!.prepareSyncRequest()
       );
-      this.peerManager.send(peerId, request);
+      // Send with piggybacked gossip for peer discovery
+      this.peerManager.sendWithGossip(peerId, request);
       log.debug(`Sent sync request to ${peerId}`);
     } catch (err) {
       log.error(`Failed to send sync request to ${peerId}:`, err);
@@ -757,9 +758,9 @@ export default class P2PSyncPlugin extends Plugin {
       
       log.debug(`Sync result - response=${result.response ? result.response.length + ' bytes' : 'null'}, modifiedPaths=${JSON.stringify(result.modifiedPaths)}`);
 
-      // If there's a response, send it back
+      // If there's a response, send it back with piggybacked gossip
       if (result.response) {
-        this.peerManager.send(peerId, result.response);
+        this.peerManager.sendWithGossip(peerId, result.response);
         log.debug(`Sent sync response to ${peerId}`);
       }
 
@@ -821,7 +822,8 @@ export default class P2PSyncPlugin extends Plugin {
         this.vault!.prepareDocumentUpdate(path)
       );
       if (update) {
-        this.peerManager.broadcast(update);
+        // Broadcast with piggybacked gossip for peer discovery
+        this.peerManager.broadcastWithGossip(update);
         log.debug(`Broadcast update for ${path} to ${this.peerManager.peerCount} peer(s)`);
       }
     } catch (err) {

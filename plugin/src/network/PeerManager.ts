@@ -629,6 +629,65 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Send sync data to a peer with piggybacked gossip.
+   *
+   * This wraps the binary sync data in a JSON envelope that includes
+   * any pending gossip updates for efficient propagation.
+   */
+  sendWithGossip(peerId: string, syncData: Uint8Array): void {
+    const membership = this.getMembership();
+
+    if (membership) {
+      const gossipJson = membership.drainGossip();
+      const gossip = gossipJson ? JSON.parse(gossipJson) : [];
+
+      if (gossip.length > 0) {
+        // Wrap with gossip
+        const message = {
+          type: "sync",
+          data: Array.from(syncData),
+          gossip,
+        };
+        const encoded = new TextEncoder().encode(JSON.stringify(message));
+        this.send(peerId, encoded);
+        log.debug(`Sent sync with ${gossip.length} gossip updates to ${peerId}`);
+        return;
+      }
+    }
+
+    // No gossip, send raw sync data
+    this.send(peerId, syncData);
+  }
+
+  /**
+   * Broadcast sync data to all peers with piggybacked gossip.
+   */
+  broadcastWithGossip(syncData: Uint8Array): void {
+    const membership = this.getMembership();
+    let gossip: GossipUpdate[] = [];
+
+    if (membership) {
+      const gossipJson = membership.drainGossip();
+      gossip = gossipJson ? JSON.parse(gossipJson) : [];
+    }
+
+    if (gossip.length > 0) {
+      // Wrap with gossip
+      const message = {
+        type: "sync",
+        data: Array.from(syncData),
+        gossip,
+      };
+      const encoded = new TextEncoder().encode(JSON.stringify(message));
+      this.broadcast(encoded);
+      log.debug(`Broadcast sync with ${gossip.length} gossip updates`);
+    } else {
+      // No gossip, send raw
+      this.broadcast(syncData);
+    }
+  }
+
+  /**
    * Check if we are already connected to a peer.
    */
   private isConnectedTo(peerId: string): boolean {
@@ -734,6 +793,23 @@ export class PeerManager extends EventEmitter {
         const fromPeerId = conn?.peerId ?? connectionId;
         log.debug(`Received gossip from ${fromPeerId}: ${msg.updates.length} updates`);
         this.handleGossip(msg.updates as GossipUpdate[], fromPeerId);
+        return;
+      }
+
+      // Handle sync message with piggybacked gossip
+      if (msg.type === "sync" && Array.isArray(msg.data)) {
+        const conn = this.connections.get(connectionId);
+        const fromPeerId = conn?.peerId ?? connectionId;
+
+        // Process piggybacked gossip if present
+        if (Array.isArray(msg.gossip) && msg.gossip.length > 0) {
+          log.debug(`Received sync with ${msg.gossip.length} piggybacked gossip from ${fromPeerId}`);
+          this.handleGossip(msg.gossip as GossipUpdate[], fromPeerId);
+        }
+
+        // Forward the sync data to listeners
+        const syncData = new Uint8Array(msg.data);
+        this.emit("message", fromPeerId, syncData);
         return;
       }
     } catch {
