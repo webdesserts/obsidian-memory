@@ -16,8 +16,10 @@
 //! - Updates: `Alive`, `Suspect`, `Dead`, `Removed`
 //! - Rapid convergence through infection-style spread
 
+pub mod failure;
 pub mod membership;
 pub mod messages;
 
+pub use failure::{FailureDetector, FailureDetectorConfig, FailureEvent};
 pub use membership::{Member, MemberState, MembershipList};
 pub use messages::{GossipUpdate, PeerInfo, SwimMessage};
