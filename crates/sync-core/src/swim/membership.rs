@@ -214,6 +214,41 @@ impl MembershipList {
         self.members.values().filter(|m| m.is_server())
     }
 
+    /// Check if a peer is removed (collective forgetting).
+    ///
+    /// Returns true if the peer is in the list and marked as Removed.
+    /// We should NOT attempt to reconnect to removed peers.
+    pub fn is_removed(&self, peer_id: &PeerId) -> bool {
+        self.members
+            .get(peer_id)
+            .map(|m| m.state == MemberState::Removed)
+            .unwrap_or(false)
+    }
+
+    /// Check if a peer is dead (failure detected).
+    ///
+    /// Returns true if the peer is in the list and marked as Dead.
+    /// Unlike Removed, we MAY attempt to reconnect to dead peers.
+    pub fn is_dead(&self, peer_id: &PeerId) -> bool {
+        self.members
+            .get(peer_id)
+            .map(|m| m.state == MemberState::Dead)
+            .unwrap_or(false)
+    }
+
+    /// Get peers that should be reconnected to.
+    /// Returns server peers that we should attempt to reconnect to.
+    ///
+    /// Includes Alive and Dead peers (failure detection means we should retry).
+    /// Excludes Removed peers (collective forgetting means no auto-reconnect).
+    /// Excludes client-only peers (they can't accept incoming connections).
+    pub fn reconnectable_peers(&self) -> impl Iterator<Item = &Member> {
+        self.members.values().filter(|m| {
+            m.state != MemberState::Removed
+                && m.is_server()
+        })
+    }
+
     /// Number of members (excluding ourselves).
     pub fn len(&self) -> usize {
         self.members.len()
@@ -858,5 +893,89 @@ mod tests {
         let servers: Vec<_> = list.server_members().collect();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].info.peer_id, peer_a());
+    }
+
+    // ==================== State query helpers ====================
+
+    #[test]
+    fn test_is_removed() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        list.add(PeerInfo::new(peer_a(), None), 1);
+        assert!(!list.is_removed(&peer_a()));
+
+        list.mark_removed(peer_a());
+        assert!(list.is_removed(&peer_a()));
+    }
+
+    #[test]
+    fn test_is_removed_unknown_peer() {
+        let list = MembershipList::new(local_id(), None);
+        assert!(!list.is_removed(&peer_a()));
+    }
+
+    #[test]
+    fn test_is_dead() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        list.add(PeerInfo::new(peer_a(), None), 1);
+        assert!(!list.is_dead(&peer_a()));
+
+        list.mark_dead(peer_a());
+        assert!(list.is_dead(&peer_a()));
+    }
+
+    #[test]
+    fn test_is_dead_unknown_peer() {
+        let list = MembershipList::new(local_id(), None);
+        assert!(!list.is_dead(&peer_a()));
+    }
+
+    #[test]
+    fn test_reconnectable_peers() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add server peers (have addresses)
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.add(PeerInfo::new(peer_b(), Some("ws://b:8080".into())), 1);
+
+        // Add client-only peer (no address)
+        list.add(PeerInfo::client_only(peer_c()), 1);
+
+        let reconnectable: Vec<_> = list.reconnectable_peers().collect();
+
+        // Should include both server peers, but not client-only
+        assert_eq!(reconnectable.len(), 2);
+        assert!(reconnectable.iter().any(|m| m.info.peer_id == peer_a()));
+        assert!(reconnectable.iter().any(|m| m.info.peer_id == peer_b()));
+    }
+
+    #[test]
+    fn test_reconnectable_peers_includes_dead() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.add(PeerInfo::new(peer_b(), Some("ws://b:8080".into())), 1);
+
+        // Mark one as dead - should still be reconnectable (failure detection)
+        list.mark_dead(peer_a());
+
+        let reconnectable: Vec<_> = list.reconnectable_peers().collect();
+        assert_eq!(reconnectable.len(), 2);
+    }
+
+    #[test]
+    fn test_reconnectable_peers_excludes_removed() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.add(PeerInfo::new(peer_b(), Some("ws://b:8080".into())), 1);
+
+        // Mark one as removed - should NOT be reconnectable (collective forgetting)
+        list.mark_removed(peer_a());
+
+        let reconnectable: Vec<_> = list.reconnectable_peers().collect();
+        assert_eq!(reconnectable.len(), 1);
+        assert_eq!(reconnectable[0].info.peer_id, peer_b());
     }
 }
