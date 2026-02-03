@@ -329,6 +329,7 @@ impl MembershipList {
 
     /// Mark a peer as explicitly removed (collective forgetting).
     ///
+    /// Automatically queues a `Removed` gossip update for propagation.
     /// Returns true if state changed.
     pub fn mark_removed(&mut self, peer_id: PeerId) -> bool {
         if peer_id == self.local_peer_id {
@@ -339,6 +340,8 @@ impl MembershipList {
             && member.state != MemberState::Removed
         {
             member.state = MemberState::Removed;
+            // Queue gossip so Removed state spreads through the mesh
+            self.queue_gossip(GossipUpdate::removed(peer_id));
             return true;
         }
         false
@@ -1080,5 +1083,73 @@ mod tests {
         } else {
             panic!("Expected Alive gossip");
         }
+    }
+
+    // ==================== mark_removed gossip auto-queue ====================
+
+    #[test]
+    fn test_mark_removed_queues_gossip() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        list.add(PeerInfo::new(peer_a(), None), 1);
+        list.mark_removed(peer_a());
+
+        // Should have queued a Removed gossip update
+        let gossip = list.drain_gossip();
+        assert_eq!(gossip.len(), 1);
+        if let GossipUpdate::Removed { peer_id } = &gossip[0] {
+            assert_eq!(*peer_id, peer_a());
+        } else {
+            panic!("Expected Removed gossip, got {:?}", gossip[0]);
+        }
+    }
+
+    #[test]
+    fn test_removed_gossip_spreads_to_other_peers() {
+        // Alice marks Carol as Removed
+        let mut alice = MembershipList::new(local_id(), None);
+        let carol_id = peer_c();
+
+        alice.add(PeerInfo::new(carol_id, Some("ws://carol:8080".into())), 1);
+        alice.mark_removed(carol_id);
+
+        // Alice sends gossip to Bob
+        let gossip = alice.drain_gossip();
+
+        // Bob processes the gossip
+        let mut bob = MembershipList::new(peer_b(), None);
+        bob.add(PeerInfo::new(carol_id, Some("ws://carol:8080".into())), 1);
+
+        bob.process_gossip(&gossip, local_id());
+
+        // Bob should now have Carol marked as Removed
+        assert!(bob.is_removed(&carol_id));
+    }
+
+    #[test]
+    fn test_mark_removed_no_gossip_for_unknown_peer() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Mark unknown peer as removed - should not queue gossip
+        list.mark_removed(peer_a());
+
+        let gossip = list.drain_gossip();
+        assert!(gossip.is_empty());
+    }
+
+    #[test]
+    fn test_mark_removed_no_duplicate_gossip() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        list.add(PeerInfo::new(peer_a(), None), 1);
+        list.mark_removed(peer_a());
+
+        // Drain first gossip
+        let _ = list.drain_gossip();
+
+        // Second call should not queue another gossip (already Removed)
+        list.mark_removed(peer_a());
+        let gossip = list.drain_gossip();
+        assert!(gossip.is_empty());
     }
 }
