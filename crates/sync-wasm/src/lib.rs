@@ -44,10 +44,15 @@ mod wasm_impl {
     use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
 
-    /// Initialize the WASM module (sets up panic hook for better error messages)
+    /// Initialize the WASM module (sets up panic hook and tracing for better debugging)
     #[wasm_bindgen]
     pub fn init() {
         console_error_panic_hook::set_once();
+        tracing_wasm::set_as_global_default_with_config(
+            tracing_wasm::WASMLayerConfigBuilder::new()
+                .set_max_level(tracing::Level::DEBUG)
+                .build()
+        );
         log("sync-wasm initialized");
     }
 
