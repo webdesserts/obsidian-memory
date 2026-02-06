@@ -7,7 +7,7 @@ use crate::peers::{ConnectedPeer, ConnectionDirection, DisconnectReason, PeerErr
 use crate::PeerId;
 
 use loro::{LoroDoc, LoroTree, TreeID, TreeParentId, VersionVector};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -122,54 +122,73 @@ impl ReconcileReport {
     }
 }
 
-/// Tracks files that were recently synced to prevent re-broadcasting.
+/// Tracks sync state for echo detection and consistency reconciliation.
 ///
 /// When a file is received from sync, we mark it here BEFORE writing to disk.
 /// When the file watcher fires, we check and consume this flag to skip broadcast.
 ///
-/// Flags expire after `FLAG_TTL` to handle cases where file watcher events are
-/// dropped (e.g., under heavy load). This prevents stale flags from incorrectly
-/// suppressing local edits.
+/// Also tracks paths that need reconciliation before processing the next sync message.
+/// This ensures loro documents match the filesystem before importing sync data.
 #[derive(Clone)]
-pub struct SyncTracker {
-    /// Map of path -> timestamp when marked as synced
+pub struct SyncState {
+    /// Map of path -> timestamp when marked as synced (for echo detection)
     synced_paths: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Paths that may need reconciliation before next sync import
+    pending_reconcile: Arc<Mutex<HashSet<String>>>,
+    /// Registry may need reconciliation before next sync import
+    registry_pending: Arc<Mutex<bool>>,
 }
 
 /// Time-to-live for sync flags. Flags older than this are considered stale.
-const FLAG_TTL: Duration = Duration::from_secs(5);
+/// Set to 30s to provide safety margin for echo detection even with delayed file watchers.
+const FLAG_TTL: Duration = Duration::from_secs(30);
 
-impl Default for SyncTracker {
+impl Default for SyncState {
     fn default() -> Self {
         Self {
             synced_paths: Arc::new(Mutex::new(HashMap::new())),
+            pending_reconcile: Arc::new(Mutex::new(HashSet::new())),
+            registry_pending: Arc::new(Mutex::new(false)),
         }
     }
 }
 
-impl SyncTracker {
+impl SyncState {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Mark a path as having been synced (call before writing to disk)
+    /// Mark a path as having been synced (call before writing to disk).
+    /// Adds to both synced_paths (for echo detection) and pending_reconcile
+    /// (to ensure consistency before next sync import).
     pub fn mark_synced(&self, path: &str) {
         self.synced_paths
             .lock()
             .unwrap()
             .insert(path.to_string(), Instant::now());
+        self.pending_reconcile
+            .lock()
+            .unwrap()
+            .insert(path.to_string());
     }
 
     /// Check if path was synced and consume the flag (returns true once).
+    /// Also removes from pending_reconcile set.
     /// Returns false if the flag has expired (older than FLAG_TTL).
     pub fn consume_synced(&self, path: &str) -> bool {
+        self.pending_reconcile.lock().unwrap().remove(path);
         let mut paths = self.synced_paths.lock().unwrap();
         if let Some(timestamp) = paths.remove(path) {
             // Check if flag is still valid (not expired)
             if timestamp.elapsed() < FLAG_TTL {
                 return true;
             }
-            // Flag expired - treat as if it wasn't set
+            // Flag expired - log for diagnostics
+            tracing::debug!(
+                "Sync flag expired for {} (age={}ms)",
+                path,
+                timestamp.elapsed().as_millis()
+            );
         }
         false
     }
@@ -191,6 +210,23 @@ impl SyncTracker {
     pub fn cleanup_expired(&self) {
         let mut paths = self.synced_paths.lock().unwrap();
         paths.retain(|_, timestamp| timestamp.elapsed() < FLAG_TTL);
+    }
+
+    /// Take all paths pending reconciliation (called before sync import).
+    /// Returns the set of paths and clears the pending set.
+    pub fn take_pending_reconcile(&self) -> HashSet<String> {
+        std::mem::take(&mut *self.pending_reconcile.lock().unwrap())
+    }
+
+    /// Mark registry as needing reconciliation before next sync import.
+    pub fn mark_registry_synced(&self) {
+        *self.registry_pending.lock().unwrap() = true;
+    }
+
+    /// Check and clear registry pending flag (atomic take).
+    /// Returns true if registry needs reconciliation.
+    pub fn take_registry_pending(&self) -> bool {
+        std::mem::take(&mut *self.registry_pending.lock().unwrap())
     }
 }
 
@@ -227,8 +263,8 @@ pub struct Vault<F: FileSystem> {
     /// Our peer ID (set on all Loro documents for consistent version vectors)
     peer_id: PeerId,
 
-    /// Tracks files that were recently synced (for echo detection)
-    sync_tracker: SyncTracker,
+    /// Tracks sync state for echo detection and consistency reconciliation
+    sync_state: SyncState,
 
     /// Event bus for sync events (native: Arc for multi-threaded Tokio)
     #[cfg(not(target_arch = "wasm32"))]
@@ -361,7 +397,7 @@ impl<F: FileSystem> Vault<F> {
             documents: RefCell::new(HashMap::new()),
             fs,
             peer_id,
-            sync_tracker: SyncTracker::new(),
+            sync_state: SyncState::new(),
             events,
             peers,
         };
@@ -372,7 +408,7 @@ impl<F: FileSystem> Vault<F> {
             documents: Mutex::new(HashMap::new()),
             fs,
             peer_id,
-            sync_tracker: SyncTracker::new(),
+            sync_state: SyncState::new(),
             events,
             peers,
         };
@@ -430,7 +466,7 @@ impl<F: FileSystem> Vault<F> {
             documents: RefCell::new(HashMap::new()),
             fs,
             peer_id,
-            sync_tracker: SyncTracker::new(),
+            sync_state: SyncState::new(),
             events,
             peers,
         };
@@ -441,7 +477,7 @@ impl<F: FileSystem> Vault<F> {
             documents: Mutex::new(HashMap::new()),
             fs,
             peer_id,
-            sync_tracker: SyncTracker::new(),
+            sync_state: SyncState::new(),
             events,
             peers,
         };
@@ -685,6 +721,97 @@ impl<F: FileSystem> Vault<F> {
         Ok(())
     }
 
+    // ========== Sync Consistency Methods ==========
+
+    /// Ensure consistency of all pending paths before processing sync messages.
+    ///
+    /// Called at the start of `process_sync_message()` to guarantee that loro documents
+    /// and the registry match the filesystem before importing sync data. This prevents
+    /// panics when sync operations reference positions that don't exist in stale documents.
+    pub(crate) async fn ensure_consistency(&self) -> Result<()> {
+        // Reconcile registry first (file tree must be consistent before documents)
+        if self.sync_state.take_registry_pending() {
+            self.reconcile_registry().await?;
+        }
+
+        // Reconcile pending document paths
+        let pending = self.sync_state.take_pending_reconcile();
+        for path in pending {
+            match self.reconcile_single(&path).await {
+                Ok(true) => tracing::debug!("Reconciled stale doc before sync: {}", path),
+                Ok(false) => {} // Already consistent
+                Err(e) => {
+                    // Check if file was deleted - skip gracefully
+                    if matches!(e, VaultError::Fs(ref fs_err) if matches!(fs_err, crate::fs::FsError::NotFound(_))) {
+                        tracing::debug!("Skipping deleted file during reconcile: {}", path);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile a single document by updating loro to match filesystem.
+    ///
+    /// Returns Ok(true) if reconciled (content differed), Ok(false) if already consistent.
+    /// Returns Err with FsError::NotFound if the file was deleted.
+    async fn reconcile_single(&self, path: &str) -> Result<bool> {
+        let md_bytes = self.fs.read(path).await?; // May return NotFound
+        let md_content = String::from_utf8_lossy(&md_bytes);
+
+        let sync_path = self.document_sync_path(path);
+        let loro_bytes = match self.fs.read(&sync_path).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(false), // No loro file yet, nothing to reconcile
+        };
+
+        let doc = match NoteDocument::from_bytes(path, &loro_bytes, self.peer_id) {
+            Ok(d) => d,
+            Err(_) => return Ok(false), // Corrupted loro doc, let sync recreate it
+        };
+
+        let loro_content = doc.to_markdown();
+
+        // Normalize and compare
+        let md_normalized = md_content.replace("\r\n", "\n");
+        let loro_normalized = loro_content.replace("\r\n", "\n");
+
+        if md_normalized == loro_normalized {
+            return Ok(false); // Already consistent
+        }
+
+        // Update loro to match filesystem
+        let parsed = crate::markdown::parse(&md_content);
+        let body_changed = doc.update_body(&parsed.body)?;
+        let fm_changed = doc.update_frontmatter(parsed.frontmatter.as_ref())?;
+
+        if body_changed || fm_changed {
+            doc.commit();
+            let snapshot = doc.export_snapshot();
+            self.fs.write(&sync_path, &snapshot).await?;
+        }
+
+        self.documents_mut().insert(path.to_string(), doc);
+        Ok(true)
+    }
+
+    /// Reconcile registry by reloading from disk.
+    ///
+    /// Ensures the in-memory registry matches the persisted state before sync import.
+    async fn reconcile_registry(&self) -> Result<()> {
+        let registry_path = format!("{}/registry.loro", SYNC_DIR);
+        if let Ok(data) = self.fs.read(&registry_path).await {
+            self.registry_mut()
+                .import(&data)
+                .map_err(|e| VaultError::Other(format!("Registry reconcile failed: {}", e)))?;
+            self.rebuild_path_cache();
+            tracing::debug!("Reconciled registry before sync");
+        }
+        Ok(())
+    }
+
     /// Get our peer ID
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
@@ -722,13 +849,19 @@ impl<F: FileSystem> Vault<F> {
     /// Mark a path as synced (call before writing to disk).
     /// Used to prevent re-broadcasting files we just received from sync.
     pub fn mark_synced(&self, path: &str) {
-        self.sync_tracker.mark_synced(path);
+        self.sync_state.mark_synced(path);
+    }
+
+    /// Mark registry as synced (call after writing registry to disk).
+    /// Used to trigger registry reconciliation before next sync import.
+    pub(crate) fn mark_registry_synced(&self) {
+        self.sync_state.mark_registry_synced();
     }
 
     /// Check if a path was synced and consume the flag.
     /// Returns true once (and clears the flag), false on subsequent calls.
     pub fn consume_sync_flag(&self, path: &str) -> bool {
-        self.sync_tracker.consume_synced(path)
+        self.sync_state.consume_synced(path)
     }
 
     /// Get the version vector for a document as encoded bytes.
@@ -1872,11 +2005,11 @@ mod tests {
         assert!(vault2.is_file_deleted("note.md"));
     }
 
-    // ========== SyncTracker Tests ==========
+    // ========== SyncState Tests ==========
 
     #[test]
-    fn test_sync_tracker_mark_and_consume() {
-        let tracker = SyncTracker::new();
+    fn test_sync_state_mark_and_consume() {
+        let tracker = SyncState::new();
 
         // Initially not synced
         assert!(!tracker.is_synced("test.md"));
@@ -1894,8 +2027,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_tracker_multiple_paths() {
-        let tracker = SyncTracker::new();
+    fn test_sync_state_multiple_paths() {
+        let tracker = SyncState::new();
 
         tracker.mark_synced("a.md");
         tracker.mark_synced("b.md");
@@ -1913,8 +2046,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_tracker_clone_shares_state() {
-        let tracker1 = SyncTracker::new();
+    fn test_sync_state_clone_shares_state() {
+        let tracker1 = SyncState::new();
         let tracker2 = tracker1.clone();
 
         // Mark via tracker1
@@ -2036,8 +2169,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_tracker_flag_within_ttl() {
-        let tracker = SyncTracker::new();
+    fn test_sync_state_flag_within_ttl() {
+        let tracker = SyncState::new();
 
         // Mark and immediately check - should be within TTL
         tracker.mark_synced("test.md");
@@ -2050,8 +2183,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_tracker_cleanup_expired() {
-        let tracker = SyncTracker::new();
+    fn test_sync_state_cleanup_expired() {
+        let tracker = SyncState::new();
 
         // Mark several paths
         tracker.mark_synced("a.md");
@@ -2068,9 +2201,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_tracker_rename_marks_both_paths() {
+    fn test_sync_state_rename_marks_both_paths() {
         // This tests the behavior expected when a rename sync is processed
-        let tracker = SyncTracker::new();
+        let tracker = SyncState::new();
 
         // Simulate what sync_engine does for FileRenamed
         let old_path = "old/note.md";

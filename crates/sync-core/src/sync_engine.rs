@@ -90,6 +90,9 @@ impl<F: FileSystem> Vault<F> {
         &self,
         data: &[u8],
     ) -> Result<(Option<Vec<u8>>, Vec<String>)> {
+        // Ensure consistency before processing any sync message
+        self.ensure_consistency().await?;
+
         self.emit(SyncEvent::MessageReceived {
             message_type: "SyncMessage".into(),
             size: data.len(),
@@ -443,6 +446,9 @@ impl<F: FileSystem> Vault<F> {
             .await
             .map_err(crate::vault::VaultError::from)?;
 
+        // Mark registry as synced so it will be reconciled before next sync import
+        self.mark_registry_synced();
+
         debug!("apply_registry_updates: complete");
         Ok(())
     }
@@ -535,6 +541,10 @@ impl<F: FileSystem> Vault<F> {
             // Get local mtime and peer_id before borrowing doc (needed for "latest wins" comparison)
             let local_mtime = self.fs.stat(path).await.ok().map(|s| s.mtime_millis);
             let peer_id = self.peer_id();
+
+            // Note: Staleness reconciliation is handled by ensure_consistency() at the
+            // start of process_sync_message(). Documents are guaranteed to be consistent
+            // with the filesystem before this point.
 
             // Document exists - check for divergent histories before merging
             let mut doc = self.get_document_mut(path).await?;
