@@ -31,7 +31,11 @@ pub enum ConnectionEvent {
     /// Received a message from the peer
     Message(IncomingMessage),
     /// Peer completed handshake, revealing their real peer ID
-    Handshake { temp_id: String, peer_id: String },
+    Handshake {
+        temp_id: String,
+        peer_id: String,
+        address: Option<String>,
+    },
     /// Connection was closed
     Closed { temp_id: String },
 }
@@ -113,12 +117,13 @@ impl PeerConnection {
                     );
                     if let Some(handshake) = HandshakeMessage::from_binary(&data) {
                         debug!(
-                            "Received handshake from {} (peer_id: {}, role: {})",
-                            temp_id, handshake.peer_id, handshake.role
+                            "Received handshake from {} (peer_id: {}, role: {}, address: {:?})",
+                            temp_id, handshake.peer_id, handshake.role, handshake.address
                         );
                         let _ = event_tx.send(ConnectionEvent::Handshake {
                             temp_id: temp_id.clone(),
                             peer_id: handshake.peer_id,
+                            address: handshake.address,
                         });
                     } else {
                         // Regular sync message
@@ -163,9 +168,12 @@ impl PeerConnection {
             .map_err(|e| anyhow!("Failed to send message: {}", e))
     }
 
-    /// Send a handshake message to the peer.
-    pub async fn send_handshake(&self, peer_id: &str) -> Result<()> {
-        let handshake = HandshakeMessage::new(peer_id, "server");
+    /// Send a handshake message to the peer, optionally including our address.
+    pub async fn send_handshake(&self, peer_id: &str, address: Option<&str>) -> Result<()> {
+        let handshake = match address {
+            Some(addr) => HandshakeMessage::with_address(peer_id, "server", addr),
+            None => HandshakeMessage::new(peer_id, "server"),
+        };
         self.send(&handshake.to_binary()).await
     }
 

@@ -132,6 +132,8 @@ pub struct OutgoingConnection {
     pub address: String,
     /// Our peer ID (for handshake)
     our_peer_id: String,
+    /// Our advertised address to include in handshake (None = client-only)
+    our_address: Option<String>,
     /// Remote peer ID (known after handshake)
     pub remote_peer_id: Option<String>,
     /// Connection state
@@ -148,10 +150,11 @@ pub struct OutgoingConnection {
 
 impl OutgoingConnection {
     /// Create a new outgoing connection (not yet connected).
-    pub fn new(address: String, our_peer_id: String) -> Self {
+    pub fn new(address: String, our_peer_id: String, our_address: Option<String>) -> Self {
         Self {
             address,
             our_peer_id,
+            our_address,
             remote_peer_id: None,
             state: OutgoingState::Connecting,
             write: None,
@@ -176,8 +179,11 @@ impl OutgoingConnection {
         let write = Arc::new(Mutex::new(write));
         self.write = Some(write.clone());
 
-        // Send our handshake immediately
-        let handshake = HandshakeMessage::new(&self.our_peer_id, "client");
+        // Send our handshake immediately (include our address if we have one)
+        let handshake = match &self.our_address {
+            Some(addr) => HandshakeMessage::with_address(&self.our_peer_id, "client", addr),
+            None => HandshakeMessage::new(&self.our_peer_id, "client"),
+        };
         {
             let mut w = write.lock().await;
             w.send(Message::Binary(handshake.to_binary().into()))
@@ -230,12 +236,13 @@ impl OutgoingConnection {
                     // Check if this is a handshake message
                     if let Some(handshake) = HandshakeMessage::from_binary(&data) {
                         debug!(
-                            "Received handshake from {} (peer_id: {}, role: {})",
-                            address, handshake.peer_id, handshake.role
+                            "Received handshake from {} (peer_id: {}, role: {}, address: {:?})",
+                            address, handshake.peer_id, handshake.role, handshake.address
                         );
                         let _ = event_tx.send(ConnectionEvent::Handshake {
                             temp_id: address.clone(),
                             peer_id: handshake.peer_id,
+                            address: handshake.address,
                         });
                     } else {
                         // Regular sync message
@@ -474,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_outgoing_connection_new() {
-        let conn = OutgoingConnection::new("ws://localhost:8080".into(), "our-peer".into());
+        let conn = OutgoingConnection::new("ws://localhost:8080".into(), "our-peer".into(), None);
 
         assert_eq!(conn.address, "ws://localhost:8080");
         assert_eq!(conn.state, OutgoingState::Connecting);
@@ -483,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_on_handshake_complete() {
-        let mut conn = OutgoingConnection::new("ws://localhost:8080".into(), "our-peer".into());
+        let mut conn = OutgoingConnection::new("ws://localhost:8080".into(), "our-peer".into(), None);
         conn.state = OutgoingState::Handshaking;
 
         conn.on_handshake_complete("remote-peer".into());
@@ -494,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_prepare_reconnect() {
-        let mut conn = OutgoingConnection::new("ws://localhost:8080".into(), "our-peer".into());
+        let mut conn = OutgoingConnection::new("ws://localhost:8080".into(), "our-peer".into(), None);
         let config = ReconnectConfig::default();
 
         conn.prepare_reconnect(1000, &config);

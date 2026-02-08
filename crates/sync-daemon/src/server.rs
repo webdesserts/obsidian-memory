@@ -15,6 +15,8 @@ use tracing::{debug, error, info, warn};
 pub struct WebSocketServer {
     /// Our peer ID
     peer_id: String,
+    /// Our advertised address (None = client-only)
+    our_address: Option<String>,
     /// Active connections indexed by temp ID
     connections: HashMap<String, PeerConnection>,
     /// Map from real peer ID to temp ID
@@ -27,19 +29,23 @@ pub struct WebSocketServer {
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     /// Channel receiver for connection events
     event_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
-    /// Channel for notifying when a peer completes handshake
-    peer_connected_tx: mpsc::UnboundedSender<String>,
+    /// Channel for notifying when a peer completes handshake (peer_id, address)
+    peer_connected_tx: mpsc::UnboundedSender<(String, Option<String>)>,
 }
 
 impl WebSocketServer {
     /// Create a new WebSocket server.
-    pub fn new(peer_id: String) -> (Self, mpsc::UnboundedReceiver<String>) {
+    pub fn new(
+        peer_id: String,
+        our_address: Option<String>,
+    ) -> (Self, mpsc::UnboundedReceiver<(String, Option<String>)>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (peer_connected_tx, peer_connected_rx) = mpsc::unbounded_channel();
 
         (
             Self {
                 peer_id,
+                our_address,
                 connections: HashMap::new(),
                 peer_to_temp: HashMap::new(),
                 temp_to_peer: HashMap::new(),
@@ -91,8 +97,8 @@ impl WebSocketServer {
         // Create connection
         let conn = PeerConnection::new(temp_id.clone(), ws_stream, self.event_tx.clone());
 
-        // Send our handshake immediately
-        if let Err(e) = conn.send_handshake(&self.peer_id).await {
+        // Send our handshake immediately (include our address if we have one)
+        if let Err(e) = conn.send_handshake(&self.peer_id, self.our_address.as_deref()).await {
             error!("Failed to send handshake to {}: {}", temp_id, e);
             return;
         }
@@ -107,10 +113,10 @@ impl WebSocketServer {
     }
 
     /// Register a peer after handshake completion.
-    pub fn register_peer(&mut self, temp_id: &str, peer_id: String) {
+    pub fn register_peer(&mut self, temp_id: &str, peer_id: String, address: Option<String>) {
         debug!(
-            "Handshake complete: {} is now known as {}",
-            temp_id, peer_id
+            "Handshake complete: {} is now known as {} (address: {:?})",
+            temp_id, peer_id, address
         );
 
         // Update ID mappings
@@ -123,7 +129,7 @@ impl WebSocketServer {
         }
 
         // Notify that peer is connected (for sync initiation)
-        let _ = self.peer_connected_tx.send(peer_id);
+        let _ = self.peer_connected_tx.send((peer_id, address));
     }
 
     /// Remove a peer after connection close.

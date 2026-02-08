@@ -497,7 +497,7 @@ async fn main() -> Result<()> {
     info!("Vault loaded, peer ID: {}", vault.peer_id());
 
     // Create WebSocket server (takes string peer_id for protocol messages)
-    let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id.to_string());
+    let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());
 
     // Create connection manager for outgoing connections
     let (outgoing, mut outgoing_rx) = ConnectionManager::new(
@@ -573,9 +573,9 @@ async fn main() -> Result<()> {
                     ConnectionEvent::Message(msg) => {
                         daemon.on_sync_message(msg).await;
                     }
-                    ConnectionEvent::Handshake { temp_id, peer_id } => {
-                        debug!("Handshake event for {} -> {}", temp_id, peer_id);
-                        daemon.server.register_peer(&temp_id, peer_id);
+                    ConnectionEvent::Handshake { temp_id, peer_id, address } => {
+                        debug!("Handshake event for {} -> {} (address: {:?})", temp_id, peer_id, address);
+                        daemon.server.register_peer(&temp_id, peer_id, address);
                     }
                     ConnectionEvent::Closed { temp_id } => {
                         // Get real peer_id before removing (for SWIM tracking)
@@ -592,8 +592,8 @@ async fn main() -> Result<()> {
             }
 
             // Handle peer connected notifications (for sync init)
-            Some(peer_id) = peer_connected_rx.recv() => {
-                daemon.on_peer_connected(peer_id, None).await;
+            Some((peer_id, address)) = peer_connected_rx.recv() => {
+                daemon.on_peer_connected(peer_id, address).await;
             }
 
             // Handle outgoing connection events
@@ -602,9 +602,9 @@ async fn main() -> Result<()> {
                     ManagerEvent::Message(msg) => {
                         daemon.on_sync_message(msg).await;
                     }
-                    ManagerEvent::HandshakeComplete { peer_id, .. } => {
+                    ManagerEvent::HandshakeComplete { peer_id, address, .. } => {
                         info!("Outgoing connection established to {}", peer_id);
-                        daemon.on_peer_connected(peer_id, None).await;
+                        daemon.on_peer_connected(peer_id, address).await;
                     }
                     ManagerEvent::ConnectionClosed { peer_id, reason } => {
                         info!("Outgoing connection closed: {} ({:?})", peer_id, reason);

@@ -102,8 +102,8 @@ async fn process_pending_events(server: &Arc<Mutex<WebSocketServer>>) {
             Ok(Some(event)) => {
                 match event {
                     ConnectionEvent::Message(_) => {} // Ignore messages in test helper
-                    ConnectionEvent::Handshake { temp_id, peer_id } => {
-                        guard.register_peer(&temp_id, peer_id);
+                    ConnectionEvent::Handshake { temp_id, peer_id, address } => {
+                        guard.register_peer(&temp_id, peer_id, address);
                     }
                     ConnectionEvent::Closed { temp_id } => {
                         guard.remove_peer(&temp_id);
@@ -123,7 +123,7 @@ async fn process_pending_events(server: &Arc<Mutex<WebSocketServer>>) {
 #[tokio::test]
 async fn test_handshake_exchange() {
     // Create server
-    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string());
+    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
@@ -161,7 +161,7 @@ async fn test_handshake_exchange() {
 
 #[tokio::test]
 async fn test_multiple_clients() {
-    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string());
+    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
@@ -204,7 +204,7 @@ async fn test_multiple_clients() {
 
 #[tokio::test]
 async fn test_message_broadcast() {
-    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string());
+    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
@@ -440,7 +440,7 @@ async fn test_native_fs_nested_directories() {
 
 #[tokio::test]
 async fn test_connection_events_flow() {
-    let (server, mut peer_rx) = WebSocketServer::new("test-server".to_string());
+    let (server, mut peer_rx) = WebSocketServer::new("test-server".to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
@@ -464,7 +464,7 @@ async fn test_connection_events_flow() {
     accept_handle.await.expect("Accept task failed");
 
     // Should receive peer_connected notification
-    let peer_id = timeout(Duration::from_secs(2), peer_rx.recv())
+    let (peer_id, _address) = timeout(Duration::from_secs(2), peer_rx.recv())
         .await
         .expect("Timeout waiting for peer_connected")
         .expect("No peer_connected received");

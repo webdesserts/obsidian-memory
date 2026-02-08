@@ -32,6 +32,7 @@ pub enum ManagerEvent {
         connection_id: String,
         peer_id: String,
         direction: ConnectionDirection,
+        address: Option<String>,
     },
     /// Connection closed
     ConnectionClosed {
@@ -158,8 +159,8 @@ impl ConnectionManager {
         // Create connection
         let conn = PeerConnection::new(temp_id.clone(), ws_stream, self.event_tx.clone());
 
-        // Send our handshake immediately
-        if let Err(e) = conn.send_handshake(&self.our_peer_id).await {
+        // Send our handshake immediately (include our address if we have one)
+        if let Err(e) = conn.send_handshake(&self.our_peer_id, self.our_address.as_deref()).await {
             error!("Failed to send handshake to {}: {}", temp_id, e);
             return;
         }
@@ -181,7 +182,11 @@ impl ConnectionManager {
 
         info!("Connecting to {}", address);
 
-        let mut conn = OutgoingConnection::new(address.to_string(), self.our_peer_id.clone());
+        let mut conn = OutgoingConnection::new(
+            address.to_string(),
+            self.our_peer_id.clone(),
+            self.our_address.clone(),
+        );
         conn.connect(self.event_tx.clone()).await?;
 
         self.connections
@@ -197,16 +202,23 @@ impl ConnectionManager {
         let event = self.event_rx.recv().await?;
 
         match event {
-            ConnectionEvent::Handshake { temp_id, peer_id } => {
-                self.on_handshake(&temp_id, &peer_id).await
-            }
+            ConnectionEvent::Handshake {
+                temp_id,
+                peer_id,
+                address,
+            } => self.on_handshake(&temp_id, &peer_id, address).await,
             ConnectionEvent::Message(msg) => Some(ManagerEvent::Message(msg)),
             ConnectionEvent::Closed { temp_id } => self.on_closed(&temp_id).await,
         }
     }
 
     /// Handle handshake completion.
-    async fn on_handshake(&mut self, conn_id: &str, peer_id: &str) -> Option<ManagerEvent> {
+    async fn on_handshake(
+        &mut self,
+        conn_id: &str,
+        peer_id: &str,
+        address: Option<String>,
+    ) -> Option<ManagerEvent> {
         let conn = self.connections.get(conn_id)?;
         let direction = conn.direction();
 
@@ -238,6 +250,7 @@ impl ConnectionManager {
                     connection_id: conn_id.to_string(),
                     peer_id: peer_id.to_string(),
                     direction,
+                    address: address.clone(),
                 })
             }
             DuplicateCheckResult::CloseThis => {
@@ -274,6 +287,7 @@ impl ConnectionManager {
                     connection_id: conn_id.to_string(),
                     peer_id: peer_id.to_string(),
                     direction,
+                    address,
                 })
             }
         }
