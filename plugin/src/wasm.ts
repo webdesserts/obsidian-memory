@@ -57,6 +57,26 @@ export interface ConnectedPeer {
   connectionCount: number;
 }
 
+// ========== Init Config Types ==========
+
+/** Log event received from the WASM callback logger */
+export interface LogEvent {
+  /** Log level: "TRACE", "DEBUG", "INFO", "WARN", "ERROR" */
+  level: string;
+  /** Module/target that emitted the log */
+  target: string;
+  /** Log message */
+  message: string;
+  /** Timestamp in milliseconds since Unix epoch */
+  timestamp: number;
+}
+
+/** Configuration for WASM initialization */
+export interface InitConfig {
+  /** Optional logger callback for routing logs to file/custom handler */
+  logger?: (event: LogEvent) => void;
+}
+
 // ========== SWIM Gossip Types ==========
 
 /** Information about a peer in the SWIM mesh */
@@ -201,8 +221,11 @@ let initialized = false;
  *
  * Must be called before using any other WASM functions.
  * Safe to call multiple times (subsequent calls are no-ops).
+ *
+ * @param config - Optional configuration:
+ *   - `logger`: Callback to receive log events (for file logging)
  */
-export async function initWasm(): Promise<void> {
+export async function initWasm(config?: InitConfig): Promise<void> {
   if (initialized) {
     return;
   }
@@ -210,8 +233,12 @@ export async function initWasm(): Promise<void> {
   // Initialize WASM synchronously using the bundled binary
   initSync(wasmBinary);
 
-  // Initialize panic hook and logging
-  wasmInit();
+  // Initialize panic hook and logging (with optional config)
+  if (config) {
+    wasmInit(config);
+  } else {
+    wasmInit();
+  }
 
   initialized = true;
   log.info(`sync-wasm v${version()} initialized`);

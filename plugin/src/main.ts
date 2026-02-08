@@ -10,6 +10,7 @@ import {
   SyncEvent,
   ConnectedPeer,
   DisconnectReason,
+  LogEvent,
 } from "./wasm";
 import { createFsBridge } from "./fs/ObsidianFs";
 import { PeerManager, PeerInfo, VaultPeerManager } from "./network";
@@ -175,9 +176,31 @@ export default class P2PSyncPlugin extends Plugin {
       return;
     }
 
-    // Initialize WASM module
+    // Initialize WASM module with file logging
     try {
-      await initWasm();
+      const debugLogPath = ".sync/debug.log";
+
+      // Ensure .sync directory exists for debug log
+      if (!await this.app.vault.adapter.exists(".sync")) {
+        await this.app.vault.adapter.mkdir(".sync");
+      }
+
+      // Reset debug log on plugin init (prevents unbounded growth)
+      await this.app.vault.adapter.write(
+        debugLogPath,
+        `--- Log started ${new Date().toISOString()} ---\n`
+      );
+
+      // Initialize WASM with logger callback that writes to file
+      await initWasm({
+        logger: (event: LogEvent) => {
+          const line = `${new Date(event.timestamp).toISOString()} [${event.level}] ${event.target}: ${event.message}\n`;
+          // Fire-and-forget append (don't await to avoid blocking sync)
+          this.app.vault.adapter.append(debugLogPath, line).catch((err) => {
+            console.error("Failed to write debug log:", err);
+          });
+        }
+      });
       log.info("WASM initialized");
     } catch (err) {
       log.error("Failed to initialize WASM:", err);

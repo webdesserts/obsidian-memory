@@ -15,6 +15,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use thiserror::Error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -62,9 +63,30 @@ impl NoteDocument {
     /// The peer_id is set before import so any new operations (like path metadata updates)
     /// are attributed to this peer. Imported operations preserve their original peer IDs.
     pub fn from_bytes(path: &str, bytes: &[u8], peer_id: PeerId) -> Result<Self> {
+        debug!(
+            path = %path,
+            bytes_len = bytes.len(),
+            "loro_from_bytes: starting import"
+        );
+
         let doc = LoroDoc::new();
         doc.set_peer_id(peer_id.as_u64()).ok();
-        doc.import(bytes).map_err(|e| DocumentError::Loro(e.to_string()))?;
+        doc.import(bytes).map_err(|e| {
+            error!(
+                path = %path,
+                bytes_len = bytes.len(),
+                error = %e,
+                "loro_from_bytes FAILED"
+            );
+            DocumentError::Loro(e.to_string())
+        })?;
+
+        let body_len = doc.get_text("body").len_unicode();
+        debug!(
+            path = %path,
+            body_len = body_len,
+            "loro_from_bytes: import complete"
+        );
 
         // Update path metadata (this is intentional - records the current path)
         let meta = doc.get_map("_meta");
@@ -237,9 +259,38 @@ impl NoteDocument {
 
     /// Import data from bytes
     pub fn import(&mut self, data: &[u8]) -> Result<()> {
-        self.doc
-            .import(data)
-            .map_err(|e| DocumentError::Loro(e.to_string()))?;
+        let body_len_before = self.body().len_unicode();
+        let vv_before = self.version();
+
+        debug!(
+            path = %self.path,
+            body_len = body_len_before,
+            data_len = data.len(),
+            vv = ?vv_before,
+            "loro_import: starting"
+        );
+
+        self.doc.import(data).map_err(|e| {
+            error!(
+                path = %self.path,
+                body_len = body_len_before,
+                data_len = data.len(),
+                vv = ?vv_before,
+                error = %e,
+                "loro_import FAILED"
+            );
+            DocumentError::Loro(e.to_string())
+        })?;
+
+        let body_len_after = self.body().len_unicode();
+        let vv_after = self.version();
+        debug!(
+            path = %self.path,
+            body_len_before = body_len_before,
+            body_len_after = body_len_after,
+            vv = ?vv_after,
+            "loro_import: complete"
+        );
 
         // Update local path cache from imported metadata if present
         if let Some(stored) = self.stored_path() {
@@ -283,13 +334,37 @@ impl NoteDocument {
     pub fn update_body(&self, new_body: &str) -> Result<bool> {
         let body = self.body();
         let old_body = body.to_string();
+        let old_len = body.len_unicode();
 
         if old_body == new_body {
             return Ok(false); // No changes
         }
 
+        debug!(
+            path = %self.path,
+            old_len = old_len,
+            new_len = new_body.chars().count(),
+            "update_body: starting update_by_line"
+        );
+
         body.update_by_line(new_body, UpdateOptions::default())
-            .map_err(|e| DocumentError::Loro(format!("{:?}", e)))?;
+            .map_err(|e| {
+                error!(
+                    path = %self.path,
+                    old_len = old_len,
+                    new_len = new_body.chars().count(),
+                    error = ?e,
+                    "update_body FAILED"
+                );
+                DocumentError::Loro(format!("{:?}", e))
+            })?;
+
+        debug!(
+            path = %self.path,
+            old_len = old_len,
+            new_len = body.len_unicode(),
+            "update_body: complete"
+        );
 
         Ok(true) // Changes applied (commit happens in caller)
     }

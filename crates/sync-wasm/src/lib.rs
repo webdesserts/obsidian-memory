@@ -40,19 +40,157 @@ pub use fs_bridge::JsFileSystemBridge;
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use super::*;
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use std::cell::RefCell;
+    use tracing_subscriber::layer::SubscriberExt;
     use wasm_bindgen::prelude::*;
 
-    /// Initialize the WASM module (sets up panic hook and tracing for better debugging)
+    // ========== Callback Logger Layer ==========
+
+    /// Store the logger callback in thread-local storage (WASM is single-threaded)
+    thread_local! {
+        static LOGGER_CALLBACK: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+    }
+
+    /// A tracing layer that invokes a JavaScript callback for each log event.
+    struct JsCallbackLayer;
+
+    impl<S> tracing_subscriber::Layer<S> for JsCallbackLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            LOGGER_CALLBACK.with(|cb| {
+                if let Some(callback) = cb.borrow().as_ref() {
+                    // Extract event data
+                    let metadata = event.metadata();
+                    let level = metadata.level().as_str();
+                    let target = metadata.target();
+
+                    // Build message from event fields
+                    let mut visitor = MessageVisitor::default();
+                    event.record(&mut visitor);
+                    let message = visitor.message;
+
+                    // Get timestamp in milliseconds
+                    let timestamp = web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as f64)
+                        .unwrap_or(0.0);
+
+                    // Create JS object for the event
+                    let js_event = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(&js_event, &"level".into(), &level.into());
+                    let _ = js_sys::Reflect::set(&js_event, &"target".into(), &target.into());
+                    let _ = js_sys::Reflect::set(&js_event, &"message".into(), &message.into());
+                    let _ = js_sys::Reflect::set(&js_event, &"timestamp".into(), &timestamp.into());
+
+                    // Call the JavaScript callback
+                    let _ = callback.call1(&JsValue::NULL, &js_event);
+                }
+            });
+        }
+    }
+
+    /// Visitor to extract message from tracing event fields
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: String,
+    }
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{:?}", value);
+            } else if self.message.is_empty() {
+                // Build message from all fields if no explicit message
+                if !self.message.is_empty() {
+                    self.message.push_str(", ");
+                }
+                self.message.push_str(&format!("{}={:?}", field.name(), value));
+            } else {
+                // Append additional fields
+                self.message.push_str(&format!(" {}={:?}", field.name(), value));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else if self.message.is_empty() {
+                self.message = format!("{}={}", field.name(), value);
+            } else {
+                self.message.push_str(&format!(" {}={}", field.name(), value));
+            }
+        }
+    }
+
+    /// Configuration for WASM initialization
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct InitConfig {
+        /// Whether a logger callback was provided (the actual function is passed separately)
+        #[serde(skip)]
+        has_logger: bool,
+    }
+
+    /// Initialize the WASM module (sets up panic hook and tracing for better debugging).
+    ///
+    /// Accepts an optional configuration object:
+    /// - `init()` - console-only logging (default)
+    /// - `init({})` - console-only logging
+    /// - `init({ logger: (event) => {...} })` - callback + console logging
+    ///
+    /// The logger callback receives events with: `{ level, target, message, timestamp }`
     #[wasm_bindgen]
-    pub fn init() {
+    pub fn init(config: Option<js_sys::Object>) {
         console_error_panic_hook::set_once();
-        tracing_wasm::set_as_global_default_with_config(
-            tracing_wasm::WASMLayerConfigBuilder::new()
-                .set_max_level(tracing::Level::DEBUG)
-                .build()
-        );
+
+        // Check if config has a logger callback
+        let has_callback = config.as_ref().map_or(false, |cfg| {
+            js_sys::Reflect::get(cfg, &"logger".into())
+                .ok()
+                .map_or(false, |v| v.is_function())
+        });
+
+        if has_callback {
+            // Extract and store the logger callback
+            let callback = config
+                .as_ref()
+                .and_then(|cfg| js_sys::Reflect::get(cfg, &"logger".into()).ok())
+                .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+
+            if let Some(cb) = callback {
+                LOGGER_CALLBACK.with(|cell| {
+                    *cell.borrow_mut() = Some(cb);
+                });
+            }
+
+            // Use combined subscriber: callback layer + console layer
+            let console_layer = tracing_wasm::WASMLayer::new(
+                tracing_wasm::WASMLayerConfigBuilder::new()
+                    .set_max_level(tracing::Level::DEBUG)
+                    .build(),
+            );
+
+            let subscriber = tracing_subscriber::registry()
+                .with(JsCallbackLayer)
+                .with(console_layer);
+
+            tracing::subscriber::set_global_default(subscriber).ok();
+        } else {
+            // Default: console-only logging
+            tracing_wasm::set_as_global_default_with_config(
+                tracing_wasm::WASMLayerConfigBuilder::new()
+                    .set_max_level(tracing::Level::DEBUG)
+                    .build(),
+            );
+        }
+
         log("sync-wasm initialized");
     }
 

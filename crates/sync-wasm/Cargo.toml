@@ -17,6 +17,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+web-time.workspace = true
 async-trait.workspace = true
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"

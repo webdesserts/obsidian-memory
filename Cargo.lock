@@ -4073,10 +4073,12 @@ dependencies = [
  "sync-core",
  "thiserror 2.0.17",
  "tracing",
+ "tracing-subscriber",
  "tracing-wasm",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+ "web-time",
 ]
 
 [[package]]
