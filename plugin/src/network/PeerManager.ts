@@ -335,7 +335,7 @@ export class PeerManager extends EventEmitter {
    *
    * @param url - Full WebSocket URL (e.g., wss://example.com/sync)
    */
-  async connectToUrl(url: string): Promise<string> {
+  async connectToUrl(url: string, options?: { reconnect?: boolean }): Promise<string> {
     let normalized: string;
     try {
       normalized = this.normalizeUrl(url);
@@ -401,7 +401,8 @@ export class PeerManager extends EventEmitter {
       this.emit("error", err);
     });
 
-    await client.connect({ url: normalized, reconnect: true, reconnectDelay: 5000 });
+    const reconnect = options?.reconnect ?? true;
+    await client.connect({ url: normalized, reconnect, reconnectDelay: 5000 });
 
     return connectionId;
   }
@@ -650,7 +651,7 @@ export class PeerManager extends EventEmitter {
       if (peer.address && !this.isConnectedTo(peer.peerId) && !this.connectingPeers.has(peer.peerId)) {
         log.info(`Discovered peer via gossip: ${peer.peerId} at ${peer.address}`);
         this.connectingPeers.add(peer.peerId);
-        this.connectToUrl(peer.address)
+        this.connectToUrl(peer.address, { reconnect: false })
           .catch((err) => {
             log.warn(`Failed to auto-connect to discovered peer ${peer.peerId}:`, err);
           })

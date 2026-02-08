@@ -548,6 +548,49 @@ describe("PeerManager", () => {
   });
 
   describe("auto-connect", () => {
+    it("should use one-shot connection (no reconnect) for gossip-discovered peers", async () => {
+      // Connect and complete handshake
+      const connectPromise = manager.connectToUrl("wss://example.com/sync");
+      const socket = socketFactory.getLatest()!;
+      socket.simulateOpen();
+      await connectPromise;
+
+      const serverHandshake = new TextEncoder().encode(
+        JSON.stringify({
+          type: "handshake",
+          peerId: "server-abc",
+          role: "server",
+        })
+      );
+      socket.simulateMessage(serverHandshake);
+
+      // Send gossip that discovers a new peer
+      const gossip = new TextEncoder().encode(
+        JSON.stringify({
+          type: "gossip",
+          updates: [{ type: "alive", peer: { peerId: "new-peer", address: "ws://new:8765" }, incarnation: 1 }],
+        })
+      );
+      socket.simulateMessage(gossip);
+
+      // Find the socket created for the gossip-discovered peer
+      const gossipSocket = socketFactory.instances.find((s) => s.url.includes("new:8765"));
+
+      if (gossipSocket) {
+        // Simulate successful connection then disconnect
+        gossipSocket.simulateOpen();
+
+        // After disconnect, should NOT attempt reconnection
+        gossipSocket.simulateClose();
+        await vi.advanceTimersByTimeAsync(10000);
+
+        // No new socket should have been created for this peer
+        const reconnectAttempts = socketFactory.instances
+          .filter((s) => s.url.includes("new:8765"));
+        expect(reconnectAttempts.length).toBe(1); // Only the original, no reconnect
+      }
+    });
+
     it("should not attempt duplicate connections to same peer", async () => {
       // Connect and complete handshake
       const connectPromise = manager.connectToUrl("wss://example.com/sync");
