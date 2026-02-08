@@ -384,6 +384,109 @@ describe("PeerManager", () => {
     });
   });
 
+  describe("sendHandshake()", () => {
+    describe("Given membershipAddress is set", () => {
+      it("should include address in handshake message", async () => {
+        const pmWithAddr = new PeerManager("test-client-id", null, "ws://192.168.1.10:9427");
+        pmWithAddr.setVault(mockVault);
+
+        const connectPromise = pmWithAddr.connectToUrl("wss://example.com/sync");
+        const socket = socketFactory.getLatest()!;
+        socket.simulateOpen();
+        await connectPromise;
+
+        const handshake = socket.getLastSentJson<{
+          type: string;
+          peerId: string;
+          role: string;
+          address?: string;
+        }>();
+        expect(handshake).toEqual({
+          type: "handshake",
+          peerId: "test-client-id",
+          role: "client",
+          address: "ws://192.168.1.10:9427",
+        });
+      });
+    });
+
+    describe("Given membershipAddress is null", () => {
+      it("should omit address from handshake message", async () => {
+        const connectPromise = manager.connectToUrl("wss://example.com/sync");
+        const socket = socketFactory.getLatest()!;
+        socket.simulateOpen();
+        await connectPromise;
+
+        const handshake = socket.getLastSentJson<{
+          type: string;
+          peerId: string;
+          role: string;
+          address?: string;
+        }>();
+        expect(handshake).toEqual({
+          type: "handshake",
+          peerId: "test-client-id",
+          role: "client",
+        });
+        expect(handshake).not.toHaveProperty("address");
+      });
+    });
+  });
+
+  describe("received handshake address", () => {
+    it("should pass handshake address to onHandshakeComplete", async () => {
+      const spy = vi.spyOn(manager as any, "onHandshakeComplete");
+
+      const connectPromise = manager.connectToUrl("wss://example.com/sync");
+      const socket = socketFactory.getLatest()!;
+      socket.simulateOpen();
+      await connectPromise;
+
+      // Simulate receiving handshake WITH address field
+      const serverHandshake = new TextEncoder().encode(
+        JSON.stringify({
+          type: "handshake",
+          peerId: "server-abc",
+          role: "server",
+          address: "ws://10.0.0.5:9427",
+        })
+      );
+      socket.simulateMessage(serverHandshake);
+
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringMatching(/^url-/),
+        "server-abc",
+        "ws://10.0.0.5:9427"
+      );
+    });
+
+    it("should fall back to vault address when handshake has no address", async () => {
+      const spy = vi.spyOn(manager as any, "onHandshakeComplete");
+
+      const connectPromise = manager.connectToUrl("wss://example.com/sync");
+      const socket = socketFactory.getLatest()!;
+      socket.simulateOpen();
+      await connectPromise;
+
+      // Simulate receiving handshake WITHOUT address field
+      const serverHandshake = new TextEncoder().encode(
+        JSON.stringify({
+          type: "handshake",
+          peerId: "server-abc",
+          role: "server",
+        })
+      );
+      socket.simulateMessage(serverHandshake);
+
+      // Should fall back to vault's peer.address ("test-address" from mock)
+      expect(spy).toHaveBeenCalledWith(
+        expect.stringMatching(/^url-/),
+        "server-abc",
+        "test-address"
+      );
+    });
+  });
+
   describe("setAdvertisedAddress()", () => {
     it("should update membershipAddress for future membership instances", () => {
       const pm = new PeerManager("test-peer", null, null, 1);
