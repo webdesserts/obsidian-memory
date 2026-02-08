@@ -792,12 +792,15 @@ export class PeerManager extends EventEmitter {
    * ```
    */
   private sendHandshake(connectionId: string, role: "server" | "client"): void {
-    const handshake = JSON.stringify({
+    const handshake: Record<string, string> = {
       type: "handshake",
       peerId: this.ownPeerId,
       role,
-    });
-    const data = new TextEncoder().encode(handshake);
+    };
+    if (this.membershipAddress) {
+      handshake.address = this.membershipAddress;
+    }
+    const data = new TextEncoder().encode(JSON.stringify(handshake));
     this.send(connectionId, data);
   }
 
@@ -827,8 +830,9 @@ export class PeerManager extends EventEmitter {
           peer = this.vault.peerHandshakeComplete(connectionId, msg.peerId);
         }
 
-        // Add peer to SWIM membership as Alive and exchange gossip
-        this.onHandshakeComplete(connectionId, msg.peerId, peer?.address);
+        // Add peer to SWIM membership as Alive and exchange gossip.
+        // Prefer address from handshake (direct from peer) over vault address.
+        this.onHandshakeComplete(connectionId, msg.peerId, msg.address ?? peer?.address);
 
         // Emit peer-connected event (now fired after handshake, not on socket open)
         if (peer) {
