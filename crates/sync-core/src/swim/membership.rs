@@ -180,10 +180,29 @@ impl MembershipList {
                 return true;
             }
 
-            // Same incarnation but transitioning from non-Alive to Alive
-            if incarnation == existing.incarnation && existing.state != MemberState::Alive {
-                existing.state = MemberState::Alive;
-                return true;
+            // Same incarnation: handle state transitions and address merging
+            if incarnation == existing.incarnation {
+                let mut changed = false;
+
+                if existing.state != MemberState::Alive {
+                    existing.state = MemberState::Alive;
+                    changed = true;
+                }
+
+                // Merge address when existing has none (e.g., handshake registered
+                // peer without address, then gossip arrives with it)
+                if existing.info.address.is_none() && info.address.is_some() {
+                    existing.info.address = info.address;
+                    changed = true;
+                }
+
+                if changed {
+                    if via.is_some() {
+                        existing.discovered_via = via;
+                    }
+                }
+
+                return changed;
             }
 
             false
@@ -1176,6 +1195,97 @@ mod tests {
 
         let gossip = list.drain_gossip();
         assert!(gossip.is_empty());
+    }
+
+    // ==================== Same-incarnation address merge ====================
+
+    #[test]
+    fn test_same_incarnation_merges_address_when_existing_has_none() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer without address (e.g., from handshake without address)
+        list.add(PeerInfo::client_only(peer_a()), 1);
+        assert!(list.get(&peer_a()).unwrap().info.address.is_none());
+
+        // Gossip arrives with address at same incarnation
+        let changed = list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+
+        assert!(changed);
+        assert_eq!(
+            list.get(&peer_a()).unwrap().info.address,
+            Some("ws://a:8080".into())
+        );
+    }
+
+    #[test]
+    fn test_same_incarnation_does_not_overwrite_existing_address() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer with address
+        list.add(PeerInfo::new(peer_a(), Some("ws://original:8080".into())), 1);
+
+        // Another update at same incarnation with different address
+        let changed = list.add(PeerInfo::new(peer_a(), Some("ws://different:8080".into())), 1);
+
+        assert!(!changed);
+        assert_eq!(
+            list.get(&peer_a()).unwrap().info.address,
+            Some("ws://original:8080".into())
+        );
+    }
+
+    #[test]
+    fn test_same_incarnation_does_not_clear_address_with_none() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer with address
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+
+        // Gossip arrives without address at same incarnation
+        let changed = list.add(PeerInfo::client_only(peer_a()), 1);
+
+        assert!(!changed);
+        assert_eq!(
+            list.get(&peer_a()).unwrap().info.address,
+            Some("ws://a:8080".into())
+        );
+    }
+
+    #[test]
+    fn test_process_gossip_returns_peer_when_address_merged() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer without address (e.g., registered during handshake)
+        list.add(PeerInfo::client_only(peer_a()), 1);
+
+        // Gossip arrives with address — should return peer for auto-connect
+        let updates = vec![GossipUpdate::alive(
+            PeerInfo::new(peer_a(), Some("ws://a:8080".into())),
+            1,
+        )];
+        let new_peers = list.process_gossip(&updates, peer_b());
+
+        assert_eq!(new_peers.len(), 1);
+        assert_eq!(new_peers[0].peer_id, peer_a());
+        assert_eq!(new_peers[0].address, Some("ws://a:8080".into()));
+    }
+
+    #[test]
+    fn test_same_incarnation_merges_address_even_when_suspected() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Add peer without address, then suspect it
+        list.add(PeerInfo::client_only(peer_a()), 1);
+        list.suspect(peer_a(), 1);
+        assert_eq!(list.get(&peer_a()).unwrap().state, MemberState::Suspected);
+
+        // Gossip arrives with address at same incarnation — should merge address AND transition to Alive
+        let changed = list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+
+        assert!(changed);
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Alive);
+        assert_eq!(member.info.address, Some("ws://a:8080".into()));
     }
 
     #[test]

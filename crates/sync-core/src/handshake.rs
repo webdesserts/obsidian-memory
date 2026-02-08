@@ -30,15 +30,31 @@ pub struct HandshakeMessage {
 
     /// Role in the connection: "server" or "client"
     pub role: String,
+
+    /// The peer's advertised WebSocket address (e.g., "ws://192.168.1.10:9427").
+    /// None for client-only peers or old peers that don't include this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 impl HandshakeMessage {
-    /// Create a new handshake message.
+    /// Create a new handshake message without an address (client-only).
     pub fn new(peer_id: &str, role: &str) -> Self {
         Self {
             msg_type: "handshake".to_string(),
             peer_id: peer_id.to_string(),
             role: role.to_string(),
+            address: None,
+        }
+    }
+
+    /// Create a handshake message that includes our advertised address.
+    pub fn with_address(peer_id: &str, role: &str, address: &str) -> Self {
+        Self {
+            msg_type: "handshake".to_string(),
+            peer_id: peer_id.to_string(),
+            role: role.to_string(),
+            address: Some(address.to_string()),
         }
     }
 
@@ -133,5 +149,47 @@ mod tests {
 
         assert_eq!(parsed.peer_id, "test-client-id");
         assert_eq!(parsed.role, "client");
+    }
+
+    // ==================== Address field ====================
+
+    #[test]
+    fn test_with_address_includes_address_in_json() {
+        let msg = HandshakeMessage::with_address("peer-1", "server", "ws://192.168.1.10:9427");
+        let binary = msg.to_binary();
+        let text = std::str::from_utf8(&binary).unwrap();
+
+        assert!(text.contains(r#""address":"ws://192.168.1.10:9427""#));
+        assert_eq!(msg.address, Some("ws://192.168.1.10:9427".to_string()));
+    }
+
+    #[test]
+    fn test_new_omits_address_field() {
+        let msg = HandshakeMessage::new("peer-1", "client");
+        let binary = msg.to_binary();
+        let text = std::str::from_utf8(&binary).unwrap();
+
+        // Address field should be absent (not serialized as null)
+        assert!(!text.contains("address"));
+        assert_eq!(msg.address, None);
+    }
+
+    #[test]
+    fn test_deserialize_without_address_field() {
+        // Old peers won't include address — should parse as None
+        let wire = br#"{"type":"handshake","peerId":"old-peer","role":"client"}"#;
+        let parsed = HandshakeMessage::from_binary(wire).unwrap();
+
+        assert_eq!(parsed.peer_id, "old-peer");
+        assert_eq!(parsed.address, None);
+    }
+
+    #[test]
+    fn test_deserialize_with_address_field() {
+        let wire = br#"{"type":"handshake","peerId":"new-peer","role":"server","address":"ws://10.0.0.5:9427"}"#;
+        let parsed = HandshakeMessage::from_binary(wire).unwrap();
+
+        assert_eq!(parsed.peer_id, "new-peer");
+        assert_eq!(parsed.address, Some("ws://10.0.0.5:9427".to_string()));
     }
 }
