@@ -778,7 +778,7 @@ describe("PeerManager", () => {
 
         // Simulate gossip arriving from peer A
         const updates = [
-          { type: "alive", peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
+          { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
         ];
         manager.handleGossip(updates, "peer-a");
 
@@ -813,7 +813,7 @@ describe("PeerManager", () => {
 
         // Simulate gossip arriving from peer A
         const updates = [
-          { type: "alive", peer: { peerId: "peer-b", address: null }, incarnation: 1 },
+          { type: "alive" as const, peer: { peerId: "peer-b", address: null }, incarnation: 1 },
         ];
         manager.handleGossip(updates, "peer-a");
 
