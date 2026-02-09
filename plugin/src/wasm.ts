@@ -107,6 +107,14 @@ export type GossipUpdate =
   | { type: "dead"; peerId: string; incarnation: number }
   | { type: "removed"; peerId: string };
 
+/** Result of processing incoming gossip through the membership list. */
+export interface ProcessedGossip {
+  /** Newly discovered peers — use for auto-connect decisions */
+  newPeers: SwimPeerInfo[];
+  /** State-changing updates only — relay to other peers (excludes already-known gossip) */
+  relay: GossipUpdate[];
+}
+
 // ========== Debug API Types ==========
 
 /** Version vector as a map of peer ID hex strings to counter values */

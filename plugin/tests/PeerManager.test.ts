@@ -86,7 +86,7 @@ function createMockMembership() {
     getAliveMembers: vi.fn(() => []),
     contains: vi.fn(() => false),
     getMemberIncarnation: vi.fn(() => undefined as number | undefined),
-    processGossip: vi.fn(() => []),
+    processGossip: vi.fn(() => JSON.stringify({ newPeers: [], relay: [] })),
     drainGossip: vi.fn(() => "[]"),
     generateFullGossip: vi.fn(() => "[]"),
     markDead: vi.fn(() => false),
@@ -776,20 +776,22 @@ describe("PeerManager", () => {
         socketA.clearSentMessages();
         socketB.clearSentMessages();
 
-        // Simulate processGossip() queuing an update (state changed)
-        const drainedUpdate = { type: "alive", peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 };
-        mockMembership.drainGossip.mockReturnValueOnce(JSON.stringify([drainedUpdate]));
+        // Simulate processGossip() returning state-changing relay updates
+        const relayUpdate = { type: "alive", peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 };
+        mockMembership.processGossip.mockReturnValueOnce(
+          JSON.stringify({ newPeers: [], relay: [relayUpdate] })
+        );
 
         const updates = [
           { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
         ];
         manager.handleGossip(updates, "peer-a");
 
-        // Peer B should have received the drained (state-changing) gossip
+        // Peer B should have received only the state-changing relay updates
         expect(socketB.sentMessages).toHaveLength(1);
         const relayedMsg = JSON.parse(new TextDecoder().decode(socketB.sentMessages[0]));
         expect(relayedMsg.type).toBe("gossip");
-        expect(relayedMsg.updates).toEqual([drainedUpdate]);
+        expect(relayedMsg.updates).toEqual([relayUpdate]);
 
         // Peer A (the sender) should NOT have received the relay
         expect(socketA.sentMessages).toHaveLength(0);
@@ -823,9 +825,7 @@ describe("PeerManager", () => {
         socketA.clearSentMessages();
         socketB.clearSentMessages();
 
-        // drainGossip returns empty — gossip was already known, no state change
-        mockMembership.drainGossip.mockReturnValueOnce("[]");
-
+        // Default mock returns empty relay — gossip was already known, no state change
         const updates = [
           { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
         ];

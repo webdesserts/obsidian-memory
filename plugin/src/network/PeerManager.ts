@@ -16,7 +16,7 @@ import { EventEmitter } from "events";
 import { Platform } from "obsidian";
 import { SyncWebSocketClient } from "./WebSocketClient";
 import { log } from "../logger";
-import type { ConnectedPeer, DisconnectReason, GossipUpdate, SwimPeerInfo, SwimMember } from "../wasm";
+import type { ConnectedPeer, DisconnectReason, GossipUpdate, ProcessedGossip, SwimPeerInfo, SwimMember } from "../wasm";
 
 // Type for dynamically loaded WebSocket server
 interface SyncWebSocketServer extends EventEmitter {
@@ -80,7 +80,7 @@ interface MembershipLike {
   getAliveMembers(): unknown;
   contains(peerId: string): boolean;
   getMemberIncarnation(peerId: string): number | undefined;
-  processGossip(gossipJson: string, fromPeerId: string): unknown;
+  processGossip(gossipJson: string, fromPeerId: string): string;
   drainGossip(): string;
   generateFullGossip(): string;
   markDead(peerId: string): boolean;
@@ -522,20 +522,13 @@ export class PeerManager extends EventEmitter {
     if (!membership || updates.length === 0) return [];
 
     const gossipJson = JSON.stringify(updates);
-    const newPeers = membership.processGossip(gossipJson, fromPeerId) as SwimPeerInfo[];
+    const { newPeers, relay }: ProcessedGossip = JSON.parse(membership.processGossip(gossipJson, fromPeerId));
 
-    // Relay only state-changing updates to prevent amplification storms.
-    // processGossip() queues gossip internally only when state actually changed
-    // (new peer, higher incarnation, state transition). Draining gives us exactly
-    // the novel updates — already-known gossip produces nothing to relay.
-    if (this.peerCount > 1) {
-      const pendingJson = membership.drainGossip();
-      const pending = pendingJson ? JSON.parse(pendingJson) : [];
-      if (pending.length > 0) {
-        const relayMsg = JSON.stringify({ type: "gossip", updates: pending });
-        this.broadcastExcept(new TextEncoder().encode(relayMsg), fromPeerId);
-        log.debug(`Relayed ${pending.length} gossip updates to ${this.peerCount - 1} other peer(s)`);
-      }
+    // Relay state-changing updates only (API prevents amplification by design)
+    if (this.peerCount > 1 && relay.length > 0) {
+      const relayMsg = JSON.stringify({ type: "gossip", updates: relay });
+      this.broadcastExcept(new TextEncoder().encode(relayMsg), fromPeerId);
+      log.debug(`Relayed ${relay.length} gossip updates to ${this.peerCount - 1} other peer(s)`);
     }
 
     // Auto-connect to newly discovered server peers
