@@ -547,6 +547,56 @@ describe("PeerManager", () => {
     });
   });
 
+  describe("broadcastExcept()", () => {
+    it("should send to all connected peers except the excluded one", async () => {
+      // Connect peer A
+      const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+      const socketA = socketFactory.getLatest()!;
+      socketA.simulateOpen();
+      await connectA;
+
+      // Complete handshake for peer A
+      socketA.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+        )
+      );
+
+      // Connect peer B
+      const connectB = manager.connectToUrl("wss://peer-b.com/sync");
+      const socketB = socketFactory.getLatest()!;
+      socketB.simulateOpen();
+      await connectB;
+
+      // Complete handshake for peer B
+      socketB.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
+        )
+      );
+
+      // Clear sent messages from handshakes
+      socketA.clearSentMessages();
+      socketB.clearSentMessages();
+
+      // Broadcast to everyone except peer A
+      const data = new TextEncoder().encode("test-data");
+      manager.broadcastExcept(data, "peer-a");
+
+      // Peer B should receive the message, peer A should not
+      expect(socketA.sentMessages).toHaveLength(0);
+      expect(socketB.sentMessages).toHaveLength(1);
+    });
+
+    it("should not throw when vault is not set", () => {
+      const managerNoVault = new PeerManager("test-client-id", null);
+
+      expect(() => {
+        managerNoVault.broadcastExcept(new TextEncoder().encode("test"), "some-peer");
+      }).not.toThrow();
+    });
+  });
+
   describe("auto-connect", () => {
     it("should use one-shot connection (no reconnect) for gossip-discovered peers", async () => {
       // Connect and complete handshake

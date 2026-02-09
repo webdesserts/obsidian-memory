@@ -365,6 +365,23 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
+   * Broadcast data to all connected peers except the specified one.
+   * Used for gossip relay (exclude sender) and alive broadcasts (exclude new peer).
+   */
+  broadcastExcept(data: Uint8Array, excludePeerId: string): void {
+    if (!this.vault) return;
+    for (const peer of this.vault.getConnectedPeers()) {
+      if (peer.id !== excludePeerId) {
+        try {
+          this.send(peer.id, data);
+        } catch {
+          // Peer may have disconnected between iteration and send
+        }
+      }
+    }
+  }
+
+  /**
    * Get list of connected peers from Rust state.
    */
   getConnectedPeers(): PeerInfo[] {
