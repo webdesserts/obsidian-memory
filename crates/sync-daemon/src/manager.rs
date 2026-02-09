@@ -78,7 +78,7 @@ pub struct ConnectionManager {
     our_peer_id: String,
     /// Our advertised address (None if client-only)
     our_address: Option<String>,
-    /// All connections indexed by connection ID (temp_id for incoming, address for outgoing)
+    /// All connections indexed by connection ID (conn_id for incoming, address for outgoing)
     connections: HashMap<String, Connection>,
     /// Map from peer ID to connection ID (for routing by peer ID)
     peer_to_conn: HashMap<String, String>,
@@ -151,23 +151,23 @@ impl ConnectionManager {
         };
 
         // Generate temp ID
-        let temp_id = format!("peer-{}", self.next_conn_id);
+        let conn_id = format!("conn-{}", self.next_conn_id);
         self.next_conn_id += 1;
 
-        info!("New incoming connection from {} (temp_id: {})", addr, temp_id);
+        info!("New incoming connection from {} (conn_id: {})", addr, conn_id);
 
         // Create connection
-        let conn = PeerConnection::new(temp_id.clone(), ws_stream, self.event_tx.clone());
+        let conn = PeerConnection::new(conn_id.clone(), ws_stream, self.event_tx.clone());
 
         // Send our handshake immediately (include our address if we have one)
         if let Err(e) = conn.send_handshake(&self.our_peer_id, self.our_address.as_deref()).await {
-            error!("Failed to send handshake to {}: {}", temp_id, e);
+            error!("Failed to send handshake to {}: {}", conn_id, e);
             return;
         }
 
         // Store connection
         self.connections
-            .insert(temp_id, Connection::Incoming(conn));
+            .insert(conn_id, Connection::Incoming(conn));
     }
 
     /// Connect to a remote peer.
@@ -203,18 +203,18 @@ impl ConnectionManager {
 
         match event {
             ConnectionEvent::Handshake {
-                temp_id,
+                conn_id,
                 peer_id,
                 address,
-            } => self.on_handshake(&temp_id, &peer_id, address).await,
+            } => self.on_handshake(&conn_id, &peer_id, address).await,
             ConnectionEvent::Message(mut msg) => {
                 // Resolve conn_id → peer_id so callers see real peer IDs
-                if let Some(pid) = self.resolve_peer_id(&msg.temp_id) {
-                    msg.temp_id = pid;
+                if let Some(pid) = self.resolve_peer_id(&msg.peer_id) {
+                    msg.peer_id = pid;
                 }
                 Some(ManagerEvent::Message(msg))
             }
-            ConnectionEvent::Closed { temp_id } => self.on_closed(&temp_id).await,
+            ConnectionEvent::Closed { conn_id } => self.on_closed(&conn_id).await,
         }
     }
 

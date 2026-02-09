@@ -19,31 +19,35 @@ use tracing::{debug, error, warn};
 /// Message received from a peer connection.
 #[derive(Debug)]
 pub struct IncomingMessage {
-    /// Temporary connection ID (e.g., "peer-1")
-    pub temp_id: String,
+    /// Peer ID (resolved after handshake by poll_event/poll_events)
+    pub peer_id: String,
     /// Raw message data
     pub data: Vec<u8>,
 }
 
-/// Event emitted by a connection.
+/// Internal event emitted by a connection's read loop.
+///
+/// These use `conn_id` (the internal connection identifier) and are
+/// resolved to real peer IDs by `WebSocketServer::poll_event()` or
+/// `ConnectionManager::poll_events()` before reaching callers.
 #[derive(Debug)]
 pub enum ConnectionEvent {
     /// Received a message from the peer
     Message(IncomingMessage),
     /// Peer completed handshake, revealing their real peer ID
     Handshake {
-        temp_id: String,
+        conn_id: String,
         peer_id: String,
         address: Option<String>,
     },
     /// Connection was closed
-    Closed { temp_id: String },
+    Closed { conn_id: String },
 }
 
 /// A single WebSocket connection to a peer.
 pub struct PeerConnection {
-    /// Temporary ID assigned by server (e.g., "peer-1")
-    pub temp_id: String,
+    /// Internal connection ID assigned by server (e.g., "conn-1")
+    pub conn_id: String,
     /// Real peer ID (known after handshake)
     pub real_peer_id: Option<String>,
     /// Write half of the WebSocket (wrapped for sharing across tasks)
@@ -57,20 +61,20 @@ impl PeerConnection {
     ///
     /// Spawns a read task that forwards messages to the event channel.
     pub fn new(
-        temp_id: String,
+        conn_id: String,
         ws_stream: WebSocketStream<TcpStream>,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) -> Self {
         let (write, read) = ws_stream.split();
         let write = Arc::new(Mutex::new(write));
 
-        let read_temp_id = temp_id.clone();
+        let read_conn_id = conn_id.clone();
         let read_task = tokio::spawn(async move {
-            Self::read_loop(read_temp_id, read, event_tx).await;
+            Self::read_loop(read_conn_id, read, event_tx).await;
         });
 
         Self {
-            temp_id,
+            conn_id,
             real_peer_id: None,
             write,
             read_task: Some(read_task),
@@ -79,7 +83,7 @@ impl PeerConnection {
 
     /// Read loop that forwards messages to the event channel.
     async fn read_loop(
-        temp_id: String,
+        conn_id: String,
         mut read: futures::stream::SplitStream<WebSocketStream<TcpStream>>,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) {
@@ -91,7 +95,7 @@ impl PeerConnection {
                         Message::Text(text) => text.into_bytes(),
                         Message::Ping(_) | Message::Pong(_) => continue,
                         Message::Close(_) => {
-                            debug!("Received close frame from {}", temp_id);
+                            debug!("Received close frame from {}", conn_id);
                             break;
                         }
                         Message::Frame(_) => continue,
@@ -101,7 +105,7 @@ impl PeerConnection {
                     if data.len() > MAX_MESSAGE_SIZE {
                         warn!(
                             "Message from {} exceeds max size ({} > {}), dropping",
-                            temp_id,
+                            conn_id,
                             data.len(),
                             MAX_MESSAGE_SIZE
                         );
@@ -111,24 +115,25 @@ impl PeerConnection {
                     // Check if this is a handshake message
                     debug!(
                         "Message from {}: {} bytes, starts_with_brace={}",
-                        temp_id,
+                        conn_id,
                         data.len(),
                         data.first() == Some(&b'{')
                     );
                     if let Some(handshake) = HandshakeMessage::from_binary(&data) {
                         debug!(
                             "Received handshake from {} (peer_id: {}, role: {}, address: {:?})",
-                            temp_id, handshake.peer_id, handshake.role, handshake.address
+                            conn_id, handshake.peer_id, handshake.role, handshake.address
                         );
                         let _ = event_tx.send(ConnectionEvent::Handshake {
-                            temp_id: temp_id.clone(),
+                            conn_id: conn_id.clone(),
                             peer_id: handshake.peer_id,
                             address: handshake.address,
                         });
                     } else {
-                        // Regular sync message
+                        // Regular sync message — peer_id starts as conn_id,
+                        // gets resolved by poll_event/poll_events before reaching callers
                         let _ = event_tx.send(ConnectionEvent::Message(IncomingMessage {
-                            temp_id: temp_id.clone(),
+                            peer_id: conn_id.clone(),
                             data,
                         }));
                     }
@@ -136,16 +141,16 @@ impl PeerConnection {
                 Some(Err(e)) => {
                     match e {
                         WsError::ConnectionClosed | WsError::AlreadyClosed => {
-                            debug!("Connection {} closed", temp_id);
+                            debug!("Connection {} closed", conn_id);
                         }
                         _ => {
-                            error!("WebSocket error on {}: {}", temp_id, e);
+                            error!("WebSocket error on {}: {}", conn_id, e);
                         }
                     }
                     break;
                 }
                 None => {
-                    debug!("Connection {} stream ended", temp_id);
+                    debug!("Connection {} stream ended", conn_id);
                     break;
                 }
             }
@@ -153,7 +158,7 @@ impl PeerConnection {
 
         // Notify that connection is closed
         let _ = event_tx.send(ConnectionEvent::Closed {
-            temp_id: temp_id.clone(),
+            conn_id: conn_id.clone(),
         });
     }
 

@@ -182,10 +182,10 @@ impl Daemon {
 
     /// Handle a sync message from a peer.
     ///
-    /// The `msg.temp_id` field contains the resolved peer_id (set by
+    /// The `msg.peer_id` field contains the resolved peer_id (set by
     /// `poll_event()` for incoming, or `poll_events()` for outgoing).
     async fn on_sync_message(&mut self, msg: IncomingMessage) {
-        let peer_id = &msg.temp_id;
+        let peer_id = &msg.peer_id;
 
         debug!("Processing message from {} ({} bytes)", peer_id, msg.data.len());
 
@@ -495,7 +495,7 @@ async fn main() -> Result<()> {
     info!("Vault loaded, peer ID: {}", vault.peer_id());
 
     // Create WebSocket server (takes string peer_id for protocol messages)
-    let (server, _peer_connected_rx) = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());
+    let server = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());
 
     // Create connection manager for outgoing connections
     let (outgoing, mut outgoing_rx) = ConnectionManager::new(

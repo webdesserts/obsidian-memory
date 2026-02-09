@@ -240,15 +240,16 @@ impl OutgoingConnection {
                             address, handshake.peer_id, handshake.role, handshake.address
                         );
                         let _ = event_tx.send(ConnectionEvent::Handshake {
-                            temp_id: address.clone(),
+                            conn_id: address.clone(),
                             peer_id: handshake.peer_id,
                             address: handshake.address,
                         });
                     } else {
-                        // Regular sync message
+                        // Regular sync message — peer_id starts as address,
+                        // gets resolved by poll_events before reaching callers
                         let _ = event_tx.send(ConnectionEvent::Message(
                             crate::connection::IncomingMessage {
-                                temp_id: address.clone(),
+                                peer_id: address.clone(),
                                 data,
                             },
                         ));
@@ -274,7 +275,7 @@ impl OutgoingConnection {
 
         // Notify that connection is closed
         let _ = event_tx.send(ConnectionEvent::Closed {
-            temp_id: address.clone(),
+            conn_id: address.clone(),
         });
     }
 

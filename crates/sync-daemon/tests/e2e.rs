@@ -116,7 +116,7 @@ impl TestClient {
 
 /// Create a server and listener bound to a random port.
 async fn create_server(peer_id: &str) -> (WebSocketServer, tokio::net::TcpListener, SocketAddr) {
-    let (server, _peer_rx) = WebSocketServer::new(peer_id.to_string(), None);
+    let server = WebSocketServer::new(peer_id.to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
@@ -222,7 +222,7 @@ async fn test_poll_event_message() {
 
     match event {
         ServerEvent::Message(msg) => {
-            assert_eq!(msg.temp_id, client_peer_id, "Message should have resolved peer_id");
+            assert_eq!(msg.peer_id, client_peer_id, "Message should have resolved peer_id");
             assert_eq!(msg.data, b"hello from client");
         }
         other => panic!("Expected Message, got {:?}", other),
