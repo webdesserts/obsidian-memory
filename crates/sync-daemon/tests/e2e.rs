@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use sync_daemon::{
-    connection::ConnectionEvent, message::HandshakeMessage, native_fs::NativeFs,
+    message::HandshakeMessage, native_fs::NativeFs, server::ServerEvent,
     server::WebSocketServer, watcher::FileWatcher, FileEventKind,
 };
 use tempfile::TempDir;
@@ -41,6 +41,27 @@ impl TestClient {
 
         // Send our handshake
         let our_hs = HandshakeMessage::new(&client.peer_id, "client");
+        client.send_binary(&our_hs.to_binary()).await;
+
+        client
+    }
+
+    /// Connect and handshake with a specific address in our handshake.
+    async fn connect_with_address(addr: SocketAddr, address: &str) -> Self {
+        let url = format!("ws://{}", addr);
+        let (ws, _) = connect_async(&url).await.expect("Failed to connect");
+
+        let mut client = Self {
+            ws,
+            peer_id: format!("test-client-{}", uuid::Uuid::new_v4()),
+        };
+
+        // Receive server handshake
+        let server_hs = client.expect_handshake().await;
+        assert_eq!(server_hs.role, "server");
+
+        // Send handshake with address
+        let our_hs = HandshakeMessage::with_address(&client.peer_id, "client", address);
         client.send_binary(&our_hs.to_binary()).await;
 
         client
@@ -93,138 +114,231 @@ impl TestClient {
 // Helpers
 // ============================================================================
 
-/// Process pending events from the server, registering/removing peers as needed.
-async fn process_pending_events(server: &Arc<Mutex<WebSocketServer>>) {
-    loop {
-        let mut guard = server.lock().await;
-        // Use try_recv pattern via recv_event with timeout
-        match tokio::time::timeout(Duration::from_millis(10), guard.recv_event()).await {
-            Ok(Some(event)) => {
-                match event {
-                    ConnectionEvent::Message(_) => {} // Ignore messages in test helper
-                    ConnectionEvent::Handshake { temp_id, peer_id, address } => {
-                        guard.register_peer(&temp_id, peer_id, address);
-                    }
-                    ConnectionEvent::Closed { temp_id } => {
-                        guard.remove_peer(&temp_id);
-                    }
-                }
-                drop(guard);
-            }
-            _ => break, // Timeout or None means no more events
-        }
-    }
-}
-
-// ============================================================================
-// Test Cases
-// ============================================================================
-
-#[tokio::test]
-async fn test_handshake_exchange() {
-    // Create server
-    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string(), None);
+/// Create a server and listener bound to a random port.
+async fn create_server(peer_id: &str) -> (WebSocketServer, tokio::net::TcpListener, SocketAddr) {
+    let (server, _peer_rx) = WebSocketServer::new(peer_id.to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
     let addr = listener.local_addr().expect("Failed to get local addr");
+    (server, listener, addr)
+}
 
-    // Wrap server for async sharing
+/// Poll for a ServerEvent with a timeout.
+async fn poll_event_timeout(
+    server: &mut WebSocketServer,
+    duration: Duration,
+) -> Option<ServerEvent> {
+    timeout(duration, server.poll_event()).await.ok().flatten()
+}
+
+// ============================================================================
+// ServerEvent Tests (poll_event API)
+// ============================================================================
+
+#[tokio::test]
+async fn test_poll_event_peer_connected() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    // Accept connection in background
+    let listener = Arc::new(listener);
+    let listener_clone = Arc::clone(&listener);
     let server = Arc::new(Mutex::new(server));
     let server_clone = Arc::clone(&server);
 
-    // Accept one connection in background and process events
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener.accept().await.expect("Failed to accept");
-        server_clone.lock().await.accept_connection(stream, peer_addr).await;
-
-        // Wait for handshake event to arrive and process it
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        process_pending_events(&server_clone).await;
+        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+        server_clone
+            .lock()
+            .await
+            .accept_connection(stream, peer_addr)
+            .await;
     });
 
-    // Connect client
-    let client = TestClient::connect_and_handshake(addr).await;
+    // Connect client with address
+    let client =
+        TestClient::connect_with_address(addr, "ws://192.168.1.10:9427").await;
 
-    // Wait for accept to complete
     accept_handle.await.expect("Accept task failed");
 
-    // Verify server has connection (give a moment for state to settle)
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let server_guard = server.lock().await;
-    assert_eq!(server_guard.peer_count(), 1, "Should have one peer after handshake");
+    // poll_event should return PeerConnected
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected");
 
-    // Cleanup
-    drop(server_guard);
+    match event {
+        ServerEvent::PeerConnected { peer_id, address } => {
+            assert_eq!(peer_id, client.peer_id);
+            assert_eq!(address.as_deref(), Some("ws://192.168.1.10:9427"));
+        }
+        other => panic!("Expected PeerConnected, got {:?}", other),
+    }
+
+    assert_eq!(guard.peer_count(), 1);
+
     client.close().await;
 }
 
 #[tokio::test]
-async fn test_multiple_clients() {
-    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string(), None);
-    let listener = WebSocketServer::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().expect("Failed to get local addr");
+async fn test_poll_event_message() {
+    let (server, listener, addr) = create_server("test-server").await;
 
-    let server = Arc::new(Mutex::new(server));
     let listener = Arc::new(listener);
-
-    // Accept connections in background
-    let server_clone = Arc::clone(&server);
     let listener_clone = Arc::clone(&listener);
+    let server = Arc::new(Mutex::new(server));
+    let server_clone = Arc::clone(&server);
 
     let accept_handle = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-            server_clone.lock().await.accept_connection(stream, peer_addr).await;
-        }
-
-        // Wait for handshake events and process them
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        process_pending_events(&server_clone).await;
+        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+        server_clone
+            .lock()
+            .await
+            .accept_connection(stream, peer_addr)
+            .await;
     });
 
-    // Connect two clients
-    let client1 = TestClient::connect_and_handshake(addr).await;
-    let client2 = TestClient::connect_and_handshake(addr).await;
-
-    // Wait for accepts
+    let mut client = TestClient::connect_and_handshake(addr).await;
     accept_handle.await.expect("Accept task failed");
 
-    // Verify server has both connections
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let server_guard = server.lock().await;
-    assert_eq!(server_guard.peer_count(), 2, "Should have two peers");
+    // Drain the PeerConnected event
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected");
+    assert!(matches!(event, ServerEvent::PeerConnected { .. }));
 
-    drop(server_guard);
-    client1.close().await;
-    client2.close().await;
+    let client_peer_id = client.peer_id.clone();
+    drop(guard);
+
+    // Send a message from client
+    client.send_binary(b"hello from client").await;
+
+    // poll_event should return Message with resolved peer_id
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive Message");
+
+    match event {
+        ServerEvent::Message(msg) => {
+            assert_eq!(msg.temp_id, client_peer_id, "Message should have resolved peer_id");
+            assert_eq!(msg.data, b"hello from client");
+        }
+        other => panic!("Expected Message, got {:?}", other),
+    }
+
+    drop(guard);
+    client.close().await;
 }
 
 #[tokio::test]
-async fn test_message_broadcast() {
-    let (server, _peer_rx) = WebSocketServer::new("test-server".to_string(), None);
-    let listener = WebSocketServer::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().expect("Failed to get local addr");
+async fn test_poll_event_peer_disconnected() {
+    let (server, listener, addr) = create_server("test-server").await;
 
-    let server = Arc::new(Mutex::new(server));
     let listener = Arc::new(listener);
+    let listener_clone = Arc::clone(&listener);
+    let server = Arc::new(Mutex::new(server));
+    let server_clone = Arc::clone(&server);
+
+    let accept_handle = tokio::spawn(async move {
+        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+        server_clone
+            .lock()
+            .await
+            .accept_connection(stream, peer_addr)
+            .await;
+    });
+
+    let client = TestClient::connect_and_handshake(addr).await;
+    accept_handle.await.expect("Accept task failed");
+
+    // Drain PeerConnected
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected");
+    let connected_peer_id = match event {
+        ServerEvent::PeerConnected { peer_id, .. } => peer_id,
+        other => panic!("Expected PeerConnected, got {:?}", other),
+    };
+    drop(guard);
+
+    // Client disconnects
+    client.close().await;
+
+    // poll_event should return PeerDisconnected
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerDisconnected");
+
+    match event {
+        ServerEvent::PeerDisconnected { peer_id } => {
+            assert_eq!(peer_id, connected_peer_id);
+        }
+        other => panic!("Expected PeerDisconnected, got {:?}", other),
+    }
+
+    assert_eq!(guard.peer_count(), 0);
+}
+
+#[tokio::test]
+async fn test_pre_handshake_close_not_emitted() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    let listener = Arc::new(listener);
+    let listener_clone = Arc::clone(&listener);
+    let server = Arc::new(Mutex::new(server));
+    let server_clone = Arc::clone(&server);
+
+    let accept_handle = tokio::spawn(async move {
+        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+        server_clone
+            .lock()
+            .await
+            .accept_connection(stream, peer_addr)
+            .await;
+    });
+
+    // Connect but DON'T send handshake, just close immediately
+    let url = format!("ws://{}", addr);
+    let (mut ws, _) = connect_async(&url).await.expect("Failed to connect");
+
+    // Receive the server handshake (server sends first)
+    let _ = ws.next().await;
+
+    // Close without sending our handshake
+    let _ = ws.close(None).await;
+
+    accept_handle.await.expect("Accept task failed");
+
+    // poll_event should NOT return PeerDisconnected (pre-handshake close is silent)
+    // Instead it should time out
+    let mut guard = server.lock().await;
+    let result = timeout(Duration::from_millis(500), guard.poll_event()).await;
+    assert!(result.is_err(), "Should not emit event for pre-handshake close");
+}
+
+#[tokio::test]
+async fn test_broadcast_except_by_peer_id() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    let listener = Arc::new(listener);
+    let server = Arc::new(Mutex::new(server));
 
     // Accept two connections
-    let server_clone = Arc::clone(&server);
     let listener_clone = Arc::clone(&listener);
+    let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
         for _ in 0..2 {
             let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-            server_clone.lock().await.accept_connection(stream, peer_addr).await;
+            server_clone
+                .lock()
+                .await
+                .accept_connection(stream, peer_addr)
+                .await;
         }
-
-        // Wait for handshake events and process them
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        process_pending_events(&server_clone).await;
     });
 
     let mut client1 = TestClient::connect_and_handshake(addr).await;
@@ -232,15 +346,158 @@ async fn test_message_broadcast() {
 
     accept_handle.await.expect("Accept task failed");
 
-    // Give handshakes time to settle
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Drain both PeerConnected events
+    let mut guard = server.lock().await;
+    let event1 = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected 1");
+    let peer_id_1 = match event1 {
+        ServerEvent::PeerConnected { peer_id, .. } => peer_id,
+        other => panic!("Expected PeerConnected, got {:?}", other),
+    };
+    let event2 = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected 2");
+    assert!(matches!(event2, ServerEvent::PeerConnected { .. }));
+
+    // broadcast_except(peer_id_1) should only reach client 2
+    guard
+        .broadcast_except(b"only for client 2", &peer_id_1)
+        .await;
+    drop(guard);
+
+    // Client 2 should receive the message
+    let msg2 = client2
+        .recv_message_timeout(Duration::from_secs(2))
+        .await
+        .expect("Client 2 should receive broadcast");
+    assert_eq!(msg2, b"only for client 2");
+
+    // Client 1 should NOT receive it
+    let msg1 = client1
+        .recv_message_timeout(Duration::from_millis(300))
+        .await;
+    assert!(msg1.is_err(), "Client 1 should not receive the broadcast");
+
+    client1.close().await;
+    client2.close().await;
+}
+
+// ============================================================================
+// Migrated Tests (from recv_event to poll_event)
+// ============================================================================
+
+#[tokio::test]
+async fn test_handshake_exchange() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    let listener = Arc::new(listener);
+    let server = Arc::new(Mutex::new(server));
+    let server_clone = Arc::clone(&server);
+
+    let listener_clone = Arc::clone(&listener);
+    let accept_handle = tokio::spawn(async move {
+        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+        server_clone
+            .lock()
+            .await
+            .accept_connection(stream, peer_addr)
+            .await;
+    });
+
+    let client = TestClient::connect_and_handshake(addr).await;
+    accept_handle.await.expect("Accept task failed");
+
+    // poll_event should produce PeerConnected
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected");
+    assert!(matches!(event, ServerEvent::PeerConnected { .. }));
+    assert_eq!(guard.peer_count(), 1, "Should have one peer after handshake");
+
+    drop(guard);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn test_multiple_clients() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    let listener = Arc::new(listener);
+    let server = Arc::new(Mutex::new(server));
+
+    let listener_clone = Arc::clone(&listener);
+    let server_clone = Arc::clone(&server);
+    let accept_handle = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+            server_clone
+                .lock()
+                .await
+                .accept_connection(stream, peer_addr)
+                .await;
+        }
+    });
+
+    let client1 = TestClient::connect_and_handshake(addr).await;
+    let client2 = TestClient::connect_and_handshake(addr).await;
+
+    accept_handle.await.expect("Accept task failed");
+
+    // Drain both PeerConnected events
+    let mut guard = server.lock().await;
+    for _ in 0..2 {
+        let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+            .await
+            .expect("Should receive PeerConnected");
+        assert!(matches!(event, ServerEvent::PeerConnected { .. }));
+    }
+    assert_eq!(guard.peer_count(), 2, "Should have two peers");
+
+    drop(guard);
+    client1.close().await;
+    client2.close().await;
+}
+
+#[tokio::test]
+async fn test_message_broadcast() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    let listener = Arc::new(listener);
+    let server = Arc::new(Mutex::new(server));
+
+    let listener_clone = Arc::clone(&listener);
+    let server_clone = Arc::clone(&server);
+    let accept_handle = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+            server_clone
+                .lock()
+                .await
+                .accept_connection(stream, peer_addr)
+                .await;
+        }
+    });
+
+    let mut client1 = TestClient::connect_and_handshake(addr).await;
+    let mut client2 = TestClient::connect_and_handshake(addr).await;
+
+    accept_handle.await.expect("Accept task failed");
+
+    // Drain PeerConnected events
+    let mut guard = server.lock().await;
+    for _ in 0..2 {
+        let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+            .await
+            .expect("Should receive PeerConnected");
+        assert!(matches!(event, ServerEvent::PeerConnected { .. }));
+    }
 
     // Broadcast from server
     let test_message = b"broadcast test";
-    {
-        let server_guard = server.lock().await;
-        server_guard.broadcast(test_message).await;
-    }
+    guard.broadcast(test_message).await;
+    drop(guard);
 
     // Both clients should receive it
     let msg1 = client1
@@ -258,6 +515,48 @@ async fn test_message_broadcast() {
     client1.close().await;
     client2.close().await;
 }
+
+#[tokio::test]
+async fn test_connection_events_flow() {
+    let (server, listener, addr) = create_server("test-server").await;
+
+    let listener = Arc::new(listener);
+    let server = Arc::new(Mutex::new(server));
+    let server_clone = Arc::clone(&server);
+
+    let listener_clone = Arc::clone(&listener);
+    let accept_handle = tokio::spawn(async move {
+        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
+        server_clone
+            .lock()
+            .await
+            .accept_connection(stream, peer_addr)
+            .await;
+    });
+
+    let client = TestClient::connect_and_handshake(addr).await;
+    accept_handle.await.expect("Accept task failed");
+
+    // Should receive PeerConnected via poll_event
+    let mut guard = server.lock().await;
+    let event = poll_event_timeout(&mut guard, Duration::from_secs(2))
+        .await
+        .expect("Should receive PeerConnected");
+
+    match event {
+        ServerEvent::PeerConnected { peer_id, .. } => {
+            assert!(!peer_id.is_empty(), "Peer ID should not be empty");
+        }
+        other => panic!("Expected PeerConnected, got {:?}", other),
+    }
+
+    drop(guard);
+    client.close().await;
+}
+
+// ============================================================================
+// File Watcher Tests (unchanged)
+// ============================================================================
 
 /// Test file watcher detects changes.
 #[tokio::test]
@@ -360,6 +659,10 @@ async fn test_file_watcher_only_md_files() {
     assert_eq!(event.path, "test.md");
 }
 
+// ============================================================================
+// Other Tests (unchanged)
+// ============================================================================
+
 #[tokio::test]
 async fn test_handshake_message_roundtrip() {
     let original = HandshakeMessage::new("peer-123", "server");
@@ -432,46 +735,6 @@ async fn test_native_fs_nested_directories() {
 
     let content = fs.read("knowledge/topic.md").await.expect("Read failed");
     assert_eq!(content, b"# Topic");
-}
-
-// ============================================================================
-// Connection Event Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_connection_events_flow() {
-    let (server, mut peer_rx) = WebSocketServer::new("test-server".to_string(), None);
-    let listener = WebSocketServer::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind");
-    let addr = listener.local_addr().expect("Failed to get local addr");
-
-    let server = Arc::new(Mutex::new(server));
-    let server_clone = Arc::clone(&server);
-
-    // Accept connection in background and process events
-    let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener.accept().await.expect("Failed to accept");
-        server_clone.lock().await.accept_connection(stream, peer_addr).await;
-
-        // Wait for handshake event and process it
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        process_pending_events(&server_clone).await;
-    });
-
-    // Connect and handshake
-    let client = TestClient::connect_and_handshake(addr).await;
-    accept_handle.await.expect("Accept task failed");
-
-    // Should receive peer_connected notification
-    let (peer_id, _address) = timeout(Duration::from_secs(2), peer_rx.recv())
-        .await
-        .expect("Timeout waiting for peer_connected")
-        .expect("No peer_connected received");
-
-    assert!(!peer_id.is_empty(), "Peer ID should not be empty");
-
-    client.close().await;
 }
 
 // ============================================================================
