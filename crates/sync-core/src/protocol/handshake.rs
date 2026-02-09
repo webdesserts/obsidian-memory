@@ -37,6 +37,13 @@ impl HandshakeRole {
     }
 }
 
+/// Maximum message size (50MB) to prevent memory exhaustion from malicious peers.
+pub const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+
+fn default_protocol_version() -> u32 {
+    PROTOCOL_VERSION
+}
+
 /// Versioned handshake message.
 ///
 /// Sent immediately after WebSocket connection is established.
@@ -47,7 +54,8 @@ pub struct Handshake {
     /// Message type discriminator
     #[serde(rename = "type")]
     pub msg_type: String,
-    /// Protocol version
+    /// Protocol version (defaults to current version when missing for backwards compat)
+    #[serde(default = "default_protocol_version")]
     pub version: u32,
     /// Peer's unique identifier
     pub peer_id: PeerId,

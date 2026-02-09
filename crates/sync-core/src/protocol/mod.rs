@@ -9,4 +9,4 @@ pub mod encoding;
 pub mod handshake;
 
 pub use encoding::{detect_message_type, MessageType};
-pub use handshake::{Handshake, HandshakeRole, PROTOCOL_VERSION};
+pub use handshake::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
