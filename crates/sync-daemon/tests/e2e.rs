@@ -8,9 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use sync_core::protocol::{Handshake, HandshakeRole};
+use sync_core::PeerId;
 use sync_daemon::{
-    message::HandshakeMessage, native_fs::NativeFs, server::ServerEvent,
-    server::WebSocketServer, watcher::FileWatcher, FileEventKind,
+    native_fs::NativeFs, server::ServerEvent, server::WebSocketServer, watcher::FileWatcher,
+    FileEventKind,
 };
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -30,18 +32,19 @@ impl TestClient {
         let url = format!("ws://{}", addr);
         let (ws, _) = connect_async(&url).await.expect("Failed to connect");
 
+        let peer_id = PeerId::generate();
         let mut client = Self {
             ws,
-            peer_id: format!("test-client-{}", uuid::Uuid::new_v4()),
+            peer_id: peer_id.to_string(),
         };
 
         // Receive server handshake
         let server_hs = client.expect_handshake().await;
-        assert_eq!(server_hs.role, "server", "Server should send server role");
+        assert_eq!(server_hs.role, HandshakeRole::Server, "Server should send server role");
 
         // Send our handshake
-        let our_hs = HandshakeMessage::new(&client.peer_id, "client");
-        client.send_binary(&our_hs.to_binary()).await;
+        let our_hs = Handshake::client(peer_id);
+        client.send_binary(&our_hs.to_json()).await;
 
         client
     }
@@ -51,26 +54,27 @@ impl TestClient {
         let url = format!("ws://{}", addr);
         let (ws, _) = connect_async(&url).await.expect("Failed to connect");
 
+        let peer_id = PeerId::generate();
         let mut client = Self {
             ws,
-            peer_id: format!("test-client-{}", uuid::Uuid::new_v4()),
+            peer_id: peer_id.to_string(),
         };
 
         // Receive server handshake
         let server_hs = client.expect_handshake().await;
-        assert_eq!(server_hs.role, "server");
+        assert_eq!(server_hs.role, HandshakeRole::Server);
 
         // Send handshake with address
-        let our_hs = HandshakeMessage::with_address(&client.peer_id, "client", address);
-        client.send_binary(&our_hs.to_binary()).await;
+        let our_hs = Handshake::new(peer_id, HandshakeRole::Client, Some(address.to_string()));
+        client.send_binary(&our_hs.to_json()).await;
 
         client
     }
 
     /// Receive and parse handshake message.
-    async fn expect_handshake(&mut self) -> HandshakeMessage {
+    async fn expect_handshake(&mut self) -> Handshake {
         let msg = self.recv_message().await;
-        HandshakeMessage::from_binary(&msg).expect("Expected handshake message")
+        Handshake::from_json(&msg).expect("Expected handshake message")
     }
 
     /// Receive binary message.
@@ -115,6 +119,8 @@ impl TestClient {
 // ============================================================================
 
 /// Create a server and listener bound to a random port.
+///
+/// `peer_id` must be a valid PeerId hex string (16 hex chars).
 async fn create_server(peer_id: &str) -> (WebSocketServer, tokio::net::TcpListener, SocketAddr) {
     let server = WebSocketServer::new(peer_id.to_string(), None);
     let listener = WebSocketServer::bind("127.0.0.1:0")
@@ -138,7 +144,7 @@ async fn poll_event_timeout(
 
 #[tokio::test]
 async fn test_poll_event_peer_connected() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     // Accept connection in background
     let listener = Arc::new(listener);
@@ -182,7 +188,7 @@ async fn test_poll_event_peer_connected() {
 
 #[tokio::test]
 async fn test_poll_event_message() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let listener_clone = Arc::clone(&listener);
@@ -234,7 +240,7 @@ async fn test_poll_event_message() {
 
 #[tokio::test]
 async fn test_poll_event_peer_disconnected() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let listener_clone = Arc::clone(&listener);
@@ -285,7 +291,7 @@ async fn test_poll_event_peer_disconnected() {
 
 #[tokio::test]
 async fn test_pre_handshake_close_not_emitted() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let listener_clone = Arc::clone(&listener);
@@ -322,7 +328,7 @@ async fn test_pre_handshake_close_not_emitted() {
 
 #[tokio::test]
 async fn test_broadcast_except_by_peer_id() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let server = Arc::new(Mutex::new(server));
@@ -389,7 +395,7 @@ async fn test_broadcast_except_by_peer_id() {
 
 #[tokio::test]
 async fn test_handshake_exchange() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let server = Arc::new(Mutex::new(server));
@@ -422,7 +428,7 @@ async fn test_handshake_exchange() {
 
 #[tokio::test]
 async fn test_multiple_clients() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let server = Arc::new(Mutex::new(server));
@@ -462,7 +468,7 @@ async fn test_multiple_clients() {
 
 #[tokio::test]
 async fn test_message_broadcast() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let server = Arc::new(Mutex::new(server));
@@ -518,7 +524,7 @@ async fn test_message_broadcast() {
 
 #[tokio::test]
 async fn test_connection_events_flow() {
-    let (server, listener, addr) = create_server("test-server").await;
+    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
 
     let listener = Arc::new(listener);
     let server = Arc::new(Mutex::new(server));
@@ -664,13 +670,14 @@ async fn test_file_watcher_only_md_files() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_handshake_message_roundtrip() {
-    let original = HandshakeMessage::new("peer-123", "server");
-    let binary = original.to_binary();
-    let parsed = HandshakeMessage::from_binary(&binary).expect("Should parse valid handshake");
+async fn test_handshake_roundtrip() {
+    let peer_id: PeerId = "a1b2c3d4e5f67890".parse().unwrap();
+    let original = Handshake::server(peer_id, "ws://localhost:8080".into());
+    let json = original.to_json();
+    let parsed = Handshake::from_json(&json).expect("Should parse valid handshake");
 
-    assert_eq!(parsed.peer_id, "peer-123");
-    assert_eq!(parsed.role, "server");
+    assert_eq!(parsed.peer_id, peer_id);
+    assert_eq!(parsed.role, HandshakeRole::Server);
     assert_eq!(parsed.msg_type, "handshake");
 }
 
@@ -678,7 +685,7 @@ async fn test_handshake_message_roundtrip() {
 async fn test_handshake_rejects_invalid_json() {
     let invalid = b"not json at all";
     assert!(
-        HandshakeMessage::from_binary(invalid).is_none(),
+        Handshake::from_json(invalid).is_none(),
         "Should reject invalid JSON"
     );
 }
@@ -687,7 +694,7 @@ async fn test_handshake_rejects_invalid_json() {
 async fn test_handshake_rejects_non_handshake_message() {
     let other_json = b"{\"type\": \"other\", \"data\": 123}";
     assert!(
-        HandshakeMessage::from_binary(other_json).is_none(),
+        Handshake::from_json(other_json).is_none(),
         "Should reject non-handshake JSON"
     );
 }
@@ -743,7 +750,7 @@ async fn test_native_fs_nested_directories() {
 
 #[tokio::test]
 async fn test_max_message_size_constant() {
-    use sync_daemon::MAX_MESSAGE_SIZE;
+    use sync_core::protocol::MAX_MESSAGE_SIZE;
 
     // 50 MB limit
     assert_eq!(MAX_MESSAGE_SIZE, 50 * 1024 * 1024);
