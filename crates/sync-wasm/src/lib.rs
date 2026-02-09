@@ -922,6 +922,24 @@ mod wasm_impl {
             let Ok(pid) = peer_id.parse() else { return false };
             self.inner.borrow_mut().mark_removed(pid)
         }
+
+        /// Handle a newly connected peer after handshake.
+        ///
+        /// Bumps incarnation, adds to membership, and returns JSON with two messages:
+        /// - `forNewPeer`: full gossip snapshot to send to the connecting peer
+        /// - `forExistingPeers`: alive broadcast to send to all other peers
+        ///
+        /// Both fields are valid wire-format `GossipMessage` objects that can be
+        /// sent directly as WebSocket messages via `JSON.stringify()`.
+        #[wasm_bindgen(js_name = onPeerConnected)]
+        pub fn on_peer_connected(&self, peer_id: String, address: Option<String>) -> Result<String, JsError> {
+            let pid = peer_id.parse()
+                .map_err(|e: sync_core::peer_id::PeerIdError| JsError::new(&e.to_string()))?;
+            let peer_info = sync_core::swim::PeerInfo::new(pid, address);
+            let messages = self.inner.borrow_mut().on_peer_connected(peer_info);
+            serde_json::to_string(&messages)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
     }
 
     /// Member info for JS serialization
