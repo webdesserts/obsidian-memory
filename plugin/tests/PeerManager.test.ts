@@ -823,6 +823,93 @@ describe("PeerManager", () => {
     });
   });
 
+  describe("onPeerDisconnected()", () => {
+    it("should broadcast dead gossip immediately when a known peer disconnects", async () => {
+      const mockMembership = createMockMembership();
+      (manager as any)._membership = mockMembership;
+
+      // Peer is known in membership with incarnation 3
+      mockMembership.getMemberIncarnation.mockReturnValue(3);
+      mockMembership.markDead.mockReturnValue(true);
+
+      // Connect peer A and peer B
+      const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+      const socketA = socketFactory.getLatest()!;
+      socketA.simulateOpen();
+      await connectA;
+      socketA.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+        )
+      );
+
+      const connectB = manager.connectToUrl("wss://peer-b.com/sync");
+      const socketB = socketFactory.getLatest()!;
+      socketB.simulateOpen();
+      await connectB;
+      socketB.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
+        )
+      );
+
+      socketA.clearSentMessages();
+      socketB.clearSentMessages();
+
+      // Peer A disconnects
+      socketA.simulateClose();
+
+      // Peer B should receive exactly one dead gossip broadcast about peer A
+      expect(socketB.sentMessages).toHaveLength(1);
+      const deadMsg = JSON.parse(new TextDecoder().decode(socketB.sentMessages[0]));
+      expect(deadMsg.type).toBe("gossip");
+      expect(deadMsg.updates).toHaveLength(1);
+      expect(deadMsg.updates[0]).toEqual({
+        type: "dead",
+        peerId: "peer-a",
+        incarnation: 3,
+      });
+    });
+
+    it("should not broadcast if peer was not in membership", async () => {
+      const mockMembership = createMockMembership();
+      (manager as any)._membership = mockMembership;
+
+      // Peer not known — markDead returns false
+      mockMembership.markDead.mockReturnValue(false);
+
+      // Connect peer A and peer B
+      const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+      const socketA = socketFactory.getLatest()!;
+      socketA.simulateOpen();
+      await connectA;
+      socketA.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+        )
+      );
+
+      const connectB = manager.connectToUrl("wss://peer-b.com/sync");
+      const socketB = socketFactory.getLatest()!;
+      socketB.simulateOpen();
+      await connectB;
+      socketB.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
+        )
+      );
+
+      socketA.clearSentMessages();
+      socketB.clearSentMessages();
+
+      // Peer A disconnects but wasn't in membership
+      socketA.simulateClose();
+
+      // No dead gossip should be broadcast
+      expect(socketB.sentMessages).toHaveLength(0);
+    });
+  });
+
   describe("auto-connect", () => {
     it("should use one-shot connection (no reconnect) for gossip-discovered peers", async () => {
       // Connect and complete handshake

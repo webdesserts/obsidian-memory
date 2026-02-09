@@ -352,10 +352,13 @@ export class PeerManager extends EventEmitter {
    * Broadcast data to all connected peers.
    */
   broadcast(data: Uint8Array): void {
-    // Send to all outgoing connections
+    // Send to all outgoing connections. Connections map has dual-key entries
+    // (connectionId + peerId) pointing to the same socket, so deduplicate.
+    const sent = new Set<SyncWebSocketClient>();
     for (const conn of this.connections.values()) {
-      if (conn.socket?.isConnected) {
+      if (conn.socket?.isConnected && !sent.has(conn.socket)) {
         conn.socket.send(data);
+        sent.add(conn.socket);
       }
     }
 
@@ -590,16 +593,24 @@ export class PeerManager extends EventEmitter {
 
   /**
    * Called when a peer disconnects. Marks the peer as Dead in SWIM membership
-   * and queues gossip to spread the failure news.
+   * and immediately broadcasts the dead gossip to remaining peers.
    */
   private onPeerDisconnected(peerId: string): void {
     const membership = this.getMembership();
     if (!membership) return;
 
-    // Mark peer as dead - this queues Dead gossip for propagation
+    const incarnation = membership.getMemberIncarnation(peerId);
     const changed = membership.markDead(peerId);
     if (changed) {
       log.debug(`Marked ${peerId} as Dead in SWIM membership`);
+
+      if (incarnation != null) {
+        const deadMsg = JSON.stringify({
+          type: "gossip",
+          updates: [{ type: "dead", peerId, incarnation }],
+        });
+        this.broadcast(new TextEncoder().encode(deadMsg));
+      }
     }
   }
 
