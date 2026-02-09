@@ -271,31 +271,19 @@ impl Daemon {
     async fn on_peer_connected(&mut self, peer_id: String, address: Option<String>) {
         info!("Peer connected: {}", peer_id);
 
-        // Add peer to SWIM membership
+        // Add peer to SWIM membership and generate gossip messages
         if let Ok(pid) = peer_id.parse::<PeerId>() {
             let peer_info = PeerInfo::new(pid, address);
-            // Bump incarnation on reconnect so the new address propagates via gossip
-            let incarnation = self.membership.get(&pid).map(|m| m.incarnation + 1).unwrap_or(1);
-            self.membership.add(peer_info.clone(), incarnation);
+            let messages = self.membership.on_peer_connected(peer_info);
 
-            // Send full gossip to the new peer
-            let full_gossip = self.membership.generate_full_gossip();
-            let gossip_msg = GossipMessage::new(full_gossip.clone());
-            if let Err(e) = self
-                .server
-                .send(&peer_id, &gossip_msg.to_json())
-                .await
-            {
+            if let Err(e) = self.server.send(&peer_id, &messages.for_new_peer.to_json()).await {
                 warn!("Failed to send gossip to {}: {}", peer_id, e);
             } else {
-                debug!("Sent full gossip ({} updates) to {}", full_gossip.len(), peer_id);
+                debug!("Sent full gossip ({} updates) to {}", messages.for_new_peer.updates.len(), peer_id);
             }
 
-            // Broadcast the new peer to existing peers
-            let alive_update = GossipUpdate::alive(peer_info, incarnation);
-            let broadcast_msg = GossipMessage::new(vec![alive_update]);
             self.server
-                .broadcast_except(&broadcast_msg.to_json(), &peer_id)
+                .broadcast_except(&messages.for_existing_peers.to_json(), &peer_id)
                 .await;
         }
 
