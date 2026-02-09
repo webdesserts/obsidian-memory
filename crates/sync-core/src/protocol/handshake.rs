@@ -277,6 +277,41 @@ mod tests {
         assert!(HandshakeRole::Client.is_client());
     }
 
+    // ==================== Backwards compatibility ====================
+
+    #[test]
+    fn test_parse_without_version_field() {
+        // Old wire format from TS plugin or legacy daemon (no version field)
+        let json = r#"{"type":"handshake","peerId":"a1b2c3d4e5f67890","role":"client"}"#;
+        let hs = Handshake::from_json(json.as_bytes()).unwrap();
+
+        assert_eq!(hs.peer_id, test_peer_id());
+        assert_eq!(hs.role, HandshakeRole::Client);
+        assert_eq!(hs.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_parse_legacy_uuid_peer_id() {
+        // Legacy UUID peer IDs get FNV-1a hashed by PeerId's FromStr
+        let json = r#"{"type":"handshake","version":1,"peerId":"550e8400-e29b-41d4-a716-446655440000","role":"server","address":"ws://10.0.0.5:9427"}"#;
+        let hs = Handshake::from_json(json.as_bytes()).unwrap();
+
+        let expected_peer_id: PeerId = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+        assert_eq!(hs.peer_id, expected_peer_id);
+        assert_eq!(hs.role, HandshakeRole::Server);
+        assert_eq!(hs.address, Some("ws://10.0.0.5:9427".into()));
+    }
+
+    #[test]
+    fn test_parse_without_version_and_with_address() {
+        // Old format with address but no version
+        let json = r#"{"type":"handshake","peerId":"a1b2c3d4e5f67890","role":"server","address":"ws://192.168.1.1:8080"}"#;
+        let hs = Handshake::from_json(json.as_bytes()).unwrap();
+
+        assert_eq!(hs.version, PROTOCOL_VERSION);
+        assert_eq!(hs.address, Some("ws://192.168.1.1:8080".into()));
+    }
+
     // ==================== Equality ====================
 
     #[test]
