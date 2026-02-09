@@ -69,6 +69,12 @@ Feature: Peer Discovery
     When Peer B gossips about Peer A to Peer C
     Then Peer C should see Peer A as a known peer with address "ws://192.168.1.10:9427"
 
+  Scenario: Peers only relay gossip that changes their membership state
+    Given Peer A, Peer B, and Peer C are all connected to each other
+    And all peers already know about Peer D
+    When Peer A sends gossip about Peer D to Peer B
+    Then Peer B should NOT relay the gossip further
+
   # --- Direct Connections ---
 
   Scenario: Auto-connect to newly discovered peer on same LAN
