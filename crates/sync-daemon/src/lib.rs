@@ -19,5 +19,5 @@ pub use message::{HandshakeMessage, MAX_MESSAGE_SIZE};
 pub use native_fs::NativeFs;
 pub use outgoing::{OutgoingConnection, OutgoingState, ReconnectConfig, ReconnectState};
 pub use persistence::{PeerStorage, PersistedPeer, PersistedPeers};
-pub use server::WebSocketServer;
+pub use server::{ServerEvent, WebSocketServer};
 pub use watcher::{FileEvent, FileEventKind, FileWatcher};
