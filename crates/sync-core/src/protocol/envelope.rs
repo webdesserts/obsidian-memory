@@ -9,6 +9,7 @@
 
 use crate::swim::GossipUpdate;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// A standalone gossip message containing SWIM membership updates.
 ///
@@ -88,6 +89,43 @@ impl SyncEnvelope {
             Some(msg)
         } else {
             None
+        }
+    }
+}
+
+/// Parsed incoming peer message, routed by the `type` field.
+///
+/// This is a parsing-only type — callers construct [`GossipMessage`] or
+/// [`SyncEnvelope`] directly when sending. Use `from_json()` to route
+/// incoming bytes. Returns `None` for non-JSON or unknown types, allowing
+/// callers to fall back to raw binary sync handling.
+///
+/// Handshake messages are intentionally excluded — they're handled at the
+/// connection level before normal message flow begins.
+#[derive(Debug)]
+pub enum PeerMessage {
+    Gossip(GossipMessage),
+    Sync(SyncEnvelope),
+}
+
+impl PeerMessage {
+    /// Try to parse and route an incoming message by its `type` field.
+    ///
+    /// Returns `None` for non-JSON input or unknown message types.
+    pub fn from_json(data: &[u8]) -> Option<Self> {
+        let value: Value = serde_json::from_slice(data).ok()?;
+        let msg_type = value.get("type")?.as_str()?;
+
+        match msg_type {
+            "gossip" => {
+                let msg: GossipMessage = serde_json::from_value(value).ok()?;
+                Some(PeerMessage::Gossip(msg))
+            }
+            "sync" => {
+                let msg: SyncEnvelope = serde_json::from_value(value).ok()?;
+                Some(PeerMessage::Sync(msg))
+            }
+            _ => None,
         }
     }
 }
@@ -190,5 +228,41 @@ mod tests {
     fn test_sync_envelope_wrong_type() {
         let json = br#"{"type":"gossip","data":[1],"gossip":[]}"#;
         assert!(SyncEnvelope::from_json(json).is_none());
+    }
+
+    // ==================== PeerMessage ====================
+
+    #[test]
+    fn test_peer_message_routes_gossip() {
+        let gossip = GossipMessage::new(sample_updates());
+        let json = gossip.to_json();
+        let parsed = PeerMessage::from_json(&json);
+        assert!(matches!(parsed, Some(PeerMessage::Gossip(_))));
+    }
+
+    #[test]
+    fn test_peer_message_routes_sync() {
+        let envelope = SyncEnvelope::new(vec![1, 2, 3], vec![]);
+        let json = envelope.to_json();
+        let parsed = PeerMessage::from_json(&json);
+        assert!(matches!(parsed, Some(PeerMessage::Sync(_))));
+    }
+
+    #[test]
+    fn test_peer_message_non_json_returns_none() {
+        assert!(PeerMessage::from_json(&[0x00, 0x01, 0x02]).is_none());
+        assert!(PeerMessage::from_json(b"raw binary data").is_none());
+    }
+
+    #[test]
+    fn test_peer_message_unknown_type_returns_none() {
+        // Handshakes are handled at the connection level, not here
+        let json = br#"{"type":"handshake","peerId":"abc","role":"server"}"#;
+        assert!(PeerMessage::from_json(json).is_none());
+    }
+
+    #[test]
+    fn test_peer_message_empty_returns_none() {
+        assert!(PeerMessage::from_json(b"").is_none());
     }
 }
