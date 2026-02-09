@@ -10,5 +10,5 @@ pub mod envelope;
 pub mod handshake;
 
 pub use encoding::{detect_message_type, MessageType};
-pub use envelope::GossipMessage;
+pub use envelope::{GossipMessage, SyncEnvelope};
 pub use handshake::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
