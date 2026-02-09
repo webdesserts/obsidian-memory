@@ -23,5 +23,5 @@ pub mod messages;
 
 pub use buddy::{select_buddy, BuddyAssignment, BuddyTracker, BuddyVerification};
 pub use failure::{FailureDetector, FailureDetectorConfig, FailureEvent};
-pub use membership::{Member, MemberState, MembershipList, PeerConnectedMessages};
+pub use membership::{Member, MemberState, MembershipList, PeerConnectedMessages, ProcessedGossip};
 pub use messages::{GossipUpdate, PeerInfo, SwimMessage};

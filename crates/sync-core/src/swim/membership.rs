@@ -72,6 +72,18 @@ impl Member {
     }
 }
 
+/// Result of processing incoming gossip updates.
+///
+/// Named fields prevent callers from accidentally relaying raw input
+/// (which would cause amplification storms in multi-peer meshes).
+#[derive(Debug, Clone)]
+pub struct ProcessedGossip {
+    /// Newly discovered peers — use for auto-connect decisions
+    pub new_peers: Vec<PeerInfo>,
+    /// State-changing updates only — relay these to other peers (excludes already-known gossip)
+    pub relay: Vec<GossipUpdate>,
+}
+
 /// Messages to send after a peer completes its handshake.
 ///
 /// Named fields prevent callers from mixing up which message goes where.
@@ -418,34 +430,49 @@ impl MembershipList {
 
     /// Process incoming gossip updates.
     ///
-    /// Returns list of newly discovered peers (for auto-connect).
-    pub fn process_gossip(&mut self, updates: &[GossipUpdate], from: PeerId) -> Vec<PeerInfo> {
+    /// Returns a `ProcessedGossip` with newly discovered peers and relay-safe
+    /// updates. Only state-changing updates appear in `relay` — callers should
+    /// forward those (not the raw input) to prevent amplification storms.
+    pub fn process_gossip(&mut self, updates: &[GossipUpdate], from: PeerId) -> ProcessedGossip {
         let mut new_peers = Vec::new();
 
         for update in updates {
             match update {
                 GossipUpdate::Alive { peer, incarnation } => {
-                    let was_new = self.add_discovered(peer.clone(), *incarnation, from);
-                    if was_new && peer.peer_id != self.local_peer_id {
-                        new_peers.push(peer.clone());
+                    let state_changed = self.add_discovered(peer.clone(), *incarnation, from);
+                    if state_changed {
+                        // Queue for relay so other peers learn about this
+                        self.queue_gossip(update.clone());
+                        if peer.peer_id != self.local_peer_id {
+                            new_peers.push(peer.clone());
+                        }
                     }
                 }
                 GossipUpdate::Suspect {
                     peer_id,
                     incarnation,
                 } => {
-                    self.suspect(*peer_id, *incarnation);
+                    let state_changed = self.suspect(*peer_id, *incarnation);
+                    if state_changed {
+                        self.queue_gossip(update.clone());
+                    }
+                    // Note: suspect() on self queues its own refutation gossip
                 }
                 GossipUpdate::Dead { peer_id, incarnation } => {
-                    self.mark_dead_with_incarnation(*peer_id, *incarnation);
+                    let state_changed = self.mark_dead_with_incarnation(*peer_id, *incarnation);
+                    if state_changed {
+                        self.queue_gossip(update.clone());
+                    }
                 }
                 GossipUpdate::Removed { peer_id } => {
+                    // mark_removed() already queues its own gossip internally
                     self.mark_removed(*peer_id);
                 }
             }
         }
 
-        new_peers
+        let relay = self.drain_gossip();
+        ProcessedGossip { new_peers, relay }
     }
 
     /// Generate Alive gossip updates for all known members.
@@ -812,10 +839,10 @@ mod tests {
             1,
         )];
 
-        let new_peers = list.process_gossip(&updates, peer_b());
+        let result = list.process_gossip(&updates, peer_b());
 
-        assert_eq!(new_peers.len(), 1);
-        assert_eq!(new_peers[0].peer_id, peer_a());
+        assert_eq!(result.new_peers.len(), 1);
+        assert_eq!(result.new_peers[0].peer_id, peer_a());
         assert!(list.contains(&peer_a()));
     }
 
@@ -874,10 +901,25 @@ mod tests {
         let mut list = MembershipList::new(local_id(), None);
 
         let updates = vec![GossipUpdate::alive(PeerInfo::client_only(local_id()), 1)];
-        let new_peers = list.process_gossip(&updates, peer_a());
+        let result = list.process_gossip(&updates, peer_a());
 
-        assert!(new_peers.is_empty());
+        assert!(result.new_peers.is_empty());
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_process_gossip_relay_excludes_already_known() {
+        let mut list = MembershipList::new(local_id(), None);
+        list.set_gossip_fanout(200);
+
+        // First time: novel gossip → relay contains updates
+        let updates = vec![GossipUpdate::alive(PeerInfo::client_only(peer_a()), 1)];
+        let result = list.process_gossip(&updates, peer_b());
+        assert!(!result.relay.is_empty(), "novel gossip should produce relay updates");
+
+        // Second time: same gossip → relay is empty (prevents amplification)
+        let result = list.process_gossip(&updates, peer_c());
+        assert!(result.relay.is_empty(), "already-known gossip should not produce relay updates");
     }
 
     // ==================== Gossip generation ====================
@@ -1149,10 +1191,10 @@ mod tests {
             PeerInfo::new(peer_a(), Some("ws://new:8080".into())),
             10,
         )];
-        let new_peers = list.process_gossip(&updates, peer_b());
+        let result = list.process_gossip(&updates, peer_b());
 
         // Should not report as new peer and should remain removed
-        assert!(new_peers.is_empty());
+        assert!(result.new_peers.is_empty());
         assert!(list.is_removed(&peer_a()));
     }
 
@@ -1302,11 +1344,11 @@ mod tests {
             PeerInfo::new(peer_a(), Some("ws://a:8080".into())),
             1,
         )];
-        let new_peers = list.process_gossip(&updates, peer_b());
+        let result = list.process_gossip(&updates, peer_b());
 
-        assert_eq!(new_peers.len(), 1);
-        assert_eq!(new_peers[0].peer_id, peer_a());
-        assert_eq!(new_peers[0].address, Some("ws://a:8080".into()));
+        assert_eq!(result.new_peers.len(), 1);
+        assert_eq!(result.new_peers[0].peer_id, peer_a());
+        assert_eq!(result.new_peers[0].address, Some("ws://a:8080".into()));
     }
 
     #[test]
