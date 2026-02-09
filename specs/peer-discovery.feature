@@ -124,13 +124,32 @@ Feature: Peer Discovery
     Then Peer B should register Peer A without an address
     And Peer A's address should be updated when gossip arrives with it
 
-  # --- Edge Cases ---
+  # --- Connection Handshake ---
+
+  Scenario: Peer is not connected until handshake completes
+    Given Peer A accepts a TCP connection from Peer B
+    When Peer B has not yet sent its handshake
+    Then Peer B should NOT appear in Peer A's connected peers
+    And messages from Peer B should be dropped
+
+  Scenario: Peer is identified by its real peer ID after handshake
+    Given Peer A accepts a connection from Peer B
+    When Peer B sends a handshake with peer ID "peer-b-uuid"
+    Then Peer A should know Peer B as "peer-b-uuid"
+    And messages from Peer B should be attributed to "peer-b-uuid"
+
+  Scenario: Connection dropped before handshake has no effect
+    Given Peer A accepts a connection
+    When the connection closes before handshake completes
+    Then no peer should appear or disappear from Peer A's connected peers
 
   Scenario: Gossip before handshake is ignored
     Given Peer A is connecting to Peer B
     When gossip arrives before handshake completes
     Then the gossip should be dropped
     And no error should occur
+
+  # --- Edge Cases ---
 
   Scenario: Cross-network peers cannot connect directly
     Given Peer A is on network 192.168.1.x
