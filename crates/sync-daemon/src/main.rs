@@ -13,10 +13,9 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Use library exports
-use sync_daemon::connection::ConnectionEvent;
 use sync_daemon::manager::{ConnectionManager, ManagerEvent};
 use sync_daemon::native_fs::NativeFs;
-use sync_daemon::server::WebSocketServer;
+use sync_daemon::server::{ServerEvent, WebSocketServer};
 use sync_daemon::watcher::{FileEvent, FileEventKind, FileWatcher};
 use sync_daemon::IncomingMessage;
 
@@ -182,11 +181,11 @@ impl Daemon {
     }
 
     /// Handle a sync message from a peer.
+    ///
+    /// The `msg.temp_id` field contains the resolved peer_id (set by
+    /// `poll_event()` for incoming, or `poll_events()` for outgoing).
     async fn on_sync_message(&mut self, msg: IncomingMessage) {
-        let peer_id = self
-            .server
-            .resolve_peer_id(&msg.temp_id)
-            .unwrap_or_else(|| msg.temp_id.clone());
+        let peer_id = &msg.temp_id;
 
         debug!("Processing message from {} ({} bytes)", peer_id, msg.data.len());
 
@@ -194,13 +193,13 @@ impl Daemon {
         let sync_data = match Self::try_parse_json_message(&msg.data) {
             Some(JsonMessage::Gossip(updates)) => {
                 // Pure gossip message - process and relay
-                self.handle_gossip_updates(&updates, &peer_id, &msg.temp_id).await;
+                self.handle_gossip_updates(&updates, peer_id).await;
                 return;
             }
             Some(JsonMessage::Sync { data, gossip }) => {
                 // Sync message with optional piggybacked gossip
                 if !gossip.is_empty() {
-                    self.handle_gossip_updates(&gossip, &peer_id, &msg.temp_id).await;
+                    self.handle_gossip_updates(&gossip, peer_id).await;
                 }
                 data
             }
@@ -219,7 +218,7 @@ impl Daemon {
             Ok((response, modified_paths)) => {
                 // Send response if any
                 if let Some(response_data) = response {
-                    if let Err(e) = self.server.send_by_temp_id(&msg.temp_id, &response_data).await {
+                    if let Err(e) = self.server.send(peer_id, &response_data).await {
                         error!("Failed to send sync response to {}: {}", peer_id, e);
                     }
                 }
@@ -228,7 +227,7 @@ impl Daemon {
                 if !modified_paths.is_empty() && self.server.peer_count() > 1 {
                     if should_relay_raw {
                         // FileDeleted/FileRenamed: relay the original message directly
-                        self.server.broadcast_except(&sync_data, &msg.temp_id).await;
+                        self.server.broadcast_except(&sync_data, peer_id).await;
                         info!(
                             "Relayed file lifecycle event for {} to {} other peer(s)",
                             modified_paths.join(", "),
@@ -239,7 +238,7 @@ impl Daemon {
                         for path in &modified_paths {
                             match vault.prepare_document_update(path).await {
                                 Ok(Some(update)) => {
-                                    self.server.broadcast_except(&update, &msg.temp_id).await;
+                                    self.server.broadcast_except(&update, peer_id).await;
                                 }
                                 Ok(None) => {
                                     debug!("No update to relay for {}", path);
@@ -397,7 +396,6 @@ impl Daemon {
         &mut self,
         updates: &[GossipUpdate],
         from_peer_id: &str,
-        from_temp_id: &str,
     ) {
         if updates.is_empty() {
             return;
@@ -412,11 +410,11 @@ impl Daemon {
                 new_peers.len()
             );
 
-            // Relay gossip to other peers (exclude sender)
+            // Relay gossip to other peers (exclude sender by peer_id)
             if self.server.peer_count() > 1 {
                 let relay_msg = serde_json::json!({ "type": "gossip", "updates": updates });
                 self.server
-                    .broadcast_except(relay_msg.to_string().as_bytes(), from_temp_id)
+                    .broadcast_except(relay_msg.to_string().as_bytes(), from_peer_id)
                     .await;
                 debug!(
                     "Relayed {} gossip updates to {} other peer(s)",
@@ -497,7 +495,7 @@ async fn main() -> Result<()> {
     info!("Vault loaded, peer ID: {}", vault.peer_id());
 
     // Create WebSocket server (takes string peer_id for protocol messages)
-    let (server, mut peer_connected_rx) = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());
+    let (server, _peer_connected_rx) = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());
 
     // Create connection manager for outgoing connections
     let (outgoing, mut outgoing_rx) = ConnectionManager::new(
@@ -567,33 +565,21 @@ async fn main() -> Result<()> {
                 daemon.on_file_changed(event).await;
             }
 
-            // Handle WebSocket events (messages, handshakes, closes)
-            Some(event) = daemon.server.recv_event() => {
+            // Handle incoming connection events (handshake encapsulated)
+            Some(event) = daemon.server.poll_event() => {
                 match event {
-                    ConnectionEvent::Message(msg) => {
+                    ServerEvent::PeerConnected { peer_id, address } => {
+                        daemon.on_peer_connected(peer_id, address).await;
+                    }
+                    ServerEvent::Message(msg) => {
                         daemon.on_sync_message(msg).await;
                     }
-                    ConnectionEvent::Handshake { temp_id, peer_id, address } => {
-                        debug!("Handshake event for {} -> {} (address: {:?})", temp_id, peer_id, address);
-                        daemon.server.register_peer(&temp_id, peer_id, address);
-                    }
-                    ConnectionEvent::Closed { temp_id } => {
-                        // Get real peer_id before removing (for SWIM tracking)
-                        if let Some(peer_id) = daemon.server.resolve_peer_id(&temp_id) {
-                            info!("Peer disconnected: {} (was {})", peer_id, temp_id);
-                            daemon.on_peer_disconnected(&peer_id);
-                            daemon.broadcast_dead_gossip(&peer_id).await;
-                        } else {
-                            info!("Connection closed before handshake: {}", temp_id);
-                        }
-                        daemon.server.remove_peer(&temp_id);
+                    ServerEvent::PeerDisconnected { peer_id } => {
+                        info!("Peer disconnected: {}", peer_id);
+                        daemon.on_peer_disconnected(&peer_id);
+                        daemon.broadcast_dead_gossip(&peer_id).await;
                     }
                 }
-            }
-
-            // Handle peer connected notifications (for sync init)
-            Some((peer_id, address)) = peer_connected_rx.recv() => {
-                daemon.on_peer_connected(peer_id, address).await;
             }
 
             // Handle outgoing connection events

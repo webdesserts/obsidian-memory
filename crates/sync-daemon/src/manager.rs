@@ -207,7 +207,13 @@ impl ConnectionManager {
                 peer_id,
                 address,
             } => self.on_handshake(&temp_id, &peer_id, address).await,
-            ConnectionEvent::Message(msg) => Some(ManagerEvent::Message(msg)),
+            ConnectionEvent::Message(mut msg) => {
+                // Resolve conn_id → peer_id so callers see real peer IDs
+                if let Some(pid) = self.resolve_peer_id(&msg.temp_id) {
+                    msg.temp_id = pid;
+                }
+                Some(ManagerEvent::Message(msg))
+            }
             ConnectionEvent::Closed { temp_id } => self.on_closed(&temp_id).await,
         }
     }
