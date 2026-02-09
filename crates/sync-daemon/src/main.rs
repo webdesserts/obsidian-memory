@@ -287,7 +287,9 @@ impl Daemon {
         // Add peer to SWIM membership
         if let Ok(pid) = peer_id.parse::<PeerId>() {
             let peer_info = PeerInfo::new(pid, address);
-            self.membership.add(peer_info.clone(), 1);
+            // Bump incarnation on reconnect so the new address propagates via gossip
+            let incarnation = self.membership.get(&pid).map(|m| m.incarnation + 1).unwrap_or(1);
+            self.membership.add(peer_info.clone(), incarnation);
 
             // Send full gossip to the new peer
             let full_gossip = self.membership.generate_full_gossip();
@@ -303,7 +305,7 @@ impl Daemon {
             }
 
             // Broadcast the new peer to existing peers
-            let alive_update = GossipUpdate::alive(peer_info, 1);
+            let alive_update = GossipUpdate::alive(peer_info, incarnation);
             let broadcast_msg = serde_json::json!({ "type": "gossip", "updates": [alive_update] });
             self.server
                 .broadcast_except(broadcast_msg.to_string().as_bytes(), &peer_id)

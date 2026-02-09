@@ -1289,6 +1289,23 @@ mod tests {
     }
 
     #[test]
+    fn test_reconnect_bumped_incarnation_updates_address() {
+        let mut list = MembershipList::new(local_id(), None);
+
+        // Peer connects with original address
+        list.add(PeerInfo::new(peer_a(), Some("ws://10.0.0.1:8080".into())), 1);
+        assert_eq!(list.get(&peer_a()).unwrap().info.address, Some("ws://10.0.0.1:8080".into()));
+
+        // Peer reconnects from different network — caller bumps incarnation
+        let inc = list.get(&peer_a()).map(|m| m.incarnation + 1).unwrap_or(1);
+        list.add(PeerInfo::new(peer_a(), Some("ws://10.0.0.2:8080".into())), inc);
+
+        // Address should be updated
+        assert_eq!(list.get(&peer_a()).unwrap().info.address, Some("ws://10.0.0.2:8080".into()));
+        assert_eq!(list.get(&peer_a()).unwrap().incarnation, 2);
+    }
+
+    #[test]
     fn test_mark_removed_no_duplicate_gossip() {
         let mut list = MembershipList::new(local_id(), None);
 
