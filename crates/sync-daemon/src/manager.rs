@@ -82,7 +82,7 @@ pub struct ConnectionManager {
     connections: HashMap<String, Connection>,
     /// Map from peer ID to connection ID (for routing by peer ID)
     peer_to_conn: HashMap<String, String>,
-    /// Counter for generating temp IDs
+    /// Counter for generating connection IDs
     next_conn_id: u64,
     /// Channel sender for connection events
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
@@ -150,7 +150,7 @@ impl ConnectionManager {
             }
         };
 
-        // Generate temp ID
+        // Generate connection ID
         let conn_id = format!("conn-{}", self.next_conn_id);
         self.next_conn_id += 1;
 

@@ -14,7 +14,7 @@ use tokio_tungstenite::accept_async;
 use tracing::{debug, error, info, warn};
 
 /// Event emitted by the server after the handshake lifecycle is resolved.
-/// Callers only see peer IDs — temp IDs are an internal detail.
+/// Callers only see peer IDs — connection IDs are an internal detail.
 #[derive(Debug)]
 pub enum ServerEvent {
     /// A peer completed handshake and is now connected.
