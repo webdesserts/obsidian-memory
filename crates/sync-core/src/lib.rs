@@ -12,7 +12,6 @@
 pub mod document;
 pub mod events;
 pub mod fs;
-pub mod handshake;
 pub mod markdown;
 pub mod peer_id;
 pub mod peers;
@@ -26,8 +25,8 @@ pub mod vault;
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
-pub use handshake::{is_likely_handshake, HandshakeMessage, MAX_MESSAGE_SIZE};
 pub use peer_id::{PeerId, PeerIdError};
+pub use protocol::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 pub use peers::{ConnectedPeer, ConnectionDirection, PeerError, PeerRegistry};
 pub use sync::SyncMessage;
 pub use transport::{PeerConnection, PeerInfo, SyncTransport};
