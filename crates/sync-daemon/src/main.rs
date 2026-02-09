@@ -336,29 +336,29 @@ impl Daemon {
         }
 
         if let Ok(from_pid) = from_peer_id.parse::<PeerId>() {
-            let new_peers = self.membership.process_gossip(updates, from_pid);
+            let result = self.membership.process_gossip(updates, from_pid);
             debug!(
                 "Processed {} gossip updates from {}, discovered {} new peers",
                 updates.len(),
                 from_peer_id,
-                new_peers.len()
+                result.new_peers.len()
             );
 
-            // Relay gossip to other peers (exclude sender by peer_id)
-            if self.server.peer_count() > 1 {
-                let relay_msg = GossipMessage::new(updates.to_vec());
+            // Relay only state-changing updates (prevents amplification storms)
+            if self.server.peer_count() > 1 && !result.relay.is_empty() {
+                let relay_msg = GossipMessage::new(result.relay);
                 self.server
                     .broadcast_except(&relay_msg.to_json(), from_peer_id)
                     .await;
                 debug!(
                     "Relayed {} gossip updates to {} other peer(s)",
-                    updates.len(),
+                    relay_msg.updates.len(),
                     self.server.peer_count() - 1
                 );
             }
 
             // TODO: Auto-connect to newly discovered server peers
-            for peer in new_peers {
+            for peer in result.new_peers {
                 if let Some(addr) = &peer.address {
                     info!(
                         "Discovered peer {} at {} (auto-connect TODO)",
