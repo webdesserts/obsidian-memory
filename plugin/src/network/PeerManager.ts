@@ -191,24 +191,7 @@ export class PeerManager extends EventEmitter {
       });
 
       server.on("close", (connectionId: string) => {
-        const conn = this.connections.get(connectionId);
-        const peerId = conn?.peerId ?? connectionId;
-
-        // Clean up
-        this.connections.delete(connectionId);
-        if (conn?.peerId && conn.peerId !== connectionId) {
-          this.connections.delete(conn.peerId);
-        }
-
-        // Mark dead in SWIM membership (queues Dead gossip)
-        this.onPeerDisconnected(peerId);
-
-        // Notify Rust
-        if (this.vault) {
-          this.vault.peerDisconnected(peerId, "remoteClosed");
-        }
-
-        this.emit("peer-disconnected", peerId);
+        this.cleanupConnection(connectionId, "remoteClosed");
       });
 
       server.on("error", (err) => {
@@ -259,53 +242,7 @@ export class PeerManager extends EventEmitter {
 
     // Add connection entry BEFORE connecting so it's available when 'open' fires
     this.connections.set(connectionId, { socket: client });
-
-    client.on("open", () => {
-      // Re-add connection on reconnect (client persists across reconnects)
-      this.connections.set(connectionId, { socket: client });
-
-      // Notify Rust of connecting state
-      if (this.vault) {
-        this.vault.peerConnecting(connectionId, `${address}:${port}`, "outgoing");
-      }
-
-      // Send handshake with error handling to prevent silent failures
-      try {
-        this.sendHandshake(connectionId, "client");
-      } catch (err) {
-        log.error(`Failed to send handshake to ${connectionId}:`, err);
-        this.emit("error", err);
-      }
-    });
-
-    client.on("message", (data) => {
-      this.handleMessage(connectionId, data);
-    });
-
-    client.on("close", () => {
-      const conn = this.connections.get(connectionId);
-      const peerId = conn?.peerId ?? connectionId;
-
-      // Clean up both connection ID and real peer ID entries
-      this.connections.delete(connectionId);
-      if (conn?.peerId && conn.peerId !== connectionId) {
-        this.connections.delete(conn.peerId);
-      }
-
-      // Mark dead in SWIM membership (queues Dead gossip)
-      this.onPeerDisconnected(peerId);
-
-      // Notify Rust
-      if (this.vault) {
-        this.vault.peerDisconnected(peerId, "networkError");
-      }
-
-      this.emit("peer-disconnected", peerId);
-    });
-
-    client.on("error", (err) => {
-      this.emit("error", err);
-    });
+    this.setupOutgoingHandlers(connectionId, `${address}:${port}`, client, "networkError");
 
     await client.connect({ url, reconnect: true, reconnectDelay: 5000 });
 
@@ -354,53 +291,7 @@ export class PeerManager extends EventEmitter {
 
     // Add connection entry BEFORE connecting so it's available when 'open' fires
     this.connections.set(connectionId, { socket: client });
-
-    client.on("open", () => {
-      // Re-add connection on reconnect (client persists across reconnects)
-      this.connections.set(connectionId, { socket: client });
-
-      // Notify Rust of connecting state
-      if (this.vault) {
-        this.vault.peerConnecting(connectionId, normalized, "outgoing");
-      }
-
-      // Send handshake with error handling to prevent silent failures
-      try {
-        this.sendHandshake(connectionId, "client");
-      } catch (err) {
-        log.error(`Failed to send handshake to ${connectionId}:`, err);
-        this.emit("error", err);
-      }
-    });
-
-    client.on("message", (data) => {
-      this.handleMessage(connectionId, data);
-    });
-
-    client.on("close", () => {
-      const conn = this.connections.get(connectionId);
-      const peerId = conn?.peerId ?? connectionId;
-
-      // Clean up both connection ID and real peer ID entries
-      this.connections.delete(connectionId);
-      if (conn?.peerId && conn.peerId !== connectionId) {
-        this.connections.delete(conn.peerId);
-      }
-
-      // Mark dead in SWIM membership (queues Dead gossip)
-      this.onPeerDisconnected(peerId);
-
-      // Notify Rust
-      if (this.vault) {
-        this.vault.peerDisconnected(peerId, "networkError");
-      }
-
-      this.emit("peer-disconnected", peerId);
-    });
-
-    client.on("error", (err) => {
-      this.emit("error", err);
-    });
+    this.setupOutgoingHandlers(connectionId, normalized, client, "networkError");
 
     const reconnect = options?.reconnect ?? true;
     await client.connect({ url: normalized, reconnect, reconnectDelay: 5000 });
@@ -412,56 +303,22 @@ export class PeerManager extends EventEmitter {
    * Disconnect from a specific peer.
    */
   disconnectPeer(peerId: string): void {
-    // Try to find connection by peer ID or connection ID
-    let connectionId = peerId;
-    let conn = this.connections.get(peerId);
-
-    // If not found, vault might know the mapping
-    if (!conn && this.vault) {
-      connectionId = this.vault.resolvePeerId(peerId);
-      conn = this.connections.get(connectionId);
-    }
+    const { conn, connectionId } = this.resolveConnection(peerId);
 
     if (conn?.socket) {
-      // Outgoing connection
       conn.socket.disconnect();
-      this.connections.delete(connectionId);
-      if (conn.peerId && conn.peerId !== connectionId) {
-        this.connections.delete(conn.peerId);
-      }
     } else if (this.server) {
-      // Incoming connection - server uses connection IDs
       this.server.disconnect(connectionId);
-      this.connections.delete(connectionId);
-      if (conn?.peerId && conn.peerId !== connectionId) {
-        this.connections.delete(conn.peerId);
-      }
     }
 
-    // Mark dead in SWIM membership (queues Dead gossip)
-    this.onPeerDisconnected(peerId);
-
-    // Notify Rust
-    if (this.vault) {
-      this.vault.peerDisconnected(peerId, "userRequested");
-    }
-
-    this.emit("peer-disconnected", peerId);
+    this.cleanupConnection(connectionId, "userRequested");
   }
 
   /**
    * Send data to a specific peer.
    */
   send(peerId: string, data: Uint8Array): void {
-    // Try to find connection by peer ID
-    let conn = this.connections.get(peerId);
-    let connectionId = peerId;
-
-    // If not found directly, resolve via vault
-    if (!conn && this.vault) {
-      connectionId = this.vault.resolvePeerId(peerId);
-      conn = this.connections.get(connectionId);
-    }
+    const { conn, connectionId } = this.resolveConnection(peerId);
 
     // Try outgoing connection
     if (conn?.socket?.isConnected) {
@@ -672,56 +529,22 @@ export class PeerManager extends EventEmitter {
    * any pending gossip updates for efficient propagation.
    */
   sendWithGossip(peerId: string, syncData: Uint8Array): void {
-    const membership = this.getMembership();
-
-    if (membership) {
-      const gossipJson = membership.drainGossip();
-      const gossip = gossipJson ? JSON.parse(gossipJson) : [];
-
-      if (gossip.length > 0) {
-        // Wrap with gossip
-        const message = {
-          type: "sync",
-          data: Array.from(syncData),
-          gossip,
-        };
-        const encoded = new TextEncoder().encode(JSON.stringify(message));
-        this.send(peerId, encoded);
-        log.debug(`Sent sync with ${gossip.length} gossip updates to ${peerId}`);
-        return;
-      }
+    const { data, gossipCount } = this.prepareWithGossip(syncData);
+    if (gossipCount > 0) {
+      log.debug(`Sent sync with ${gossipCount} gossip updates to ${peerId}`);
     }
-
-    // No gossip, send raw sync data
-    this.send(peerId, syncData);
+    this.send(peerId, data);
   }
 
   /**
    * Broadcast sync data to all peers with piggybacked gossip.
    */
   broadcastWithGossip(syncData: Uint8Array): void {
-    const membership = this.getMembership();
-    let gossip: GossipUpdate[] = [];
-
-    if (membership) {
-      const gossipJson = membership.drainGossip();
-      gossip = gossipJson ? JSON.parse(gossipJson) : [];
+    const { data, gossipCount } = this.prepareWithGossip(syncData);
+    if (gossipCount > 0) {
+      log.debug(`Broadcast sync with ${gossipCount} gossip updates`);
     }
-
-    if (gossip.length > 0) {
-      // Wrap with gossip
-      const message = {
-        type: "sync",
-        data: Array.from(syncData),
-        gossip,
-      };
-      const encoded = new TextEncoder().encode(JSON.stringify(message));
-      this.broadcast(encoded);
-      log.debug(`Broadcast sync with ${gossip.length} gossip updates`);
-    } else {
-      // No gossip, send raw
-      this.broadcast(syncData);
-    }
+    this.broadcast(data);
   }
 
   /**
@@ -785,6 +608,111 @@ export class PeerManager extends EventEmitter {
     } catch (err) {
       log.warn(`Failed to send gossip to ${peerId}:`, err);
     }
+  }
+
+  // ========== Private Helpers ==========
+
+  /**
+   * Clean up a connection and notify vault/SWIM of the disconnect.
+   */
+  private cleanupConnection(connectionId: string, reason: DisconnectReason): void {
+    const conn = this.connections.get(connectionId);
+    const peerId = conn?.peerId ?? connectionId;
+
+    this.connections.delete(connectionId);
+    if (conn?.peerId && conn.peerId !== connectionId) {
+      this.connections.delete(conn.peerId);
+    }
+
+    this.onPeerDisconnected(peerId);
+
+    if (this.vault) {
+      this.vault.peerDisconnected(peerId, reason);
+    }
+
+    this.emit("peer-disconnected", peerId);
+  }
+
+  /**
+   * Wire up open/message/close/error handlers for an outgoing client connection.
+   */
+  private setupOutgoingHandlers(
+    connectionId: string,
+    address: string,
+    client: SyncWebSocketClient,
+    reason: DisconnectReason
+  ): void {
+    client.on("open", () => {
+      // Re-add connection on reconnect (client persists across reconnects)
+      this.connections.set(connectionId, { socket: client });
+
+      // Notify Rust of connecting state
+      if (this.vault) {
+        this.vault.peerConnecting(connectionId, address, "outgoing");
+      }
+
+      // Send handshake with error handling to prevent silent failures
+      try {
+        this.sendHandshake(connectionId, "client");
+      } catch (err) {
+        log.error(`Failed to send handshake to ${connectionId}:`, err);
+        this.emit("error", err);
+      }
+    });
+
+    client.on("message", (data) => {
+      this.handleMessage(connectionId, data);
+    });
+
+    client.on("close", () => {
+      this.cleanupConnection(connectionId, reason);
+    });
+
+    client.on("error", (err) => {
+      this.emit("error", err);
+    });
+  }
+
+  /**
+   * Wrap sync data in a gossip envelope if there are pending gossip updates.
+   * Returns the ready-to-send bytes (either raw sync data or JSON envelope).
+   */
+  private prepareWithGossip(syncData: Uint8Array): { data: Uint8Array; gossipCount: number } {
+    const membership = this.getMembership();
+
+    if (membership) {
+      const gossipJson = membership.drainGossip();
+      const gossip = gossipJson ? JSON.parse(gossipJson) : [];
+
+      if (gossip.length > 0) {
+        const message = {
+          type: "sync",
+          data: Array.from(syncData),
+          gossip,
+        };
+        return {
+          data: new TextEncoder().encode(JSON.stringify(message)),
+          gossipCount: gossip.length,
+        };
+      }
+    }
+
+    return { data: syncData, gossipCount: 0 };
+  }
+
+  /**
+   * Resolve a peer ID to its connection entry, checking vault for mapping.
+   */
+  private resolveConnection(peerId: string): { conn: Connection | undefined; connectionId: string } {
+    let conn = this.connections.get(peerId);
+    let connectionId = peerId;
+
+    if (!conn && this.vault) {
+      connectionId = this.vault.resolvePeerId(peerId);
+      conn = this.connections.get(connectionId);
+    }
+
+    return { conn, connectionId };
   }
 
   /**
