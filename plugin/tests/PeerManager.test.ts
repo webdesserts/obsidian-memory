@@ -747,7 +747,7 @@ describe("PeerManager", () => {
 
   describe("handleGossip()", () => {
     describe("Given multiple peers connected", () => {
-      it("should relay received gossip to other peers, excluding sender", async () => {
+      it("should relay state-changing gossip to other peers, excluding sender", async () => {
         const mockMembership = createMockMembership();
         (manager as any)._membership = mockMembership;
 
@@ -776,20 +776,64 @@ describe("PeerManager", () => {
         socketA.clearSentMessages();
         socketB.clearSentMessages();
 
-        // Simulate gossip arriving from peer A
+        // Simulate processGossip() queuing an update (state changed)
+        const drainedUpdate = { type: "alive", peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 };
+        mockMembership.drainGossip.mockReturnValueOnce(JSON.stringify([drainedUpdate]));
+
         const updates = [
           { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
         ];
         manager.handleGossip(updates, "peer-a");
 
-        // Peer B should have received the relayed gossip
+        // Peer B should have received the drained (state-changing) gossip
         expect(socketB.sentMessages).toHaveLength(1);
         const relayedMsg = JSON.parse(new TextDecoder().decode(socketB.sentMessages[0]));
         expect(relayedMsg.type).toBe("gossip");
-        expect(relayedMsg.updates).toEqual(updates);
+        expect(relayedMsg.updates).toEqual([drainedUpdate]);
 
         // Peer A (the sender) should NOT have received the relay
         expect(socketA.sentMessages).toHaveLength(0);
+      });
+
+      it("should not relay already-known gossip (prevents amplification)", async () => {
+        const mockMembership = createMockMembership();
+        (manager as any)._membership = mockMembership;
+
+        // Connect peer A and peer B
+        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+        const socketA = socketFactory.getLatest()!;
+        socketA.simulateOpen();
+        await connectA;
+        socketA.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+          )
+        );
+
+        const connectB = manager.connectToUrl("wss://peer-b.com/sync");
+        const socketB = socketFactory.getLatest()!;
+        socketB.simulateOpen();
+        await connectB;
+        socketB.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
+          )
+        );
+
+        socketA.clearSentMessages();
+        socketB.clearSentMessages();
+
+        // drainGossip returns empty — gossip was already known, no state change
+        mockMembership.drainGossip.mockReturnValueOnce("[]");
+
+        const updates = [
+          { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
+        ];
+        manager.handleGossip(updates, "peer-a");
+
+        // No relay should happen — prevents infinite amplification in mesh
+        expect(socketA.sentMessages).toHaveLength(0);
+        expect(socketB.sentMessages).toHaveLength(0);
       });
     });
 
