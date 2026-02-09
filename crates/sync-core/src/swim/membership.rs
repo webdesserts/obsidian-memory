@@ -6,7 +6,9 @@
 //! - Incarnation numbers for conflict resolution
 
 use super::{GossipUpdate, PeerInfo};
+use crate::protocol::GossipMessage;
 use crate::PeerId;
+use serde::Serialize;
 use std::collections::HashMap;
 
 /// Maximum number of pending gossip updates before oldest are dropped
@@ -68,6 +70,18 @@ impl Member {
     pub fn is_client_only(&self) -> bool {
         self.info.address.is_none()
     }
+}
+
+/// Messages to send after a peer completes its handshake.
+///
+/// Named fields prevent callers from mixing up which message goes where.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerConnectedMessages {
+    /// Full gossip snapshot — send to the newly connected peer
+    pub for_new_peer: GossipMessage,
+    /// Single alive update — broadcast to all other connected peers
+    pub for_existing_peers: GossipMessage,
 }
 
 /// Membership list tracking all known peers.
@@ -457,6 +471,31 @@ impl MembershipList {
 
         let alive: Vec<_> = self.alive_members().collect();
         alive.choose(&mut rand::rng()).copied()
+    }
+
+    /// Handle a newly connected peer after handshake.
+    ///
+    /// Encapsulates the 4-step ceremony: bump incarnation, add to membership,
+    /// generate full gossip for the new peer, and create an alive broadcast
+    /// for existing peers. Returns both messages for callers to send.
+    pub fn on_peer_connected(&mut self, peer: PeerInfo) -> PeerConnectedMessages {
+        let incarnation = self
+            .members
+            .get(&peer.peer_id)
+            .map(|m| m.incarnation + 1)
+            .unwrap_or(1);
+        self.add(peer.clone(), incarnation);
+
+        let full_gossip = self.generate_full_gossip();
+        let for_new_peer = GossipMessage::new(full_gossip);
+
+        let alive_update = GossipUpdate::alive(peer, incarnation);
+        let for_existing_peers = GossipMessage::new(vec![alive_update]);
+
+        PeerConnectedMessages {
+            for_new_peer,
+            for_existing_peers,
+        }
     }
 
     /// Pick K random members for indirect pinging.
@@ -1319,5 +1358,128 @@ mod tests {
         list.mark_removed(peer_a());
         let gossip = list.drain_gossip();
         assert!(gossip.is_empty());
+    }
+
+    // ==================== on_peer_connected ====================
+
+    #[test]
+    fn test_on_peer_connected_new_peer() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        let messages = list.on_peer_connected(peer);
+
+        // Peer should be added as Alive with incarnation 1
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Alive);
+        assert_eq!(member.incarnation, 1);
+
+        // Both messages should be populated
+        assert!(!messages.for_new_peer.updates.is_empty());
+        assert!(!messages.for_existing_peers.updates.is_empty());
+    }
+
+    #[test]
+    fn test_on_peer_connected_broadcasts_to_existing() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        let messages = list.on_peer_connected(peer);
+
+        // for_existing_peers should contain exactly 1 Alive update for the new peer
+        assert_eq!(messages.for_existing_peers.updates.len(), 1);
+        if let GossipUpdate::Alive { peer, incarnation } = &messages.for_existing_peers.updates[0] {
+            assert_eq!(peer.peer_id, peer_a());
+            assert_eq!(peer.address, Some("ws://a:8080".into()));
+            assert_eq!(*incarnation, 1);
+        } else {
+            panic!("Expected Alive update for existing peers");
+        }
+    }
+
+    #[test]
+    fn test_on_peer_connected_sends_known_peers() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+
+        // Add 2 existing alive members
+        list.add(PeerInfo::new(peer_b(), Some("ws://b:8080".into())), 1);
+        list.add(PeerInfo::new(peer_c(), Some("ws://c:8080".into())), 1);
+
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        let messages = list.on_peer_connected(peer);
+
+        // for_new_peer should contain: local + peer_a + peer_b + peer_c = 4 alive updates
+        assert_eq!(messages.for_new_peer.updates.len(), 4);
+
+        let peer_ids: Vec<_> = messages
+            .for_new_peer
+            .updates
+            .iter()
+            .filter_map(|u| match u {
+                GossipUpdate::Alive { peer, .. } => Some(peer.peer_id),
+                _ => None,
+            })
+            .collect();
+
+        assert!(peer_ids.contains(&local_id()));
+        assert!(peer_ids.contains(&peer_a()));
+        assert!(peer_ids.contains(&peer_b()));
+        assert!(peer_ids.contains(&peer_c()));
+    }
+
+    #[test]
+    fn test_on_peer_connected_address_update() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+
+        // First connection from original address
+        let peer = PeerInfo::new(peer_a(), Some("ws://10.0.0.1:8080".into()));
+        list.on_peer_connected(peer);
+        assert_eq!(list.get(&peer_a()).unwrap().incarnation, 1);
+
+        // Reconnect from new address
+        let peer = PeerInfo::new(peer_a(), Some("ws://10.0.0.2:8080".into()));
+        let messages = list.on_peer_connected(peer);
+
+        // Incarnation should bump from 1 to 2
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.incarnation, 2);
+        assert_eq!(member.info.address, Some("ws://10.0.0.2:8080".into()));
+
+        // Both messages should reflect the new address
+        if let GossipUpdate::Alive { peer, incarnation } = &messages.for_existing_peers.updates[0] {
+            assert_eq!(peer.address, Some("ws://10.0.0.2:8080".into()));
+            assert_eq!(*incarnation, 2);
+        } else {
+            panic!("Expected Alive update with new address");
+        }
+    }
+
+    #[test]
+    fn test_on_peer_connected_reconnecting_dead_peer() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+
+        // Peer connects, then dies
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        list.on_peer_connected(peer);
+        // Simulate incarnation reaching 3 via gossip
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 3);
+        list.mark_dead(peer_a());
+        assert_eq!(list.get(&peer_a()).unwrap().state, MemberState::Dead);
+
+        // Peer reconnects
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        let messages = list.on_peer_connected(peer);
+
+        // Should be alive again with bumped incarnation
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Alive);
+        assert_eq!(member.incarnation, 4);
+
+        // Broadcast should reflect the new incarnation
+        if let GossipUpdate::Alive { incarnation, .. } = &messages.for_existing_peers.updates[0] {
+            assert_eq!(*incarnation, 4);
+        } else {
+            panic!("Expected Alive update for reconnecting peer");
+        }
     }
 }
