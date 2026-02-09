@@ -521,6 +521,13 @@ export class PeerManager extends EventEmitter {
     const gossipJson = JSON.stringify(updates);
     const newPeers = membership.processGossip(gossipJson, fromPeerId) as SwimPeerInfo[];
 
+    // Relay gossip to other connected peers (exclude sender)
+    if (this.peerCount > 1) {
+      const relayMsg = JSON.stringify({ type: "gossip", updates });
+      this.broadcastExcept(new TextEncoder().encode(relayMsg), fromPeerId);
+      log.debug(`Relayed ${updates.length} gossip updates to ${this.peerCount - 1} other peer(s)`);
+    }
+
     // Auto-connect to newly discovered server peers
     for (const peer of newPeers) {
       // Skip if already connected or connection in progress

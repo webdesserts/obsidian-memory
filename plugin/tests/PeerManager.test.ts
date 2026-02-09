@@ -745,6 +745,84 @@ describe("PeerManager", () => {
     });
   });
 
+  describe("handleGossip()", () => {
+    describe("Given multiple peers connected", () => {
+      it("should relay received gossip to other peers, excluding sender", async () => {
+        const mockMembership = createMockMembership();
+        (manager as any)._membership = mockMembership;
+
+        // Connect peer A
+        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+        const socketA = socketFactory.getLatest()!;
+        socketA.simulateOpen();
+        await connectA;
+        socketA.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+          )
+        );
+
+        // Connect peer B
+        const connectB = manager.connectToUrl("wss://peer-b.com/sync");
+        const socketB = socketFactory.getLatest()!;
+        socketB.simulateOpen();
+        await connectB;
+        socketB.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
+          )
+        );
+
+        socketA.clearSentMessages();
+        socketB.clearSentMessages();
+
+        // Simulate gossip arriving from peer A
+        const updates = [
+          { type: "alive", peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
+        ];
+        manager.handleGossip(updates, "peer-a");
+
+        // Peer B should have received the relayed gossip
+        expect(socketB.sentMessages).toHaveLength(1);
+        const relayedMsg = JSON.parse(new TextDecoder().decode(socketB.sentMessages[0]));
+        expect(relayedMsg.type).toBe("gossip");
+        expect(relayedMsg.updates).toEqual(updates);
+
+        // Peer A (the sender) should NOT have received the relay
+        expect(socketA.sentMessages).toHaveLength(0);
+      });
+    });
+
+    describe("Given only one peer connected", () => {
+      it("should not relay gossip when only sender is connected", async () => {
+        const mockMembership = createMockMembership();
+        (manager as any)._membership = mockMembership;
+
+        // Connect only peer A
+        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+        const socketA = socketFactory.getLatest()!;
+        socketA.simulateOpen();
+        await connectA;
+        socketA.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+          )
+        );
+
+        socketA.clearSentMessages();
+
+        // Simulate gossip arriving from peer A
+        const updates = [
+          { type: "alive", peer: { peerId: "peer-b", address: null }, incarnation: 1 },
+        ];
+        manager.handleGossip(updates, "peer-a");
+
+        // Peer A should not receive anything (no relay needed with only 1 peer)
+        expect(socketA.sentMessages).toHaveLength(0);
+      });
+    });
+  });
+
   describe("auto-connect", () => {
     it("should use one-shot connection (no reconnect) for gossip-discovered peers", async () => {
       // Connect and complete handshake
