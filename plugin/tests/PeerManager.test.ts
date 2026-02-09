@@ -78,6 +78,38 @@ function createMockVault(): VaultPeerManager & {
   };
 }
 
+/** Create a mock SWIM membership for testing gossip behavior without WASM */
+function createMockMembership() {
+  return {
+    localIncarnation: vi.fn(() => BigInt(1)),
+    memberCount: vi.fn(() => 0),
+    getAliveMembers: vi.fn(() => []),
+    contains: vi.fn(() => false),
+    getMemberIncarnation: vi.fn(() => undefined as number | undefined),
+    processGossip: vi.fn(() => []),
+    drainGossip: vi.fn(() => "[]"),
+    generateFullGossip: vi.fn(() => "[]"),
+    markDead: vi.fn(() => false),
+    setLocalAddress: vi.fn(),
+    onPeerConnected: vi.fn(() =>
+      JSON.stringify({
+        forNewPeer: {
+          type: "gossip",
+          updates: [
+            { type: "alive", peer: { peerId: "test-client-id", address: null }, incarnation: 1 },
+          ],
+        },
+        forExistingPeers: {
+          type: "gossip",
+          updates: [
+            { type: "alive", peer: { peerId: "new-peer", address: null }, incarnation: 1 },
+          ],
+        },
+      })
+    ),
+  };
+}
+
 describe("PeerManager", () => {
   let manager: PeerManager;
   let socketFactory: MockWebSocketFactory;
@@ -594,6 +626,122 @@ describe("PeerManager", () => {
       expect(() => {
         managerNoVault.broadcastExcept(new TextEncoder().encode("test"), "some-peer");
       }).not.toThrow();
+    });
+  });
+
+  describe("onHandshakeComplete()", () => {
+    describe("Given membership is available", () => {
+      let mockMembership: ReturnType<typeof createMockMembership>;
+
+      beforeEach(() => {
+        mockMembership = createMockMembership();
+        (manager as any)._membership = mockMembership;
+      });
+
+      it("should call onPeerConnected with peer ID and address", async () => {
+        const connectPromise = manager.connectToUrl("wss://example.com/sync");
+        const socket = socketFactory.getLatest()!;
+        socket.simulateOpen();
+        await connectPromise;
+
+        socket.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({
+              type: "handshake",
+              peerId: "server-abc",
+              role: "server",
+              address: "ws://10.0.0.5:9427",
+            })
+          )
+        );
+
+        expect(mockMembership.onPeerConnected).toHaveBeenCalledWith(
+          "server-abc",
+          "ws://10.0.0.5:9427"
+        );
+      });
+
+      it("should send forNewPeer gossip to the connecting peer", async () => {
+        const connectPromise = manager.connectToUrl("wss://example.com/sync");
+        const socket = socketFactory.getLatest()!;
+        socket.simulateOpen();
+        await connectPromise;
+        socket.clearSentMessages();
+
+        socket.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({
+              type: "handshake",
+              peerId: "server-abc",
+              role: "server",
+            })
+          )
+        );
+
+        // Should have sent forNewPeer gossip to the new peer
+        expect(socket.sentMessages.length).toBeGreaterThanOrEqual(1);
+        const sentMsg = JSON.parse(new TextDecoder().decode(socket.sentMessages[0]));
+        expect(sentMsg.type).toBe("gossip");
+        expect(sentMsg.updates).toHaveLength(1);
+        expect(sentMsg.updates[0].peer.peerId).toBe("test-client-id");
+      });
+
+      it("should broadcast forExistingPeers to other connected peers", async () => {
+        // Connect peer A first
+        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
+        const socketA = socketFactory.getLatest()!;
+        socketA.simulateOpen();
+        await connectA;
+
+        socketA.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
+          )
+        );
+        socketA.clearSentMessages();
+
+        // Now connect peer B — onHandshakeComplete should broadcast to peer A
+        // Update mock to return peer-b-specific gossip
+        mockMembership.onPeerConnected.mockReturnValue(
+          JSON.stringify({
+            forNewPeer: {
+              type: "gossip",
+              updates: [
+                { type: "alive", peer: { peerId: "test-client-id", address: null }, incarnation: 1 },
+                { type: "alive", peer: { peerId: "peer-a", address: null }, incarnation: 1 },
+              ],
+            },
+            forExistingPeers: {
+              type: "gossip",
+              updates: [
+                { type: "alive", peer: { peerId: "peer-b", address: "ws://peer-b:8765" }, incarnation: 1 },
+              ],
+            },
+          })
+        );
+
+        const connectB = manager.connectToUrl("wss://peer-b.com/sync");
+        const socketB = socketFactory.getLatest()!;
+        socketB.simulateOpen();
+        await connectB;
+
+        socketB.simulateMessage(
+          new TextEncoder().encode(
+            JSON.stringify({
+              type: "handshake",
+              peerId: "peer-b",
+              role: "server",
+              address: "ws://peer-b:8765",
+            })
+          )
+        );
+
+        // Peer A should have received the forExistingPeers broadcast
+        expect(socketA.sentMessages).toHaveLength(1);
+        const broadcastMsg = JSON.parse(new TextDecoder().decode(socketA.sentMessages[0]));
+        expect(broadcastMsg.type).toBe("gossip");
+        expect(broadcastMsg.updates[0].peer.peerId).toBe("peer-b");
+      });
     });
   });
 

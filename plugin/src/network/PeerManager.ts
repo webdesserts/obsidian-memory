@@ -85,6 +85,7 @@ interface MembershipLike {
   generateFullGossip(): string;
   markDead(peerId: string): boolean;
   setLocalAddress(address: string): void;
+  onPeerConnected(peerId: string, address?: string): string;
 }
 
 export class PeerManager extends EventEmitter {
@@ -596,8 +597,9 @@ export class PeerManager extends EventEmitter {
   }
 
   /**
-   * Called after handshake completes. Adds the peer to SWIM membership and
-   * exchanges full gossip for peer discovery.
+   * Called after handshake completes. Registers the peer in SWIM membership
+   * via the Rust `onPeerConnected()` binding, sends full gossip to the new
+   * peer, and broadcasts the new peer's alive status to existing peers.
    */
   private onHandshakeComplete(
     connectionId: string,
@@ -607,23 +609,21 @@ export class PeerManager extends EventEmitter {
     const membership = this.getMembership();
     if (!membership) return;
 
-    // Bump incarnation on reconnect so the new address propagates via gossip
-    const existingInc = membership.getMemberIncarnation(peerId) ?? 0;
-    const incarnation = existingInc + 1;
-    const gossipJson = JSON.stringify([
-      { type: "alive", peer: { peerId, address: address ?? null }, incarnation },
-    ]);
-    membership.processGossip(gossipJson, peerId);
-
-    // Send our full peer list to the new peer
     try {
-      const fullGossip = membership.generateFullGossip();
-      const updates = JSON.parse(fullGossip);
-      const gossipMsg = JSON.stringify({ type: "gossip", updates });
-      this.send(connectionId, new TextEncoder().encode(gossipMsg));
-      log.debug(`Sent full gossip to ${peerId}: ${updates.length} updates`);
+      const result = JSON.parse(
+        membership.onPeerConnected(peerId, address ?? undefined)
+      );
+
+      // Send full gossip to the new peer
+      const forNewPeer = new TextEncoder().encode(JSON.stringify(result.forNewPeer));
+      this.send(connectionId, forNewPeer);
+      log.debug(`Sent full gossip to ${peerId}: ${result.forNewPeer.updates.length} updates`);
+
+      // Broadcast alive status to existing peers (previously missing!)
+      const forExisting = new TextEncoder().encode(JSON.stringify(result.forExistingPeers));
+      this.broadcastExcept(forExisting, peerId);
     } catch (err) {
-      log.warn(`Failed to send gossip to ${peerId}:`, err);
+      log.warn(`Failed gossip exchange with ${peerId}:`, err);
     }
   }
 
