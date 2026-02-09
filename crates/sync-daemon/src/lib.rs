@@ -15,7 +15,7 @@ pub mod watcher;
 // Re-export key types for convenience
 pub use connection::{ConnectionEvent, IncomingMessage, PeerConnection};
 pub use manager::{ConnectionManager, ManagerEvent};
-pub use message::{HandshakeMessage, MAX_MESSAGE_SIZE};
+pub use message::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 pub use native_fs::NativeFs;
 pub use outgoing::{OutgoingConnection, OutgoingState, ReconnectConfig, ReconnectState};
 pub use persistence::{PeerStorage, PersistedPeer, PersistedPeers};

@@ -1,6 +1,5 @@
-//! Handshake protocol messages.
+//! Protocol message types.
 //!
-//! Re-exports from sync-core for backwards compatibility.
-//! The canonical implementation is in sync-core::handshake.
+//! Re-exports from sync-core's protocol module.
 
-pub use sync_core::{is_likely_handshake, HandshakeMessage, MAX_MESSAGE_SIZE};
+pub use sync_core::protocol::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};

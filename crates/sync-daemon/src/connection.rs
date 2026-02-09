@@ -3,7 +3,8 @@
 //! Each peer connection wraps a WebSocket stream, handling the split
 //! between read and write halves for async operation.
 
-use crate::message::{HandshakeMessage, MAX_MESSAGE_SIZE};
+use crate::message::{Handshake, MAX_MESSAGE_SIZE};
+use sync_core::PeerId;
 use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -119,14 +120,14 @@ impl PeerConnection {
                         data.len(),
                         data.first() == Some(&b'{')
                     );
-                    if let Some(handshake) = HandshakeMessage::from_binary(&data) {
+                    if let Some(handshake) = Handshake::from_json(&data) {
                         debug!(
-                            "Received handshake from {} (peer_id: {}, role: {}, address: {:?})",
+                            "Received handshake from {} (peer_id: {}, role: {:?}, address: {:?})",
                             conn_id, handshake.peer_id, handshake.role, handshake.address
                         );
                         let _ = event_tx.send(ConnectionEvent::Handshake {
                             conn_id: conn_id.clone(),
-                            peer_id: handshake.peer_id,
+                            peer_id: handshake.peer_id.to_string(),
                             address: handshake.address,
                         });
                     } else {
@@ -174,12 +175,16 @@ impl PeerConnection {
     }
 
     /// Send a handshake message to the peer, optionally including our address.
+    ///
+    /// The daemon always sends `HandshakeRole::Server`. The address is included
+    /// when the daemon is reachable for incoming connections.
     pub async fn send_handshake(&self, peer_id: &str, address: Option<&str>) -> Result<()> {
-        let handshake = match address {
-            Some(addr) => HandshakeMessage::with_address(peer_id, "server", addr),
-            None => HandshakeMessage::new(peer_id, "server"),
-        };
-        self.send(&handshake.to_binary()).await
+        let peer_id: PeerId = peer_id
+            .parse()
+            .expect("daemon peer_id is always a valid PeerId");
+        let handshake =
+            Handshake::new(peer_id, crate::message::HandshakeRole::Server, address.map(String::from));
+        self.send(&handshake.to_json()).await
     }
 
     /// Set the real peer ID after handshake.

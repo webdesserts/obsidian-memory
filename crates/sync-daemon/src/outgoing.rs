@@ -6,7 +6,7 @@
 //! - State tracking (connecting, connected, reconnecting)
 
 use crate::connection::ConnectionEvent;
-use crate::message::HandshakeMessage;
+use crate::message::{Handshake, MAX_MESSAGE_SIZE};
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -20,9 +20,6 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, error, info, warn};
-
-/// Maximum message size for outgoing connections (50MB).
-pub const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 /// State of an outgoing connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,13 +177,18 @@ impl OutgoingConnection {
         self.write = Some(write.clone());
 
         // Send our handshake immediately (include our address if we have one)
-        let handshake = match &self.our_address {
-            Some(addr) => HandshakeMessage::with_address(&self.our_peer_id, "client", addr),
-            None => HandshakeMessage::new(&self.our_peer_id, "client"),
-        };
+        let peer_id: sync_core::PeerId = self
+            .our_peer_id
+            .parse()
+            .expect("daemon peer_id is always a valid PeerId");
+        let handshake = Handshake::new(
+            peer_id,
+            crate::message::HandshakeRole::Client,
+            self.our_address.clone(),
+        );
         {
             let mut w = write.lock().await;
-            w.send(Message::Binary(handshake.to_binary().into()))
+            w.send(Message::Binary(handshake.to_json().into()))
                 .await?;
         }
 
@@ -234,14 +236,14 @@ impl OutgoingConnection {
                     }
 
                     // Check if this is a handshake message
-                    if let Some(handshake) = HandshakeMessage::from_binary(&data) {
+                    if let Some(handshake) = Handshake::from_json(&data) {
                         debug!(
-                            "Received handshake from {} (peer_id: {}, role: {}, address: {:?})",
+                            "Received handshake from {} (peer_id: {}, role: {:?}, address: {:?})",
                             address, handshake.peer_id, handshake.role, handshake.address
                         );
                         let _ = event_tx.send(ConnectionEvent::Handshake {
                             conn_id: address.clone(),
-                            peer_id: handshake.peer_id,
+                            peer_id: handshake.peer_id.to_string(),
                             address: handshake.address,
                         });
                     } else {
