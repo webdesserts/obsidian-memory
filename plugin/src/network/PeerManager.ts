@@ -79,6 +79,7 @@ interface MembershipLike {
   memberCount(): number;
   getAliveMembers(): unknown;
   contains(peerId: string): boolean;
+  getMemberIncarnation(peerId: string): number | undefined;
   processGossip(gossipJson: string, fromPeerId: string): unknown;
   drainGossip(): string;
   generateFullGossip(): string;
@@ -766,9 +767,11 @@ export class PeerManager extends EventEmitter {
     const membership = this.getMembership();
     if (!membership) return;
 
-    // Add peer to membership as Alive with incarnation 1 (will be updated via gossip)
+    // Bump incarnation on reconnect so the new address propagates via gossip
+    const existingInc = membership.getMemberIncarnation(peerId) ?? 0;
+    const incarnation = existingInc + 1;
     const gossipJson = JSON.stringify([
-      { type: "alive", peer: { peerId, address: address ?? null }, incarnation: 1 },
+      { type: "alive", peer: { peerId, address: address ?? null }, incarnation },
     ]);
     membership.processGossip(gossipJson, peerId);
 

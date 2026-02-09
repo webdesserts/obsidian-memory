@@ -885,6 +885,13 @@ mod wasm_impl {
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
+        /// Get a peer's current incarnation number (for reconnection incarnation bumps).
+        #[wasm_bindgen(js_name = getMemberIncarnation)]
+        pub fn get_member_incarnation(&self, peer_id: String) -> Option<u64> {
+            let pid = peer_id.parse().ok()?;
+            self.inner.borrow().get(&pid).map(|m| m.incarnation)
+        }
+
         /// Check if a specific peer is known and alive.
         #[wasm_bindgen(js_name = isAlive)]
         pub fn is_alive(&self, peer_id: String) -> bool {
