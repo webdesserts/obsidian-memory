@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -20,6 +19,7 @@ use sync_daemon::watcher::{FileEvent, FileEventKind, FileWatcher};
 use sync_daemon::IncomingMessage;
 
 use sync_core::fs::FileSystem;
+use sync_core::protocol::PeerMessage;
 use sync_core::swim::{GossipUpdate, MembershipList, PeerInfo};
 use sync_core::{PeerId, Vault};
 
@@ -67,17 +67,6 @@ enum Command {
     AddPeer {
         /// WebSocket address of the peer (e.g., ws://peer.example.com:8080)
         address: String,
-    },
-}
-
-/// Parsed JSON message from plugin.
-enum JsonMessage {
-    /// Pure gossip message
-    Gossip(Vec<GossipUpdate>),
-    /// Sync message with optional piggybacked gossip
-    Sync {
-        data: Vec<u8>,
-        gossip: Vec<GossipUpdate>,
     },
 }
 
@@ -189,22 +178,20 @@ impl Daemon {
 
         debug!("Processing message from {} ({} bytes)", peer_id, msg.data.len());
 
-        // Try to parse as JSON first (handles gossip, sync-with-gossip, etc.)
-        let sync_data = match Self::try_parse_json_message(&msg.data) {
-            Some(JsonMessage::Gossip(updates)) => {
-                // Pure gossip message - process and relay
-                self.handle_gossip_updates(&updates, peer_id).await;
+        // Try to parse as a typed JSON message (gossip or sync envelope)
+        let sync_data = match PeerMessage::from_json(&msg.data) {
+            Some(PeerMessage::Gossip(gossip_msg)) => {
+                self.handle_gossip_updates(&gossip_msg.updates, peer_id).await;
                 return;
             }
-            Some(JsonMessage::Sync { data, gossip }) => {
-                // Sync message with optional piggybacked gossip
-                if !gossip.is_empty() {
-                    self.handle_gossip_updates(&gossip, peer_id).await;
+            Some(PeerMessage::Sync(envelope)) => {
+                if !envelope.gossip.is_empty() {
+                    self.handle_gossip_updates(&envelope.gossip, peer_id).await;
                 }
-                data
+                envelope.data
             }
             None => {
-                // Not JSON - treat as raw binary sync message
+                // Not JSON — treat as raw binary sync message
                 msg.data.clone()
             }
         };
@@ -347,49 +334,6 @@ impl Daemon {
                 self.server.broadcast(msg.to_string().as_bytes()).await;
                 info!("Broadcast dead gossip for {}", peer_id);
             }
-        }
-    }
-
-    /// Try to parse a message as JSON.
-    ///
-    /// Returns parsed message type, or None if not JSON.
-    fn try_parse_json_message(data: &[u8]) -> Option<JsonMessage> {
-        let text = std::str::from_utf8(data).ok()?;
-        let msg: Value = serde_json::from_str(text).ok()?;
-
-        let msg_type = msg.get("type")?.as_str()?;
-
-        match msg_type {
-            "gossip" => {
-                let updates = msg.get("updates").and_then(|u| u.as_array())?;
-                let parsed: Vec<GossipUpdate> = updates
-                    .iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect();
-                Some(JsonMessage::Gossip(parsed))
-            }
-            "sync" => {
-                // Extract piggybacked gossip
-                let gossip: Vec<GossipUpdate> = msg
-                    .get("gossip")
-                    .and_then(|g| g.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // Extract sync data
-                let data = msg.get("data").and_then(|d| d.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as u8))
-                        .collect()
-                })?;
-
-                Some(JsonMessage::Sync { data, gossip })
-            }
-            _ => None,
         }
     }
 
