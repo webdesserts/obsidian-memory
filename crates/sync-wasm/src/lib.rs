@@ -809,17 +809,21 @@ mod wasm_impl {
         ///
         /// @param gossipJson - JSON array of GossipUpdate objects
         /// @param fromPeerId - Peer ID who sent the gossip
-        /// @returns JSON array of newly discovered PeerInfo objects
+        /// @returns JSON string: `{ newPeers: PeerInfo[], relay: GossipUpdate[] }`
         #[wasm_bindgen(js_name = processGossip)]
-        pub fn process_gossip(&self, gossip_json: String, from_peer_id: String) -> Result<JsValue, JsError> {
+        pub fn process_gossip(&self, gossip_json: String, from_peer_id: String) -> Result<String, JsError> {
             let updates: Vec<sync_core::swim::GossipUpdate> = serde_json::from_str(&gossip_json)
                 .map_err(|e| JsError::new(&format!("Invalid gossip JSON: {}", e)))?;
             let from_pid = from_peer_id.parse()
                 .map_err(|e: sync_core::peer_id::PeerIdError| JsError::new(&e.to_string()))?;
 
-            let new_peers = self.inner.borrow_mut().process_gossip(&updates, from_pid);
+            let result = self.inner.borrow_mut().process_gossip(&updates, from_pid);
 
-            serde_wasm_bindgen::to_value(&new_peers)
+            let json_result = serde_json::json!({
+                "newPeers": result.new_peers,
+                "relay": result.relay,
+            });
+            serde_json::to_string(&json_result)
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
