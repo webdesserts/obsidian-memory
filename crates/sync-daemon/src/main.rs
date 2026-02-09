@@ -19,7 +19,7 @@ use sync_daemon::watcher::{FileEvent, FileEventKind, FileWatcher};
 use sync_daemon::IncomingMessage;
 
 use sync_core::fs::FileSystem;
-use sync_core::protocol::PeerMessage;
+use sync_core::protocol::{GossipMessage, PeerMessage};
 use sync_core::swim::{GossipUpdate, MembershipList, PeerInfo};
 use sync_core::{PeerId, Vault};
 
@@ -280,10 +280,10 @@ impl Daemon {
 
             // Send full gossip to the new peer
             let full_gossip = self.membership.generate_full_gossip();
-            let gossip_msg = serde_json::json!({ "type": "gossip", "updates": full_gossip });
+            let gossip_msg = GossipMessage::new(full_gossip.clone());
             if let Err(e) = self
                 .server
-                .send(&peer_id, gossip_msg.to_string().as_bytes())
+                .send(&peer_id, &gossip_msg.to_json())
                 .await
             {
                 warn!("Failed to send gossip to {}: {}", peer_id, e);
@@ -293,9 +293,9 @@ impl Daemon {
 
             // Broadcast the new peer to existing peers
             let alive_update = GossipUpdate::alive(peer_info, incarnation);
-            let broadcast_msg = serde_json::json!({ "type": "gossip", "updates": [alive_update] });
+            let broadcast_msg = GossipMessage::new(vec![alive_update]);
             self.server
-                .broadcast_except(broadcast_msg.to_string().as_bytes(), &peer_id)
+                .broadcast_except(&broadcast_msg.to_json(), &peer_id)
                 .await;
         }
 
@@ -330,8 +330,8 @@ impl Daemon {
         if let Ok(pid) = peer_id.parse::<PeerId>() {
             if let Some(member) = self.membership.get(&pid) {
                 let dead_update = GossipUpdate::dead(pid, member.incarnation);
-                let msg = serde_json::json!({ "type": "gossip", "updates": [dead_update] });
-                self.server.broadcast(msg.to_string().as_bytes()).await;
+                let msg = GossipMessage::new(vec![dead_update]);
+                self.server.broadcast(&msg.to_json()).await;
                 info!("Broadcast dead gossip for {}", peer_id);
             }
         }
@@ -358,9 +358,9 @@ impl Daemon {
 
             // Relay gossip to other peers (exclude sender by peer_id)
             if self.server.peer_count() > 1 {
-                let relay_msg = serde_json::json!({ "type": "gossip", "updates": updates });
+                let relay_msg = GossipMessage::new(updates.to_vec());
                 self.server
-                    .broadcast_except(relay_msg.to_string().as_bytes(), from_peer_id)
+                    .broadcast_except(&relay_msg.to_json(), from_peer_id)
                     .await;
                 debug!(
                     "Relayed {} gossip updates to {} other peer(s)",
