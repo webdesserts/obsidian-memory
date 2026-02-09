@@ -96,6 +96,14 @@ Feature: Peer Discovery
     Then Peer A should NOT automatically retry the connection
     And Peer B should remain in Peer A's known peers for future reconnection
 
+  # --- Failure Propagation ---
+
+  Scenario: Peer broadcasts dead status when a connection drops
+    Given Peer A, Peer B, and Peer C are all connected to each other
+    When Peer B disconnects from Peer A
+    Then Peer A should broadcast that Peer B is Dead to Peer C
+    And Peer C should mark Peer B as Dead
+
   # --- Reconnection ---
 
   Scenario: Periodic sweep retries known but disconnected peers
