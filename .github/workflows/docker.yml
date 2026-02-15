@@ -27,6 +27,9 @@ jobs:
         id: version
         run: echo "version=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -52,13 +55,14 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.memory
+          platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=memory
+          cache-to: type=gha,mode=max,scope=memory
 
   build-sync:
     runs-on: ubuntu-latest
@@ -68,6 +72,9 @@ jobs:
       - name: Extract version from plan
         id: version
         run: echo "version=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -94,13 +101,14 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.sync
+          platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=sync
+          cache-to: type=gha,mode=max,scope=sync
 
   build-auth:
     runs-on: ubuntu-latest
@@ -110,6 +118,9 @@ jobs:
       - name: Extract version from plan
         id: version
         run: echo "version=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -136,10 +147,11 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.auth
+          platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=auth
+          cache-to: type=gha,mode=max,scope=auth
