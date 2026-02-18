@@ -215,7 +215,7 @@ impl OutgoingConnection {
                 Some(Ok(msg)) => {
                     let data = match msg {
                         Message::Binary(data) => data.to_vec(),
-                        Message::Text(text) => text.into_bytes(),
+                        Message::Text(text) => text.as_bytes().to_vec(),
                         Message::Ping(_) | Message::Pong(_) => continue,
                         Message::Close(_) => {
                             debug!("Received close frame from {}", address);

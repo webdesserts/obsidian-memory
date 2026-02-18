@@ -82,7 +82,7 @@ impl TestClient {
         loop {
             match self.ws.next().await {
                 Some(Ok(Message::Binary(data))) => return data.to_vec(),
-                Some(Ok(Message::Text(text))) => return text.into_bytes(),
+                Some(Ok(Message::Text(text))) => return text.as_bytes().to_vec(),
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_))) => panic!("Connection closed unexpectedly"),
                 Some(Err(e)) => panic!("WebSocket error: {}", e),
