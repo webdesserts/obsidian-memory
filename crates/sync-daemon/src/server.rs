@@ -6,11 +6,10 @@
 
 use crate::connection::{ConnectionEvent, IncomingMessage, PeerConnection};
 use anyhow::Result;
+use axum::extract::ws::WebSocket;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio_tungstenite::accept_async;
 use tracing::{debug, error, info, warn};
 
 /// Event emitted by the server after the handshake lifecycle is resolved.
@@ -65,37 +64,11 @@ impl WebSocketServer {
         }
     }
 
-    /// Bind to an address and return the TCP listener.
-    pub async fn bind(listen_addr: &str) -> Result<TcpListener> {
-        let listener = TcpListener::bind(listen_addr).await?;
-        info!("WebSocket server listening on {}", listen_addr);
-        Ok(listener)
-    }
-
-    /// Handle a new incoming TCP connection.
+    /// Handle a new incoming WebSocket connection (already upgraded by axum).
     ///
-    /// Upgrades to WebSocket and sends our handshake. The connection stays
-    /// in the pending map until the remote peer completes handshake.
-    pub async fn accept_connection(&mut self, stream: TcpStream, addr: SocketAddr) {
-        // Upgrade to WebSocket
-        let ws_stream = match accept_async(stream).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                // Health checks (like `nc -z`) connect and immediately close without
-                // completing the WebSocket handshake. Log these as debug, not error.
-                let err_str = e.to_string();
-                if err_str.contains("Handshake not finished")
-                    || err_str.contains("Connection reset")
-                    || err_str.contains("unexpected EOF")
-                {
-                    debug!("Connection closed before handshake from {}", addr);
-                } else {
-                    error!("WebSocket upgrade failed for {}: {}", addr, e);
-                }
-                return;
-            }
-        };
-
+    /// Sends our handshake. The connection stays in the pending map until
+    /// the remote peer completes handshake.
+    pub async fn accept_connection(&mut self, ws: WebSocket, addr: SocketAddr) {
         // Generate internal connection ID
         let conn_id = format!("conn-{}", self.next_conn_id);
         self.next_conn_id += 1;
@@ -103,7 +76,7 @@ impl WebSocketServer {
         info!("New connection from {} (conn_id: {})", addr, conn_id);
 
         // Create connection
-        let conn = PeerConnection::new(conn_id.clone(), ws_stream, self.event_tx.clone());
+        let conn = PeerConnection::new(conn_id.clone(), ws, self.event_tx.clone());
 
         // Send our handshake immediately (include our address if we have one)
         if let Err(e) = conn

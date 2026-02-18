@@ -7,11 +7,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Use library exports
+use sync_daemon::http;
 use sync_daemon::manager::{ConnectionManager, ManagerEvent};
 use sync_daemon::native_fs::NativeFs;
 use sync_daemon::server::{ServerEvent, WebSocketServer};
@@ -437,12 +438,14 @@ async fn main() -> Result<()> {
         args.advertise.clone(),
     );
 
-    // Only listen for incoming connections if not in client-only mode
-    let listener = if !args.client_only {
-        Some(WebSocketServer::bind(&args.listen).await?)
-    } else {
-        None
-    };
+    // Start HTTP server for incoming connections (unless client-only)
+    let (ws_tx, mut ws_rx) = mpsc::channel(32);
+    if !args.client_only {
+        let listen_addr = args.listen.clone();
+        tokio::spawn(async move {
+            http::serve(&listen_addr, ws_tx).await;
+        });
+    }
 
     // Create file watcher
     let watcher = FileWatcher::new(args.vault.clone())?;
@@ -472,26 +475,10 @@ async fn main() -> Result<()> {
 
     // Main event loop
     loop {
-        // Create accept future only if we have a listener
-        let accept_future = async {
-            if let Some(ref l) = listener {
-                Some(l.accept().await)
-            } else {
-                std::future::pending::<Option<std::io::Result<_>>>().await
-            }
-        };
-
         tokio::select! {
-            // Accept new WebSocket connections (if listening)
-            Some(result) = accept_future => {
-                match result {
-                    Ok((stream, addr)) => {
-                        daemon.server.accept_connection(stream, addr).await;
-                    }
-                    Err(e) => {
-                        error!("Failed to accept connection: {}", e);
-                    }
-                }
+            // Accept new WebSocket connections from axum HTTP server
+            Some((ws, addr)) = ws_rx.recv() => {
+                daemon.server.accept_connection(ws, addr).await;
             }
 
             // Handle file watcher events

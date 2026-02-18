@@ -7,16 +7,13 @@
 //! - Connection deduplication
 //! - Automatic reconnection for outgoing connections
 
-use crate::connection::{ConnectionEvent, IncomingMessage, PeerConnection};
+use crate::connection::{ConnectionEvent, IncomingMessage};
 use crate::outgoing::{OutgoingConnection, OutgoingState, ReconnectConfig};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::accept_async;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use sync_core::peers::{
     check_duplicate_connection, ConnectionDirection, DisconnectReason, DuplicateCheckResult,
@@ -43,32 +40,20 @@ pub enum ManagerEvent {
     PeerDiscovered { peer_id: String, address: String },
 }
 
-/// A unified connection (incoming or outgoing).
-enum Connection {
-    Incoming(PeerConnection),
-    Outgoing(OutgoingConnection),
-}
+/// A managed outgoing connection.
+struct Connection(OutgoingConnection);
 
 impl Connection {
     fn direction(&self) -> ConnectionDirection {
-        match self {
-            Connection::Incoming(_) => ConnectionDirection::Incoming,
-            Connection::Outgoing(_) => ConnectionDirection::Outgoing,
-        }
+        ConnectionDirection::Outgoing
     }
 
     fn peer_id(&self) -> Option<&str> {
-        match self {
-            Connection::Incoming(c) => c.real_peer_id.as_deref(),
-            Connection::Outgoing(c) => c.remote_peer_id.as_deref(),
-        }
+        self.0.remote_peer_id.as_deref()
     }
 
     async fn send(&self, data: &[u8]) -> Result<()> {
-        match self {
-            Connection::Incoming(c) => c.send(data).await,
-            Connection::Outgoing(c) => c.send(data).await,
-        }
+        self.0.send(data).await
     }
 }
 
@@ -82,8 +67,6 @@ pub struct ConnectionManager {
     connections: HashMap<String, Connection>,
     /// Map from peer ID to connection ID (for routing by peer ID)
     peer_to_conn: HashMap<String, String>,
-    /// Counter for generating connection IDs
-    next_conn_id: u64,
     /// Channel sender for connection events
     event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     /// Channel receiver for internal events
@@ -109,7 +92,6 @@ impl ConnectionManager {
                 our_address,
                 connections: HashMap::new(),
                 peer_to_conn: HashMap::new(),
-                next_conn_id: 1,
                 event_tx,
                 event_rx,
                 manager_tx,
@@ -127,47 +109,6 @@ impl ConnectionManager {
     /// Get our advertised address.
     pub fn address(&self) -> Option<&str> {
         self.our_address.as_deref()
-    }
-
-    /// Handle a new incoming TCP connection.
-    ///
-    /// Upgrades to WebSocket and sends our handshake.
-    pub async fn accept_incoming(&mut self, stream: TcpStream, addr: SocketAddr) {
-        // Upgrade to WebSocket
-        let ws_stream = match accept_async(stream).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("Handshake not finished")
-                    || err_str.contains("Connection reset")
-                    || err_str.contains("unexpected EOF")
-                {
-                    debug!("Connection closed before handshake from {}", addr);
-                } else {
-                    error!("WebSocket upgrade failed for {}: {}", addr, e);
-                }
-                return;
-            }
-        };
-
-        // Generate connection ID
-        let conn_id = format!("conn-{}", self.next_conn_id);
-        self.next_conn_id += 1;
-
-        info!("New incoming connection from {} (conn_id: {})", addr, conn_id);
-
-        // Create connection
-        let conn = PeerConnection::new(conn_id.clone(), ws_stream, self.event_tx.clone());
-
-        // Send our handshake immediately (include our address if we have one)
-        if let Err(e) = conn.send_handshake(&self.our_peer_id, self.our_address.as_deref()).await {
-            error!("Failed to send handshake to {}: {}", conn_id, e);
-            return;
-        }
-
-        // Store connection
-        self.connections
-            .insert(conn_id, Connection::Incoming(conn));
     }
 
     /// Connect to a remote peer.
@@ -190,7 +131,7 @@ impl ConnectionManager {
         conn.connect(self.event_tx.clone()).await?;
 
         self.connections
-            .insert(address.to_string(), Connection::Outgoing(conn));
+            .insert(address.to_string(), Connection(conn));
 
         Ok(())
     }
@@ -245,10 +186,8 @@ impl ConnectionManager {
                     .insert(peer_id.to_string(), conn_id.to_string());
 
                 // Update connection's peer ID
-                match self.connections.get_mut(conn_id) {
-                    Some(Connection::Incoming(c)) => c.set_peer_id(peer_id.to_string()),
-                    Some(Connection::Outgoing(c)) => c.on_handshake_complete(peer_id.to_string()),
-                    None => {}
+                if let Some(Connection(c)) = self.connections.get_mut(conn_id) {
+                    c.on_handshake_complete(peer_id.to_string());
                 }
 
                 debug!("Handshake complete: {} -> {}", conn_id, peer_id);
@@ -283,10 +222,8 @@ impl ConnectionManager {
                 // Register the new connection
                 self.peer_to_conn
                     .insert(peer_id.to_string(), conn_id.to_string());
-                match self.connections.get_mut(conn_id) {
-                    Some(Connection::Incoming(c)) => c.set_peer_id(peer_id.to_string()),
-                    Some(Connection::Outgoing(c)) => c.on_handshake_complete(peer_id.to_string()),
-                    None => {}
+                if let Some(Connection(c)) = self.connections.get_mut(conn_id) {
+                    c.on_handshake_complete(peer_id.to_string());
                 }
 
                 Some(ManagerEvent::HandshakeComplete {
@@ -312,18 +249,17 @@ impl ConnectionManager {
 
         let pid_for_event = peer_id.unwrap_or_else(|| conn_id.to_string());
 
-        // For outgoing connections, schedule reconnection
-        if let Connection::Outgoing(mut outgoing) = conn {
-            if outgoing.state != OutgoingState::Closed {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
+        // Schedule reconnection
+        let Connection(mut outgoing) = conn;
+        if outgoing.state != OutgoingState::Closed {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
 
-                outgoing.prepare_reconnect(now_ms, &self.reconnect_config);
-                self.connections
-                    .insert(outgoing.address.clone(), Connection::Outgoing(outgoing));
-            }
+            outgoing.prepare_reconnect(now_ms, &self.reconnect_config);
+            self.connections
+                .insert(outgoing.address.clone(), Connection(outgoing));
         }
 
         info!(
@@ -346,10 +282,7 @@ impl ConnectionManager {
             }
 
             // Close the actual connection
-            match &mut conn {
-                Connection::Incoming(c) => c.close().await,
-                Connection::Outgoing(c) => c.close().await,
-            }
+            conn.0.close().await;
 
             let _ = self.manager_tx.send(ManagerEvent::ConnectionClosed {
                 peer_id: conn.peer_id().unwrap_or(conn_id).to_string(),
@@ -419,13 +352,12 @@ impl ConnectionManager {
     pub fn check_reconnections(&self, now_ms: u64) -> Vec<String> {
         self.connections
             .values()
-            .filter_map(|conn| {
-                if let Connection::Outgoing(out) = conn {
-                    if out.should_reconnect(now_ms) {
-                        return Some(out.address.clone());
-                    }
+            .filter_map(|Connection(out)| {
+                if out.should_reconnect(now_ms) {
+                    Some(out.address.clone())
+                } else {
+                    None
                 }
-                None
             })
             .collect()
     }

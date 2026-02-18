@@ -28,11 +28,13 @@ notify-debouncer-mini = "0.6"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Networking (WebSocket)
+# Networking (WebSocket + HTTP)
 tokio-tungstenite = "0.28"
+axum = { version = "0.8", features = ["ws"] }
 
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+reqwest = "0.13.2"
 tempfile.workspace = true

@@ -4,18 +4,14 @@
 //! between read and write halves for async operation.
 
 use crate::message::{Handshake, MAX_MESSAGE_SIZE};
+use axum::extract::ws::{Message, WebSocket};
 use sync_core::PeerId;
 use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{
-    tungstenite::{Error as WsError, Message},
-    WebSocketStream,
-};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 /// Message received from a peer connection.
 #[derive(Debug)]
@@ -52,21 +48,21 @@ pub struct PeerConnection {
     /// Real peer ID (known after handshake)
     pub real_peer_id: Option<String>,
     /// Write half of the WebSocket (wrapped for sharing across tasks)
-    write: Arc<Mutex<futures::stream::SplitSink<WebSocketStream<TcpStream>, Message>>>,
+    write: Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>,
     /// Handle to the read task
     read_task: Option<JoinHandle<()>>,
 }
 
 impl PeerConnection {
-    /// Create a new peer connection from a WebSocket stream.
+    /// Create a new peer connection from an axum WebSocket.
     ///
     /// Spawns a read task that forwards messages to the event channel.
     pub fn new(
         conn_id: String,
-        ws_stream: WebSocketStream<TcpStream>,
+        ws: WebSocket,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) -> Self {
-        let (write, read) = ws_stream.split();
+        let (write, read) = ws.split();
         let write = Arc::new(Mutex::new(write));
 
         let read_conn_id = conn_id.clone();
@@ -85,7 +81,7 @@ impl PeerConnection {
     /// Read loop that forwards messages to the event channel.
     async fn read_loop(
         conn_id: String,
-        mut read: futures::stream::SplitStream<WebSocketStream<TcpStream>>,
+        mut read: futures::stream::SplitStream<WebSocket>,
         event_tx: mpsc::UnboundedSender<ConnectionEvent>,
     ) {
         loop {
@@ -99,7 +95,6 @@ impl PeerConnection {
                             debug!("Received close frame from {}", conn_id);
                             break;
                         }
-                        Message::Frame(_) => continue,
                     };
 
                     // Check message size
@@ -140,14 +135,7 @@ impl PeerConnection {
                     }
                 }
                 Some(Err(e)) => {
-                    match e {
-                        WsError::ConnectionClosed | WsError::AlreadyClosed => {
-                            debug!("Connection {} closed", conn_id);
-                        }
-                        _ => {
-                            error!("WebSocket error on {}: {}", conn_id, e);
-                        }
-                    }
+                    debug!("WebSocket error on {}: {}", conn_id, e);
                     break;
                 }
                 None => {

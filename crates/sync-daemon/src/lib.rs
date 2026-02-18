@@ -4,6 +4,7 @@
 //! allowing integration tests to access internal types.
 
 pub mod connection;
+pub mod http;
 pub mod manager;
 pub mod message;
 pub mod native_fs;

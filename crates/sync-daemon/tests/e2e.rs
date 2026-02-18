@@ -11,12 +11,12 @@ use futures::{SinkExt, StreamExt};
 use sync_core::protocol::{Handshake, HandshakeRole};
 use sync_core::PeerId;
 use sync_daemon::{
-    native_fs::NativeFs, server::ServerEvent, server::WebSocketServer, watcher::FileWatcher,
-    FileEventKind,
+    http, native_fs::NativeFs, server::ServerEvent, server::WebSocketServer,
+    watcher::FileWatcher, FileEventKind,
 };
 use tempfile::TempDir;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
@@ -29,7 +29,7 @@ struct TestClient {
 impl TestClient {
     /// Connect to the daemon and complete handshake.
     async fn connect_and_handshake(addr: SocketAddr) -> Self {
-        let url = format!("ws://{}", addr);
+        let url = format!("ws://{}/sync", addr);
         let (ws, _) = connect_async(&url).await.expect("Failed to connect");
 
         let peer_id = PeerId::generate();
@@ -51,7 +51,7 @@ impl TestClient {
 
     /// Connect and handshake with a specific address in our handshake.
     async fn connect_with_address(addr: SocketAddr, address: &str) -> Self {
-        let url = format!("ws://{}", addr);
+        let url = format!("ws://{}/sync", addr);
         let (ws, _) = connect_async(&url).await.expect("Failed to connect");
 
         let peer_id = PeerId::generate();
@@ -118,16 +118,30 @@ impl TestClient {
 // Helpers
 // ============================================================================
 
-/// Create a server and listener bound to a random port.
+/// Create a server with an axum HTTP frontend bound to a random port.
 ///
-/// `peer_id` must be a valid PeerId hex string (16 hex chars).
-async fn create_server(peer_id: &str) -> (WebSocketServer, tokio::net::TcpListener, SocketAddr) {
+/// Returns the server, a channel to receive upgraded WebSocket connections,
+/// and the bound address. `peer_id` must be a valid PeerId hex string.
+async fn create_server(
+    peer_id: &str,
+) -> (
+    WebSocketServer,
+    mpsc::Receiver<http::IncomingWebSocket>,
+    SocketAddr,
+) {
     let server = WebSocketServer::new(peer_id.to_string(), None);
-    let listener = WebSocketServer::bind("127.0.0.1:0")
+    let (ws_tx, ws_rx) = mpsc::channel(32);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
     let addr = listener.local_addr().expect("Failed to get local addr");
-    (server, listener, addr)
+
+    tokio::spawn(async move {
+        http::serve_on_listener(listener, ws_tx).await;
+    });
+
+    (server, ws_rx, addr)
 }
 
 /// Poll for a ServerEvent with a timeout.
@@ -138,27 +152,28 @@ async fn poll_event_timeout(
     timeout(duration, server.poll_event()).await.ok().flatten()
 }
 
+/// Accept a single WebSocket connection from the channel and register it with the server.
+async fn accept_one(
+    ws_rx: &mut mpsc::Receiver<http::IncomingWebSocket>,
+    server: &Arc<Mutex<WebSocketServer>>,
+) {
+    let (ws, addr) = ws_rx.recv().await.expect("Channel closed");
+    server.lock().await.accept_connection(ws, addr).await;
+}
+
 // ============================================================================
 // ServerEvent Tests (poll_event API)
 // ============================================================================
 
 #[tokio::test]
 async fn test_poll_event_peer_connected() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
+    let server = Arc::new(Mutex::new(server));
 
     // Accept connection in background
-    let listener = Arc::new(listener);
-    let listener_clone = Arc::clone(&listener);
-    let server = Arc::new(Mutex::new(server));
     let server_clone = Arc::clone(&server);
-
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-        server_clone
-            .lock()
-            .await
-            .accept_connection(stream, peer_addr)
-            .await;
+        accept_one(&mut ws_rx, &server_clone).await;
     });
 
     // Connect client with address
@@ -188,20 +203,12 @@ async fn test_poll_event_peer_connected() {
 
 #[tokio::test]
 async fn test_poll_event_message() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
-    let listener_clone = Arc::clone(&listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
-    let server_clone = Arc::clone(&server);
 
+    let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-        server_clone
-            .lock()
-            .await
-            .accept_connection(stream, peer_addr)
-            .await;
+        accept_one(&mut ws_rx, &server_clone).await;
     });
 
     let mut client = TestClient::connect_and_handshake(addr).await;
@@ -240,20 +247,12 @@ async fn test_poll_event_message() {
 
 #[tokio::test]
 async fn test_poll_event_peer_disconnected() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
-    let listener_clone = Arc::clone(&listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
-    let server_clone = Arc::clone(&server);
 
+    let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-        server_clone
-            .lock()
-            .await
-            .accept_connection(stream, peer_addr)
-            .await;
+        accept_one(&mut ws_rx, &server_clone).await;
     });
 
     let client = TestClient::connect_and_handshake(addr).await;
@@ -291,24 +290,16 @@ async fn test_poll_event_peer_disconnected() {
 
 #[tokio::test]
 async fn test_pre_handshake_close_not_emitted() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
-    let listener_clone = Arc::clone(&listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
-    let server_clone = Arc::clone(&server);
 
+    let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-        server_clone
-            .lock()
-            .await
-            .accept_connection(stream, peer_addr)
-            .await;
+        accept_one(&mut ws_rx, &server_clone).await;
     });
 
     // Connect but DON'T send handshake, just close immediately
-    let url = format!("ws://{}", addr);
+    let url = format!("ws://{}/sync", addr);
     let (mut ws, _) = connect_async(&url).await.expect("Failed to connect");
 
     // Receive the server handshake (server sends first)
@@ -328,22 +319,14 @@ async fn test_pre_handshake_close_not_emitted() {
 
 #[tokio::test]
 async fn test_broadcast_except_by_peer_id() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
 
     // Accept two connections
-    let listener_clone = Arc::clone(&listener);
     let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
         for _ in 0..2 {
-            let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-            server_clone
-                .lock()
-                .await
-                .accept_connection(stream, peer_addr)
-                .await;
+            accept_one(&mut ws_rx, &server_clone).await;
         }
     });
 
@@ -395,20 +378,12 @@ async fn test_broadcast_except_by_peer_id() {
 
 #[tokio::test]
 async fn test_handshake_exchange() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
-    let server_clone = Arc::clone(&server);
 
-    let listener_clone = Arc::clone(&listener);
+    let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-        server_clone
-            .lock()
-            .await
-            .accept_connection(stream, peer_addr)
-            .await;
+        accept_one(&mut ws_rx, &server_clone).await;
     });
 
     let client = TestClient::connect_and_handshake(addr).await;
@@ -428,21 +403,13 @@ async fn test_handshake_exchange() {
 
 #[tokio::test]
 async fn test_multiple_clients() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
 
-    let listener_clone = Arc::clone(&listener);
     let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
         for _ in 0..2 {
-            let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-            server_clone
-                .lock()
-                .await
-                .accept_connection(stream, peer_addr)
-                .await;
+            accept_one(&mut ws_rx, &server_clone).await;
         }
     });
 
@@ -468,21 +435,13 @@ async fn test_multiple_clients() {
 
 #[tokio::test]
 async fn test_message_broadcast() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
 
-    let listener_clone = Arc::clone(&listener);
     let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
         for _ in 0..2 {
-            let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-            server_clone
-                .lock()
-                .await
-                .accept_connection(stream, peer_addr)
-                .await;
+            accept_one(&mut ws_rx, &server_clone).await;
         }
     });
 
@@ -524,20 +483,12 @@ async fn test_message_broadcast() {
 
 #[tokio::test]
 async fn test_connection_events_flow() {
-    let (server, listener, addr) = create_server("aa00bb11cc22dd33").await;
-
-    let listener = Arc::new(listener);
+    let (server, mut ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
     let server = Arc::new(Mutex::new(server));
-    let server_clone = Arc::clone(&server);
 
-    let listener_clone = Arc::clone(&listener);
+    let server_clone = Arc::clone(&server);
     let accept_handle = tokio::spawn(async move {
-        let (stream, peer_addr) = listener_clone.accept().await.expect("Failed to accept");
-        server_clone
-            .lock()
-            .await
-            .accept_connection(stream, peer_addr)
-            .await;
+        accept_one(&mut ws_rx, &server_clone).await;
     });
 
     let client = TestClient::connect_and_handshake(addr).await;
@@ -558,6 +509,22 @@ async fn test_connection_events_flow() {
 
     drop(guard);
     client.close().await;
+}
+
+// ============================================================================
+// Health Check Test
+// ============================================================================
+
+#[tokio::test]
+async fn test_health_endpoint() {
+    let (_server, _ws_rx, addr) = create_server("aa00bb11cc22dd33").await;
+
+    let resp = reqwest::get(format!("http://{}/health", addr))
+        .await
+        .expect("Health request failed");
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "OK");
 }
 
 // ============================================================================

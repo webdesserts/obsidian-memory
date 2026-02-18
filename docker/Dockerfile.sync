@@ -4,7 +4,7 @@ FROM debian:bookworm-slim
 
 # Runtime deps + xz-utils for installer
 RUN apt-get update && apt-get install -y \
-    ca-certificates curl xz-utils netcat-openbsd \
+    ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install binary via cargo-dist installer with retry logic
@@ -26,9 +26,9 @@ WORKDIR /notes
 
 EXPOSE 8080
 
-# Health check - verify WebSocket port is listening
+# Health check - verify HTTP server is responding
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD nc -z localhost 8080 || exit 1
+    CMD curl -f http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["sync-daemon"]
 CMD ["--vault", "/notes", "--listen", "0.0.0.0:8080"]
