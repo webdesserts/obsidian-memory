@@ -11,6 +11,8 @@ services:
       - AUTH_PATH_PREFIX=/auth
     expose:
       - "3001"
+    networks:
+      - proxy
     restart: unless-stopped
     mem_limit: 48m
     memswap_limit: 48m
@@ -31,6 +33,8 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "3000"
+    networks:
+      - proxy
     depends_on:
       - auth-service
     restart: unless-stopped
@@ -53,37 +57,12 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "8080"
+    networks:
+      - proxy
     restart: unless-stopped
     mem_limit: 64m
     memswap_limit: 64m
     mem_reservation: 32m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # TLS termination + routing
-  caddy:
-    image: caddy:2-alpine
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      - DOMAIN=${DOMAIN:?DOMAIN required}
-    depends_on:
-      - auth-service
-      - memory
-      - sync-daemon
-    restart: unless-stopped
-    mem_limit: 64m
-    memswap_limit: 64m
-    mem_reservation: 16m
-    oom_score_adj: -300  # Protect gateway - if it dies, nothing is reachable
     logging:
       driver: json-file
       options:
@@ -102,6 +81,6 @@ volumes:
   # Persistent config for auth service (tokens, clients, API keys)
   auth-config:
 
-  # Caddy TLS certificates and config
-  caddy-data:
-  caddy-config:
+networks:
+  proxy:
+    external: true

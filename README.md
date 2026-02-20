@@ -42,6 +42,42 @@ cargo install --path crates/memory
 
 Note: Building from source uses runtime model download from HuggingFace. Pre-built binaries have the model embedded and work on corporate networks that block HuggingFace.
 
+### Option 4: Docker (Server Deployment)
+
+For running as a persistent HTTP server behind a reverse proxy.
+
+```bash
+cd docker
+DOMAIN=example.com NOTES_PATH=/path/to/vault docker compose up -d
+```
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DOMAIN` | Yes | Public domain for OAuth URLs (e.g., `example.com`) |
+| `NOTES_PATH` | Yes | Absolute path to vault directory on the host |
+| `VERSION` | No | Image tag (defaults to `latest`) |
+| `RUST_LOG` | No | Log level (defaults to `info`) |
+
+The compose file expects an external Docker network called `proxy` that your reverse proxy also joins. Create it before starting:
+
+```bash
+docker network create proxy
+```
+
+#### Reverse Proxy Requirements
+
+The services don't handle TLS or authentication routing themselves — that's the reverse proxy's job. See [`docker/Caddyfile`](docker/Caddyfile) for a working Caddy example. Any reverse proxy needs to handle:
+
+- **OAuth discovery** — `/.well-known/oauth-authorization-server` → `auth-service:3001`
+- **Auth endpoints** — `/auth/*` → `auth-service:3001` (strip the `/auth` prefix)
+- **MCP endpoint** — `/mcp*` → `memory:3000` (protected via auth delegation to `auth-service:3001/validate`)
+- **Sync WebSocket** — `/sync` → `sync-daemon:8080`
+
+Important proxy considerations:
+- The MCP endpoint uses SSE streaming — disable response buffering for `/mcp*`
+- MCP operations (especially embedding computation) can be slow — set read/write timeouts to at least 5 minutes
+- The auth-service `/validate` endpoint works with any proxy that supports forward-auth / auth delegation (Caddy `forward_auth`, nginx `auth_request`, Traefik `ForwardAuth`, etc.)
+
 ## Usage
 
 ### Environment Variables
