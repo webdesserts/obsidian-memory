@@ -426,7 +426,7 @@ mod tests {
         ).unwrap();
 
         let content_hash = read_json["content_hash"].as_str().unwrap();
-        assert_eq!(read_json["content"].as_str().unwrap(), "Version 1");
+        assert_eq!(read_json["content"].as_str().unwrap(), "1\tVersion 1");
 
         // Step 2: WriteNote with hash from read
         let write_result = execute(

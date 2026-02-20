@@ -122,13 +122,41 @@ pub struct WriteNoteParams {
     pub content_hash: Option<String>,
 }
 
-/// A single edit operation for the EditNote tool
+/// A single find-and-replace operation for the ReplaceInNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditOperation {
+pub struct ReplaceOperation {
     /// Text to search for - must match exactly and appear only once
     #[serde(rename = "oldText")]
     pub old_text: String,
     /// Text to replace with
+    #[serde(rename = "newText")]
+    pub new_text: String,
+}
+
+/// Parameters for the ReplaceInNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReplaceInNoteParams {
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
+    /// Array of edit operations. Each oldText must appear exactly once in the note.
+    pub edits: Vec<ReplaceOperation>,
+    /// Content hash from ReadNote - required to verify note hasn't changed
+    pub content_hash: String,
+    /// Preview changes without applying them (default: false)
+    #[serde(default, rename = "dryRun")]
+    pub dry_run: bool,
+}
+
+/// A single line-range edit operation for the EditNote tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LineEditOperation {
+    /// First line to replace (1-indexed, inclusive). Matches line numbers from ReadNote output.
+    #[serde(rename = "startLine")]
+    pub start_line: usize,
+    /// Last line to replace (1-indexed, inclusive). Use the same value as startLine to replace a single line.
+    #[serde(rename = "endLine")]
+    pub end_line: usize,
+    /// Replacement text. Use empty string to delete lines. May contain newlines to expand a range into multiple lines.
     #[serde(rename = "newText")]
     pub new_text: String,
 }
@@ -138,8 +166,8 @@ pub struct EditOperation {
 pub struct EditNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
-    /// Array of edit operations. Each oldText must appear exactly once in the note.
-    pub edits: Vec<EditOperation>,
+    /// Array of line-range edit operations. Ranges must not overlap.
+    pub edits: Vec<LineEditOperation>,
     /// Content hash from ReadNote - required to verify note hasn't changed
     pub content_hash: String,
     /// Preview changes without applying them (default: false)
@@ -379,7 +407,7 @@ impl MemoryServer {
         tools::load_private_memory::execute(&self.config().vault_path, &params.0.reason).await
     }
 
-    #[tool(description = "Read the complete contents of a note. Returns JSON with content and content_hash. Use content_hash when calling WriteNote or EditNote.")]
+    #[tool(description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote, EditNote, or ReplaceInNote unchanged.")]
     async fn read_note(&self, params: Parameters<ReadNoteParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::read_note::execute(
@@ -405,11 +433,35 @@ impl MemoryServer {
     }
 
     #[tool(description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits.")]
-    async fn edit_note(&self, params: Parameters<EditNoteParams>) -> Result<CallToolResult, ErrorData> {
-        let edits: Vec<tools::edit_note::Edit> = params.0.edits
+    async fn replace_in_note(&self, params: Parameters<ReplaceInNoteParams>) -> Result<CallToolResult, ErrorData> {
+        let edits: Vec<tools::replace_in_note::Edit> = params.0.edits
             .into_iter()
-            .map(|e| tools::edit_note::Edit {
+            .map(|e| tools::replace_in_note::Edit {
                 old_text: e.old_text,
+                new_text: e.new_text,
+            })
+            .collect();
+
+        let graph = self.graph().read().await;
+        tools::replace_in_note::execute(
+            &self.config().vault_path,
+            self.storage(),
+            &graph,
+            &params.0.note,
+            edits,
+            &params.0.content_hash,
+            params.0.dry_run,
+        )
+        .await
+    }
+
+    #[tool(description = "Replace lines in a note by line number. Each edit specifies a startLine and endLine (1-indexed, inclusive, matching ReadNote output) and newText to replace that range. Use empty newText to delete lines. Ranges must not overlap. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits.")]
+    async fn edit_note(&self, params: Parameters<EditNoteParams>) -> Result<CallToolResult, ErrorData> {
+        let edits: Vec<tools::edit_note::LineEdit> = params.0.edits
+            .into_iter()
+            .map(|e| tools::edit_note::LineEdit {
+                start_line: e.start_line,
+                end_line: e.end_line,
                 new_text: e.new_text,
             })
             .collect();

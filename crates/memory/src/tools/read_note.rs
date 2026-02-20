@@ -2,10 +2,27 @@
 
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use serde::Serialize;
+use std::fmt::Write;
 
 use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
 use crate::storage::{ContentHash, Storage, StorageError};
+
+/// Format content with `cat -n` style line numbers (right-aligned number + tab).
+pub fn number_lines(content: &str) -> String {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let total = lines.len();
+    let width = total.to_string().len().max(1);
+
+    let mut result = String::with_capacity(content.len() + total * (width + 2));
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        let _ = write!(result, "{:>width$}\t{}", i + 1, line, width = width);
+    }
+    result
+}
 
 /// Response from ReadNote tool.
 #[derive(Serialize)]
@@ -45,12 +62,12 @@ pub async fn execute<S: Storage>(
         _ => ErrorData::internal_error(format!("Failed to read note: {}", e), None),
     })?;
 
-    // Compute content hash for client to use in subsequent writes
+    // Compute content hash on raw content before numbering
     let content_hash = ContentHash::from_content(&content);
 
-    // Return JSON with content and hash
+    // Return JSON with numbered content and hash
     let response = ReadNoteResponse {
-        content,
+        content: number_lines(&content),
         content_hash: content_hash.as_str().to_string(),
     };
     let json = serde_json::to_string(&response)
@@ -107,7 +124,7 @@ mod tests {
             .expect("should succeed");
 
         let response = parse_response(&result);
-        assert_eq!(response.content, "Hello, world!");
+        assert_eq!(response.content, "1\tHello, world!");
         // Hash should be present and non-empty
         assert!(!response.content_hash.is_empty());
     }
@@ -161,7 +178,7 @@ mod tests {
             .expect("should succeed");
 
         let response = parse_response(&result);
-        assert_eq!(response.content, "Note content");
+        assert_eq!(response.content, "1\tNote content");
     }
 
     #[tokio::test]
@@ -190,7 +207,7 @@ mod tests {
             .expect("should succeed");
 
         let response = parse_response(&result);
-        assert_eq!(response.content, "Content");
+        assert_eq!(response.content, "1\tContent");
     }
 
     #[tokio::test]
@@ -210,6 +227,61 @@ mod tests {
             .expect("should succeed");
 
         let response = parse_response(&result);
-        assert_eq!(response.content, "Content");
+        assert_eq!(response.content, "1\tContent");
+    }
+
+    #[tokio::test]
+    async fn test_read_multiline_content_has_line_numbers() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        fs::write(temp_dir.path().join("test.md"), "line one\nline two\nline three")
+            .await
+            .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let result = execute(&storage, &graph, "test")
+            .await
+            .expect("should succeed");
+
+        let response = parse_response(&result);
+        assert_eq!(response.content, "1\tline one\n2\tline two\n3\tline three");
+    }
+
+    #[tokio::test]
+    async fn test_read_empty_content() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        fs::write(temp_dir.path().join("test.md"), "")
+            .await
+            .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let result = execute(&storage, &graph, "test")
+            .await
+            .expect("should succeed");
+
+        let response = parse_response(&result);
+        assert_eq!(response.content, "1\t");
+    }
+
+    #[tokio::test]
+    async fn test_line_numbers_right_aligned() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        // 10+ lines to test right-alignment
+        let content = (1..=12).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        fs::write(temp_dir.path().join("test.md"), &content)
+            .await
+            .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let result = execute(&storage, &graph, "test")
+            .await
+            .expect("should succeed");
+
+        let response = parse_response(&result);
+        // Single-digit lines should be right-aligned with space padding
+        assert!(response.content.starts_with(" 1\tline 1\n"));
+        assert!(response.content.contains("12\tline 12"));
     }
 }
