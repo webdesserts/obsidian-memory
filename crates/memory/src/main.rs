@@ -79,6 +79,16 @@ pub struct WriteLogsParams {
     pub entries: std::collections::HashMap<String, String>,
 }
 
+/// Parameters for the Remember tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RememberParams {
+    /// The client's current working directory path. Used for project discovery
+    /// via git remote and directory name matching. When omitted (e.g. on iOS
+    /// or other clients without a filesystem), project discovery is skipped
+    /// but Log, Working Memory, and the weekly note are still loaded.
+    pub cwd: Option<String>,
+}
+
 /// Parameters for the Reflect tool
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReflectParams {
@@ -329,10 +339,10 @@ impl MemoryServer {
     }
 
     #[tool(description = "Load all session context files in a single call. Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. Automatically discovers projects based on git remotes and directory names. Use this at the start of every session to get complete context about recent work, current focus, this week's activity, and project context.")]
-    async fn remember(&self) -> Result<CallToolResult, ErrorData> {
+    async fn remember(&self, params: Parameters<RememberParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
-        let cwd = std::env::current_dir().unwrap_or_default();
-        tools::remember::execute(&self.config().vault_path, &graph, &cwd).await
+        let cwd = params.0.cwd.map(std::path::PathBuf::from);
+        tools::remember::execute(&self.config().vault_path, &graph, cwd.as_deref()).await
     }
 
     #[tool(description = "Search for relevant notes using semantic similarity. Encodes the query and compares it against all note embeddings. Returns similarity-ordered list of potentially relevant notes. Supports note references via wiki-links: [[Note Name]]")]

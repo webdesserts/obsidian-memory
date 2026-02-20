@@ -17,7 +17,7 @@ use crate::tools::get_weekly_note_info;
 pub async fn execute(
     vault_path: &Path,
     graph_index: &GraphIndex,
-    cwd: &Path,
+    cwd: Option<&Path>,
 ) -> Result<CallToolResult, ErrorData> {
     // Define paths to all context files
     let log_path = vault_path.join("Log.md");
@@ -26,8 +26,8 @@ pub async fn execute(
     // Get weekly note path
     let (weekly_note_uri, weekly_note_path) = get_weekly_note_path(vault_path);
 
-    // Discover projects for current working directory
-    let discovery_result = discover_projects(cwd, graph_index, vault_path);
+    // Discover projects if CWD was provided
+    let discovery_result = cwd.map(|cwd| discover_projects(cwd, graph_index, vault_path));
 
     // Read all context files
     let log_content = tokio::fs::read_to_string(&log_path).await.ok();
@@ -36,13 +36,15 @@ pub async fn execute(
 
     // Read strict match project notes
     let mut project_contents = Vec::new();
-    for m in &discovery_result.strict_matches {
-        if let Ok(content) = tokio::fs::read_to_string(&m.metadata.file_path).await {
-            project_contents.push((
-                m.metadata.file_path.clone(),
-                m.metadata.name.clone(),
-                content,
-            ));
+    if let Some(ref result) = discovery_result {
+        for m in &result.strict_matches {
+            if let Ok(content) = tokio::fs::read_to_string(&m.metadata.file_path).await {
+                project_contents.push((
+                    m.metadata.file_path.clone(),
+                    m.metadata.name.clone(),
+                    content,
+                ));
+            }
         }
     }
 
@@ -87,16 +89,28 @@ pub async fn execute(
     }
 
     // Generate project discovery status message
-    let project_status = generate_discovery_status_message(&discovery_result, cwd);
+    let project_status = match (&discovery_result, cwd) {
+        (Some(result), Some(cwd)) => generate_discovery_status_message(result, cwd),
+        _ => "Project discovery skipped (no cwd provided).".to_string(),
+    };
 
     // Add project status as text content
     content_blocks.push(Content::text(project_status));
+
+    let structured = match &discovery_result {
+        Some(result) => build_structured_content(result),
+        None => serde_json::json!({
+            "projectsFound": 0,
+            "projectDisconnects": 0,
+            "projectSuggestions": 0,
+        }),
+    };
 
     Ok(CallToolResult {
         content: content_blocks,
         is_error: None,
         meta: None,
-        structured_content: Some(build_structured_content(&discovery_result)),
+        structured_content: Some(structured),
     })
 }
 
@@ -178,7 +192,7 @@ mod tests {
         let vault_path = temp_dir.path();
 
         // Use a non-matching CWD so we don't trigger project discovery
-        let result = execute(vault_path, &graph, Path::new("/tmp"))
+        let result = execute(vault_path, &graph, Some(Path::new("/tmp")))
             .await
             .unwrap();
 
@@ -219,7 +233,7 @@ mod tests {
             .output()
             .ok();
 
-        let result = execute(vault_path, &graph, &test_cwd).await.unwrap();
+        let result = execute(vault_path, &graph, Some(&test_cwd)).await.unwrap();
 
         // Check structured content shows project found
         let structured = result.structured_content.unwrap();
@@ -233,7 +247,7 @@ mod tests {
         let graph = GraphIndex::new();
 
         // Empty vault - no files exist
-        let result = execute(vault_path, &graph, Path::new("/tmp"))
+        let result = execute(vault_path, &graph, Some(Path::new("/tmp")))
             .await
             .unwrap();
 
@@ -247,5 +261,38 @@ mod tests {
             .filter(|c| c.raw.as_text().is_some())
             .count();
         assert!(text_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_remember_without_cwd_skips_discovery() {
+        let (temp_dir, graph) = create_test_vault();
+        let vault_path = temp_dir.path();
+
+        // No CWD provided — should still load context files but skip project discovery
+        let result = execute(vault_path, &graph, None).await.unwrap();
+
+        // Should have Log, Working Memory, Weekly Note, and status message
+        let resource_count = result
+            .content
+            .iter()
+            .filter(|c| c.raw.as_resource().is_some())
+            .count();
+        assert!(
+            resource_count >= 3,
+            "Expected at least 3 resources, got {}",
+            resource_count
+        );
+
+        // Structured content should show no projects found
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["projectsFound"], 0);
+
+        // Status message should indicate discovery was skipped
+        let text_content: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|c| c.raw.as_text().map(|t| t.text.as_str()))
+            .collect();
+        assert!(text_content.iter().any(|t| t.contains("skipped")));
     }
 }
