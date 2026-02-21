@@ -92,11 +92,12 @@ fn apply_edits(content: &str, edits: &[Edit]) -> Result<(String, String), String
 /// Truncate a string for display, adding ellipsis if needed.
 fn truncate_for_display(s: &str, max_len: usize) -> String {
     let trimmed = s.trim();
-    if trimmed.len() <= max_len {
-        // Replace newlines with visible markers
+    let char_count = trimmed.chars().count();
+    if char_count <= max_len {
         trimmed.replace('\n', "\\n")
     } else {
-        format!("{}...", &trimmed[..max_len].replace('\n', "\\n"))
+        let truncated: String = trimmed.chars().take(max_len).collect();
+        format!("{}...", truncated.replace('\n', "\\n"))
     }
 }
 

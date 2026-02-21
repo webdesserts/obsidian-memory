@@ -142,10 +142,12 @@ fn apply_line_edits(content: &str, edits: &[LineEdit]) -> Result<(String, String
 /// Truncate a string for display, adding ellipsis if needed.
 fn truncate_for_display(s: &str, max_len: usize) -> String {
     let trimmed = s.trim();
-    if trimmed.len() <= max_len {
+    let char_count = trimmed.chars().count();
+    if char_count <= max_len {
         trimmed.replace('\n', "\\n")
     } else {
-        format!("{}...", &trimmed[..max_len].replace('\n', "\\n"))
+        let truncated: String = trimmed.chars().take(max_len).collect();
+        format!("{}...", truncated.replace('\n', "\\n"))
     }
 }
 
@@ -540,5 +542,121 @@ mod tests {
 
         let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
         assert_eq!(written, "A\nb\nC");
+    }
+
+    #[tokio::test]
+    async fn test_trailing_newline_creates_phantom_line() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        // Most real files have a trailing newline, which split('\n') turns into an extra empty element
+        let content = "line one\nline two\n";
+        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let hash = ContentHash::from_content(content);
+
+        // The trailing newline means split('\n') produces 3 elements: ["line one", "line two", ""]
+        // So editing "line 2" should work and preserve the trailing newline
+        let edits = vec![LineEdit {
+            start_line: 2,
+            end_line: 2,
+            new_text: "replaced".to_string(),
+        }];
+
+        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
+            .await
+            .expect("should succeed");
+
+        let _ = parse_response(&result);
+        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        assert_eq!(written, "line one\nreplaced\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_then_edit_line_range_flow() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        // Create note in subdirectory (mirrors replace_in_note's integration test)
+        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
+        fs::write(
+            temp_dir.path().join("knowledge/My Note.md"),
+            "first\nsecond\nthird",
+        )
+        .await
+        .unwrap();
+        graph.update_note(
+            "My Note",
+            PathBuf::from("knowledge/My Note.md"),
+            HashSet::new(),
+        );
+
+        // Step 1: ReadNote to get content_hash
+        let read_result = super::super::read_note::execute(
+            &storage,
+            &graph,
+            "My Note",
+        )
+        .await
+        .expect("ReadNote should succeed");
+
+        let read_json: serde_json::Value = serde_json::from_str(
+            &read_result.content[0].raw.as_text().unwrap().text
+        ).unwrap();
+
+        let content_hash = read_json["content_hash"].as_str().unwrap();
+        // Verify line numbers appear in the content
+        assert!(read_json["content"].as_str().unwrap().contains("1\tfirst"));
+
+        // Step 2: EditNote with hash from read — replace line 2
+        let edits = vec![LineEdit {
+            start_line: 2,
+            end_line: 2,
+            new_text: "REPLACED".to_string(),
+        }];
+
+        let edit_result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "My Note",
+            edits,
+            content_hash,
+            false,
+        )
+        .await
+        .expect("EditNote should succeed");
+
+        let response = parse_response(&edit_result);
+        assert_eq!(response.uri, "memory:knowledge/My Note");
+
+        // Verify the file was actually modified
+        let content = fs::read_to_string(temp_dir.path().join("knowledge/My Note.md"))
+            .await
+            .unwrap();
+        assert_eq!(content, "first\nREPLACED\nthird");
+    }
+
+    #[tokio::test]
+    async fn test_unicode_content_does_not_panic() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        let content = "Hello 🌍\n日本語テスト\naccénted";
+        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let hash = ContentHash::from_content(content);
+        let edits = vec![LineEdit {
+            start_line: 2,
+            end_line: 2,
+            new_text: "replaced".to_string(),
+        }];
+
+        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
+            .await
+            .expect("should succeed");
+
+        let _ = parse_response(&result);
+        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        assert_eq!(written, "Hello 🌍\nreplaced\naccénted");
     }
 }
