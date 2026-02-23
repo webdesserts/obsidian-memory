@@ -687,14 +687,12 @@ export default class P2PSyncPlugin extends Plugin {
    * Try to load an existing vault (if .sync directory exists).
    */
   private async tryLoadVault(): Promise<void> {
-    if (!this.peerId) return;
-
     try {
       const fsBridge = createFsBridge(this.app.vault);
       const syncDirExists = await this.app.vault.adapter.exists(".sync");
 
       if (syncDirExists) {
-        this.vault = await WasmVault.load(fsBridge, this.peerId);
+        this.vault = await WasmVault.load(fsBridge);
         log.info("Vault loaded");
         this.updateStatusBar("loaded");
         this.subscribeToDebugEvents();
@@ -713,17 +711,13 @@ export default class P2PSyncPlugin extends Plugin {
    * Creates the .sync directory and initializes Loro documents.
    */
   async initializeVault(): Promise<void> {
-    if (!this.peerId) {
-      throw new Error("Peer ID not set");
-    }
-
     if (this.vault) {
       log.info("Vault already initialized");
       return;
     }
 
     const fsBridge = createFsBridge(this.app.vault);
-    this.vault = await WasmVault.init(fsBridge, this.peerId);
+    this.vault = await WasmVault.init(fsBridge);
     log.info("Vault initialized");
     this.updateStatusBar("initialized");
     this.subscribeToDebugEvents();
