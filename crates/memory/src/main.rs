@@ -554,7 +554,7 @@ enum Command {
     },
 
     /// Start all services (sync + MCP HTTP)
-    #[cfg(all(feature = "daemon", feature = "http"))]
+    #[cfg(all(feature = "sync", feature = "http"))]
     Up {
         /// Path to the vault directory
         #[arg(long)]
@@ -613,7 +613,7 @@ enum McpAction {
 #[derive(clap::Subcommand)]
 enum SyncAction {
     /// Start sync daemon
-    #[cfg(feature = "daemon")]
+    #[cfg(feature = "sync")]
     Up {
         /// Path to the vault directory
         #[arg(long)]
@@ -707,7 +707,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
 
-        #[cfg(feature = "daemon")]
+        #[cfg(feature = "sync")]
         Some(Command::Sync { action }) => match action {
             SyncAction::Up {
                 vault,
@@ -732,14 +732,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
 
-        #[cfg(not(feature = "daemon"))]
+        #[cfg(not(feature = "sync"))]
         Some(Command::Sync { .. }) => {
             eprintln!("Sync daemon is not available in this build.");
             eprintln!("Rebuild with: cargo build --features daemon");
             std::process::exit(1);
         }
 
-        #[cfg(all(feature = "daemon", feature = "http"))]
+        #[cfg(all(feature = "sync", feature = "http"))]
         Some(Command::Up {
             vault,
             port,

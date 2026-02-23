@@ -13,7 +13,7 @@ name = "memory"
 path = "src/main.rs"
 
 [features]
-default = ["download-model"]
+default = ["download-model", "http", "sync"]
 # Download model from HuggingFace at runtime (default for dev)
 download-model = ["dep:reqwest", "dep:futures-util"]
 # Use model embedded in binary (for release builds)
@@ -21,7 +21,7 @@ embedded-model = ["semantic-embeddings/embedded-model"]
 # Enable HTTP transport for remote MCP server
 http = ["rmcp/transport-streamable-http-server", "dep:axum"]
 # Enable embedded sync daemon
-daemon = ["dep:sync-daemon"]
+sync = ["dep:sync-daemon"]
 
 [dependencies]
 # MCP SDK

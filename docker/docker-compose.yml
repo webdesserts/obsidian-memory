@@ -23,16 +23,16 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # MCP server with HTTP transport
+  # MCP server (HTTP) + P2P sync daemon
   memory:
     image: ghcr.io/webdesserts/memory:${VERSION:-latest}
     volumes:
       - notes:/notes:rw
     environment:
-      - OBSIDIAN_VAULT_PATH=/notes
       - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "3000"
+      - "8080"
     networks:
       - proxy
     depends_on:
@@ -41,33 +41,14 @@ services:
     mem_limit: 1280m
     memswap_limit: 1280m
     mem_reservation: 128m
-    oom_score_adj: 300  # Kill first - can recover, is the memory hog
+    oom_score_adj: 300
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
-  # P2P vault sync daemon
-  sync-daemon:
-    image: ghcr.io/webdesserts/sync-daemon:${VERSION:-latest}
-    volumes:
-      - notes:/notes:rw
-    environment:
-      - RUST_LOG=${RUST_LOG:-info}
-    expose:
-      - "8080"
-    networks:
-      - proxy
-    restart: unless-stopped
-    mem_limit: 64m
-    memswap_limit: 64m
-    mem_reservation: 32m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    # Runs both MCP HTTP + sync daemon
+    command: ["up", "--vault", "/notes", "--port", "3000", "--bind", "0.0.0.0"]
 
 volumes:
   # Vault data - bind mount to host directory

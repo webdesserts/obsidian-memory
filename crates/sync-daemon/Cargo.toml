@@ -40,6 +40,9 @@ uuid = { version = "1", features = ["v4"] }
 # File locking (flock-based daemon lock)
 fs2 = "0.4"
 
+[package.metadata.dist]
+dist = false
+
 [dev-dependencies]
 reqwest = "0.13.2"
 tempfile.workspace = true

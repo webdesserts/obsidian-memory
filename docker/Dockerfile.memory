@@ -24,13 +24,12 @@ RUN mkdir -p /notes /config && chown memory:memory /notes /config
 USER memory
 WORKDIR /notes
 
-EXPOSE 3000
+EXPOSE 3000 8080
 
 # Health check - embeddings preload is async now so start-period can be short
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD pgrep -x memory || exit 1
 
-ENV OBSIDIAN_VAULT_PATH=/notes
-
+# Default: run both MCP HTTP + sync daemon together
 ENTRYPOINT ["memory"]
-CMD ["--http", "--port", "3000", "--bind", "0.0.0.0"]
+CMD ["up", "--vault", "/notes", "--port", "3000", "--bind", "0.0.0.0"]
