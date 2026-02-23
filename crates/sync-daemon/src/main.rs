@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 // Use library exports
+use sync_daemon::daemon_lock::DaemonLock;
 use sync_daemon::http;
 use sync_daemon::manager::{ConnectionManager, ManagerEvent};
 use sync_daemon::native_fs::NativeFs;
@@ -408,6 +409,11 @@ async fn main() -> Result<()> {
         eprintln!("For now, use --bootstrap {} on daemon startup", address);
         return Ok(());
     }
+
+    // Acquire exclusive daemon lock before anything else.
+    // Prevents two daemons from running on the same vault simultaneously.
+    let _daemon_lock = DaemonLock::acquire(&args.vault)
+        .context("Failed to acquire daemon lock — is another daemon already running on this vault?")?;
 
     info!("Starting sync-daemon");
     info!("Vault path: {:?}", args.vault);
