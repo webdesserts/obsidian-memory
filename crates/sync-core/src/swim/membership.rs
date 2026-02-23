@@ -10,6 +10,8 @@ use crate::protocol::GossipMessage;
 use crate::PeerId;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Duration;
+use web_time::Instant;
 
 /// Maximum number of pending gossip updates before oldest are dropped
 const MAX_GOSSIP_QUEUE_SIZE: usize = 100;
@@ -38,6 +40,8 @@ pub struct Member {
     pub incarnation: u64,
     /// Which peer told us about this member (for debugging/tracing)
     pub discovered_via: Option<PeerId>,
+    /// When this member was marked Dead (for TTL-based eviction)
+    pub dead_since: Option<Instant>,
 }
 
 impl Member {
@@ -48,6 +52,7 @@ impl Member {
             state: MemberState::Alive,
             incarnation,
             discovered_via: None,
+            dead_since: None,
         }
     }
 
@@ -58,6 +63,7 @@ impl Member {
             state: MemberState::Alive,
             incarnation,
             discovered_via: Some(via),
+            dead_since: None,
         }
     }
 
@@ -200,6 +206,7 @@ impl MembershipList {
                 existing.info = info;
                 existing.incarnation = incarnation;
                 existing.state = MemberState::Alive;
+                existing.dead_since = None;
                 if via.is_some() {
                     existing.discovered_via = via;
                 }
@@ -212,6 +219,7 @@ impl MembershipList {
 
                 if existing.state != MemberState::Alive {
                     existing.state = MemberState::Alive;
+                    existing.dead_since = None;
                     changed = true;
                 }
 
@@ -366,6 +374,7 @@ impl MembershipList {
             && member.state != MemberState::Dead
         {
             member.state = MemberState::Dead;
+            member.dead_since = Some(Instant::now());
             return true;
         }
         false
@@ -385,6 +394,7 @@ impl MembershipList {
             if incarnation >= member.incarnation && member.state != MemberState::Dead {
                 member.state = MemberState::Dead;
                 member.incarnation = incarnation;
+                member.dead_since = Some(Instant::now());
                 return true;
             }
         }
@@ -409,6 +419,31 @@ impl MembershipList {
             return true;
         }
         false
+    }
+
+    /// Evict members that have been Dead longer than the TTL.
+    ///
+    /// Transitions Dead members to Removed state (which blocks gossip re-addition).
+    /// Returns the number of members evicted.
+    pub fn evict_dead_members(&mut self, ttl: Duration) -> usize {
+        let now = Instant::now();
+        let to_evict: Vec<PeerId> = self
+            .members
+            .iter()
+            .filter(|(_, m)| {
+                m.state == MemberState::Dead
+                    && m.dead_since
+                        .map(|t| now.duration_since(t) >= ttl)
+                        .unwrap_or(false)
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+
+        let count = to_evict.len();
+        for pid in to_evict {
+            self.mark_removed(pid);
+        }
+        count
     }
 
     /// Queue a gossip update for propagation.
@@ -1523,5 +1558,84 @@ mod tests {
         } else {
             panic!("Expected Alive update for reconnecting peer");
         }
+    }
+
+    // ==================== Dead Member Eviction ====================
+
+    #[test]
+    fn test_mark_dead_sets_dead_since() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+
+        assert!(list.get(&peer_a()).unwrap().dead_since.is_none());
+
+        list.mark_dead(peer_a());
+
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Dead);
+        assert!(member.dead_since.is_some());
+    }
+
+    #[test]
+    fn test_evict_dead_members_removes_after_ttl() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.mark_dead(peer_a());
+
+        // Manually backdate dead_since to simulate time passing
+        list.members.get_mut(&peer_a()).unwrap().dead_since =
+            Some(Instant::now() - Duration::from_secs(400));
+
+        let evicted = list.evict_dead_members(Duration::from_secs(300));
+
+        assert_eq!(evicted, 1);
+        assert_eq!(
+            list.get(&peer_a()).unwrap().state,
+            MemberState::Removed
+        );
+    }
+
+    #[test]
+    fn test_evict_dead_members_keeps_before_ttl() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.mark_dead(peer_a());
+
+        // dead_since is "now", so TTL hasn't expired
+        let evicted = list.evict_dead_members(Duration::from_secs(300));
+
+        assert_eq!(evicted, 0);
+        assert_eq!(list.get(&peer_a()).unwrap().state, MemberState::Dead);
+    }
+
+    #[test]
+    fn test_evict_does_not_affect_alive_or_suspected() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.add(PeerInfo::new(peer_b(), Some("ws://b:8080".into())), 1);
+
+        // peer_a is alive, peer_b is suspected
+        list.members.get_mut(&peer_b()).unwrap().state = MemberState::Suspected;
+
+        let evicted = list.evict_dead_members(Duration::from_secs(0));
+
+        assert_eq!(evicted, 0);
+        assert_eq!(list.get(&peer_a()).unwrap().state, MemberState::Alive);
+        assert_eq!(list.get(&peer_b()).unwrap().state, MemberState::Suspected);
+    }
+
+    #[test]
+    fn test_dead_since_cleared_on_revival() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 1);
+        list.mark_dead(peer_a());
+        assert!(list.get(&peer_a()).unwrap().dead_since.is_some());
+
+        // Peer reconnects with higher incarnation
+        list.on_peer_connected(PeerInfo::new(peer_a(), Some("ws://a:8080".into())));
+
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Alive);
+        assert!(member.dead_since.is_none());
     }
 }
