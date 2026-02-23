@@ -73,6 +73,18 @@ const REGISTRY_FILE: &str = ".sync/registry.loro";
 /// Vault metadata file (contains VaultId and format version)
 const METADATA_FILE: &str = ".sync/metadata.toml";
 
+// Loro container and field names for the registry tree — changing these breaks existing
+// .loro files. Format stability tests will trip if these change.
+
+/// Loro tree container name in the registry document.
+pub(crate) const REGISTRY_TREE: &str = "files";
+/// Tree node meta field: node type (always "file").
+const TREE_META_TYPE: &str = "type";
+/// Tree node meta field: file name (last path segment).
+const TREE_META_NAME: &str = "name";
+/// Tree node meta field: deterministic hash for document identity.
+const TREE_META_DOC_ID: &str = "doc_id";
+
 /// Current version of the .sync/ directory format.
 /// Bump this when any breaking change is made to file layout, Loro schema, or naming.
 const CURRENT_SYNC_VERSION: u32 = 1;
@@ -460,7 +472,7 @@ impl<F: FileSystem> Vault<F> {
         registry.set_peer_id(vault_id.as_u64()).ok();
         // Initialize the file tree (LoroTree inside registry)
         // The tree is created on first access via get_tree()
-        let _file_tree = registry.get_tree("files");
+        let _file_tree = registry.get_tree(REGISTRY_TREE);
 
         // Save initial registry
         let registry_bytes = registry.export(loro::ExportMode::Snapshot).unwrap();
@@ -535,7 +547,7 @@ impl<F: FileSystem> Vault<F> {
             let doc = LoroDoc::new();
             doc.set_peer_id(vault_id.as_u64()).ok();
             // Initialize file tree for new registries
-            let _file_tree = doc.get_tree("files");
+            let _file_tree = doc.get_tree(REGISTRY_TREE);
             doc
         };
 
@@ -1209,7 +1221,7 @@ impl<F: FileSystem> Vault<F> {
 
     /// Get the file tree from the registry
     pub(crate) fn file_tree(&self) -> LoroTree {
-        self.registry().get_tree("files")
+        self.registry().get_tree(REGISTRY_TREE)
     }
 
     /// Rebuild the path cache from the current tree state.
@@ -1227,7 +1239,7 @@ impl<F: FileSystem> Vault<F> {
 
             // Only cache file nodes (not folders)
             if let Ok(meta) = tree.get_meta(node_id) {
-                let node_type = meta.get("type").and_then(|v| {
+                let node_type = meta.get(TREE_META_TYPE).and_then(|v| {
                     if let loro::ValueOrContainer::Value(val) = v {
                         val.as_string().map(|s| s.to_string())
                     } else {
@@ -1255,7 +1267,7 @@ impl<F: FileSystem> Vault<F> {
         loop {
             // Get node metadata
             let meta = tree.get_meta(current).ok()?;
-            let name = meta.get("name").and_then(|v| {
+            let name = meta.get(TREE_META_NAME).and_then(|v| {
                 if let loro::ValueOrContainer::Value(val) = v {
                     val.as_string().map(|s| s.to_string())
                 } else {
@@ -1356,11 +1368,11 @@ impl<F: FileSystem> Vault<F> {
         let meta = tree
             .get_meta(node_id)
             .map_err(|e| VaultError::Other(format!("Failed to get file meta: {}", e)))?;
-        meta.insert("type", "file")
+        meta.insert(TREE_META_TYPE, "file")
             .map_err(|e| VaultError::Other(format!("Failed to set file type: {}", e)))?;
-        meta.insert("name", file_name[0])
+        meta.insert(TREE_META_NAME, file_name[0])
             .map_err(|e| VaultError::Other(format!("Failed to set file name: {}", e)))?;
-        meta.insert("doc_id", simple_hash(path))
+        meta.insert(TREE_META_DOC_ID, simple_hash(path))
             .map_err(|e| VaultError::Other(format!("Failed to set doc_id: {}", e)))?;
 
         // Update cache
@@ -1484,9 +1496,9 @@ impl<F: FileSystem> Vault<F> {
         let meta = tree
             .get_meta(node_id)
             .map_err(|e| VaultError::Other(format!("Failed to get file meta: {}", e)))?;
-        meta.insert("name", new_name[0])
+        meta.insert(TREE_META_NAME, new_name[0])
             .map_err(|e| VaultError::Other(format!("Failed to update file name: {}", e)))?;
-        meta.insert("doc_id", simple_hash(new_path))
+        meta.insert(TREE_META_DOC_ID, simple_hash(new_path))
             .map_err(|e| VaultError::Other(format!("Failed to update doc_id: {}", e)))?;
 
         // Update caches
@@ -1547,7 +1559,7 @@ impl<F: FileSystem> Vault<F> {
                     })
                     .unwrap_or(false);
 
-                let child_name = meta.get("name").and_then(|v| {
+                let child_name = meta.get(TREE_META_NAME).and_then(|v| {
                     if let loro::ValueOrContainer::Value(val) = v {
                         val.as_string().map(|s| s.to_string())
                     } else {
@@ -1569,9 +1581,9 @@ impl<F: FileSystem> Vault<F> {
         let meta = tree
             .get_meta(node_id)
             .map_err(|e| VaultError::Other(format!("Failed to get folder meta: {}", e)))?;
-        meta.insert("type", "folder")
+        meta.insert(TREE_META_TYPE, "folder")
             .map_err(|e| VaultError::Other(format!("Failed to set folder type: {}", e)))?;
-        meta.insert("name", name)
+        meta.insert(TREE_META_NAME, name)
             .map_err(|e| VaultError::Other(format!("Failed to set folder name: {}", e)))?;
 
         Ok(TreeParentId::Node(node_id))
@@ -2548,5 +2560,81 @@ mod tests {
 
         let info = vault.get_document_info("test.md").await.unwrap().unwrap();
         assert!(info.has_frontmatter);
+    }
+
+    // ========== Format Stability Tests ==========
+    //
+    // These tests act as tripwires — if any format changes, the test fails and
+    // forces the developer to consider whether a version bump + migration is needed.
+
+    #[test]
+    fn test_simple_hash_known_outputs() {
+        // simple_hash uses FNV-1a. Changing the algorithm breaks doc_id linkage
+        // between registry tree nodes and .loro document files.
+        assert_eq!(simple_hash("test.md"), "9006b3b63c0e9510");
+        assert_eq!(simple_hash("folder/note.md"), "a1b149525257902d");
+        assert_eq!(simple_hash("deeply/nested/path/file.md"), "daec06fdbc6a5936");
+        assert_eq!(simple_hash(""), "cbf29ce484222325"); // FNV-1a offset basis
+    }
+
+    #[test]
+    fn test_registry_tree_container_name() {
+        assert_eq!(REGISTRY_TREE, "files");
+    }
+
+    #[test]
+    fn test_document_container_names() {
+        use crate::document::{
+            BODY_CONTAINER, FRONTMATTER_CONTAINER, META_CONTAINER, META_DOC_ID, META_PATH,
+        };
+        assert_eq!(META_CONTAINER, "_meta");
+        assert_eq!(FRONTMATTER_CONTAINER, "frontmatter");
+        assert_eq!(BODY_CONTAINER, "body");
+        assert_eq!(META_DOC_ID, "doc_id");
+        assert_eq!(META_PATH, "path");
+    }
+
+    #[test]
+    fn test_tree_meta_field_names() {
+        assert_eq!(TREE_META_TYPE, "type");
+        assert_eq!(TREE_META_NAME, "name");
+        assert_eq!(TREE_META_DOC_ID, "doc_id");
+    }
+
+    #[test]
+    fn test_peer_id_display_format_is_16_char_hex() {
+        let peer_id = PeerId::from(0xa1b2c3d4e5f67890u64);
+        let display = peer_id.to_string();
+        assert_eq!(display.len(), 16);
+        assert!(display.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(display, "a1b2c3d4e5f67890");
+    }
+
+    #[test]
+    fn test_vault_id_display_format_is_16_char_hex() {
+        let vault_id = VaultId::from(0xa1b2c3d4e5f67890u64);
+        let display = vault_id.to_string();
+        assert_eq!(display.len(), 16);
+        assert!(display.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(display, "a1b2c3d4e5f67890");
+    }
+
+    #[test]
+    fn test_sync_dir_paths() {
+        assert_eq!(SYNC_DIR, ".sync");
+        assert_eq!(REGISTRY_FILE, ".sync/registry.loro");
+        assert_eq!(METADATA_FILE, ".sync/metadata.toml");
+    }
+
+    #[test]
+    fn test_metadata_toml_field_names() {
+        // Verify the TOML keys used in metadata.toml are stable
+        let meta = SyncMetadata {
+            version: 1,
+            vault_id: VaultId::from(0x1234567890abcdefu64),
+        };
+        let toml_str = toml::to_string(&meta).unwrap();
+        assert!(toml_str.contains("version = "));
+        assert!(toml_str.contains("vault_id = "));
     }
 }

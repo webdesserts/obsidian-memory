@@ -29,6 +29,20 @@ pub enum DocumentError {
 
 pub type Result<T> = std::result::Result<T, DocumentError>;
 
+// Loro container and field names — changing these breaks existing .loro files.
+// Format stability tests in vault.rs will trip if these change.
+
+/// Loro map container for internal sync metadata (doc_id, path).
+pub const META_CONTAINER: &str = "_meta";
+/// Field within `_meta` that tracks document lineage for divergent history detection.
+pub const META_DOC_ID: &str = "doc_id";
+/// Field within `_meta` that stores the file path (for detecting moves/renames).
+pub const META_PATH: &str = "path";
+/// Loro map container for user's YAML frontmatter.
+pub const FRONTMATTER_CONTAINER: &str = "frontmatter";
+/// Loro text container for markdown body content.
+pub const BODY_CONTAINER: &str = "body";
+
 /// A single note (markdown file) as a Loro document
 #[derive(Clone)]
 pub struct NoteDocument {
@@ -48,8 +62,8 @@ impl NoteDocument {
         doc.set_peer_id(vault_id.as_u64()).ok();
 
         // Set path metadata only - doc_id comes from imported content or from_markdown()
-        let meta = doc.get_map("_meta");
-        meta.insert("path", path).ok();
+        let meta = doc.get_map(META_CONTAINER);
+        meta.insert(META_PATH, path).ok();
         doc.commit();
 
         Self {
@@ -82,7 +96,7 @@ impl NoteDocument {
             DocumentError::Loro(e.to_string())
         })?;
 
-        let body_len = doc.get_text("body").len_unicode();
+        let body_len = doc.get_text(BODY_CONTAINER).len_unicode();
         debug!(
             path = %path,
             body_len = body_len,
@@ -90,8 +104,8 @@ impl NoteDocument {
         );
 
         // Update path metadata (this is intentional - records the current path)
-        let meta = doc.get_map("_meta");
-        meta.insert("path", path)
+        let meta = doc.get_map(META_CONTAINER);
+        meta.insert(META_PATH, path)
             .map_err(|e| DocumentError::Loro(e.to_string()))?;
         doc.commit();
 
@@ -111,10 +125,10 @@ impl NoteDocument {
     /// This may differ from `path()` if the file was moved.
     /// Returns None if metadata is missing (legacy document).
     pub fn stored_path(&self) -> Option<String> {
-        let meta = self.doc.get_map("_meta");
+        let meta = self.doc.get_map(META_CONTAINER);
         let value = meta.get_deep_value();
         if let loro::LoroValue::Map(map) = value {
-            if let Some(loro::LoroValue::String(s)) = map.get("path") {
+            if let Some(loro::LoroValue::String(s)) = map.get(META_PATH) {
                 return Some(s.to_string());
             }
         }
@@ -127,10 +141,10 @@ impl NoteDocument {
     /// Documents created independently have different doc_ids, indicating divergent history.
     /// Returns None for legacy documents created before doc_id was added.
     pub fn doc_id(&self) -> Option<String> {
-        let meta = self.doc.get_map("_meta");
+        let meta = self.doc.get_map(META_CONTAINER);
         let value = meta.get_deep_value();
         if let loro::LoroValue::Map(map) = value {
-            if let Some(loro::LoroValue::String(s)) = map.get("doc_id") {
+            if let Some(loro::LoroValue::String(s)) = map.get(META_DOC_ID) {
                 return Some(s.to_string());
             }
         }
@@ -141,8 +155,8 @@ impl NoteDocument {
     ///
     /// Called when a file move is detected during reconciliation.
     pub fn update_path(&mut self, new_path: &str) -> Result<()> {
-        let meta = self.doc.get_map("_meta");
-        meta.insert("path", new_path)
+        let meta = self.doc.get_map(META_CONTAINER);
+        meta.insert(META_PATH, new_path)
             .map_err(|e| DocumentError::Loro(e.to_string()))?;
         self.path = new_path.to_string();
         self.doc.commit();
@@ -151,12 +165,12 @@ impl NoteDocument {
 
     /// Get the frontmatter container
     pub fn frontmatter(&self) -> LoroMap {
-        self.doc.get_map("frontmatter")
+        self.doc.get_map(FRONTMATTER_CONTAINER)
     }
 
     /// Get the body container
     pub fn body(&self) -> LoroText {
-        self.doc.get_text("body")
+        self.doc.get_text(BODY_CONTAINER)
     }
 
     /// Compute a hash of the document content (frontmatter + body).
@@ -178,15 +192,15 @@ impl NoteDocument {
         let parsed = markdown::parse(content);
 
         // Set internal metadata with unique doc_id
-        let meta = doc.get_map("_meta");
-        meta.insert("doc_id", Uuid::new_v4().to_string())
+        let meta = doc.get_map(META_CONTAINER);
+        meta.insert(META_DOC_ID, Uuid::new_v4().to_string())
             .map_err(|e| DocumentError::Loro(e.to_string()))?;
-        meta.insert("path", path)
+        meta.insert(META_PATH, path)
             .map_err(|e| DocumentError::Loro(e.to_string()))?;
 
         // Set frontmatter
         if let Some(fm) = parsed.frontmatter {
-            let frontmatter = doc.get_map("frontmatter");
+            let frontmatter = doc.get_map(FRONTMATTER_CONTAINER);
             for (key, value) in fm {
                 let json_value = serde_json::to_value(&value)
                     .map_err(|e| DocumentError::Serialization(e.to_string()))?;
@@ -197,7 +211,7 @@ impl NoteDocument {
         }
 
         // Set body
-        let body = doc.get_text("body");
+        let body = doc.get_text(BODY_CONTAINER);
         body.insert(0, &parsed.body)
             .map_err(|e| DocumentError::Loro(e.to_string()))?;
 
