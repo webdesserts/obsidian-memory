@@ -1,7 +1,7 @@
-//! Persistence for known peers.
+//! Persistence for daemon state and known peers.
 //!
-//! Stores peer information to disk for recovery after restarts.
-//! Peers are stored in `.sync/known_peers.json` within the vault directory.
+//! - **DaemonConfig** (`daemon.toml`): Daemon-specific identity (PeerId) and incarnation
+//! - **PeerStorage** (`known_peers.json`): Known peers for recovery after restarts
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,80 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use sync_core::peer_id::PeerId;
 use sync_core::swim::PeerInfo;
+use tracing::info;
+
+const DAEMON_CONFIG_FILE: &str = ".sync/daemon.toml";
+
+/// Daemon-specific configuration persisted in `.sync/daemon.toml`.
+///
+/// Contains the daemon's network identity (PeerId) and SWIM incarnation number.
+/// This is separate from the vault-level metadata (VaultId in `metadata.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Daemon's network identity for SWIM membership and handshakes
+    pub peer_id: PeerId,
+    /// SWIM incarnation number, bumped on refutation to override stale suspicions
+    pub incarnation: u64,
+}
+
+impl DaemonConfig {
+    /// Load daemon config from `.sync/daemon.toml`, or generate a new one.
+    ///
+    /// If `cli_peer_id` is provided, it overrides the persisted PeerId and
+    /// the config is saved with the new value.
+    pub fn load_or_generate(vault_path: &Path, cli_peer_id: Option<PeerId>) -> Result<Self> {
+        let config_path = vault_path.join(DAEMON_CONFIG_FILE);
+
+        let mut config = if config_path.exists() {
+            let contents = fs::read_to_string(&config_path)?;
+            let config: DaemonConfig = toml::from_str(&contents)
+                .map_err(|e| anyhow::anyhow!("Corrupt daemon.toml: {}", e))?;
+            info!(peer_id = %config.peer_id, incarnation = config.incarnation, "Loaded daemon config");
+            config
+        } else {
+            let config = DaemonConfig {
+                peer_id: PeerId::generate(),
+                incarnation: 1,
+            };
+            info!(peer_id = %config.peer_id, "Generated new daemon config");
+            config
+        };
+
+        // CLI flag overrides persisted PeerId
+        if let Some(override_id) = cli_peer_id {
+            if override_id != config.peer_id {
+                info!(old = %config.peer_id, new = %override_id, "CLI --peer-id overriding persisted PeerId");
+                config.peer_id = override_id;
+            }
+        }
+
+        // Always save (creates file on first run, updates on override)
+        config.save(vault_path)?;
+
+        Ok(config)
+    }
+
+    /// Save the current config to `.sync/daemon.toml`.
+    pub fn save(&self, vault_path: &Path) -> Result<()> {
+        let config_path = vault_path.join(DAEMON_CONFIG_FILE);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string(self)?;
+        fs::write(&config_path, contents)?;
+        Ok(())
+    }
+
+    /// Save only if incarnation has changed (called after gossip processing).
+    pub fn save_if_incarnation_changed(&mut self, new_incarnation: u64, vault_path: &Path) -> Result<()> {
+        if new_incarnation != self.incarnation {
+            info!(old = self.incarnation, new = new_incarnation, "Incarnation bumped, saving daemon config");
+            self.incarnation = new_incarnation;
+            self.save(vault_path)?;
+        }
+        Ok(())
+    }
+}
 
 /// Persisted peer information.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -397,5 +471,87 @@ mod tests {
             // Client-only C should still be known but not reconnectable
             assert!(storage.get(&"c".repeat(16)).is_some());
         }
+    }
+
+    // ==================== DaemonConfig tests ====================
+
+    #[test]
+    fn test_daemon_config_generates_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+
+        // Should have a valid PeerId and incarnation starting at 1
+        assert_ne!(config.peer_id.as_u64(), 0);
+        assert_eq!(config.incarnation, 1);
+
+        // File should exist
+        let config_path = vault_path.join(".sync/daemon.toml");
+        assert!(config_path.exists());
+    }
+
+    #[test]
+    fn test_daemon_config_persists_across_restarts() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        // First start
+        let config1 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+
+        // "Restart" — should load same PeerId
+        let config2 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+
+        assert_eq!(config1.peer_id, config2.peer_id);
+        assert_eq!(config2.incarnation, 1);
+    }
+
+    #[test]
+    fn test_daemon_config_cli_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        // First start
+        let config1 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+
+        // Override with a specific PeerId
+        let override_id = PeerId::generate();
+        assert_ne!(override_id, config1.peer_id);
+
+        let config2 = DaemonConfig::load_or_generate(vault_path, Some(override_id)).unwrap();
+        assert_eq!(config2.peer_id, override_id);
+
+        // Third start without override should use the updated PeerId
+        let config3 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        assert_eq!(config3.peer_id, override_id);
+    }
+
+    #[test]
+    fn test_daemon_config_incarnation_bump() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let mut config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        assert_eq!(config.incarnation, 1);
+
+        // Simulate incarnation bump from SWIM refutation
+        config.save_if_incarnation_changed(5, vault_path).unwrap();
+        assert_eq!(config.incarnation, 5);
+
+        // Reload should see the new incarnation
+        let config2 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        assert_eq!(config2.incarnation, 5);
+    }
+
+    #[test]
+    fn test_daemon_config_incarnation_no_change_skips_save() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let mut config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+
+        // Same incarnation — should be a no-op (no error, no write)
+        config.save_if_incarnation_changed(1, vault_path).unwrap();
+        assert_eq!(config.incarnation, 1);
     }
 }

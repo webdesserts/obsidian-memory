@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 use sync_daemon::http;
 use sync_daemon::manager::{ConnectionManager, ManagerEvent};
 use sync_daemon::native_fs::NativeFs;
+use sync_daemon::persistence::DaemonConfig;
 use sync_daemon::server::{ServerEvent, WebSocketServer};
 use sync_daemon::watcher::{FileEvent, FileEventKind, FileWatcher};
 use sync_daemon::IncomingMessage;
@@ -83,6 +84,10 @@ struct Daemon {
     watcher: FileWatcher,
     /// SWIM membership list for gossip-based peer discovery
     membership: MembershipList,
+    /// Persisted daemon config (PeerId + incarnation)
+    daemon_config: DaemonConfig,
+    /// Vault directory path (for saving config)
+    vault_path: PathBuf,
 }
 
 impl Daemon {
@@ -347,6 +352,14 @@ impl Daemon {
                 result.new_peers.len()
             );
 
+            // Persist incarnation if it was bumped during gossip (e.g., refuting suspicion)
+            if let Err(e) = self.daemon_config.save_if_incarnation_changed(
+                self.membership.local_incarnation(),
+                &self.vault_path,
+            ) {
+                error!("Failed to save daemon config after incarnation bump: {}", e);
+            }
+
             // Relay only state-changing updates (prevents amplification storms)
             if self.server.peer_count() > 1 && !result.relay.is_empty() {
                 let relay_msg = GossipMessage::new(result.relay);
@@ -421,15 +434,13 @@ async fn main() -> Result<()> {
 
     info!("Vault loaded, vault ID: {}", vault.vault_id());
 
-    // Generate or parse peer ID for network identity (separate from VaultId)
-    let peer_id: sync_core::PeerId = match args.peer_id {
-        Some(id_str) => id_str.parse().context("Invalid peer ID")?,
-        None => {
-            let id = sync_core::PeerId::generate();
-            info!("Generated peer ID: {}", id);
-            id
-        }
+    // Load or generate daemon-specific identity (PeerId + incarnation)
+    let cli_peer_id: Option<sync_core::PeerId> = match args.peer_id {
+        Some(id_str) => Some(id_str.parse().context("Invalid peer ID")?),
+        None => None,
     };
+    let daemon_config = DaemonConfig::load_or_generate(&args.vault, cli_peer_id)?;
+    let peer_id = daemon_config.peer_id;
 
     // Create WebSocket server (takes string peer_id for protocol messages)
     let server = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());
@@ -453,8 +464,8 @@ async fn main() -> Result<()> {
     let watcher = FileWatcher::new(args.vault.clone())?;
     info!("File watcher started");
 
-    // Create SWIM membership list for gossip-based peer discovery
-    let membership = MembershipList::new(peer_id, args.advertise.clone());
+    // Create SWIM membership list with persisted incarnation
+    let membership = MembershipList::with_incarnation(peer_id, args.advertise.clone(), daemon_config.incarnation);
 
     // Create daemon state
     let mut daemon = Daemon {
@@ -463,6 +474,8 @@ async fn main() -> Result<()> {
         outgoing,
         watcher,
         membership,
+        daemon_config,
+        vault_path: args.vault.clone(),
     };
 
     // Connect to bootstrap peers
