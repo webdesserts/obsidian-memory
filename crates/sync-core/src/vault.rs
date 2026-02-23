@@ -147,7 +147,8 @@ impl SyncMetadata {
                 .map_err(|e| VaultError::Other(format!("Failed to serialize metadata: {}", e)))?;
             fs.write(METADATA_FILE, toml_str.as_bytes()).await?;
 
-            // Verify write by re-reading (concurrent safety: if another client beat us, use theirs)
+            // Verify the write succeeded by re-reading. Does NOT protect against
+            // concurrent writers — vault locking (Phase 2) addresses that.
             let bytes = fs.read(METADATA_FILE).await?;
             let content = String::from_utf8(bytes.to_vec())
                 .map_err(|e| VaultError::CorruptMetadata(format!("invalid UTF-8: {}", e)))?;

@@ -546,6 +546,17 @@ impl MembershipList {
             .get(&peer.peer_id)
             .map(|m| m.incarnation + 1)
             .unwrap_or(1);
+
+        // A direct connection is proof of liveness — override Removed state so
+        // add() doesn't silently reject the peer. Gossip alone can't do this
+        // (the Removed guard in add_impl blocks stale gossip resurrection).
+        if let Some(existing) = self.members.get_mut(&peer.peer_id) {
+            if existing.state == MemberState::Removed {
+                existing.state = MemberState::Dead;
+                existing.dead_since = None;
+            }
+        }
+
         self.add(peer.clone(), incarnation);
 
         let full_gossip = self.generate_full_gossip();
@@ -1557,6 +1568,36 @@ mod tests {
             assert_eq!(*incarnation, 4);
         } else {
             panic!("Expected Alive update for reconnecting peer");
+        }
+    }
+
+    #[test]
+    fn test_on_peer_connected_reconnecting_evicted_peer() {
+        let mut list = MembershipList::new(local_id(), Some("ws://local:8080".into()));
+
+        // Peer connects, gets evicted
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        list.on_peer_connected(peer);
+        list.add(PeerInfo::new(peer_a(), Some("ws://a:8080".into())), 3);
+        list.mark_dead(peer_a());
+        list.mark_removed(peer_a());
+        assert_eq!(list.get(&peer_a()).unwrap().state, MemberState::Removed);
+
+        // Peer genuinely reconnects via TCP
+        let peer = PeerInfo::new(peer_a(), Some("ws://a:8080".into()));
+        let messages = list.on_peer_connected(peer);
+
+        // Direct connection overrides Removed — peer should be Alive
+        let member = list.get(&peer_a()).unwrap();
+        assert_eq!(member.state, MemberState::Alive);
+        assert_eq!(member.incarnation, 4);
+        assert!(member.dead_since.is_none());
+
+        // Broadcast should reflect the reconnection
+        if let GossipUpdate::Alive { incarnation, .. } = &messages.for_existing_peers.updates[0] {
+            assert_eq!(*incarnation, 4);
+        } else {
+            panic!("Expected Alive update for reconnecting evicted peer");
         }
     }
 
