@@ -19,7 +19,9 @@ download-model = ["dep:reqwest", "dep:futures-util"]
 # Use model embedded in binary (for release builds)
 embedded-model = ["semantic-embeddings/embedded-model"]
 # Enable HTTP transport for remote MCP server
-http = ["rmcp/transport-streamable-http-server", "dep:axum", "dep:clap"]
+http = ["rmcp/transport-streamable-http-server", "dep:axum"]
+# Enable embedded sync daemon
+daemon = ["dep:sync-daemon"]
 
 [dependencies]
 # MCP SDK
@@ -28,8 +30,11 @@ rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
 # HTTP server (optional, for HTTP transport)
 axum = { workspace = true, optional = true }
 
-# CLI argument parsing (optional, for HTTP transport)
-clap = { workspace = true, optional = true }
+# CLI argument parsing
+clap.workspace = true
+
+# Sync daemon (optional, for `memory sync up` and `memory up`)
+sync-daemon = { path = "../sync-daemon", optional = true }
 
 # Async runtime
 tokio.workspace = true

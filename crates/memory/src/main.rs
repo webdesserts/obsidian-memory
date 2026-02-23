@@ -1,3 +1,4 @@
+use clap::Parser;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -7,6 +8,8 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -521,56 +524,295 @@ impl rmcp::ServerHandler for MemoryServer {
     }
 }
 
-/// CLI arguments for the MCP server.
-#[cfg(feature = "http")]
-#[derive(clap::Parser)]
-#[command(name = "obsidian-memory")]
-#[command(about = "MCP server for Obsidian memory integration")]
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+#[derive(Parser)]
+#[command(name = "memory", about = "Persistent memory for AI coding assistants")]
 struct Cli {
-    /// Run in HTTP mode instead of stdio
-    #[arg(long)]
-    http: bool,
-
-    /// Port to listen on in HTTP mode
-    #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
-    port: u16,
-
-    /// Address to bind to in HTTP mode. Use 0.0.0.0 for all interfaces (unsafe without auth).
-    #[arg(long, default_value = "127.0.0.1")]
-    bind: String,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-#[cfg(feature = "http")]
-const DEFAULT_HTTP_PORT: u16 = 3000;
+#[derive(clap::Subcommand)]
+enum Command {
+    /// MCP server (stdio when piped, help when interactive)
+    Mcp {
+        /// Path to the vault directory
+        #[arg(long)]
+        vault: Option<PathBuf>,
+
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
+
+    /// Sync daemon
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
+
+    /// Start all services (sync + MCP HTTP)
+    #[cfg(all(feature = "daemon", feature = "http"))]
+    Up {
+        /// Path to the vault directory
+        #[arg(long)]
+        vault: PathBuf,
+
+        /// Port to listen on for MCP HTTP
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+
+        /// Address to bind MCP HTTP to
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+
+        /// Address for sync daemon to listen on
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+
+        /// Address to advertise to other sync peers
+        #[arg(long)]
+        advertise: Option<String>,
+
+        /// Bootstrap peer(s) to connect to on startup
+        #[arg(long)]
+        bootstrap: Vec<String>,
+
+        /// Enable verbose logging
+        #[arg(long)]
+        verbose: bool,
+    },
+
+    /// Manage the Obsidian plugin
+    Obsidian {
+        #[command(subcommand)]
+        action: ObsidianAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum McpAction {
+    /// MCP stdio transport (explicit — `memory mcp` also starts stdio when piped)
+    Io,
+
+    /// Start MCP HTTP server
+    #[cfg(feature = "http")]
+    Up {
+        /// Port to listen on
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+
+        /// Address to bind to. Use 0.0.0.0 for all interfaces (unsafe without auth).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SyncAction {
+    /// Start sync daemon
+    #[cfg(feature = "daemon")]
+    Up {
+        /// Path to the vault directory
+        #[arg(long)]
+        vault: PathBuf,
+
+        /// Address to listen on for incoming connections
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+
+        /// Address to advertise to other peers
+        #[arg(long)]
+        advertise: Option<String>,
+
+        /// Bootstrap peer(s) to connect to on startup
+        #[arg(long)]
+        bootstrap: Vec<String>,
+
+        /// Run in client-only mode (don't listen for incoming connections)
+        #[arg(long)]
+        client_only: bool,
+
+        /// Peer ID (generated if not provided)
+        #[arg(long)]
+        peer_id: Option<String>,
+
+        /// Enable verbose logging
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ObsidianAction {
+    /// Install the Obsidian plugin
+    Install {
+        /// Path to the vault
+        #[arg(long)]
+        vault: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for logging
+    let cli = Cli::parse();
+
+    match cli.command {
+        // `memory` with no args → help
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!();
+            Ok(())
+        }
+
+        Some(Command::Mcp { vault, action }) => match action {
+            // `memory mcp` → TTY detection
+            None => {
+                if std::io::stdin().is_terminal() {
+                    use clap::CommandFactory;
+                    // Print help for the mcp subcommand
+                    Cli::command()
+                        .find_subcommand_mut("mcp")
+                        .expect("mcp subcommand exists")
+                        .print_help()?;
+                    println!();
+                    Ok(())
+                } else {
+                    let vault = require_vault(vault)?;
+                    init_mcp_tracing();
+                    run_stdio_server(Config::new(&vault)).await
+                }
+            }
+
+            // `memory mcp io` → explicit stdio
+            Some(McpAction::Io) => {
+                let vault = require_vault(vault)?;
+                init_mcp_tracing();
+                run_stdio_server(Config::new(&vault)).await
+            }
+
+            // `memory mcp up` → HTTP server
+            #[cfg(feature = "http")]
+            Some(McpAction::Up { port, bind }) => {
+                let vault = require_vault(vault)?;
+                init_mcp_tracing();
+                run_http_server(Config::new(&vault), &bind, port).await
+            }
+        },
+
+        #[cfg(feature = "daemon")]
+        Some(Command::Sync { action }) => match action {
+            SyncAction::Up {
+                vault,
+                listen,
+                advertise,
+                bootstrap,
+                client_only,
+                peer_id,
+                verbose,
+            } => {
+                memory_common::init_tracing(verbose, "sync_daemon");
+                sync_daemon::daemon::run(sync_daemon::daemon::DaemonRunConfig {
+                    vault,
+                    listen,
+                    advertise,
+                    bootstrap,
+                    client_only,
+                    peer_id,
+                })
+                .await?;
+                Ok(())
+            }
+        },
+
+        #[cfg(not(feature = "daemon"))]
+        Some(Command::Sync { .. }) => {
+            eprintln!("Sync daemon is not available in this build.");
+            eprintln!("Rebuild with: cargo build --features daemon");
+            std::process::exit(1);
+        }
+
+        #[cfg(all(feature = "daemon", feature = "http"))]
+        Some(Command::Up {
+            vault,
+            port,
+            bind,
+            listen,
+            advertise,
+            bootstrap,
+            verbose,
+        }) => {
+            memory_common::init_tracing(verbose, "memory");
+
+            let vault_str = vault.to_string_lossy().to_string();
+
+            // Spawn sync daemon as background task
+            let sync_config = sync_daemon::daemon::DaemonRunConfig {
+                vault,
+                listen,
+                advertise,
+                bootstrap,
+                client_only: false,
+                peer_id: None,
+            };
+            let sync_handle = tokio::spawn(async move {
+                if let Err(e) = sync_daemon::daemon::run(sync_config).await {
+                    tracing::error!("Sync daemon error: {}", e);
+                }
+            });
+
+            // Run MCP HTTP server on main task
+            let mcp_result = run_http_server(Config::new(&vault_str), &bind, port).await;
+
+            // On shutdown, abort the sync daemon
+            sync_handle.abort();
+            mcp_result
+        }
+
+        Some(Command::Obsidian { action }) => match action {
+            ObsidianAction::Install { .. } => {
+                eprintln!("Plugin installation is not yet available.");
+                Ok(())
+            }
+        },
+    }
+}
+
+/// Require --vault flag, returning the path as a string for Config::new().
+fn require_vault(vault: Option<PathBuf>) -> Result<String, Box<dyn std::error::Error>> {
+    match vault {
+        Some(v) => Ok(v.to_string_lossy().to_string()),
+        None => {
+            // Fall back to OBSIDIAN_VAULT_PATH for backwards compatibility
+            std::env::var("OBSIDIAN_VAULT_PATH").map_err(|_| {
+                "Vault path required. Use --vault <path> or set OBSIDIAN_VAULT_PATH.".into()
+            })
+        }
+    }
+}
+
+/// Initialize tracing for MCP server (logs to stderr, respects RUST_LOG).
+fn init_mcp_tracing() {
     tracing_subscriber::registry()
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env())
         .init();
-
-    // Load configuration from environment
-    let config = Config::from_env()?;
-    tracing::info!("Vault path: {}", config.vault_path.display());
-
-    #[cfg(feature = "http")]
-    {
-        use clap::Parser;
-        let cli = Cli::parse();
-
-        if cli.http {
-            return run_http_server(config, &cli.bind, cli.port).await;
-        }
-    }
-
-    // Default: Run with STDIO transport
-    run_stdio_server(config).await
 }
 
-/// Run the server with STDIO transport (default mode).
+// ---------------------------------------------------------------------------
+// Server functions
+// ---------------------------------------------------------------------------
+
+/// Run the server with STDIO transport.
 async fn run_stdio_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Vault path: {}", config.vault_path.display());
     let server = MemoryServer::new(config).await?;
 
     let service = server.serve(stdio()).await.inspect_err(|e| {
@@ -590,18 +832,14 @@ async fn run_http_server(
     bind: &str,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Pre-initialize shared state (graph, embeddings, storage, watcher).
-    // This is done once before starting the HTTP server.
+    tracing::info!("Vault path: {}", config.vault_path.display());
+
     let shared = Arc::new(SharedState::new(config).await?);
 
-    // The StreamableHttpService creates a new MemoryServer for each session.
     let service = StreamableHttpService::new(
         {
             let shared = shared.clone();
-            move || {
-                // Sync factory: create server from pre-initialized shared state
-                Ok(MemoryServer::from_shared((*shared).clone()))
-            }
+            move || Ok(MemoryServer::from_shared((*shared).clone()))
         },
         LocalSessionManager::default().into(),
         Default::default(),
@@ -609,10 +847,9 @@ async fn run_http_server(
 
     let router = axum::Router::new().nest_service("/mcp", service);
 
-    // Parse bind address - default to localhost for safety
-    let bind_addr: std::net::IpAddr = bind.parse().map_err(|e| {
-        format!("Invalid bind address '{}': {}", bind, e)
-    })?;
+    let bind_addr: std::net::IpAddr = bind
+        .parse()
+        .map_err(|e| format!("Invalid bind address '{}': {}", bind, e))?;
     let addr = std::net::SocketAddr::from((bind_addr, port));
 
     if bind_addr.is_unspecified() {
@@ -622,11 +859,14 @@ async fn run_http_server(
         );
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        format!("Failed to bind to {}:{} - {}", bind, port, e)
-    })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {}:{} - {}", bind, port, e))?;
 
-    tracing::info!("Obsidian Memory MCP server started (HTTP) at http://{}/mcp", addr);
+    tracing::info!(
+        "Obsidian Memory MCP server started (HTTP) at http://{}/mcp",
+        addr
+    );
 
     axum::serve(listener, router)
         .with_graceful_shutdown(memory_common::shutdown_signal())
