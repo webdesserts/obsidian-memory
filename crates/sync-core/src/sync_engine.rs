@@ -646,7 +646,7 @@ impl<F: FileSystem> Vault<F> {
 
             // Save to disk
             let snapshot = doc.export_snapshot();
-            self.fs.write(&sync_path, &snapshot).await.map_err(crate::vault::VaultError::from)?;
+            self.fs.atomic_write(&sync_path, &snapshot).await.map_err(crate::vault::VaultError::from)?;
             self.fs.write(path, doc.to_markdown().as_bytes()).await.map_err(crate::vault::VaultError::from)?;
 
             // Note: Don't register in tree here - tree sync handles that via registry.

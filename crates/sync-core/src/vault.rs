@@ -145,7 +145,7 @@ impl SyncMetadata {
 
             let toml_str = toml::to_string(&meta)
                 .map_err(|e| VaultError::Other(format!("Failed to serialize metadata: {}", e)))?;
-            fs.write(METADATA_FILE, toml_str.as_bytes()).await?;
+            fs.atomic_write(METADATA_FILE, toml_str.as_bytes()).await?;
 
             // Verify the write succeeded by re-reading. Does NOT protect against
             // concurrent writers — vault locking (Phase 2) addresses that.
@@ -477,7 +477,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Save initial registry
         let registry_bytes = registry.export(loro::ExportMode::Snapshot).unwrap();
-        fs.write(REGISTRY_FILE, &registry_bytes).await?;
+        fs.atomic_write(REGISTRY_FILE, &registry_bytes).await?;
 
         #[cfg(not(target_arch = "wasm32"))]
         let events = Arc::new(EventBus::new());
@@ -738,7 +738,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Save to new location
         let snapshot = doc.export_snapshot();
-        self.fs.write(&new_sync_path, &snapshot).await?;
+        self.fs.atomic_write(&new_sync_path, &snapshot).await?;
 
         // Delete old file
         self.fs.delete(&old_sync_path).await?;
@@ -815,7 +815,7 @@ impl<F: FileSystem> Vault<F> {
         if body_changed || fm_changed {
             doc.commit();
             let snapshot = doc.export_snapshot();
-            self.fs.write(&sync_path, &snapshot).await?;
+            self.fs.atomic_write(&sync_path, &snapshot).await?;
             tracing::debug!("Re-indexed document via diff: {}", path);
         }
 
@@ -894,7 +894,7 @@ impl<F: FileSystem> Vault<F> {
         if body_changed || fm_changed {
             doc.commit();
             let snapshot = doc.export_snapshot();
-            self.fs.write(&sync_path, &snapshot).await?;
+            self.fs.atomic_write(&sync_path, &snapshot).await?;
         }
 
         self.documents_mut().insert(path.to_string(), doc);
@@ -1107,7 +1107,7 @@ impl<F: FileSystem> Vault<F> {
                 existing_doc.commit();
                 let snapshot = existing_doc.export_snapshot();
                 self.documents_mut().insert(path.to_string(), existing_doc);
-                self.fs.write(&sync_path, &snapshot).await?;
+                self.fs.atomic_write(&sync_path, &snapshot).await?;
                 tracing::debug!("Updated document via diff: {}", path);
             } else {
                 tracing::debug!("No changes detected (sync echo): {}", path);
@@ -1127,7 +1127,7 @@ impl<F: FileSystem> Vault<F> {
             if body_changed || fm_changed {
                 doc.commit();
                 let snapshot = doc.export_snapshot();
-                self.fs.write(&sync_path, &snapshot).await?;
+                self.fs.atomic_write(&sync_path, &snapshot).await?;
                 tracing::debug!("Updated cold-cache document via diff: {}", path);
             } else {
                 tracing::debug!("No changes detected (cold cache sync echo): {}", path);
@@ -1140,7 +1140,7 @@ impl<F: FileSystem> Vault<F> {
         // Document doesn't exist anywhere - create new (this is the only time we need new peer ID)
         let new_doc = NoteDocument::from_markdown(path, &content, self.vault_id)?;
         let snapshot = new_doc.export_snapshot();
-        self.fs.write(&sync_path, &snapshot).await?;
+        self.fs.atomic_write(&sync_path, &snapshot).await?;
         self.documents_mut().insert(path.to_string(), new_doc);
 
         // Register in tree for delete/rename tracking
@@ -1163,7 +1163,7 @@ impl<F: FileSystem> Vault<F> {
             // Save sync state
             let sync_path = self.document_sync_path(path);
             let snapshot = doc.export_snapshot();
-            self.fs.write(&sync_path, &snapshot).await?;
+            self.fs.atomic_write(&sync_path, &snapshot).await?;
         }
         Ok(())
     }
@@ -1511,7 +1511,7 @@ impl<F: FileSystem> Vault<F> {
         let new_sync_path = self.document_sync_path(new_path);
         if self.fs.exists(&old_sync_path).await? {
             let bytes = self.fs.read(&old_sync_path).await?;
-            self.fs.write(&new_sync_path, &bytes).await?;
+            self.fs.atomic_write(&new_sync_path, &bytes).await?;
             self.fs.delete(&old_sync_path).await?;
         }
 
