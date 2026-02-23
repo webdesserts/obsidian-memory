@@ -2601,6 +2601,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "hex",
+ "memory-common",
  "notify",
  "notify-debouncer-mini",
  "obsidian-fs",
@@ -2621,6 +2622,16 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "wiki-links",
+]
+
+[[package]]
+name = "memory-common"
+version = "0.2.24"
+dependencies = [
+ "dirs",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4287,6 +4298,7 @@ dependencies = [
  "clap",
  "fs2",
  "futures",
+ "memory-common",
  "notify",
  "notify-debouncer-mini",
  "reqwest 0.13.2",

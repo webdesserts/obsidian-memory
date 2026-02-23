@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 sync-core = { path = "../sync-core" }
+memory-common = { path = "../memory-common" }
 tokio.workspace = true
 bincode.workspace = true
 async-trait.workspace = true

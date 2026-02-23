@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/memory",
+    "crates/memory-common",
     "crates/wiki-links",
     "crates/obsidian-fs",
     "crates/semantic-embeddings",

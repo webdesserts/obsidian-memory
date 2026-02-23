@@ -10,6 +10,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// Create configuration from a vault path (with tilde expansion).
+    pub fn new(vault_path: &str) -> Self {
+        let vault_path = memory_common::expand_tilde(vault_path);
+        let vault_name = vault_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("vault")
+            .to_string();
+
+        Self {
+            vault_path,
+            vault_name,
+        }
+    }
+
     /// Load configuration from environment variables.
     ///
     /// Required environment variables:
@@ -17,34 +32,8 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let vault_path_str = std::env::var("OBSIDIAN_VAULT_PATH")
             .map_err(|_| ConfigError::MissingVaultPath)?;
-        
-        // Expand tilde to home directory
-        let vault_path = expand_tilde(&vault_path_str);
 
-        // Derive vault name from path
-        let vault_name = vault_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("vault")
-            .to_string();
-
-        Ok(Self {
-            vault_path,
-            vault_name,
-        })
-    }
-}
-
-/// Expand ~ or ~/ prefix to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|home| home.join(rest))
-            .unwrap_or_else(|| PathBuf::from(path))
-    } else {
-        PathBuf::from(path)
+        Ok(Self::new(&vault_path_str))
     }
 }
 
