@@ -70,6 +70,41 @@ pub struct DocumentInfo {
 pub(crate) const SYNC_DIR: &str = ".sync";
 /// File registry document
 const REGISTRY_FILE: &str = ".sync/registry.loro";
+/// Vault metadata file (contains VaultId and format version)
+const METADATA_FILE: &str = ".sync/metadata.toml";
+
+/// Current version of the .sync/ directory format.
+/// Bump this when any breaking change is made to file layout, Loro schema, or naming.
+const CURRENT_SYNC_VERSION: u32 = 1;
+
+/// Vault-level metadata persisted in `.sync/metadata.toml`.
+///
+/// The `version` field represents the entire `.sync/` directory format — not just
+/// this struct's schema. Migrations can move files, rewrite Loro docs, create
+/// directories, etc. The version is just the marker for what state the directory is in.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyncMetadata {
+    /// Format version of the .sync/ directory
+    pub version: u32,
+    /// Stable author identity for this vault copy (used as Loro peer ID)
+    pub vault_id: crate::VaultId,
+}
+
+impl SyncMetadata {
+    /// Create metadata for a new vault with a freshly generated VaultId.
+    pub fn new() -> Self {
+        Self {
+            version: CURRENT_SYNC_VERSION,
+            vault_id: crate::VaultId::generate(),
+        }
+    }
+}
+
+impl Default for SyncMetadata {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum VaultError {
@@ -1683,6 +1718,7 @@ fn simple_hash(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs::InMemoryFs;
+    use crate::VaultId;
 
     fn test_peer_id() -> PeerId {
         PeerId::from(12345u64)
@@ -1691,6 +1727,44 @@ mod tests {
     fn test_peer_id_2() -> PeerId {
         PeerId::from(67890u64)
     }
+
+    // ========== SyncMetadata Tests ==========
+
+    #[test]
+    fn test_sync_metadata_default_has_version_1() {
+        let meta = SyncMetadata::default();
+        assert_eq!(meta.version, 1);
+    }
+
+    #[test]
+    fn test_sync_metadata_serializes_to_toml() {
+        let meta = SyncMetadata {
+            version: 1,
+            vault_id: VaultId::from(0xa1b2c3d4e5f67890u64),
+        };
+        let toml_str = toml::to_string(&meta).unwrap();
+        assert!(toml_str.contains("version = 1"));
+        assert!(toml_str.contains("vault_id = \"a1b2c3d4e5f67890\""));
+    }
+
+    #[test]
+    fn test_sync_metadata_deserializes_from_toml() {
+        let toml_str = "version = 1\nvault_id = \"a1b2c3d4e5f67890\"\n";
+        let meta: SyncMetadata = toml::from_str(toml_str).unwrap();
+        assert_eq!(meta.version, 1);
+        assert_eq!(meta.vault_id.as_u64(), 0xa1b2c3d4e5f67890);
+    }
+
+    #[test]
+    fn test_sync_metadata_roundtrip() {
+        let original = SyncMetadata::new();
+        let toml_str = toml::to_string(&original).unwrap();
+        let parsed: SyncMetadata = toml::from_str(&toml_str).unwrap();
+        assert_eq!(original.version, parsed.version);
+        assert_eq!(original.vault_id, parsed.vault_id);
+    }
+
+    // ========== Vault Tests ==========
 
     #[tokio::test]
     async fn test_vault_init() {

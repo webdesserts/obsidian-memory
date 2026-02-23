@@ -25,7 +25,7 @@ pub mod vault;
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
-pub use peer_id::{PeerId, PeerIdError};
+pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use protocol::{
     GossipMessage, Handshake, HandshakeRole, PeerMessage, SyncEnvelope, MAX_MESSAGE_SIZE,
     PROTOCOL_VERSION,
@@ -33,4 +33,4 @@ pub use protocol::{
 pub use peers::{ConnectedPeer, ConnectionDirection, PeerError, PeerRegistry};
 pub use sync::SyncMessage;
 pub use transport::{PeerConnection, PeerInfo, SyncTransport};
-pub use vault::Vault;
+pub use vault::{SyncMetadata, Vault};
