@@ -71,7 +71,7 @@ The services don't handle TLS or authentication routing themselves — that's th
 - **OAuth discovery** — `/.well-known/oauth-authorization-server` → `auth-service:3001`
 - **Auth endpoints** — `/auth/*` → `auth-service:3001` (strip the `/auth` prefix)
 - **MCP endpoint** — `/mcp*` → `memory:3000` (protected via auth delegation to `auth-service:3001/validate`)
-- **Sync WebSocket** — `/sync` → `sync-daemon:8080`
+- **Sync WebSocket** — `/sync` → `memory:8080`
 
 Important proxy considerations:
 - The MCP endpoint uses SSE streaming — disable response buffering for `/mcp*`
@@ -80,19 +80,20 @@ Important proxy considerations:
 
 ## Usage
 
-### Environment Variables
+### CLI Commands
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OBSIDIAN_VAULT_PATH` | Yes | Path to your Obsidian vault (e.g., `~/notes` or `/home/user/notes`). Tilde expansion is supported. |
+```
+memory mcp --vault ~/notes       # MCP stdio (when piped by agent) or help (when interactive)
+memory mcp --vault ~/notes io    # MCP stdio (explicit, always works)
+memory mcp --vault ~/notes up    # MCP HTTP server
+memory sync up --vault ~/notes   # Sync daemon only
+memory up --vault ~/notes        # Both sync + MCP HTTP together
+memory obsidian install          # Stub: not yet implemented
+```
 
-If `OBSIDIAN_VAULT_PATH` is not set, the server will exit with an error message.
+The `--vault` flag specifies the path to your Obsidian vault. `OBSIDIAN_VAULT_PATH` environment variable is also supported as a fallback.
 
 ### Running the Server
-
-```bash
-OBSIDIAN_VAULT_PATH=~/notes obsidian-memory
-```
 
 The server communicates over stdio and is designed to be launched by an MCP client. It indexes your vault on first run (may take a few seconds for large vaults) and watches for file changes.
 
@@ -100,8 +101,7 @@ The server communicates over stdio and is designed to be launched by an MCP clie
 
 ```bash
 claude mcp add obsidian-memory --scope user \
-  -e OBSIDIAN_VAULT_PATH=~/notes \
-  -- obsidian-memory
+  -- memory mcp --vault ~/notes io
 ```
 
 ### OpenCode Configuration
@@ -113,10 +113,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "obsidian-memory": {
       "type": "local",
-      "command": ["obsidian-memory"],
-      "environment": {
-        "OBSIDIAN_VAULT_PATH": "~/notes"
-      },
+      "command": ["memory", "mcp", "--vault", "~/notes", "io"],
       "enabled": true
     }
   }
@@ -189,7 +186,7 @@ Requires Rust 1.85+ (edition 2024).
 cargo test
 
 # Run locally (downloads model from HuggingFace on first run)
-OBSIDIAN_VAULT_PATH=~/notes cargo run -p memory
+cargo run -p memory -- mcp --vault ~/notes io
 
 # Build release
 cargo build --release
@@ -203,7 +200,7 @@ cargo build --features embedded-model --no-default-features -p memory
 
 **Model download fails during build**: If you're behind a corporate firewall that blocks HuggingFace, use the pre-built binaries (Homebrew or shell installer) which have the model embedded.
 
-**Vault not found**: Ensure `OBSIDIAN_VAULT_PATH` is an absolute path to an existing directory. Check that the path doesn't have trailing slashes.
+**Vault not found**: Ensure the `--vault` path is an existing directory. Tilde expansion (`~/notes`) is supported.
 
 **Search returns no results**: The semantic index builds on first run. Give it a few seconds to index your vault. Large vaults (1000+ notes) may take longer.
 
