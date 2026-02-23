@@ -103,5 +103,9 @@ export function createFsBridge(vault: Vault): JsFileSystemBridge {
     await vault.adapter.mkdir(path);
   };
 
-  return new JsFileSystemBridge(read, write, list, del, exists, stat, mkdir);
+  const rename = async (from: string, to: string): Promise<void> => {
+    await vault.adapter.rename(from, to);
+  };
+
+  return new JsFileSystemBridge(read, write, list, del, exists, stat, mkdir, rename);
 }

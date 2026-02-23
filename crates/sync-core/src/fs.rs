@@ -81,6 +81,25 @@ pub trait FileSystem: Send + Sync {
 
     /// Create directory (and parents if needed)
     async fn mkdir(&self, path: &str) -> Result<()>;
+
+    /// Rename/move a file or directory
+    async fn rename(&self, from: &str, to: &str) -> Result<()>;
+
+    /// Write file contents atomically via write-to-temp + rename.
+    ///
+    /// If the process crashes mid-write, the original file is preserved.
+    /// The temp file is written to `{path}.tmp` in the same directory to
+    /// ensure the rename stays on the same filesystem (required for POSIX).
+    async fn atomic_write(&self, path: &str, content: &[u8]) -> Result<()> {
+        let tmp_path = format!("{}.tmp", path);
+        self.write(&tmp_path, content).await?;
+        if let Err(e) = self.rename(&tmp_path, path).await {
+            // Best-effort cleanup of temp file
+            let _ = self.delete(&tmp_path).await;
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 /// Platform-independent filesystem abstraction (WASM version without Send + Sync).
@@ -108,6 +127,24 @@ pub trait FileSystem {
 
     /// Create directory (and parents if needed)
     async fn mkdir(&self, path: &str) -> Result<()>;
+
+    /// Rename/move a file or directory
+    async fn rename(&self, from: &str, to: &str) -> Result<()>;
+
+    /// Write file contents atomically via write-to-temp + rename.
+    ///
+    /// If the process crashes mid-write, the original file is preserved.
+    /// The temp file is written to `{path}.tmp` in the same directory to
+    /// ensure the rename stays on the same filesystem (required for POSIX).
+    async fn atomic_write(&self, path: &str, content: &[u8]) -> Result<()> {
+        let tmp_path = format!("{}.tmp", path);
+        self.write(&tmp_path, content).await?;
+        if let Err(e) = self.rename(&tmp_path, path).await {
+            let _ = self.delete(&tmp_path).await;
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 /// In-memory filesystem for testing
@@ -328,6 +365,35 @@ impl FileSystem for InMemoryFs {
         dirs.insert(path, ());
         Ok(())
     }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let from = Self::normalize_path(from);
+        let to = Self::normalize_path(to);
+
+        // Try file first
+        let mut files = self.files.write().unwrap();
+        if let Some(content) = files.remove(&from) {
+            files.insert(to.clone(), content);
+            drop(files);
+
+            // Move mtime too
+            let mut mtimes = self.mtimes.write().unwrap();
+            if let Some(mtime) = mtimes.remove(&from) {
+                mtimes.insert(to, mtime);
+            }
+            return Ok(());
+        }
+        drop(files);
+
+        // Try directory
+        let mut dirs = self.dirs.write().unwrap();
+        if dirs.remove(&from).is_some() {
+            dirs.insert(to, ());
+            return Ok(());
+        }
+
+        Err(FsError::NotFound(from))
+    }
 }
 
 // Implement FileSystem for Arc<T> where T: FileSystem
@@ -363,6 +429,10 @@ impl<T: FileSystem + Send + Sync> FileSystem for std::sync::Arc<T> {
     async fn mkdir(&self, path: &str) -> Result<()> {
         (**self).mkdir(path).await
     }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        (**self).rename(from, to).await
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +457,47 @@ mod tests {
         // Delete
         fs.delete("test.txt").await.unwrap();
         assert!(!fs.exists("test.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_inmemory_fs_rename() {
+        let fs = InMemoryFs::new();
+
+        fs.write("old.txt", b"content").await.unwrap();
+        fs.rename("old.txt", "new.txt").await.unwrap();
+
+        assert!(!fs.exists("old.txt").await.unwrap());
+        assert!(fs.exists("new.txt").await.unwrap());
+        assert_eq!(fs.read("new.txt").await.unwrap(), b"content");
+    }
+
+    #[tokio::test]
+    async fn test_inmemory_fs_rename_not_found() {
+        let fs = InMemoryFs::new();
+
+        let result = fs.rename("nonexistent.txt", "new.txt").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_inmemory_fs_atomic_write_new_file() {
+        let fs = InMemoryFs::new();
+
+        fs.atomic_write("file.loro", b"data").await.unwrap();
+
+        assert_eq!(fs.read("file.loro").await.unwrap(), b"data");
+        assert!(!fs.exists("file.loro.tmp").await.unwrap(), "temp file should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_inmemory_fs_atomic_write_overwrites() {
+        let fs = InMemoryFs::new();
+
+        fs.write("file.loro", b"old").await.unwrap();
+        fs.atomic_write("file.loro", b"new").await.unwrap();
+
+        assert_eq!(fs.read("file.loro").await.unwrap(), b"new");
+        assert!(!fs.exists("file.loro.tmp").await.unwrap());
     }
 
     #[tokio::test]

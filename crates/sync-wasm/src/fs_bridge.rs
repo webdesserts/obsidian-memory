@@ -32,6 +32,7 @@ pub struct JsFileSystemBridge {
     exists_fn: js_sys::Function,
     stat_fn: js_sys::Function,
     mkdir_fn: js_sys::Function,
+    rename_fn: js_sys::Function,
 }
 
 #[wasm_bindgen]
@@ -48,6 +49,7 @@ impl JsFileSystemBridge {
         exists_fn: js_sys::Function,
         stat_fn: js_sys::Function,
         mkdir_fn: js_sys::Function,
+        rename_fn: js_sys::Function,
     ) -> Self {
         Self {
             read_fn,
@@ -57,6 +59,7 @@ impl JsFileSystemBridge {
             exists_fn,
             stat_fn,
             mkdir_fn,
+            rename_fn,
         }
     }
 }
@@ -194,7 +197,15 @@ impl FileSystem for JsFileSystemBridge {
         call_js_async(&self.mkdir_fn, &[path.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
+        Ok(())
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        call_js_async(&self.rename_fn, &[from.into(), to.into()])
+            .await
+            .map_err(js_err_to_fs_err)?;
+
         Ok(())
     }
 }

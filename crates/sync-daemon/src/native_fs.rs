@@ -126,4 +126,12 @@ impl FileSystem for NativeFs {
             .await
             .map_err(|e| FsError::Io(e.to_string()))
     }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let from_path = self.full_path(from);
+        let to_path = self.full_path(to);
+        fs::rename(&from_path, &to_path)
+            .await
+            .map_err(|e| FsError::Io(e.to_string()))
+    }
 }
