@@ -1,5 +1,7 @@
 Feature: Atomic File Writes
-  Sync data files should not be corrupted by crashes during writes.
+  Sync data files (.loro snapshots, registry, metadata) should not be
+  corrupted by crashes during writes, whether syncing via the Obsidian
+  plugin or the daemon.
 
   Scenario: Writing a file completes fully
     Given a sync file "example.loro" exists with content A
