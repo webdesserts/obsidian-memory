@@ -4285,6 +4285,7 @@ dependencies = [
  "axum 0.8.8",
  "bincode",
  "clap",
+ "fs2",
  "futures",
  "notify",
  "notify-debouncer-mini",

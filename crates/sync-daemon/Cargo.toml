@@ -36,6 +36,9 @@ axum = { version = "0.8", features = ["ws"] }
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
 
+# File locking (flock-based daemon lock)
+fs2 = "0.4"
+
 [dev-dependencies]
 reqwest = "0.13.2"
 tempfile.workspace = true
