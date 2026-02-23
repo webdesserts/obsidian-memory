@@ -9,7 +9,7 @@
 //! The `_meta.path` field allows detecting file moves/renames during reconciliation.
 
 use crate::markdown;
-use crate::PeerId;
+use crate::VaultId;
 use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, UpdateOptions, VersionVector};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -42,10 +42,10 @@ impl NoteDocument {
     /// Does NOT set doc_id - this is intended for receiving imported data
     /// or as a container that will receive content via update methods.
     /// Use `from_markdown()` to create a new document with original content and doc_id.
-    /// The peer_id must be set before any operations to ensure consistent version vectors.
-    pub fn new(path: &str, peer_id: PeerId) -> Self {
+    /// The vault_id is set as the Loro peer ID for consistent version vectors.
+    pub fn new(path: &str, vault_id: VaultId) -> Self {
         let doc = LoroDoc::new();
-        doc.set_peer_id(peer_id.as_u64()).ok();
+        doc.set_peer_id(vault_id.as_u64()).ok();
 
         // Set path metadata only - doc_id comes from imported content or from_markdown()
         let meta = doc.get_map("_meta");
@@ -60,9 +60,10 @@ impl NoteDocument {
 
     /// Create a NoteDocument by importing from existing Loro bytes.
     ///
-    /// The peer_id is set before import so any new operations (like path metadata updates)
-    /// are attributed to this peer. Imported operations preserve their original peer IDs.
-    pub fn from_bytes(path: &str, bytes: &[u8], peer_id: PeerId) -> Result<Self> {
+    /// The vault_id is set as the Loro peer ID before import so any new operations
+    /// (like path metadata updates) are attributed to this vault. Imported operations
+    /// preserve their original author IDs.
+    pub fn from_bytes(path: &str, bytes: &[u8], vault_id: VaultId) -> Result<Self> {
         debug!(
             path = %path,
             bytes_len = bytes.len(),
@@ -70,7 +71,7 @@ impl NoteDocument {
         );
 
         let doc = LoroDoc::new();
-        doc.set_peer_id(peer_id.as_u64()).ok();
+        doc.set_peer_id(vault_id.as_u64()).ok();
         doc.import(bytes).map_err(|e| {
             error!(
                 path = %path,
@@ -170,10 +171,10 @@ impl NoteDocument {
     /// Load from markdown content.
     ///
     /// Generates a unique `doc_id` to track document lineage across syncs.
-    /// The peer_id must be set before any operations to ensure consistent version vectors.
-    pub fn from_markdown(path: &str, content: &str, peer_id: PeerId) -> Result<Self> {
+    /// The vault_id is set as the Loro peer ID for consistent version vectors.
+    pub fn from_markdown(path: &str, content: &str, vault_id: VaultId) -> Result<Self> {
         let doc = LoroDoc::new();
-        doc.set_peer_id(peer_id.as_u64()).ok();
+        doc.set_peer_id(vault_id.as_u64()).ok();
         let parsed = markdown::parse(content);
 
         // Set internal metadata with unique doc_id
@@ -471,13 +472,13 @@ fn loro_value_to_yaml(value: &loro::LoroValue) -> std::result::Result<serde_yaml
 mod tests {
     use super::*;
 
-    fn test_peer_id() -> PeerId {
-        PeerId::from(12345u64)
+    fn test_vault_id() -> VaultId {
+        VaultId::from(12345u64)
     }
 
     #[test]
     fn test_new_document() {
-        let doc = NoteDocument::new("test.md", test_peer_id());
+        let doc = NoteDocument::new("test.md", test_vault_id());
         assert_eq!(doc.path(), "test.md");
         assert!(doc.body().to_string().is_empty());
     }
@@ -492,7 +493,7 @@ title: Test
 
 World"#;
 
-        let doc = NoteDocument::from_markdown("test.md", content, test_peer_id()).unwrap();
+        let doc = NoteDocument::from_markdown("test.md", content, test_vault_id()).unwrap();
         assert!(doc.to_markdown().contains("title:"));
         assert!(doc.to_markdown().contains("# Hello"));
     }
@@ -500,8 +501,8 @@ World"#;
     #[test]
     fn test_sync_between_documents() {
         // Create two documents
-        let doc1 = NoteDocument::from_markdown("test.md", "Hello", test_peer_id()).unwrap();
-        let mut doc2 = NoteDocument::new("test.md", test_peer_id());
+        let doc1 = NoteDocument::from_markdown("test.md", "Hello", test_vault_id()).unwrap();
+        let mut doc2 = NoteDocument::new("test.md", test_vault_id());
 
         // Sync from doc1 to doc2
         let snapshot = doc1.export_snapshot();
@@ -513,7 +514,7 @@ World"#;
     #[test]
     fn test_update_body_with_update_by_line() {
         // Test that update_body (using update_by_line) works correctly
-        let doc = NoteDocument::from_markdown("test.md", "Hello World", test_peer_id()).unwrap();
+        let doc = NoteDocument::from_markdown("test.md", "Hello World", test_vault_id()).unwrap();
         assert_eq!(doc.body().to_string(), "Hello World");
 
         // Update the body
@@ -527,7 +528,7 @@ World"#;
     #[test]
     fn test_update_body_no_change() {
         // Test that update_body returns false when content is the same
-        let doc = NoteDocument::from_markdown("test.md", "Hello", test_peer_id()).unwrap();
+        let doc = NoteDocument::from_markdown("test.md", "Hello", test_vault_id()).unwrap();
 
         let changed = doc.update_body("Hello").unwrap();
 

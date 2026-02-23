@@ -407,7 +407,21 @@ async fn main() -> Result<()> {
         info!("Running in client-only mode (no incoming connections)");
     }
 
-    // Generate or parse peer ID
+    // Create filesystem
+    let fs = NativeFs::new(args.vault.clone());
+
+    // Initialize or load vault (VaultId is managed by metadata.toml)
+    let vault = if fs.exists(".sync").await? {
+        info!("Loading existing vault");
+        Vault::load(fs).await?
+    } else {
+        info!("Initializing new vault");
+        Vault::init(fs).await?
+    };
+
+    info!("Vault loaded, vault ID: {}", vault.vault_id());
+
+    // Generate or parse peer ID for network identity (separate from VaultId)
     let peer_id: sync_core::PeerId = match args.peer_id {
         Some(id_str) => id_str.parse().context("Invalid peer ID")?,
         None => {
@@ -416,20 +430,6 @@ async fn main() -> Result<()> {
             id
         }
     };
-
-    // Create filesystem
-    let fs = NativeFs::new(args.vault.clone());
-
-    // Initialize or load vault
-    let vault = if fs.exists(".sync").await? {
-        info!("Loading existing vault");
-        Vault::load(fs, peer_id).await?
-    } else {
-        info!("Initializing new vault");
-        Vault::init(fs, peer_id).await?
-    };
-
-    info!("Vault loaded, peer ID: {}", vault.peer_id());
 
     // Create WebSocket server (takes string peer_id for protocol messages)
     let server = WebSocketServer::new(peer_id.to_string(), args.advertise.clone());

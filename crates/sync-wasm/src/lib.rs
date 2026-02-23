@@ -256,17 +256,13 @@ mod wasm_impl {
 
     #[wasm_bindgen]
     impl WasmVault {
-        /// Initialize a new vault (creates .sync directory).
+        /// Initialize a new vault (creates .sync directory and generates VaultId).
         ///
         /// Call this when the user clicks "Initialize Sync" for the first time.
-        /// The `peer_id` should be a hex string from `generatePeerId()` or a legacy UUID.
+        /// The VaultId is generated automatically and persisted in `.sync/metadata.toml`.
         #[wasm_bindgen]
-        pub async fn init(fs: fs_bridge::JsFileSystemBridge, peer_id: String) -> Result<WasmVault, JsError> {
-            let peer_id: sync_core::PeerId = peer_id
-                .parse()
-                .map_err(|e| JsError::new(&format!("Invalid peer ID: {}", e)))?;
-
-            let inner = sync_core::Vault::init(fs, peer_id)
+        pub async fn init(fs: fs_bridge::JsFileSystemBridge) -> Result<WasmVault, JsError> {
+            let inner = sync_core::Vault::init(fs)
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
 
@@ -277,16 +273,10 @@ mod wasm_impl {
         ///
         /// Call this on plugin startup if vault is already initialized.
         /// Reconciliation detects files added/modified/deleted while plugin was off.
-        /// The `peer_id` should be a hex string from `generatePeerId()` or a legacy UUID.
-        ///
-        /// Returns a report of what was reconciled.
+        /// The VaultId is read from `.sync/metadata.toml` (migrated from v0 if needed).
         #[wasm_bindgen]
-        pub async fn load(fs: fs_bridge::JsFileSystemBridge, peer_id: String) -> Result<WasmVault, JsError> {
-            let peer_id: sync_core::PeerId = peer_id
-                .parse()
-                .map_err(|e| JsError::new(&format!("Invalid peer ID: {}", e)))?;
-
-            let inner = sync_core::Vault::load(fs, peer_id)
+        pub async fn load(fs: fs_bridge::JsFileSystemBridge) -> Result<WasmVault, JsError> {
+            let inner = sync_core::Vault::load(fs)
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
 
