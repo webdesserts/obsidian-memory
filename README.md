@@ -40,7 +40,7 @@ cd obsidian-memory
 cargo install --path crates/memory
 ```
 
-Note: Building from source uses runtime model download from HuggingFace. Pre-built binaries have the model embedded and work on corporate networks that block HuggingFace.
+Note: Building from source downloads the embedding model from HuggingFace at runtime on first launch. Pre-built binaries have the model embedded and work offline or on corporate networks that block HuggingFace.
 
 ### Option 4: Docker (Server Deployment)
 
@@ -193,7 +193,7 @@ cargo build --release
 
 # Build with embedded model (for testing release builds)
 ./scripts/download-model.sh
-cargo build --features embedded-model --no-default-features -p memory
+cargo build --features embedded-model -p memory
 ```
 
 ## Troubleshooting

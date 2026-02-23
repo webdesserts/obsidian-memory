@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::RwLock;
 
-#[cfg(feature = "download-model")]
+#[cfg(not(feature = "embedded-model"))]
 use super::download::download_model;
 
 /// Cache entry storing an embedding and its content hash.
@@ -57,7 +57,7 @@ impl EmbeddingManager {
     /// Initialize the embedding manager by loading the model.
     ///
     /// With `embedded-model` feature: loads model from binary (no network).
-    /// With `download-model` feature: downloads from HuggingFace if not present.
+    /// Without: downloads from HuggingFace if not already cached on disk.
     ///
     /// Uses write lock for the entire operation to prevent race conditions.
     pub async fn initialize(&self) -> Result<()> {
@@ -67,7 +67,6 @@ impl EmbeddingManager {
             return Ok(());
         }
 
-        // Load model based on feature flags
         #[cfg(feature = "embedded-model")]
         {
             self.embeddings
@@ -76,23 +75,13 @@ impl EmbeddingManager {
             tracing::info!("Loaded embedded model");
         }
 
-        #[cfg(all(feature = "download-model", not(feature = "embedded-model")))]
+        #[cfg(not(feature = "embedded-model"))]
         {
-            // Download model if needed
             download_model(&self.model_dir).await?;
-
-            // Load model from disk
             self.embeddings
                 .load_model_from_dir(&self.model_dir)
                 .context("Failed to load embedding model")?;
             tracing::info!("Loaded model from disk");
-        }
-
-        #[cfg(not(any(feature = "embedded-model", feature = "download-model")))]
-        {
-            anyhow::bail!(
-                "No model loading method available. Enable either 'embedded-model' or 'download-model' feature."
-            );
         }
 
         *loaded = true;

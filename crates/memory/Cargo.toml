@@ -13,22 +13,18 @@ name = "memory"
 path = "src/main.rs"
 
 [features]
-default = ["download-model", "http", "sync"]
-# Download model from HuggingFace at runtime (default for dev)
-download-model = ["dep:reqwest", "dep:futures-util"]
+default = ["sync"]
 # Use model embedded in binary (for release builds)
 embedded-model = ["semantic-embeddings/embedded-model"]
-# Enable HTTP transport for remote MCP server
-http = ["rmcp/transport-streamable-http-server", "dep:axum"]
 # Enable embedded sync daemon
 sync = ["dep:sync-daemon"]
 
 [dependencies]
 # MCP SDK
-rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "0.12", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 
-# HTTP server (optional, for HTTP transport)
-axum = { workspace = true, optional = true }
+# HTTP server
+axum = { workspace = true }
 
 # CLI argument parsing
 clap.workspace = true
@@ -72,9 +68,9 @@ tracing-subscriber.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
 
-# HTTP client for model downloads (optional, only needed without embedded-model)
-reqwest = { version = "0.12", features = ["rustls-tls", "stream"], optional = true }
-futures-util = { version = "0.3", optional = true }
+# HTTP client for runtime model downloads (not used with embedded-model feature)
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
+futures-util = { version = "0.3" }
 
 # Hashing for cache keys
 sha2 = "0.10"

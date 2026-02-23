@@ -14,7 +14,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-#[cfg(feature = "http")]
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpService,
 };
@@ -554,7 +553,7 @@ enum Command {
     },
 
     /// Start all services (sync + MCP HTTP)
-    #[cfg(all(feature = "sync", feature = "http"))]
+    #[cfg(feature = "sync")]
     Up {
         /// Path to the vault directory
         #[arg(long)]
@@ -598,7 +597,6 @@ enum McpAction {
     Io,
 
     /// Start MCP HTTP server
-    #[cfg(feature = "http")]
     Up {
         /// Port to listen on
         #[arg(long, default_value_t = 3000)]
@@ -699,7 +697,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // `memory mcp up` → HTTP server
-            #[cfg(feature = "http")]
             Some(McpAction::Up { port, bind }) => {
                 let vault = require_vault(vault)?;
                 init_mcp_tracing();
@@ -739,7 +736,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
 
-        #[cfg(all(feature = "sync", feature = "http"))]
+        #[cfg(feature = "sync")]
         Some(Command::Up {
             vault,
             port,
@@ -826,7 +823,6 @@ async fn run_stdio_server(config: Config) -> Result<(), Box<dyn std::error::Erro
 }
 
 /// Run the server with HTTP transport.
-#[cfg(feature = "http")]
 async fn run_http_server(
     config: Config,
     bind: &str,
