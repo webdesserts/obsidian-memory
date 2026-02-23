@@ -45,6 +45,16 @@ toml = "0.8"
 # Error handling
 thiserror = "2"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP server
+axum = "0.8"
+
+# File watching
+notify = "8"
+notify-debouncer-mini = "0.6"
+
 # Cross-platform time (works in WASM)
 web-time = "1"
 
