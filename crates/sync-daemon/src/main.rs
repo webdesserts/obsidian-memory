@@ -135,11 +135,6 @@ impl Daemon {
 
     /// Handle a file modification.
     async fn on_file_modified(&mut self, path: &str) {
-        // Skip broadcast if no peers connected
-        if self.server.peer_count() == 0 {
-            return;
-        }
-
         let vault = self.vault.lock().await;
 
         // Check if this modification was from sync (consume flag)
@@ -148,9 +143,16 @@ impl Daemon {
             return;
         }
 
-        // Notify vault of the file change
+        // Always update vault state so .loro files stay current for future sync exchanges.
+        // Without this, edits made while no peers are connected would be silently lost
+        // when a peer connects — prepare_sync_request trusts .loro state, with no fallback.
         if let Err(e) = vault.on_file_changed(path).await {
             error!("Failed to process file change for {}: {}", path, e);
+            return;
+        }
+
+        // Only broadcast if peers are connected
+        if self.server.peer_count() == 0 {
             return;
         }
 
