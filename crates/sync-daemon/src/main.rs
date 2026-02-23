@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -488,6 +489,10 @@ async fn main() -> Result<()> {
 
     info!("Daemon running. Press Ctrl+C to stop.");
 
+    // Periodic dead member eviction (60s sweep, 300s TTL)
+    let mut eviction_interval = tokio::time::interval(Duration::from_secs(60));
+    let eviction_ttl = Duration::from_secs(300);
+
     // Main event loop
     loop {
         tokio::select! {
@@ -537,6 +542,14 @@ async fn main() -> Result<()> {
                         info!("Discovered peer {} at {}", peer_id, address);
                         // TODO: Auto-connect to discovered peers
                     }
+                }
+            }
+
+            // Periodic dead member eviction
+            _ = eviction_interval.tick() => {
+                let evicted = daemon.membership.evict_dead_members(eviction_ttl);
+                if evicted > 0 {
+                    info!("Evicted {} dead member(s) past {}s TTL", evicted, eviction_ttl.as_secs());
                 }
             }
 
