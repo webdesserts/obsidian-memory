@@ -4,6 +4,7 @@
 //! allowing integration tests to access internal types.
 
 pub mod connection;
+pub mod daemon;
 pub mod daemon_lock;
 pub mod http;
 pub mod manager;
