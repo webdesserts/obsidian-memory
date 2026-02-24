@@ -1,0 +1,66 @@
+name: Obsidian Plugin
+
+on:
+  # Called by cargo-dist after successful release
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  build-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract tag from plan
+        id: version
+        run: echo "tag=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build plugin
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+
+      - name: Prepare release assets
+        working-directory: plugin
+        run: |
+          cp main.js ../obsidian-plugin-main.js
+          cp manifest.json ../obsidian-plugin-manifest.json
+          cp ws-server.js ../obsidian-plugin-ws-server.js
+
+      - name: Generate checksums
+        run: |
+          echo '{' > obsidian-plugin-checksums.json
+          for f in obsidian-plugin-main.js obsidian-plugin-manifest.json obsidian-plugin-ws-server.js; do
+            hash=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "  \"$f\": \"$hash\"," >> obsidian-plugin-checksums.json
+          done
+          sed -i '$ s/,$//' obsidian-plugin-checksums.json
+          echo '}' >> obsidian-plugin-checksums.json
+          cat obsidian-plugin-checksums.json
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.version.outputs.tag }}" \
+            obsidian-plugin-main.js \
+            obsidian-plugin-manifest.json \
+            obsidian-plugin-ws-server.js \
+            obsidian-plugin-checksums.json
