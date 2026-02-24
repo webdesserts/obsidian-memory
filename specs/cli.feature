@@ -91,8 +91,27 @@ Feature: CLI Commands
     When I run `memory sync` with no further arguments
     Then it should display help for sync subcommands (up)
 
-  # --- Plugin (stub for Phase 2) ---
+  # --- Plugin Installation ---
 
-  Scenario: Obsidian install is not yet implemented
+  Scenario: Install plugin to auto-discovered vault
+    Given Obsidian is installed with one vault at "~/notes"
     When I run `memory obsidian install`
-    Then it should print a message that plugin installation is not yet available
+    Then it should create `.obsidian/plugins/obsidian-p2p-sync/` in the vault
+    And it should write the bootstrap harness as `main.js`
+    And it should write a `manifest.json` with the CLI version
+    And it should print success with instructions to enable the plugin
+
+  Scenario: Install plugin with explicit vault path
+    When I run `memory obsidian install --vault ~/my-vault`
+    Then it should install the plugin to `~/my-vault/.obsidian/plugins/obsidian-p2p-sync/`
+
+  Scenario: Install refuses to overwrite existing plugin without --force
+    Given the vault already has a `main.js` that is not the bootstrap harness
+    When I run `memory obsidian install --vault ~/notes`
+    Then it should warn that a plugin already exists
+    And it should exit without modifying any files
+
+  Scenario: Install with --force overwrites existing plugin
+    Given the vault already has a `main.js` that is not the bootstrap harness
+    When I run `memory obsidian install --vault ~/notes --force`
+    Then it should overwrite the existing plugin files

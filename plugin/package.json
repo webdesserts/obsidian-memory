@@ -1,6 +1,6 @@
 {
   "name": "obsidian-p2p-sync",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "P2P vault synchronization for Obsidian using Loro CRDTs",
   "main": "main.js",
   "scripts": {
