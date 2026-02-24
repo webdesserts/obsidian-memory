@@ -87,6 +87,59 @@ jobs:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
 
+  # Build the Obsidian plugin and generate checksums for release
+  build-plugin:
+    needs:
+      - plan
+    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build plugin
+        working-directory: plugin
+        run: |
+          npm ci
+          npm run build
+      - name: Prepare release assets
+        working-directory: plugin
+        run: |
+          cp main.js ../obsidian-plugin-main.js
+          cp manifest.json ../obsidian-plugin-manifest.json
+          cp ws-server.js ../obsidian-plugin-ws-server.js
+      - name: Generate checksums
+        run: |
+          echo '{' > obsidian-plugin-checksums.json
+          for f in obsidian-plugin-main.js obsidian-plugin-manifest.json obsidian-plugin-ws-server.js; do
+            hash=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "  \"$f\": \"$hash\"," >> obsidian-plugin-checksums.json
+          done
+          # Remove trailing comma and close
+          sed -i '$ s/,$//' obsidian-plugin-checksums.json
+          echo '}' >> obsidian-plugin-checksums.json
+          cat obsidian-plugin-checksums.json
+      - name: Upload plugin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-plugin
+          path: |
+            obsidian-plugin-main.js
+            obsidian-plugin-manifest.json
+            obsidian-plugin-ws-server.js
+            obsidian-plugin-checksums.json
+
   # Build and packages all the platform-specific things
   build-local-artifacts:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
@@ -232,8 +285,9 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+      - build-plugin
+    # Only run if we're "publishing", and only if plan, local, global, and plugin didn't fail (skipped is fine)
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.build-plugin.result == 'skipped' || needs.build-plugin.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
