@@ -23,7 +23,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # MCP server (HTTP) + P2P sync daemon
+  # MCP server (HTTP transport)
   memory:
     image: ghcr.io/webdesserts/memory:${VERSION:-latest}
     volumes:
@@ -32,7 +32,6 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "3000"
-      - "8080"
     networks:
       - proxy
     depends_on:
@@ -42,13 +41,34 @@ services:
     memswap_limit: 1280m
     mem_reservation: 128m
     oom_score_adj: 300
+    command: ["mcp", "--vault", "/notes", "up", "--port", "3000", "--bind", "0.0.0.0"]
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    # Runs both MCP HTTP + sync daemon
-    command: ["up", "--vault", "/notes", "--port", "3000", "--bind", "0.0.0.0"]
+
+  # P2P vault sync daemon
+  sync:
+    image: ghcr.io/webdesserts/memory:${VERSION:-latest}
+    volumes:
+      - notes:/notes:rw
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+    expose:
+      - "8080"
+    networks:
+      - proxy
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    mem_reservation: 64m
+    command: ["sync", "up", "--vault", "/notes", "--listen", "0.0.0.0:8080"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   # Vault data - bind mount to host directory
