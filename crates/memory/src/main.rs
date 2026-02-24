@@ -647,10 +647,164 @@ enum SyncAction {
 enum ObsidianAction {
     /// Install the Obsidian plugin
     Install {
-        /// Path to the vault
+        /// Path to the vault (auto-discovered if omitted)
         #[arg(long)]
         vault: Option<String>,
+
+        /// Overwrite an existing plugin installation
+        #[arg(long)]
+        force: bool,
     },
+}
+
+/// Marker comment embedded in the harness so we can detect it vs a real plugin.
+const HARNESS_MARKER: &str = "// Bootstrap harness for P2P Sync plugin.";
+
+/// The bootstrap harness JS, embedded at compile time.
+const HARNESS_JS: &str = include_str!("harness.js");
+
+/// Run `memory obsidian install`.
+fn run_obsidian_install(
+    vault_arg: Option<String>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vault_path = match vault_arg {
+        Some(p) => {
+            if p.starts_with("~/") || p == "~" {
+                let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+                home.join(p.strip_prefix("~/").unwrap_or(""))
+            } else {
+                std::path::PathBuf::from(p)
+            }
+        }
+        None => discover_vault()?,
+    };
+
+    // Validate vault
+    let obsidian_dir = vault_path.join(".obsidian");
+    if !obsidian_dir.is_dir() {
+        return Err(format!(
+            "Not an Obsidian vault (no .obsidian/ directory): {}",
+            vault_path.display()
+        )
+        .into());
+    }
+
+    let plugin_dir = obsidian_dir.join("plugins").join("obsidian-p2p-sync");
+    let main_js_path = plugin_dir.join("main.js");
+
+    // Overwrite protection: if main.js exists and isn't the harness, require --force
+    if main_js_path.exists() && !force {
+        let existing = std::fs::read_to_string(&main_js_path).unwrap_or_default();
+        if !existing.starts_with(HARNESS_MARKER) {
+            return Err(
+                "Plugin already installed. Use --force to overwrite.".into()
+            );
+        }
+    }
+
+    // Create plugin directory
+    std::fs::create_dir_all(&plugin_dir)?;
+
+    // Write manifest.json with the CLI's version
+    let manifest = serde_json::json!({
+        "id": "obsidian-p2p-sync",
+        "name": "P2P Sync",
+        "version": env!("CARGO_PKG_VERSION"),
+        "minAppVersion": "1.5.0",
+        "description": "P2P vault synchronization using Loro CRDTs",
+        "author": "webdesserts",
+        "authorUrl": "https://github.com/webdesserts",
+        "isDesktopOnly": false
+    });
+    std::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    // Write bootstrap harness as main.js
+    std::fs::write(&main_js_path, HARNESS_JS)?;
+
+    eprintln!("Plugin installed to {}", plugin_dir.display());
+    eprintln!();
+    eprintln!("Next steps:");
+    eprintln!("  1. Open Obsidian");
+    eprintln!("  2. Go to Settings → Community plugins");
+    eprintln!("  3. Enable \"P2P Sync\"");
+    eprintln!("  4. The plugin will download itself from GitHub on first load");
+
+    Ok(())
+}
+
+/// Discover Obsidian vaults from the Obsidian config file.
+fn discover_vault() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let config_path = if cfg!(target_os = "macos") {
+        dirs::home_dir()
+            .ok_or("Could not determine home directory")?
+            .join("Library/Application Support/obsidian/obsidian.json")
+    } else {
+        dirs::config_dir()
+            .ok_or("Could not determine config directory")?
+            .join("obsidian/obsidian.json")
+    };
+
+    if !config_path.exists() {
+        return Err(format!(
+            "Obsidian config not found at {}. Use --vault to specify the vault path.",
+            config_path.display()
+        )
+        .into());
+    }
+
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+    let vaults = config
+        .get("vaults")
+        .and_then(|v| v.as_object())
+        .ok_or("Invalid obsidian.json: missing 'vaults' object")?;
+
+    // Collect valid vaults (directory exists and has .obsidian/)
+    let valid_vaults: Vec<std::path::PathBuf> = vaults
+        .values()
+        .filter_map(|v| v.get("path").and_then(|p| p.as_str()))
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir() && p.join(".obsidian").is_dir())
+        .collect();
+
+    match valid_vaults.len() {
+        0 => Err("No valid Obsidian vaults found. Use --vault to specify the vault path.".into()),
+        1 => {
+            eprintln!("Found vault: {}", valid_vaults[0].display());
+            Ok(valid_vaults[0].clone())
+        }
+        _ => {
+            // Interactive prompt: list vaults
+            eprintln!("Multiple vaults found:");
+            for (i, v) in valid_vaults.iter().enumerate() {
+                eprintln!("  {}) {}", i + 1, v.display());
+            }
+            eprintln!("  a) All vaults");
+            eprint!("Select vault [1-{}] or 'a': ", valid_vaults.len());
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+
+            if input.eq_ignore_ascii_case("a") {
+                // Install to all vaults — just use the first one here,
+                // the caller would need to loop. For now, return first.
+                // TODO: support installing to all vaults
+                Err("Installing to all vaults is not yet supported. Use --vault to specify one.".into())
+            } else {
+                let idx: usize = input.parse::<usize>().map_err(|_| "Invalid selection")?;
+                if idx < 1 || idx > valid_vaults.len() {
+                    return Err("Selection out of range".into());
+                }
+                Ok(valid_vaults[idx - 1].clone())
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -774,10 +928,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Some(Command::Obsidian { action }) => match action {
-            ObsidianAction::Install { .. } => {
-                eprintln!("Plugin installation is not yet available.");
-                Ok(())
-            }
+            ObsidianAction::Install { vault, force } => run_obsidian_install(vault, force),
         },
     }
 }
