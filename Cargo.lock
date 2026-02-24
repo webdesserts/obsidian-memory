@@ -190,7 +190,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-service"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "memory"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "memory-common"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "dirs",
  "tokio",
@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "obsidian-fs"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3922,7 +3922,7 @@ dependencies = [
 
 [[package]]
 name = "semantic-embeddings"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -4290,7 +4290,7 @@ dependencies = [
 
 [[package]]
 name = "sync-daemon"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4318,7 +4318,7 @@ dependencies = [
 
 [[package]]
 name = "sync-wasm"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -5303,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "wiki-links"
-version = "0.2.24"
+version = "0.3.1"
 dependencies = [
  "serde",
 ]

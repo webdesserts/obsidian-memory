@@ -1,7 +1,7 @@
 {
   "id": "obsidian-p2p-sync",
   "name": "P2P Sync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "minAppVersion": "1.5.0",
   "description": "P2P vault synchronization using Loro CRDTs",
   "author": "webdesserts",
