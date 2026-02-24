@@ -16,6 +16,7 @@ import { createFsBridge } from "./fs/ObsidianFs";
 import { PeerManager, PeerInfo, VaultPeerManager } from "./network";
 import { VaultOperationQueue } from "./VaultOperationQueue";
 import { log } from "./logger";
+import { checkForUpdates } from "./updater";
 
 /** Result from processSyncMessage */
 interface SyncMessageResult {
@@ -262,6 +263,8 @@ export default class P2PSyncPlugin extends Plugin {
     });
 
     log.info("Plugin loaded");
+
+    checkForUpdates(this);
   }
 
   /**
