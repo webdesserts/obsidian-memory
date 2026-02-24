@@ -1,4 +1,4 @@
-import { Notice, Plugin, Platform, requestUrl } from "obsidian";
+import { Notice, Plugin, requestUrl } from "obsidian";
 import { log } from "./logger";
 
 /** How often to check for updates (24 hours) */
@@ -23,9 +23,6 @@ const ASSET_FILE_MAP: Record<string, string> = {
  * Downloads newer versions from GitHub releases with SHA-256 verification.
  */
 export function checkForUpdates(plugin: Plugin): void {
-  // Only run on desktop where we have filesystem access
-  if (Platform.isMobile) return;
-
   // Rate limit: once per 24h
   const lastCheck = localStorage.getItem(LAST_UPDATE_CHECK_KEY);
   if (lastCheck) {
@@ -115,7 +112,7 @@ async function doUpdateCheck(
   for (const [assetName, localName] of Object.entries(ASSET_FILE_MAP)) {
     const asset = assets.find((a) => a.name === assetName);
     if (!asset) {
-      // ws-server.js is optional on mobile (though we already checked Platform.isMobile above)
+      // ws-server.js is optional on mobile
       if (assetName === "obsidian-plugin-ws-server.js") continue;
       log.warn(`Missing release asset: ${assetName}`);
       return;
