@@ -1,2 +1,4 @@
 plugin/node_modules/
 node_modules/
+main.js
+ws-server.js
