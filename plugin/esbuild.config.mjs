@@ -3,10 +3,11 @@ import esbuildSvelte from "esbuild-svelte";
 import sveltePreprocess from "svelte-preprocess";
 import process from "process";
 import builtins from "builtin-modules";
-import { readFileSync } from "fs";
+import { copyFileSync, mkdirSync, readFileSync } from "fs";
 import { dirname, resolve } from "path";
 
 const prod = process.argv[2] === "production";
+const outdir = "dist/obsidian-p2p-sync";
 
 // Build the desktop-only WebSocket server module separately (Node.js platform)
 await esbuild.build({
@@ -15,7 +16,7 @@ await esbuild.build({
   platform: "node",
   format: "cjs",
   external: [...builtins],
-  outfile: "ws-server.js",
+  outfile: `${outdir}/ws-server.js`,
   minify: prod,
   sourcemap: prod ? false : "inline",
 });
@@ -75,7 +76,7 @@ const context = await esbuild.context({
   logLevel: "info",
   sourcemap: prod ? false : "inline",
   treeShaking: true,
-  outfile: "main.js",
+  outfile: `${outdir}/main.js`,
   minify: prod,
   plugins: [
     esbuildSvelte({
@@ -88,6 +89,8 @@ const context = await esbuild.context({
 
 if (prod) {
   await context.rebuild();
+  mkdirSync(outdir, { recursive: true });
+  copyFileSync("manifest.json", `${outdir}/manifest.json`);
   process.exit(0);
 } else {
   await context.watch();

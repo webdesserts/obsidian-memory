@@ -40,9 +40,9 @@ jobs:
       - name: Prepare release assets
         working-directory: plugin
         run: |
-          cp main.js ../obsidian-plugin-main.js
-          cp manifest.json ../obsidian-plugin-manifest.json
-          cp ws-server.js ../obsidian-plugin-ws-server.js
+          cp dist/obsidian-p2p-sync/main.js ../obsidian-plugin-main.js
+          cp dist/obsidian-p2p-sync/manifest.json ../obsidian-plugin-manifest.json
+          cp dist/obsidian-p2p-sync/ws-server.js ../obsidian-plugin-ws-server.js
 
       - name: Generate checksums
         run: |
