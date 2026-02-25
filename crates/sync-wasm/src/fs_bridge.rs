@@ -208,4 +208,11 @@ impl FileSystem for JsFileSystemBridge {
 
         Ok(())
     }
+
+    async fn atomic_write(&self, path: &str, content: &[u8]) -> Result<()> {
+        // Obsidian's adapter.rename() doesn't overwrite like POSIX rename(),
+        // so the default tmp+rename pattern fails. Direct write is safe here
+        // since the plugin runs in single-threaded JS.
+        self.write(path, content).await
+    }
 }
