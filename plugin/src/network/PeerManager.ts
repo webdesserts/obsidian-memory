@@ -12,16 +12,16 @@
  * - Cached peer IDs for message routing (avoids WASM call per message)
  */
 
-import { EventEmitter } from "events";
-import { Platform } from "obsidian";
+import { Events, Platform } from "obsidian";
 import { SyncWebSocketClient } from "./WebSocketClient";
 import { log } from "../logger";
 import type { ConnectedPeer, DisconnectReason, GossipUpdate, ProcessedGossip, SwimPeerInfo, SwimMember } from "../wasm";
 
 // Type for dynamically loaded WebSocket server
-interface SyncWebSocketServer extends EventEmitter {
+interface SyncWebSocketServer {
   start(options: { port: number; maxRetries?: number }): Promise<number>;
   stop(): Promise<void>;
+  on(event: string, callback: (...args: any[]) => void): void;
   send(peerId: string, data: Uint8Array): void;
   broadcast(data: Uint8Array): void;
   disconnect(peerId: string): void;
@@ -88,7 +88,7 @@ interface MembershipLike {
   onPeerConnected(peerId: string, address?: string): string;
 }
 
-export class PeerManager extends EventEmitter {
+export class PeerManager extends Events {
   private server: SyncWebSocketServer | null = null;
   private connections: Map<string, Connection> = new Map();
   private serverPort: number = DEFAULT_PORT;
@@ -196,7 +196,7 @@ export class PeerManager extends EventEmitter {
       });
 
       server.on("error", (err) => {
-        this.emit("error", err);
+        this.trigger("error", err);
       });
 
       // Start server, retrying on port conflicts
@@ -407,7 +407,7 @@ export class PeerManager extends EventEmitter {
    */
   updatePeerActivity(peerId: string): void {
     // Activity is now tracked in Rust via touch() if needed
-    this.emit("peer-activity", peerId);
+    this.trigger("peer-activity", peerId);
   }
 
   /**
@@ -665,7 +665,7 @@ export class PeerManager extends EventEmitter {
       this.vault.peerDisconnected(peerId, reason);
     }
 
-    this.emit("peer-disconnected", peerId);
+    this.trigger("peer-disconnected", peerId);
   }
 
   /**
@@ -691,12 +691,12 @@ export class PeerManager extends EventEmitter {
         this.sendHandshake(connectionId, "client");
       } catch (err) {
         log.error(`Failed to send handshake to ${connectionId}:`, err);
-        this.emit("error", err);
+        this.trigger("error", err);
       }
     });
 
     client.on("message", (data) => {
-      this.handleMessage(connectionId, data);
+      this.handleMessage(connectionId, data as Uint8Array);
     });
 
     client.on("close", () => {
@@ -704,7 +704,7 @@ export class PeerManager extends EventEmitter {
     });
 
     client.on("error", (err) => {
-      this.emit("error", err);
+      this.trigger("error", err);
     });
   }
 
@@ -803,7 +803,7 @@ export class PeerManager extends EventEmitter {
 
         // Emit peer-connected event (now fired after handshake, not on socket open)
         if (peer) {
-          this.emit("peer-connected", peer);
+          this.trigger("peer-connected", peer);
         }
         return;
       }
@@ -834,7 +834,7 @@ export class PeerManager extends EventEmitter {
 
         // Forward the sync data to listeners
         const syncData = new Uint8Array(msg.data);
-        this.emit("message", fromPeerId, syncData);
+        this.trigger("message", fromPeerId, syncData);
         return;
       }
     } catch {
@@ -846,6 +846,6 @@ export class PeerManager extends EventEmitter {
     const resolvedPeerId = conn?.peerId ?? connectionId;
 
     // Forward to listeners (sync engine)
-    this.emit("message", resolvedPeerId, data);
+    this.trigger("message", resolvedPeerId, data);
   }
 }

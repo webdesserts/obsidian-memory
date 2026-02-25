@@ -211,7 +211,7 @@ describe("PeerManager", () => {
 
         it("should emit peer-connected event after handshake (not on socket open)", async () => {
           const events: { id: string; direction: string }[] = [];
-          manager.on("peer-connected", (info) => events.push(info));
+          manager.on("peer-connected", (info) => events.push(info as { id: string; direction: string }));
 
           const connectPromise = manager.connectToUrl("wss://example.com/sync");
           const socket = socketFactory.getLatest()!;
@@ -255,7 +255,7 @@ describe("PeerManager", () => {
           // Clear the handshake message and send a sync message
           socket.clearSentMessages();
           const messages: { peerId: string; data: Uint8Array }[] = [];
-          manager.on("message", (peerId, data) => messages.push({ peerId, data }));
+          manager.on("message", (peerId, data) => messages.push({ peerId: peerId as string, data: data as Uint8Array }));
 
           // Simulate a binary sync message
           const syncData = new Uint8Array([1, 2, 3, 4]);
@@ -335,7 +335,7 @@ describe("PeerManager", () => {
     describe("Given handshake sending fails", () => {
       it("should emit error event without crashing", async () => {
         const errors: Error[] = [];
-        manager.on("error", (err) => errors.push(err));
+        manager.on("error", (err) => errors.push(err as Error));
 
         const connectPromise = manager.connectToUrl("wss://example.com/sync");
         const socket = socketFactory.getLatest()!;

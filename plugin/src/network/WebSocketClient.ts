@@ -4,7 +4,7 @@
  * Uses the browser WebSocket API (available in Electron renderer).
  */
 
-import { EventEmitter } from "events";
+import { Events } from "obsidian";
 import { log } from "../logger";
 
 export interface ClientOptions {
@@ -20,7 +20,7 @@ export interface ClientOptions {
  * - 'close': Connection closed
  * - 'error': Connection error (Error)
  */
-export class SyncWebSocketClient extends EventEmitter {
+export class SyncWebSocketClient extends Events {
   private socket: WebSocket | null = null;
   private options: ClientOptions | null = null;
   private reconnecting = false;
@@ -45,14 +45,14 @@ export class SyncWebSocketClient extends EventEmitter {
         this.socket.onopen = () => {
           log.debug(`Connected to ${options.url}`);
           this.reconnecting = false;
-          this.emit("open");
+          this.trigger("open");
           resolve();
         };
 
         this.socket.onerror = (event) => {
           log.error("WebSocket error:", event);
           const err = new Error("WebSocket connection failed");
-          this.emit("error", err);
+          this.trigger("error", err);
           if (!this.reconnecting) {
             reject(err);
           }
@@ -71,13 +71,13 @@ export class SyncWebSocketClient extends EventEmitter {
             log.warn("Unexpected message type:", typeof event.data);
             return;
           }
-          this.emit("message", bytes);
+          this.trigger("message", bytes);
         };
 
         this.socket.onclose = () => {
           log.debug(`Disconnected from ${options.url}`);
           this.socket = null;
-          this.emit("close");
+          this.trigger("close");
 
           // Attempt reconnect if enabled
           if (this.shouldReconnect && !this.reconnecting) {
