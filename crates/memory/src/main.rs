@@ -953,7 +953,9 @@ async fn run_http_server(
         Default::default(),
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .route("/health", axum::routing::get(|| async { "OK" }))
+        .nest_service("/mcp", service);
 
     let addr: std::net::SocketAddr = listen
         .parse()
@@ -980,5 +982,30 @@ async fn run_http_server(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let router = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "OK" }));
+
+        let request = axum::http::Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"OK");
+    }
 }
 

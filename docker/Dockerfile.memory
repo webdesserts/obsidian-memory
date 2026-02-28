@@ -2,9 +2,9 @@
 
 FROM debian:bookworm-slim
 
-# Runtime deps + xz-utils for installer, procps for pgrep health check
+# Runtime deps + xz-utils for installer, curl for health check
 RUN apt-get update && apt-get install -y \
-    ca-certificates curl xz-utils procps \
+    ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install binary via cargo-dist installer with retry logic
@@ -26,9 +26,9 @@ WORKDIR /notes
 
 EXPOSE 3000 8080
 
-# Health check - embeddings preload is async now so start-period can be short
+# Health check — verifies the HTTP server is accepting requests
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD pgrep -x memory || exit 1
+    CMD curl -sf http://localhost:3000/health || exit 1
 
 # Default: run both MCP HTTP + sync daemon together
 ENTRYPOINT ["memory"]
