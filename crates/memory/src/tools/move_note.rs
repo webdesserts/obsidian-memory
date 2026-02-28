@@ -5,13 +5,15 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 use tokio::sync::RwLock;
 
+use super::common::resolve_note_uri;
 use crate::graph::GraphIndex;
 use crate::storage::{Storage, StorageError};
 
 /// Execute the MoveNote tool.
 ///
 /// Moves or renames a note and updates all notes that link to it.
-/// Always updates backlinks automatically.
+/// The `from` parameter uses graph-aware resolution so plain names find notes
+/// in subdirectories. The `to` parameter is a literal destination path.
 pub async fn execute<S: Storage>(
     vault_path: &Path,
     storage: &S,
@@ -19,13 +21,20 @@ pub async fn execute<S: Storage>(
     from: &str,
     to: &str,
 ) -> Result<CallToolResult, ErrorData> {
-    let from_normalized = normalize_note_reference(from);
+    // Resolve source through graph (handles plain names in subdirectories)
+    let (from_uri, from_exists) = {
+        let graph_read = graph.read().await;
+        resolve_note_uri(storage, &graph_read, from)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Failed to resolve source: {}", e), None))?
+    };
+
+    // Destination is a literal path, not a graph lookup
     let to_normalized = normalize_note_reference(to);
-    let from_uri = &from_normalized.path;
     let to_uri = &to_normalized.path;
 
     let from_file = vault_path
-        .join(ensure_markdown_extension(from_uri))
+        .join(ensure_markdown_extension(&from_uri))
         .to_string_lossy()
         .to_string();
     let to_file = vault_path
@@ -33,10 +42,7 @@ pub async fn execute<S: Storage>(
         .to_string_lossy()
         .to_string();
 
-    // Check source exists
-    if !storage.exists(from_uri).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to check source: {}", e), None)
-    })? {
+    if !from_exists {
         return Err(ErrorData::invalid_params(
             format!(
                 "Source note not found: {}. Cannot move a note that doesn't exist.\n\
@@ -61,19 +67,22 @@ pub async fn execute<S: Storage>(
         ));
     }
 
+    // Extract display names from URIs (last path component)
+    let from_name = from_uri.rsplit('/').next().unwrap_or(&from_uri).to_string();
+
     // Find and update backlinks before the move
     let mut backlinks_updated = Vec::new();
     {
         let graph_read = graph.read().await;
 
         // Get notes that link to the source note by name
-        if let Some(linking_paths) = graph_read.get_backlinks(&from_normalized.name) {
-            let old_link = format!("[[{}]]", from_normalized.name);
+        if let Some(linking_paths) = graph_read.get_backlinks(&from_name) {
+            let old_link = format!("[[{}]]", from_name);
             let new_link = format!("[[{}]]", to_normalized.name);
 
             for path in linking_paths.iter() {
                 // Skip the source note itself
-                if path == &ensure_markdown_extension(from_uri) {
+                if path == &ensure_markdown_extension(&from_uri) {
                     continue;
                 }
 
@@ -97,7 +106,7 @@ pub async fn execute<S: Storage>(
     }
 
     // Perform the rename
-    storage.rename(from_uri, to_uri).await.map_err(|e| match e {
+    storage.rename(&from_uri, to_uri).await.map_err(|e| match e {
         StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
             format!(
                 "Parent directory doesn't exist for '{}': {}. \
@@ -130,7 +139,7 @@ pub async fn execute<S: Storage>(
          **From:** memory:{}\n\
          **To:** memory:{}\n\
          **New file:** {}{}",
-        from_normalized.name, to_normalized.name, from_uri, to_uri, to_file, backlinks_summary
+        from_name, to_normalized.name, from_uri, to_uri, to_file, backlinks_summary
     );
 
     Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -291,5 +300,42 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("Parent directory doesn't exist"));
+    }
+
+    #[tokio::test]
+    async fn test_move_plain_name_resolves_subdirectory() {
+        let (temp_dir, storage, graph) = create_test_env().await;
+
+        // Create note in subdirectory and register in graph
+        fs::create_dir(temp_dir.path().join("knowledge"))
+            .await
+            .unwrap();
+        fs::write(temp_dir.path().join("knowledge/My Note.md"), "Original content")
+            .await
+            .unwrap();
+        {
+            let mut g = graph.write().await;
+            g.update_note(
+                "My Note",
+                PathBuf::from("knowledge/My Note.md"),
+                HashSet::new(),
+            );
+        }
+
+        // Move using just the plain name — should resolve via graph
+        let result = execute(temp_dir.path(), &storage, &graph, "My Note", "Renamed Note")
+            .await
+            .expect("should succeed");
+
+        let text = result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+
+        assert!(text.contains("Moved note"));
+        assert!(!temp_dir.path().join("knowledge/My Note.md").exists());
+        assert!(temp_dir.path().join("Renamed Note.md").exists());
     }
 }

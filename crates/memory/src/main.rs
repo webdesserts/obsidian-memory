@@ -485,6 +485,7 @@ impl MemoryServer {
         tools::delete_note::execute(
             &self.config().vault_path,
             self.storage(),
+            self.graph(),
             &params.0.note,
         )
         .await
