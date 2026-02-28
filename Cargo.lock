@@ -2617,7 +2617,6 @@ dependencies = [
  "sha2",
  "sync-daemon",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

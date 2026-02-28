@@ -16,14 +16,14 @@ Feature: CLI Commands
     CLI which manages a shared server behind the scenes.
 
   # --- Client Mode ---
-  # The agent's MCP config invokes `memory mcp io` to start an on-demand
-  # stdio session. No sync daemon needed — the Obsidian plugin handles it.
+  # The agent's MCP config invokes `memory mcp io --vault ~/notes` to start
+  # an on-demand stdio session. No sync daemon needed — the Obsidian plugin
+  # handles it.
 
   Scenario: Agent launches MCP server via stdio
-    Given an agent MCP config that runs `memory mcp --vault ~/notes`
+    Given an agent MCP config that runs `memory mcp io --vault ~/notes`
     When the agent starts a session
-    Then stdin should not be a terminal (piped by the agent)
-    And the MCP server should start with stdio transport
+    Then the MCP server should start with stdio transport
     And it should accept MCP protocol messages on stdin/stdout
     And it should exit when the agent disconnects
 
@@ -32,9 +32,10 @@ Feature: CLI Commands
     Then it should display help for MCP subcommands (io, up)
     And it should not start any server
 
-  Scenario: Explicit stdio override
-    When I run `memory mcp io`
-    Then the MCP server should start with stdio transport regardless of TTY
+  Scenario: Missing --vault shows error
+    When I run `memory mcp io` without --vault
+    Then it should display an error about the missing --vault flag
+    And it should not start any server
 
   # --- Daemon Mode ---
   # On a home server or VPS, the user starts all services with one command.
@@ -54,9 +55,9 @@ Feature: CLI Commands
     And the MCP server should not start
 
   Scenario: Start only the MCP HTTP server
-    When I run `memory mcp up`
+    When I run `memory mcp up --vault ~/notes`
     Then the MCP server should start with HTTP transport
-    And it should listen on port 3000 by default
+    And it should listen on 127.0.0.1:3000 by default
     And the sync daemon should not start
 
   Scenario: Graceful shutdown on Ctrl+C
@@ -66,8 +67,8 @@ Feature: CLI Commands
 
   # --- Configuration ---
 
-  Scenario: Custom MCP HTTP port and bind address
-    When I run `memory mcp up --port 8080 --bind 0.0.0.0`
+  Scenario: Custom MCP HTTP listen address
+    When I run `memory mcp up --vault ~/notes --listen 0.0.0.0:8080`
     Then the MCP server should listen on 0.0.0.0:8080
 
   Scenario: Sync daemon with bootstrap peers

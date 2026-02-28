@@ -32,4 +32,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Default: run both MCP HTTP + sync daemon together
 ENTRYPOINT ["memory"]
-CMD ["up", "--vault", "/notes", "--port", "3000", "--bind", "0.0.0.0"]
+CMD ["up", "--vault", "/notes", "--listen", "0.0.0.0:3000"]

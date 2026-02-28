@@ -41,7 +41,7 @@ services:
     memswap_limit: 1280m
     mem_reservation: 128m
     oom_score_adj: 300
-    command: ["mcp", "--vault", "/notes", "up", "--port", "3000", "--bind", "0.0.0.0"]
+    command: ["mcp", "up", "--vault", "/notes", "--listen", "0.0.0.0:3000"]
     logging:
       driver: json-file
       options:

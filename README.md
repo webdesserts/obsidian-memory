@@ -83,15 +83,15 @@ Important proxy considerations:
 ### CLI Commands
 
 ```
-memory mcp --vault ~/notes       # MCP stdio (when piped by agent) or help (when interactive)
-memory mcp --vault ~/notes io    # MCP stdio (explicit, always works)
-memory mcp --vault ~/notes up    # MCP HTTP server
-memory sync up --vault ~/notes   # Sync daemon only
-memory up --vault ~/notes        # Both sync + MCP HTTP together
-memory obsidian install          # Stub: not yet implemented
+memory mcp io --vault ~/notes                  # MCP stdio (launched by agent)
+memory mcp up --vault ~/notes                  # MCP HTTP server (localhost:3000)
+memory mcp up --vault ~/notes --listen 0.0.0.0:3000  # MCP HTTP on all interfaces
+memory sync up --vault ~/notes                 # Sync daemon only
+memory up --vault ~/notes                      # Both sync + MCP HTTP together
+memory obsidian install                        # Install Obsidian sync plugin
 ```
 
-The `--vault` flag specifies the path to your Obsidian vault. `OBSIDIAN_VAULT_PATH` environment variable is also supported as a fallback.
+The `--vault` flag specifies the path to your Obsidian vault and is required on each subcommand.
 
 ### Running the Server
 
@@ -101,7 +101,7 @@ The server communicates over stdio and is designed to be launched by an MCP clie
 
 ```bash
 claude mcp add obsidian-memory --scope user \
-  -- memory mcp --vault ~/notes io
+  -- memory mcp io --vault ~/notes
 ```
 
 ### OpenCode Configuration
@@ -113,7 +113,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "obsidian-memory": {
       "type": "local",
-      "command": ["memory", "mcp", "--vault", "~/notes", "io"],
+      "command": ["memory", "mcp", "io", "--vault", "~/notes"],
       "enabled": true
     }
   }
@@ -186,7 +186,7 @@ Requires Rust 1.85+ (edition 2024).
 cargo test
 
 # Run locally (downloads model from HuggingFace on first run)
-cargo run -p memory -- mcp --vault ~/notes io
+cargo run -p memory -- mcp io --vault ~/notes
 
 # Build release
 cargo build --release

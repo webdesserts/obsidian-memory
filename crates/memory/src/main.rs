@@ -8,7 +8,6 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -536,14 +535,10 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// MCP server (stdio when piped, help when interactive)
+    /// MCP server
     Mcp {
-        /// Path to the vault directory
-        #[arg(long)]
-        vault: Option<PathBuf>,
-
         #[command(subcommand)]
-        action: Option<McpAction>,
+        action: McpAction,
     },
 
     /// Sync daemon
@@ -559,17 +554,13 @@ enum Command {
         #[arg(long)]
         vault: PathBuf,
 
-        /// Port to listen on for MCP HTTP
-        #[arg(long, default_value_t = 3000)]
-        port: u16,
-
-        /// Address to bind MCP HTTP to
-        #[arg(long, default_value = "0.0.0.0")]
-        bind: String,
+        /// Address for MCP HTTP to listen on
+        #[arg(long, default_value = "0.0.0.0:3000")]
+        listen: String,
 
         /// Address for sync daemon to listen on
         #[arg(long, default_value = "0.0.0.0:8080")]
-        listen: String,
+        sync_listen: String,
 
         /// Address to advertise to other sync peers
         #[arg(long)]
@@ -593,18 +584,22 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum McpAction {
-    /// MCP stdio transport (explicit — `memory mcp` also starts stdio when piped)
-    Io,
+    /// Start MCP stdio transport
+    Io {
+        /// Path to the vault directory
+        #[arg(long)]
+        vault: PathBuf,
+    },
 
     /// Start MCP HTTP server
     Up {
-        /// Port to listen on
-        #[arg(long, default_value_t = 3000)]
-        port: u16,
+        /// Path to the vault directory
+        #[arg(long)]
+        vault: PathBuf,
 
-        /// Address to bind to. Use 0.0.0.0 for all interfaces (unsafe without auth).
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        listen: String,
     },
 }
 
@@ -824,37 +819,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
 
-        Some(Command::Mcp { vault, action }) => match action {
-            // `memory mcp` → TTY detection
-            None => {
-                if std::io::stdin().is_terminal() {
-                    use clap::CommandFactory;
-                    // Print help for the mcp subcommand
-                    Cli::command()
-                        .find_subcommand_mut("mcp")
-                        .expect("mcp subcommand exists")
-                        .print_help()?;
-                    println!();
-                    Ok(())
-                } else {
-                    let vault = require_vault(vault)?;
-                    init_mcp_tracing();
-                    run_stdio_server(Config::new(&vault)).await
-                }
-            }
-
-            // `memory mcp io` → explicit stdio
-            Some(McpAction::Io) => {
-                let vault = require_vault(vault)?;
+        Some(Command::Mcp { action }) => match action {
+            McpAction::Io { vault } => {
+                let vault = vault.to_string_lossy().to_string();
                 init_mcp_tracing();
                 run_stdio_server(Config::new(&vault)).await
             }
 
-            // `memory mcp up` → HTTP server
-            Some(McpAction::Up { port, bind }) => {
-                let vault = require_vault(vault)?;
+            McpAction::Up { vault, listen } => {
+                let vault = vault.to_string_lossy().to_string();
                 init_mcp_tracing();
-                run_http_server(Config::new(&vault), &bind, port).await
+                run_http_server(Config::new(&vault), &listen).await
             }
         },
 
@@ -893,9 +868,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "sync")]
         Some(Command::Up {
             vault,
-            port,
-            bind,
             listen,
+            sync_listen,
             advertise,
             bootstrap,
             verbose,
@@ -907,7 +881,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Spawn sync daemon as background task
             let sync_config = sync_daemon::daemon::DaemonRunConfig {
                 vault,
-                listen,
+                listen: sync_listen,
                 advertise,
                 bootstrap,
                 client_only: false,
@@ -920,7 +894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             // Run MCP HTTP server on main task
-            let mcp_result = run_http_server(Config::new(&vault_str), &bind, port).await;
+            let mcp_result = run_http_server(Config::new(&vault_str), &listen).await;
 
             // On shutdown, abort the sync daemon
             sync_handle.abort();
@@ -930,19 +904,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Obsidian { action }) => match action {
             ObsidianAction::Install { vault, force } => run_obsidian_install(vault, force),
         },
-    }
-}
-
-/// Require --vault flag, returning the path as a string for Config::new().
-fn require_vault(vault: Option<PathBuf>) -> Result<String, Box<dyn std::error::Error>> {
-    match vault {
-        Some(v) => Ok(v.to_string_lossy().to_string()),
-        None => {
-            // Fall back to OBSIDIAN_VAULT_PATH for backwards compatibility
-            std::env::var("OBSIDIAN_VAULT_PATH").map_err(|_| {
-                "Vault path required. Use --vault <path> or set OBSIDIAN_VAULT_PATH.".into()
-            })
-        }
     }
 }
 
@@ -976,8 +937,7 @@ async fn run_stdio_server(config: Config) -> Result<(), Box<dyn std::error::Erro
 /// Run the server with HTTP transport.
 async fn run_http_server(
     config: Config,
-    bind: &str,
-    port: u16,
+    listen: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Vault path: {}", config.vault_path.display());
 
@@ -994,21 +954,20 @@ async fn run_http_server(
 
     let router = axum::Router::new().nest_service("/mcp", service);
 
-    let bind_addr: std::net::IpAddr = bind
+    let addr: std::net::SocketAddr = listen
         .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", bind, e))?;
-    let addr = std::net::SocketAddr::from((bind_addr, port));
+        .map_err(|e| format!("Invalid listen address '{}': {}", listen, e))?;
 
-    if bind_addr.is_unspecified() {
+    if addr.ip().is_unspecified() {
         tracing::info!(
             "Binding to all interfaces ({}). Ensure a reverse proxy handles authentication.",
-            bind
+            addr.ip()
         );
     }
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| format!("Failed to bind to {}:{} - {}", bind, port, e))?;
+        .map_err(|e| format!("Failed to bind to {} - {}", listen, e))?;
 
     tracing::info!(
         "Obsidian Memory MCP server started (HTTP) at http://{}/mcp",
