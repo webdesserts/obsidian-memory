@@ -4,6 +4,7 @@
   import type { PeerInfo } from "../network";
   import type { EventRef } from "obsidian";
   import { onMount, onDestroy } from "svelte";
+  import { inferProtocol } from "../network/url";
 
   export let plugin: P2PSyncPlugin;
 
@@ -185,13 +186,7 @@
     }
   }
 
-  // Check if input is a WebSocket URL
-  function isUrl(input: string): boolean {
-    const lower = input.toLowerCase().trim();
-    return lower.startsWith('ws://') || lower.startsWith('wss://');
-  }
-
-  // Connect to peer (smart-detect URL vs IP:port)
+  // Connect to peer — infers wss:// for bare addresses
   async function connect() {
     const input = connectInput.trim();
     if (!input) {
@@ -203,14 +198,8 @@
     errorMessage = null;
 
     try {
-      if (isUrl(input)) {
-        await plugin.connectToUrl(input);
-      } else {
-        // Parse as ip:port (default port 8765)
-        const [address, portStr] = input.split(':');
-        const port = parseInt(portStr, 10) || 8765;
-        await plugin.connectToPeer(address, port);
-      }
+      const url = inferProtocol(input);
+      await plugin.connectToUrl(url);
       showConnectForm = false;
       connectInput = "";
       await checkStatus();
@@ -418,7 +407,7 @@
           <div class="p2p-sync-connect-form">
             <input
               type="text"
-              placeholder="wss://example.com/sync or 192.168.1.100:8765"
+              placeholder="umbra.computer/sync or 192.168.1.100:8765"
               bind:value={connectInput}
               class="p2p-sync-input"
             />
