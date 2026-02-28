@@ -62,9 +62,6 @@ pub struct UpdateFrontmatterParams {
 pub struct SearchParams {
     /// The search query - what information are you looking for? Supports wiki-links: [[Note]] searches using that note's content. Multiple notes: [[TypeScript]] [[Projects]] finds notes similar to BOTH. Mixed: 'type safety in [[TypeScript]]' combines note content with text. Wiki-links enable graph boosting (connected notes rank higher).
     pub query: String,
-    /// Whether to include private notes in search. Requires explicit user consent.
-    #[serde(default)]
-    pub include_private: bool,
     /// Show detailed score breakdown (semantic, graph proximity, boost calculation). Useful for understanding how results are ranked.
     #[serde(default)]
     pub debug: bool,
@@ -88,21 +85,6 @@ pub struct RememberParams {
     /// or other clients without a filesystem), project discovery is skipped
     /// but Log, Working Memory, and the weekly note are still loaded.
     pub cwd: Option<String>,
-}
-
-/// Parameters for the Reflect tool
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReflectParams {
-    /// Include private notes in reflection (default: false)
-    #[serde(default, rename = "includePrivate")]
-    pub include_private: bool,
-}
-
-/// Parameters for the LoadPrivateMemory tool
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct LoadPrivateMemoryParams {
-    /// Reason for loading private memory
-    pub reason: String,
 }
 
 /// Parameters for the ReadNote tool
@@ -382,7 +364,6 @@ impl MemoryServer {
             &graph,
             self.embeddings(),
             &params.0.query,
-            params.0.include_private,
             params.0.debug,
         )
         .await
@@ -399,16 +380,11 @@ impl MemoryServer {
     }
 
     #[tool(description = "Review active context (Log.md, Working Memory.md, current weekly journal, project notes) and consolidate content into permanent storage. Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. Returns detailed consolidation instructions.")]
-    async fn reflect(&self, params: Parameters<ReflectParams>) -> Result<CallToolResult, ErrorData> {
-        tools::reflect::execute(params.0.include_private)
+    async fn reflect(&self) -> Result<CallToolResult, ErrorData> {
+        tools::reflect::execute()
     }
 
-    #[tool(description = "Load private memory indexes (requires explicit user consent)")]
-    async fn load_private_memory(&self, params: Parameters<LoadPrivateMemoryParams>) -> Result<CallToolResult, ErrorData> {
-        tools::load_private_memory::execute(&self.config().vault_path, &params.0.reason).await
-    }
-
-    #[tool(description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote, EditNote, or ReplaceInNote unchanged.")]
+#[tool(description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote, EditNote, or ReplaceInNote unchanged.")]
     async fn read_note(&self, params: Parameters<ReadNoteParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::read_note::execute(

@@ -5,7 +5,6 @@ pub mod replace_in_note;
 pub mod get_current_datetime;
 pub mod get_note_info;
 pub mod get_weekly_note_info;
-pub mod load_private_memory;
 pub mod log;
 pub mod log_format;
 pub mod move_note;

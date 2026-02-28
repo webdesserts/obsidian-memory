@@ -34,7 +34,7 @@ async fn resolve_note_to_path(
     }
 
     // Generate search paths and try each one
-    let search_paths = generate_search_paths(&note_ref.name, false);
+    let search_paths = generate_search_paths(&note_ref.name);
     for search_path in &search_paths {
         let file_path = vault_path.join(ensure_markdown_extension(search_path));
         if file_path.exists() {

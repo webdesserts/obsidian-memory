@@ -41,12 +41,10 @@ pub async fn execute(
     graph: &GraphIndex,
     embeddings: &EmbeddingManager,
     query: &str,
-    include_private: bool,
     debug: bool,
 ) -> Result<CallToolResult, ErrorData> {
     tracing::info!(
         query_len = query.len(),
-        include_private = include_private,
         "Starting search"
     );
 
@@ -59,7 +57,7 @@ pub async fn execute(
         .map_err(|e| ErrorData::internal_error(format!("Failed to build query embedding: {}", e), None))?;
 
     // Get all note embeddings
-    let notes = get_all_notes(vault_path, graph, include_private).await;
+    let notes = get_all_notes(vault_path, graph).await;
     if notes.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(
             "No notes found in vault.",
@@ -217,19 +215,10 @@ async fn build_query_embedding(
 }
 
 /// Get all markdown notes in the vault.
-async fn get_all_notes(
-    vault_path: &Path,
-    graph: &GraphIndex,
-    include_private: bool,
-) -> Vec<(String, String)> {
+async fn get_all_notes(vault_path: &Path, graph: &GraphIndex) -> Vec<(String, String)> {
     let mut notes = Vec::new();
 
     for rel_path in graph.all_paths() {
-        // Skip private notes unless requested
-        if !include_private && rel_path.starts_with("private/") {
-            continue;
-        }
-
         let full_path = vault_path.join(rel_path);
         if let Ok(content) = fs::read_to_string(&full_path).await {
             notes.push((rel_path.clone(), content));

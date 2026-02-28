@@ -11,7 +11,6 @@ Obsidian Memory is an [MCP](https://modelcontextprotocol.io/) server that lets C
 - **Graph navigation** - Wiki links, backlinks, neighborhood discovery
 - **Semantic search** - Fast, offline embeddings (all-MiniLM-L6-v2) with Personalized PageRank graph boosting
 - **Memory system** - Working Memory, Log, weekly journals, project notes
-- **Private memory** - Consent-based access to sensitive notes
 - **Project discovery** - Auto-loads project notes based on git remotes
 - **Note management** - Create, read, update, move, and delete notes
 
@@ -130,7 +129,6 @@ The memory system organizes notes into categories:
 - **Periodic notes** (`journal/`) - Weekly summaries that persist longer
 - **Project notes** (`projects/`) - Context for specific codebases
 - **Permanent notes** (`knowledge/`) - Stable reference material
-- **Private notes** (`private/`) - Sensitive content, loaded only with explicit consent
 
 ### Memory Files
 
@@ -141,7 +139,6 @@ The memory system organizes notes into categories:
 | `journal/YYYY-wNN.md` | Weekly summaries and notes | Current week only |
 | `projects/*.md` | Project-specific context | Matched by git remote URL or directory name |
 | `knowledge/*.md` | Stable long-term notes | On demand |
-| `private/*.md` | Sensitive notes | With consent |
 
 ### Search
 
@@ -162,7 +159,7 @@ The `Search` tool combines semantic embeddings with graph structure:
 | Tool | Description |
 |------|-------------|
 | `Remember` | Load session context (Working Memory, Log, weekly journal, project notes) at session start |
-| `Search` | Find notes by semantic similarity. Supports `query`, `include_private`, and `debug` parameters |
+| `Search` | Find notes by semantic similarity. Supports `query` and `debug` parameters |
 | `ReadNote` | Read full content of a note |
 | `WriteNote` | Create or overwrite a note |
 | `EditNote` | Make text replacements in a note (find/replace) |
@@ -175,7 +172,6 @@ The `Search` tool combines semantic embeddings with graph structure:
 | `GetWeeklyNote` | Get the path for the current week's journal note |
 | `GetCurrentDatetime` | Get current datetime in ISO format |
 | `Reflect` | Get instructions for memory consolidation |
-| `LoadPrivateMemory` | Load notes from `private/` (requires explicit consent) |
 
 ## Development
 

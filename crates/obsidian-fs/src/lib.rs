@@ -22,13 +22,6 @@ pub const COMMON_SEARCH_PATHS: &[&str] = &[
     "projects",
 ];
 
-/// Options for resolving note paths
-#[derive(Debug, Clone, Default)]
-pub struct ResolutionOptions {
-    /// Whether to include private folder in search
-    pub include_private: bool,
-}
-
 /// Priority categories for path resolution
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PathPriority {
@@ -37,7 +30,6 @@ enum PathPriority {
     Journal = 2,
     Projects = 3,
     Other = 4,
-    Private = 5,
 }
 
 fn get_priority(path: &str) -> PathPriority {
@@ -49,8 +41,6 @@ fn get_priority(path: &str) -> PathPriority {
         PathPriority::Journal
     } else if path.starts_with("projects/") {
         PathPriority::Projects
-    } else if path.starts_with("private/") {
-        PathPriority::Private
     } else {
         PathPriority::Other
     }
@@ -58,10 +48,10 @@ fn get_priority(path: &str) -> PathPriority {
 
 /// Resolve a note path from available options using priority order.
 ///
-/// Priority: root → knowledge/ → journal/ → projects/ → others → private/
+/// Priority: root → knowledge/ → journal/ → projects/ → others
 ///
 /// Returns the best matching path, or None if no paths provided.
-pub fn resolve_note_path(available_paths: &[&str], options: &ResolutionOptions) -> Option<String> {
+pub fn resolve_note_path(available_paths: &[&str]) -> Option<String> {
     if available_paths.is_empty() {
         return None;
     }
@@ -69,24 +59,7 @@ pub fn resolve_note_path(available_paths: &[&str], options: &ResolutionOptions) 
         return Some(available_paths[0].to_string());
     }
 
-    // Filter out private paths if not included (unless it's the only option)
-    let paths: Vec<&str> = if !options.include_private {
-        let non_private: Vec<&str> = available_paths
-            .iter()
-            .filter(|p| !p.starts_with("private/"))
-            .copied()
-            .collect();
-        if non_private.is_empty() {
-            available_paths.to_vec()
-        } else {
-            non_private
-        }
-    } else {
-        available_paths.to_vec()
-    };
-
-    // Sort by priority and return the first
-    let mut sorted = paths;
+    let mut sorted = available_paths.to_vec();
     sorted.sort_by_key(|p| get_priority(p));
     sorted.first().map(|s| s.to_string())
 }
@@ -94,7 +67,7 @@ pub fn resolve_note_path(available_paths: &[&str], options: &ResolutionOptions) 
 /// Generate search paths for a note name.
 ///
 /// Returns an array of paths to try (without .md extension).
-pub fn generate_search_paths(note_name: &str, include_private: bool) -> Vec<String> {
+pub fn generate_search_paths(note_name: &str) -> Vec<String> {
     let mut paths = Vec::new();
 
     for folder in COMMON_SEARCH_PATHS {
@@ -103,10 +76,6 @@ pub fn generate_search_paths(note_name: &str, include_private: bool) -> Vec<Stri
         } else {
             paths.push(format!("{}/{}", folder, note_name));
         }
-    }
-
-    if include_private {
-        paths.push(format!("private/{}", note_name));
     }
 
     paths
@@ -211,100 +180,45 @@ mod tests {
     // resolveNotePath tests
     #[test]
     fn resolve_returns_none_for_empty_paths() {
-        let result = resolve_note_path(&[], &ResolutionOptions::default());
+        let result = resolve_note_path(&[]);
         assert!(result.is_none());
     }
 
     #[test]
     fn resolve_returns_only_path_when_one_option() {
-        let result = resolve_note_path(&["knowledge/Test"], &ResolutionOptions::default());
+        let result = resolve_note_path(&["knowledge/Test"]);
         assert_eq!(result, Some("knowledge/Test".to_string()));
     }
 
     #[test]
     fn resolve_prioritizes_root_level_notes() {
-        let paths = vec!["private/Index", "Index", "knowledge/Index"];
-        let result = resolve_note_path(&paths, &ResolutionOptions::default());
+        let paths = vec!["other/Index", "Index", "knowledge/Index"];
+        let result = resolve_note_path(&paths);
         assert_eq!(result, Some("Index".to_string()));
     }
 
     #[test]
     fn resolve_prioritizes_knowledge_over_journal() {
-        let paths = vec!["journal/Note", "knowledge/Note", "private/Note"];
-        let result = resolve_note_path(&paths, &ResolutionOptions::default());
+        let paths = vec!["journal/Note", "knowledge/Note"];
+        let result = resolve_note_path(&paths);
         assert_eq!(result, Some("knowledge/Note".to_string()));
     }
 
     #[test]
     fn resolve_prioritizes_journal_over_other_folders() {
-        let paths = vec!["private/Note", "other/Note", "journal/Note"];
-        let result = resolve_note_path(&paths, &ResolutionOptions::default());
+        let paths = vec!["other/Note", "journal/Note"];
+        let result = resolve_note_path(&paths);
         assert_eq!(result, Some("journal/Note".to_string()));
-    }
-
-    #[test]
-    fn resolve_deprioritizes_private_by_default() {
-        let paths = vec!["private/Note", "other/Note"];
-        let result = resolve_note_path(&paths, &ResolutionOptions::default());
-        assert_eq!(result, Some("other/Note".to_string()));
-    }
-
-    #[test]
-    fn resolve_includes_private_when_requested() {
-        let paths = vec!["private/Note"];
-        let result = resolve_note_path(
-            &paths,
-            &ResolutionOptions {
-                include_private: true,
-            },
-        );
-        assert_eq!(result, Some("private/Note".to_string()));
-    }
-
-    #[test]
-    fn resolve_filters_out_private_when_alternatives_exist() {
-        let paths = vec!["private/Note", "Note"];
-        let result = resolve_note_path(
-            &paths,
-            &ResolutionOptions {
-                include_private: false,
-            },
-        );
-        assert_eq!(result, Some("Note".to_string()));
-    }
-
-    #[test]
-    fn resolve_returns_private_as_fallback_if_only_option() {
-        let paths = vec!["private/Note"];
-        let result = resolve_note_path(
-            &paths,
-            &ResolutionOptions {
-                include_private: false,
-            },
-        );
-        assert_eq!(result, Some("private/Note".to_string()));
     }
 
     // generateSearchPaths tests
     #[test]
     fn generate_common_search_paths() {
-        let paths = generate_search_paths("Test", false);
+        let paths = generate_search_paths("Test");
         assert_eq!(
             paths,
             vec!["Test", "knowledge/Test", "journal/Test", "projects/Test"]
         );
-    }
-
-    #[test]
-    fn generate_includes_private_when_requested() {
-        let paths = generate_search_paths("Test", true);
-        assert!(paths.contains(&"private/Test".to_string()));
-    }
-
-    #[test]
-    fn generate_excludes_private_by_default() {
-        let paths = generate_search_paths("Test", false);
-        assert!(!paths.contains(&"private/Test".to_string()));
     }
 
     // normalizeNoteReference tests

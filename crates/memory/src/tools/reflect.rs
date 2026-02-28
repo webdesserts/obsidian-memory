@@ -8,27 +8,14 @@
 use rmcp::model::{CallToolResult, Content, ErrorData};
 
 /// Execute the Reflect tool - returns consolidation instructions.
-pub fn execute(include_private: bool) -> Result<CallToolResult, ErrorData> {
-    let prompt = build_reflect_prompt(include_private);
+pub fn execute() -> Result<CallToolResult, ErrorData> {
+    let prompt = build_reflect_prompt();
     Ok(CallToolResult::success(vec![Content::text(prompt)]))
 }
 
 /// Build the comprehensive consolidation prompt.
-fn build_reflect_prompt(include_private: bool) -> String {
-    let private_section = if include_private {
-        r#"
-## Private Memory
-
-You have access to private memory for this session. Include `private/Working Memory.md` 
-in your review alongside the regular Working Memory. Private content should consolidate 
-to `private/*.md` knowledge notes, not public ones.
-"#
-    } else {
-        ""
-    };
-
-    format!(
-        r#"# Memory Consolidation
+fn build_reflect_prompt() -> String {
+    r#"# Memory Consolidation
 
 You are performing a focused consolidation session to optimize token usage while preserving important memories. Review active context and consolidate content into permanent storage.
 
@@ -53,14 +40,14 @@ You are performing a focused consolidation session to optimize token usage while
 
 1. **Forget** - Remove incorrect, irrelevant, or obvious information
    - Search first to avoid leaving phantom memories in other notes
-   
+
 2. **Compact** - Rewrite concisely while preserving essential information
    - Example: Detailed debugging steps → "Fixed X by doing Y"
-   
+
 3. **Migrate** - Move information to appropriate permanent notes
    - Working Memory sections → knowledge notes or project notes
    - Log entries → weekly journal summaries
-   
+
 4. **Fragment** - Split large notes into smaller focused notes
    - Use wiki-links to connect fragments
 
@@ -80,7 +67,7 @@ When consolidating logs to weekly journal, create episodic narratives:
 - Include the thought process and discoveries
 - Use bold summaries for browsability
 - Group related work into coherent stories
-{private_section}
+
 ## Your Task
 
 1. **Review** - Read through:
@@ -119,7 +106,7 @@ When consolidating logs to weekly journal, create episodic narratives:
 
 Begin by reading the active context files, then propose your consolidation plan.
 "#
-    )
+    .to_string()
 }
 
 #[cfg(test)]
@@ -128,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_execute_returns_success() {
-        let result = execute(false);
+        let result = execute();
         assert!(result.is_ok());
 
         let call_result = result.unwrap();
@@ -137,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_prompt_contains_key_sections() {
-        let result = execute(false).unwrap();
+        let result = execute().unwrap();
         let content = result.content[0]
             .raw
             .as_text()
@@ -148,28 +135,5 @@ mod tests {
         assert!(content.text.contains("Log.md Format"));
         assert!(content.text.contains("Your Task"));
         assert!(content.text.contains("Token Targets"));
-    }
-
-    #[test]
-    fn test_private_flag_includes_private_section() {
-        let result = execute(true).unwrap();
-        let content = result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text content");
-
-        assert!(content.text.contains("Private Memory"));
-        assert!(content.text.contains("private/Working Memory.md"));
-    }
-
-    #[test]
-    fn test_no_private_flag_excludes_private_section() {
-        let result = execute(false).unwrap();
-        let content = result.content[0]
-            .raw
-            .as_text()
-            .expect("Expected text content");
-
-        assert!(!content.text.contains("Private Memory"));
     }
 }
