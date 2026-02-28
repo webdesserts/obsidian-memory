@@ -935,6 +935,11 @@ async fn run_stdio_server(config: Config) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Health check router, shared between the server and tests.
+fn health_router() -> axum::Router {
+    axum::Router::new().route("/health", axum::routing::get(|| async { "OK" }))
+}
+
 /// Run the server with HTTP transport.
 async fn run_http_server(
     config: Config,
@@ -954,7 +959,7 @@ async fn run_http_server(
     );
 
     let router = axum::Router::new()
-        .route("/health", axum::routing::get(|| async { "OK" }))
+        .merge(health_router())
         .nest_service("/mcp", service);
 
     let addr: std::net::SocketAddr = listen
@@ -992,8 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint() {
-        let router = axum::Router::new()
-            .route("/health", axum::routing::get(|| async { "OK" }));
+        let router = super::health_router();
 
         let request = axum::http::Request::builder()
             .uri("/health")

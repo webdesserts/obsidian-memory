@@ -7,7 +7,7 @@
 //! independently. Both the Log and WriteLogs tools use this module to parse,
 //! merge duplicates, and render back to a clean file.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// A parsed day section from the log.
 #[derive(Debug, Clone)]
@@ -25,9 +25,8 @@ pub struct LogSection {
 /// in the original file.
 pub fn parse_log_sections(content: &str) -> (Vec<String>, Vec<LogSection>) {
     let mut preamble: Vec<String> = Vec::new();
-    // BTreeMap wouldn't preserve insertion order; use a Vec + index map instead
     let mut section_order: Vec<String> = Vec::new();
-    let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut sections: HashMap<String, Vec<String>> = HashMap::new();
     let mut current_header: Option<String> = None;
 
     for line in content.lines() {
@@ -107,7 +106,7 @@ pub fn render_log_sections(preamble: &[String], sections: &[LogSection]) -> Stri
 /// Parse a log entry bullet into 24-hour (hour, minute).
 ///
 /// Expects format: `- h:MM AM – content`
-fn parse_entry_time_24h(entry: &str) -> Option<(u32, u32)> {
+pub fn parse_entry_time_24h(entry: &str) -> Option<(u32, u32)> {
     let entry = entry.trim().strip_prefix("- ")?;
     let time_end = entry.find(" – ")?;
     let time_str = &entry[..time_end];

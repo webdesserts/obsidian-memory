@@ -3,7 +3,7 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 use tokio::fs;
 
-use super::log_format::{parse_log_sections, render_log_sections, LogSection};
+use super::log_format::{parse_entry_time_24h, parse_log_sections, render_log_sections, LogSection};
 
 /// Format ISO week date as YYYY-Www-D (e.g., 2025-W48-1)
 /// Uses chrono's IsoWeek trait
@@ -64,40 +64,6 @@ fn format_12_hour_time(dt: &DateTime<Local>) -> String {
     format!("{}:{:02} {}", hour_12, minute, am_pm)
 }
 
-/// Parse time from a log entry line (e.g., "- 9:30 AM – content")
-/// Returns (hour, minute) in 24-hour format, or None if parsing fails
-fn parse_entry_time(entry: &str) -> Option<(u32, u32)> {
-    // Match pattern: "- TIME – " where TIME is like "9:30 AM"
-    let entry = entry.strip_prefix("- ")?;
-    let time_end = entry.find(" – ")?;
-    let time_str = &entry[..time_end];
-
-    // Parse "h:mm AM" or "h:mm PM"
-    let parts: Vec<&str> = time_str.split_whitespace().collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let time_parts: Vec<&str> = parts[0].split(':').collect();
-    if time_parts.len() != 2 {
-        return None;
-    }
-
-    let hour: u32 = time_parts[0].parse().ok()?;
-    let minute: u32 = time_parts[1].parse().ok()?;
-    let am_pm = parts[1];
-
-    let hour_24 = match am_pm {
-        "AM" if hour == 12 => 0,
-        "AM" => hour,
-        "PM" if hour == 12 => 12,
-        "PM" => hour + 12,
-        _ => return None,
-    };
-
-    Some((hour_24, minute))
-}
-
 /// Add a new entry to the log file, organizing by day and sorting chronologically.
 ///
 /// Parses the file through `parse_log_sections` first, which merges any duplicate
@@ -135,16 +101,13 @@ pub async fn add_log(
         });
     }
 
-    // render_log_sections handles chronological sorting within each section
-    // but we re-parse to get the sorting. Instead, just sort the target section.
-    // Actually, parse_log_sections sorts on parse, but we just pushed a new entry.
-    // Re-sort the section we modified.
+    // parse_log_sections sorts on parse, but we just pushed a new entry — re-sort
     if let Some(section) = sections.iter_mut().find(|s| {
         s.header == format!("## {} ({})", iso_week_date, day_abbrev)
     }) {
         section.entries.sort_by(|a, b| {
-            let ta = parse_entry_time(a).unwrap_or((24, 0));
-            let tb = parse_entry_time(b).unwrap_or((24, 0));
+            let ta = parse_entry_time_24h(a).unwrap_or((24, 0));
+            let tb = parse_entry_time_24h(b).unwrap_or((24, 0));
             ta.cmp(&tb)
         });
     }
@@ -199,18 +162,6 @@ mod tests {
         assert_eq!(format_12_hour_time(&make_time(12, 0)), "12:00 PM");
         assert_eq!(format_12_hour_time(&make_time(15, 30)), "3:30 PM");
         assert_eq!(format_12_hour_time(&make_time(23, 59)), "11:59 PM");
-    }
-
-    #[test]
-    fn test_parse_entry_time() {
-        assert_eq!(parse_entry_time("- 9:30 AM – some content"), Some((9, 30)));
-        assert_eq!(
-            parse_entry_time("- 12:00 PM – afternoon entry"),
-            Some((12, 0))
-        );
-        assert_eq!(parse_entry_time("- 3:45 PM – later entry"), Some((15, 45)));
-        assert_eq!(parse_entry_time("- 12:30 AM – midnight entry"), Some((0, 30)));
-        assert_eq!(parse_entry_time("not a valid entry"), None);
     }
 
     #[tokio::test]

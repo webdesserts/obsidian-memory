@@ -30,4 +30,12 @@ describe("inferProtocol()", () => {
   it("should trim whitespace", () => {
     expect(inferProtocol("  umbra.computer  ")).toBe("wss://umbra.computer");
   });
+
+  it("should reject http:// URLs", () => {
+    expect(() => inferProtocol("http://umbra.computer/sync")).toThrow("not an HTTP URL");
+  });
+
+  it("should reject https:// URLs", () => {
+    expect(() => inferProtocol("https://umbra.computer/sync")).toThrow("not an HTTP URL");
+  });
 });
