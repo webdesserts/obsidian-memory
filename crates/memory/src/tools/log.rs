@@ -3,6 +3,8 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 use tokio::fs;
 
+use super::log_format::{parse_log_sections, render_log_sections, LogSection};
+
 /// Format ISO week date as YYYY-Www-D (e.g., 2025-W48-1)
 /// Uses chrono's IsoWeek trait
 fn format_iso_week_date(dt: &DateTime<Local>) -> String {
@@ -96,7 +98,10 @@ fn parse_entry_time(entry: &str) -> Option<(u32, u32)> {
     Some((hour_24, minute))
 }
 
-/// Add a new entry to the log file, organizing by day and sorting chronologically
+/// Add a new entry to the log file, organizing by day and sorting chronologically.
+///
+/// Parses the file through `parse_log_sections` first, which merges any duplicate
+/// day sections that P2P sync may have created.
 pub async fn add_log(
     log_path: &Path,
     time: DateTime<Local>,
@@ -106,80 +111,45 @@ pub async fn add_log(
     let day_abbrev = get_day_abbreviation(&time);
     let time_str = format_12_hour_time(&time);
 
-    // Format the new entry - strip leading dash if present
+    // Format the new entry — strip leading dash if present
     let bullet_content = entry.strip_prefix('-').map(|s| s.trim()).unwrap_or(entry);
     let new_entry = format!("- {} – {}", time_str, bullet_content);
 
-    // Read existing log content
+    // Read and parse existing log (merges duplicate sections)
     let log_content = match fs::read_to_string(log_path).await {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
 
-    // Parse log into lines
+    let (preamble, mut sections) = parse_log_sections(&log_content);
     let day_header = format!("## {} ({})", iso_week_date, day_abbrev);
-    let mut lines: Vec<String> = log_content.lines().map(String::from).collect();
 
-    // Find the section for this day
-    let section_index = lines.iter().position(|l| l == &day_header);
-
-    if section_index.is_none() {
-        // Day section doesn't exist - add at the end
-        if !lines.is_empty() {
-            lines.push(String::new()); // blank line before new section
-        }
-        lines.push(day_header);
-        lines.push(String::new());
-        lines.push(new_entry);
-        lines.push(String::new()); // trailing newline
+    // Find or create the section for this day
+    if let Some(section) = sections.iter_mut().find(|s| s.header == day_header) {
+        section.entries.push(new_entry);
     } else {
-        let section_start = section_index.unwrap();
-
-        // Find all entries in this section and their times
-        let mut entries: Vec<(usize, Option<(u32, u32)>)> = Vec::new();
-        let mut current_index = section_start + 1;
-
-        // Skip blank lines after header
-        while current_index < lines.len() && lines[current_index].trim().is_empty() {
-            current_index += 1;
-        }
-
-        // Collect all entries in this section
-        while current_index < lines.len() && !lines[current_index].starts_with("##") {
-            let line = &lines[current_index];
-            if line.starts_with('-') {
-                entries.push((current_index, parse_entry_time(line)));
-            }
-            current_index += 1;
-        }
-
-        // Find where to insert based on time
-        let new_time = (time.hour(), time.minute());
-        let mut insert_index = section_start + 1;
-
-        // Skip blank lines after header
-        while insert_index < lines.len() && lines[insert_index].trim().is_empty() {
-            insert_index += 1;
-        }
-
-        // Find chronological position
-        for (entry_idx, entry_time) in &entries {
-            if let Some(existing_time) = entry_time {
-                if *existing_time > new_time {
-                    insert_index = *entry_idx;
-                    break;
-                }
-            }
-            insert_index = entry_idx + 1;
-        }
-
-        // Insert the new entry
-        lines.insert(insert_index, new_entry);
+        sections.push(LogSection {
+            header: day_header,
+            entries: vec![new_entry],
+        });
     }
 
-    // Write the file
-    let content = lines.join("\n");
+    // render_log_sections handles chronological sorting within each section
+    // but we re-parse to get the sorting. Instead, just sort the target section.
+    // Actually, parse_log_sections sorts on parse, but we just pushed a new entry.
+    // Re-sort the section we modified.
+    if let Some(section) = sections.iter_mut().find(|s| {
+        s.header == format!("## {} ({})", iso_week_date, day_abbrev)
+    }) {
+        section.entries.sort_by(|a, b| {
+            let ta = parse_entry_time(a).unwrap_or((24, 0));
+            let tb = parse_entry_time(b).unwrap_or((24, 0));
+            ta.cmp(&tb)
+        });
+    }
+
+    let content = render_log_sections(&preamble, &sections);
     fs::write(log_path, content).await?;
 
     Ok((iso_week_date, time_str))
@@ -278,6 +248,44 @@ mod tests {
         let first_pos = content.find("First entry").unwrap();
         let second_pos = content.find("Second entry").unwrap();
         assert!(first_pos < second_pos);
+    }
+
+    #[tokio::test]
+    async fn test_add_log_merges_duplicate_day_sections() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("Log.md");
+
+        // Simulate P2P sync creating duplicate sections
+        let content = "\
+## 2026-W01-1 (Mon)
+
+- 9:00 AM – Morning task
+
+## 2026-W01-1 (Mon)
+
+- 2:00 PM – Afternoon task
+";
+        fs::write(&log_path, content).await.unwrap();
+
+        // Add a new entry for the same day (Mon 2025-12-29 = 2026-W01-1)
+        let time = make_time(11, 0);
+        add_log(&log_path, time, "Midday task").await.unwrap();
+
+        let result = fs::read_to_string(&log_path).await.unwrap();
+
+        // Should have exactly one section header
+        assert_eq!(
+            result.matches("## 2026-W01-1 (Mon)").count(),
+            1,
+            "duplicate sections should be merged"
+        );
+
+        // All three entries should be present in chronological order
+        let morning = result.find("Morning task").unwrap();
+        let midday = result.find("Midday task").unwrap();
+        let afternoon = result.find("Afternoon task").unwrap();
+        assert!(morning < midday, "morning before midday");
+        assert!(midday < afternoon, "midday before afternoon");
     }
 
     #[tokio::test]

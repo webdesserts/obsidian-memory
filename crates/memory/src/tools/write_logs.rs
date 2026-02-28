@@ -1,6 +1,8 @@
 //! WriteLogs tool for bulk replacing a day's log entries.
 //!
 //! Used during memory consolidation to rewrite or summarize a day's logs.
+//! Parses through `log_format` first, which merges any duplicate day sections
+//! that P2P sync may have created.
 
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::collections::HashMap;
@@ -8,6 +10,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::log::get_day_abbreviation_from_iso;
+use super::log_format::{parse_log_sections, render_log_sections, LogSection};
 
 /// Replace an entire day's log entries with new entries.
 pub async fn execute(
@@ -48,7 +51,7 @@ pub async fn execute(
     let day_abbrev = get_day_abbreviation_from_iso(iso_week_date);
     let day_header = format!("## {} ({})", iso_week_date, day_abbrev);
 
-    // Read existing content
+    // Read and parse existing content (merges duplicate sections)
     let log_content = match fs::read_to_string(&log_path).await {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -60,47 +63,32 @@ pub async fn execute(
         }
     };
 
-    let mut lines: Vec<String> = log_content.lines().map(String::from).collect();
+    let (preamble, mut sections) = parse_log_sections(&log_content);
 
-    // Find the section for this day
-    let section_start = lines.iter().position(|l| l == &day_header);
-
-    // If entries is empty, delete the entire day section
+    // If entries is empty, delete the target day section
     if entries.is_empty() {
-        if let Some(start) = section_start {
-            // Find the end of this section (next ## header or end of file)
-            let mut end = start + 1;
-            while end < lines.len() {
-                if lines[end].starts_with("##") {
-                    break;
-                }
-                end += 1;
-            }
+        let had_section = sections.iter().any(|s| s.header == day_header);
+        sections.retain(|s| s.header != day_header);
 
-            // Remove the section
-            lines.drain(start..end);
+        let content = render_log_sections(&preamble, &sections);
+        if let Err(e) = fs::write(&log_path, content).await {
+            return Err(ErrorData::internal_error(
+                format!("Failed to write Log.md: {}", e),
+                None,
+            ));
+        }
 
-            // Clean up extra blank lines
-            cleanup_blank_lines(&mut lines);
-
-            let content = lines.join("\n");
-            if let Err(e) = fs::write(&log_path, content).await {
-                return Err(ErrorData::internal_error(
-                    format!("Failed to write Log.md: {}", e),
-                    None,
-                ));
-            }
-
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+        return if had_section {
+            Ok(CallToolResult::success(vec![Content::text(format!(
                 "Deleted day section for {}",
                 iso_week_date
-            ))]));
+            ))]))
         } else {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(CallToolResult::success(vec![Content::text(format!(
                 "No entries to delete - day section {} does not exist",
                 iso_week_date
-            ))]));
-        }
+            ))]))
+        };
     }
 
     // Sort entries chronologically
@@ -117,34 +105,17 @@ pub async fn execute(
         .map(|(time, message)| format!("- {} – {}", time, message))
         .collect();
 
-    if let Some(start) = section_start {
-        // Find the end of this section
-        let mut end = start + 1;
-        while end < lines.len() {
-            if lines[end].starts_with("##") {
-                break;
-            }
-            end += 1;
-        }
-
-        // Replace the section content (keeping header)
-        let mut new_section = vec![day_header, String::new()];
-        new_section.extend(new_entries);
-        new_section.push(String::new());
-
-        lines.splice(start..end, new_section);
+    // Replace or create the target section
+    if let Some(section) = sections.iter_mut().find(|s| s.header == day_header) {
+        section.entries = new_entries;
     } else {
-        // Add new section at the end
-        if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {
-            lines.push(String::new());
-        }
-        lines.push(day_header);
-        lines.push(String::new());
-        lines.extend(new_entries);
-        lines.push(String::new());
+        sections.push(LogSection {
+            header: day_header,
+            entries: new_entries,
+        });
     }
 
-    let content = lines.join("\n");
+    let content = render_log_sections(&preamble, &sections);
     if let Err(e) = fs::write(&log_path, content).await {
         return Err(ErrorData::internal_error(
             format!("Failed to write Log.md: {}", e),
@@ -219,25 +190,6 @@ fn parse_time_12h(s: &str) -> Option<(u32, u32)> {
     };
 
     Some((hour_24, minute))
-}
-
-/// Clean up multiple consecutive blank lines to at most 2
-fn cleanup_blank_lines(lines: &mut Vec<String>) {
-    let mut i = 0;
-    let mut blank_count = 0;
-
-    while i < lines.len() {
-        if lines[i].trim().is_empty() {
-            blank_count += 1;
-            if blank_count > 2 {
-                lines.remove(i);
-                continue;
-            }
-        } else {
-            blank_count = 0;
-        }
-        i += 1;
-    }
 }
 
 #[cfg(test)]
@@ -379,5 +331,46 @@ mod tests {
 
         assert!(first_pos < second_pos);
         assert!(second_pos < third_pos);
+    }
+
+    #[tokio::test]
+    async fn test_write_logs_merges_duplicate_sections() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+        let log_path = vault_path.join("Log.md");
+
+        // Simulate P2P sync creating duplicate Monday sections
+        let content = "\
+## 2025-W50-1 (Mon)
+
+- 9:00 AM – Morning task
+
+## 2025-W50-1 (Mon)
+
+- 2:00 PM – Afternoon task
+";
+        fs::write(&log_path, content).await.unwrap();
+
+        // Write entries for Tuesday — should heal Monday duplicates too
+        let mut entries = HashMap::new();
+        entries.insert("10:00 AM".to_string(), "Tuesday work".to_string());
+        execute(vault_path, "2025-W50-2", entries).await.unwrap();
+
+        let result = fs::read_to_string(&log_path).await.unwrap();
+
+        // Monday should be merged into one section
+        assert_eq!(
+            result.matches("## 2025-W50-1 (Mon)").count(),
+            1,
+            "duplicate Monday sections should be merged"
+        );
+
+        // Both Monday entries should survive
+        assert!(result.contains("Morning task"));
+        assert!(result.contains("Afternoon task"));
+
+        // Tuesday should exist
+        assert!(result.contains("## 2025-W50-2 (Tue)"));
+        assert!(result.contains("Tuesday work"));
     }
 }

@@ -7,6 +7,7 @@ pub mod get_note_info;
 pub mod get_weekly_note_info;
 pub mod load_private_memory;
 pub mod log;
+pub mod log_format;
 pub mod move_note;
 pub mod read_note;
 pub mod reflect;
