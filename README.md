@@ -20,7 +20,7 @@ Obsidian Memory is an [MCP](https://modelcontextprotocol.io/) server that lets C
 
 ```bash
 brew tap webdesserts/tap
-brew install obsidian-memory-mcp
+brew install webdesserts/tap/memory
 ```
 
 ### Option 2: Shell Script (Mac/Linux)
