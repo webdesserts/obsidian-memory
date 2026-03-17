@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["native"]
+# Native-only features: full iroh networking stack and tokio runtime
+native = ["iroh/default", "iroh-gossip/net", "dep:tokio"]
+
 [dependencies]
 loro.workspace = true
 async-trait.workspace = true
@@ -20,6 +25,16 @@ uuid.workspace = true
 rand.workspace = true
 getrandom.workspace = true
 
+# P2P networking — default-features = false for WASM compatibility.
+# The `native` feature above re-enables the full networking stack for native builds.
+iroh = { version = "0.97", default-features = false }
+iroh-gossip = { version = "0.97", default-features = false }
+
+# Tokio is gated behind `native` because it is not available in WASM.
+tokio = { workspace = true, features = ["rt", "macros"], optional = true }
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tempfile.workspace = true
+anyhow.workspace = true
+bytes = "1"
