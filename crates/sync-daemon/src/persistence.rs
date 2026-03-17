@@ -66,6 +66,14 @@ impl IdentityKey {
     pub fn peer_id(&self) -> PeerId {
         PeerId::from_bytes(self.signing_key.verifying_key().to_bytes())
     }
+
+    /// Return the raw 32-byte ed25519 secret key.
+    ///
+    /// Used to initialize the iroh `SyncNode`, which needs the secret key to
+    /// derive a stable `EndpointId` (the iroh equivalent of our `PeerId`).
+    pub fn secret_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
 }
 
 /// Daemon-specific configuration persisted in `.sync/daemon.toml`.
@@ -88,9 +96,12 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Load or generate daemon config, deriving PeerId from the identity key.
     ///
+    /// Returns `(config, identity_key)` so the caller can access the raw secret
+    /// key bytes needed to initialize the iroh `SyncNode`.
+    ///
     /// `identity_key_path` — if provided, loads a custom key file instead of the
     /// default `.sync/daemon.key`. This replaces the old `--peer-id` flag.
-    pub async fn load_or_generate(vault_path: &Path, identity_key_path: Option<&Path>) -> Result<Self> {
+    pub async fn load_or_generate(vault_path: &Path, identity_key_path: Option<&Path>) -> Result<(Self, IdentityKey)> {
         let config_path = vault_path.join(DAEMON_CONFIG_FILE);
         let key_path = vault_path.join(DAEMON_KEY_FILE);
 
@@ -159,7 +170,7 @@ impl DaemonConfig {
         // Always save (creates file on first run, applies migrations)
         config.save(vault_path)?;
 
-        Ok(config)
+        Ok((config, identity_key))
     }
 
     /// Save the current config to `.sync/daemon.toml`.
@@ -623,6 +634,19 @@ mod tests {
         assert_ne!(default_key.peer_id(), alt_peer_id);
     }
 
+    #[tokio::test]
+    async fn test_identity_key_secret_key_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
+        let bytes = key.secret_key_bytes();
+
+        // Verify round-trip: reconstructing from bytes produces the same PeerId
+        let reconstructed = IdentityKey::from_bytes(bytes);
+        assert_eq!(reconstructed.peer_id(), key.peer_id());
+    }
+
     // ==================== DaemonConfig tests ====================
 
     #[tokio::test]
@@ -630,7 +654,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _key) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Should have a valid PeerId (64-char hex, non-zero as_u64)
         assert_eq!(config.peer_id.to_string().len(), 64);
@@ -647,10 +671,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let config1 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config1, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Simulate restart — should load same PeerId from key file
-        let config2 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config2, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         assert_eq!(config1.peer_id, config2.peer_id);
     }
@@ -661,7 +685,7 @@ mod tests {
         let vault_path = temp_dir.path();
 
         // First start with default key
-        let config1 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config1, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Generate an alternate key in a separate location
         let alt_dir = TempDir::new().unwrap();
@@ -671,12 +695,12 @@ mod tests {
 
         // Start with alternate key — should update PeerId in config
         let alt_key_path = alt_dir.path().join(".sync/daemon.key");
-        let config2 = DaemonConfig::load_or_generate(vault_path, Some(&alt_key_path)).await.unwrap();
+        let (config2, _) = DaemonConfig::load_or_generate(vault_path, Some(&alt_key_path)).await.unwrap();
         assert_eq!(config2.peer_id, alt_peer_id);
 
         // After using the alternate key, the config reflects the alternate PeerId.
         // Default restart now uses the default key again (config tracks last used PeerId).
-        let config3 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config3, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
         assert_eq!(config3.peer_id, config1.peer_id);
     }
 
@@ -697,7 +721,7 @@ incarnation = 3
         fs::write(sync_dir.join("known_peers.json"), r#"{"peers":[]}"#).unwrap();
 
         // Load with new code — should generate a new ed25519 key and migrate
-        let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // New PeerId should be 64-char hex (ed25519)
         assert_eq!(config.peer_id.to_string().len(), 64);
@@ -733,7 +757,7 @@ incarnation = 3
         .unwrap();
 
         // Should load without error, ignoring incarnation
-        let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
         assert_eq!(config.peer_id, peer_id);
 
         // Saved file should no longer have incarnation field
