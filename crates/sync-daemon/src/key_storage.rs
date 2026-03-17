@@ -56,6 +56,15 @@ impl KeyStorage for FileKeyStorage {
             .await
             .map_err(|e| KeyStorageError::Io(e.to_string()))?;
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&self.path, perms)
+                .await
+                .map_err(|e| KeyStorageError::Io(e.to_string()))?;
+        }
+
         Ok(())
     }
 }

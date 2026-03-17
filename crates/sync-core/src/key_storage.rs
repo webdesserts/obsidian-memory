@@ -35,6 +35,11 @@ pub trait KeyStorage: Send + Sync {
     /// Load the existing key, or generate a new one and save it.
     ///
     /// The key is generated using cryptographically secure randomness.
+    ///
+    /// Note: This method is not atomic. If multiple processes call it
+    /// simultaneously, they may each generate different keys. Callers
+    /// should hold an appropriate lock (e.g., the daemon flock) before
+    /// calling this method.
     async fn load_or_generate(&self) -> Result<[u8; 32]> {
         if let Some(key) = self.load_key().await? {
             return Ok(key);
@@ -60,6 +65,11 @@ pub trait KeyStorage {
     /// Load the existing key, or generate a new one and save it.
     ///
     /// The key is generated using cryptographically secure randomness.
+    ///
+    /// Note: This method is not atomic. If multiple processes call it
+    /// simultaneously, they may each generate different keys. Callers
+    /// should hold an appropriate lock (e.g., the daemon flock) before
+    /// calling this method.
     async fn load_or_generate(&self) -> Result<[u8; 32]> {
         if let Some(key) = self.load_key().await? {
             return Ok(key);
