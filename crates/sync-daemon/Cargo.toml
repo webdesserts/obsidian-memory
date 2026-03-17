@@ -42,6 +42,7 @@ getrandom.workspace = true
 
 # Iroh node IDs (for EndpointId parsing)
 iroh = { version = "0.97", default-features = false }
+iroh-relay = { version = "0.97", features = ["server"] }
 
 [package.metadata.dist]
 dist = false

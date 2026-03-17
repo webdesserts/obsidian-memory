@@ -10,6 +10,7 @@ pub mod http;
 pub mod key_storage;
 pub mod native_fs;
 pub mod persistence;
+pub mod relay;
 pub mod watcher;
 
 // Re-export key types for convenience
