@@ -19,6 +19,7 @@ web-time.workspace = true
 uuid.workspace = true
 rand.workspace = true
 getrandom.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

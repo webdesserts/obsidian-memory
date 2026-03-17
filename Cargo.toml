@@ -67,6 +67,9 @@ rand = "0.9"
 getrandom = { version = "0.2", features = ["js"] }
 getrandom_0_3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
+# Ed25519 keypairs for peer identity (pure Rust, WASM-compatible)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
 # WASM (for sync-wasm)
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

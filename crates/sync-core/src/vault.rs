@@ -922,8 +922,14 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Get the vault's author identity as a PeerId (for backward compatibility with protocol code).
+    ///
+    /// Constructs a PeerId from the VaultId's u64 by embedding it in the first 8 bytes
+    /// of a 32-byte array. Callers that need the actual network peer identity should use
+    /// the daemon's `IdentityKey`-derived PeerId instead.
     pub fn peer_id(&self) -> PeerId {
-        PeerId::from(self.vault_id.as_u64())
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&self.vault_id.as_u64().to_be_bytes());
+        PeerId::from_bytes(bytes)
     }
 
     /// Subscribe to sync events. Returns `Subscription` that unsubscribes on drop.
@@ -1795,11 +1801,16 @@ mod tests {
     use crate::VaultId;
 
     fn test_peer_id() -> PeerId {
-        PeerId::from(12345u64)
+        // Deterministic test PeerId using from_bytes
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&12345u64.to_be_bytes());
+        PeerId::from_bytes(bytes)
     }
 
     fn test_peer_id_2() -> PeerId {
-        PeerId::from(67890u64)
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&67890u64.to_be_bytes());
+        PeerId::from_bytes(bytes)
     }
 
     // ========== SyncMetadata Tests ==========
@@ -2603,12 +2614,11 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_id_display_format_is_16_char_hex() {
-        let peer_id = PeerId::from(0xa1b2c3d4e5f67890u64);
+    fn test_peer_id_display_format_is_64_char_hex() {
+        let peer_id = PeerId::generate();
         let display = peer_id.to_string();
-        assert_eq!(display.len(), 16);
+        assert_eq!(display.len(), 64);
         assert!(display.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(display, "a1b2c3d4e5f67890");
     }
 
     #[test]
