@@ -17,23 +17,20 @@
 //! - **Gossip**: Lightweight change notifications (~1KB). Broadcast to all peers.
 //! - **QUIC streams**: Heavy data transfer. Version vector exchange, bulk updates.
 //!
-//! # Feature flags
+//! # Platform support
 //!
-//! The full networking stack requires the `native` feature (tokio runtime, real sockets).
-//! WASM builds include iroh for compilation but cannot run the networking stack directly.
+//! The networking stack compiles for both native and WASM targets.
+//! On native, peers connect via direct QUIC sockets or relay-assisted hole punching.
+//! In WASM (Obsidian plugin), peers connect exclusively via relay WebSocket transport
+//! since browsers cannot bind UDP sockets.
+//!
+//! mDNS local discovery requires OS-level networking and is native-only.
 
-#[cfg(feature = "native")]
 pub mod gossip;
-
-#[cfg(feature = "native")]
 pub mod streams;
+pub use node::{SyncNode, SYNC_ALPN};
+mod node;
 
 // Discovery is native-only (mDNS requires OS-level networking)
 #[cfg(feature = "native")]
 pub mod discovery;
-
-#[cfg(feature = "native")]
-pub use node::{SyncNode, SYNC_ALPN};
-
-#[cfg(feature = "native")]
-mod node;

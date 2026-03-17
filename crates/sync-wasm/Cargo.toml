@@ -8,8 +8,9 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# default-features = false excludes the `native` feature (iroh's QUIC stack + tokio)
-# which is not available in WASM. Only the WASM-compatible subset of sync-core is used.
+# default-features = false excludes the `native` feature (iroh's direct QUIC sockets
+# and full tokio runtime). The network module (gossip + QUIC streams) is now always-on
+# and available in WASM via relay WebSocket transport.
 sync-core = { path = "../sync-core", default-features = false }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
@@ -27,6 +28,10 @@ tracing-wasm = "0.2"
 # getrandom 0.3 is pulled in transitively by ahash -> quick_cache -> loro-kv-store.
 # The wasm_js feature is required for WASM compilation.
 getrandom_0_3.workspace = true
+# Used by WasmSyncNode bindings
+bincode.workspace = true
+iroh = { version = "0.97", default-features = false }
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

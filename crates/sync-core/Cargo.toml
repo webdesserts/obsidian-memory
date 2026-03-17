@@ -6,8 +6,10 @@ license.workspace = true
 
 [features]
 default = ["native"]
-# Native-only features: full iroh networking stack and tokio runtime
-native = ["iroh/default", "iroh-gossip/net", "dep:tokio", "dep:anyhow", "dep:bytes"]
+# Native-only: direct QUIC sockets (require OS networking) and full tokio runtime.
+# iroh/default enables direct socket binding and portmapper — not available in WASM.
+# The network module itself (gossip, streams, node) compiles for both native and WASM.
+native = ["iroh/default", "tokio/rt", "tokio/macros"]
 
 [dependencies]
 loro.workspace = true
@@ -26,18 +28,29 @@ rand.workspace = true
 getrandom.workspace = true
 ed25519-dalek.workspace = true
 
-# P2P networking — default-features = false for WASM compatibility.
-# The `native` feature above re-enables the full networking stack for native builds.
+# P2P networking — iroh QUIC transport.
+# default-features = false: skips portmapper and fast-apple-datapath (OS-specific).
+# The `native` feature re-enables iroh/default for direct socket binding.
 iroh = { version = "0.97", default-features = false }
-iroh-gossip = { version = "0.97", default-features = false }
 
-# Tokio is gated behind `native` because it is not available in WASM.
-tokio = { workspace = true, features = ["rt", "macros"], optional = true }
+# iroh-gossip — HyParView membership + PlumTree broadcast.
+# The `net` feature enables the Gossip API (GossipTopic, GossipSender, Event).
+# tokio::sync (used by gossip internals) compiles to WASM, so net works in both targets.
+iroh-gossip = { version = "0.97", default-features = false, features = ["net"] }
 
-# These are used by the native network module. Declared here (not dev-deps) so
-# they compile into the network module. Gated by the `native` feature above.
-anyhow = { workspace = true, optional = true }
-bytes = { version = "1", optional = true }
+# Cross-platform async task spawning.
+# On native: delegates to tokio::spawn. In WASM: uses wasm_bindgen_futures::spawn_local.
+n0-future = "0.3"
+
+# Utilities used by the network module — always needed (not native-only).
+anyhow.workspace = true
+bytes = "1"
+
+# tokio::sync (channels, mutex) compiles to WASM and is used by the network module.
+# The `native` feature above adds rt + macros for the async test runtime and proc macros.
+# We specify the dep directly (not workspace) to avoid inheriting features = ["full"]
+# which includes net/io features that don't compile to WASM.
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

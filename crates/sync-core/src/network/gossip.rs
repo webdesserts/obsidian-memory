@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use iroh::EndpointId;
 use iroh_gossip::{TopicId, api::{Event, GossipSender}};
+use n0_future::task;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -53,7 +54,7 @@ pub struct VaultGossip {
     /// Events from the gossip subscription, pumped by a background task.
     pub event_rx: mpsc::UnboundedReceiver<GossipEvent>,
     /// Background task handle (kept alive while subscription is active).
-    _task: tokio::task::JoinHandle<()>,
+    _task: task::JoinHandle<()>,
 }
 
 impl VaultGossip {
@@ -62,7 +63,7 @@ impl VaultGossip {
         let (sender, mut receiver) = handle.split();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        let task = tokio::spawn(async move {
+        let task = task::spawn(async move {
             while let Some(result) = receiver.next().await {
                 let event = match result {
                     Ok(e) => e,

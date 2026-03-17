@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::sync::SyncMessage;
@@ -47,7 +47,7 @@ pub struct InboundSyncRequest {
     /// The message received from the remote peer.
     pub message: SyncMessage,
     /// Send the response back through here.
-    pub reply_tx: tokio::sync::oneshot::Sender<SyncMessage>,
+    pub reply_tx: oneshot::Sender<SyncMessage>,
 }
 
 /// Receives inbound sync requests from remote peers.
@@ -100,7 +100,7 @@ impl ProtocolHandler for SyncStreamHandler {
             .map_err(|e| AcceptError::from_boxed(e.into()))?;
         debug!("Inbound sync message: {:?}", std::mem::discriminant(&message));
 
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
         let request = InboundSyncRequest { message, reply_tx };
 
         if self.inbound_tx.send(request).is_err() {

@@ -710,6 +710,312 @@ mod wasm_impl {
         }
     }
 
+    // ========== WasmSyncNode ==========
+
+    /// Serializable gossip event for JS consumers.
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase", tag = "type")]
+    enum GossipEventJs {
+        /// A peer joined the gossip swarm.
+        NeighborUp { node_id: String },
+        /// A peer left the gossip swarm.
+        NeighborDown { node_id: String },
+        /// A change notification received from a peer.
+        ChangeReceived { from: String, path: String },
+    }
+
+    /// Serializable inbound sync request for JS consumers.
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct InboundSyncRequestJs {
+        /// The encoded SyncMessage bytes to pass to WasmVault.processSyncMessage.
+        message_bytes: Vec<u8>,
+    }
+
+    /// iroh-based P2P sync node exposed to JavaScript.
+    ///
+    /// Wraps `SyncNode` and provides async polling methods for gossip events
+    /// and inbound sync requests. The plugin drives these polling loops to
+    /// receive peer events without needing explicit background threads.
+    ///
+    /// # Usage pattern
+    ///
+    /// ```js
+    /// const node = await WasmSyncNode.create(secretKeyBytes);
+    /// await node.joinVaultGossip(vaultId, bootstrapPeers);
+    ///
+    /// // Drive gossip events in a loop
+    /// while (running) {
+    ///     const event = await node.pollGossipEvent();
+    ///     if (event) handleEvent(event);
+    /// }
+    /// ```
+    #[wasm_bindgen]
+    pub struct WasmSyncNode {
+        inner: RefCell<Option<WasmSyncNodeState>>,
+    }
+
+    struct WasmSyncNodeState {
+        node: sync_core::network::SyncNode,
+        gossip: Option<sync_core::network::gossip::VaultGossip>,
+        /// Pending reply sender for the current inbound sync request.
+        /// The plugin calls `replyInboundSync` to send the response.
+        pending_reply: Option<tokio::sync::oneshot::Sender<sync_core::sync::SyncMessage>>,
+    }
+
+    #[wasm_bindgen]
+    impl WasmSyncNode {
+        /// Create a new iroh sync node from a 32-byte ed25519 secret key.
+        ///
+        /// The node connects to other peers via relay (WebSocket) since browsers
+        /// cannot bind UDP sockets directly.
+        #[wasm_bindgen]
+        pub async fn create(secret_key: &[u8]) -> Result<WasmSyncNode, JsError> {
+            let key_bytes: [u8; 32] = secret_key
+                .try_into()
+                .map_err(|_| JsError::new("secret_key must be exactly 32 bytes"))?;
+
+            let node = sync_core::network::SyncNode::new(key_bytes)
+                .await
+                .map_err(|e| JsError::new(&format!("Failed to create sync node: {e}")))?;
+
+            Ok(WasmSyncNode {
+                inner: RefCell::new(Some(WasmSyncNodeState {
+                    node,
+                    gossip: None,
+                    pending_reply: None,
+                })),
+            })
+        }
+
+        /// This node's iroh EndpointId as a hex string.
+        ///
+        /// This is the public key of the ed25519 keypair and uniquely identifies
+        /// this node in the iroh network.
+        #[wasm_bindgen(js_name = nodeId)]
+        pub fn node_id(&self) -> Result<String, JsError> {
+            let state = self.inner.borrow();
+            let state = state.as_ref().ok_or_else(|| JsError::new("Node is shut down"))?;
+            Ok(state.node.node_id().to_string())
+        }
+
+        /// Join the gossip swarm for a specific vault.
+        ///
+        /// `vault_id` should be the vault's hex string identifier.
+        /// `bootstrap_peers` is a JS array of hex string `EndpointId`s to bootstrap from.
+        ///
+        /// After calling this, use `pollGossipEvent` to receive membership and
+        /// change notification events.
+        #[wasm_bindgen(js_name = joinVaultGossip)]
+        pub async fn join_vault_gossip(
+            &self,
+            vault_id: &str,
+            bootstrap_peers: js_sys::Array,
+        ) -> Result<(), JsError> {
+            use iroh::EndpointId;
+            use std::str::FromStr;
+
+            // Parse vault ID from its 16-char hex string representation
+            let vault_id: sync_core::peer_id::VaultId = vault_id
+                .parse()
+                .map_err(|e| JsError::new(&format!("Invalid vault_id: {e}")))?;
+
+            // Parse bootstrap peer IDs
+            let mut peers: Vec<EndpointId> = Vec::new();
+            for peer_val in bootstrap_peers.iter() {
+                let peer_str = peer_val
+                    .as_string()
+                    .ok_or_else(|| JsError::new("bootstrap_peers must be strings"))?;
+                let peer_id = EndpointId::from_str(&peer_str)
+                    .map_err(|e| JsError::new(&format!("Invalid peer id '{peer_str}': {e}")))?;
+                peers.push(peer_id);
+            }
+
+            let mut state = self.inner.borrow_mut();
+            let state = state
+                .as_mut()
+                .ok_or_else(|| JsError::new("Node is shut down"))?;
+
+            let gossip = state
+                .node
+                .join_vault_gossip(&vault_id, peers)
+                .await
+                .map_err(|e| JsError::new(&format!("Failed to join vault gossip: {e}")))?;
+
+            state.gossip = Some(gossip);
+            Ok(())
+        }
+
+        /// Poll for the next gossip event (non-blocking).
+        ///
+        /// Returns a JS object if an event is immediately available, or `null` otherwise.
+        /// The plugin should call this in a loop, yielding between calls (e.g., with
+        /// `await Promise.resolve()`) to let the WASM event queue process incoming data.
+        ///
+        /// Event types:
+        /// - `{ type: "neighborUp", nodeId: string }` — peer joined the swarm
+        /// - `{ type: "neighborDown", nodeId: string }` — peer left the swarm
+        /// - `{ type: "changeReceived", from: string, path: string }` — change notification
+        #[wasm_bindgen(js_name = pollGossipEvent)]
+        pub fn poll_gossip_event(&self) -> Result<JsValue, JsError> {
+            use sync_core::network::gossip::GossipEvent;
+            use tokio::sync::mpsc::error::TryRecvError;
+
+            let mut state = self.inner.borrow_mut();
+            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let gossip = match state.gossip.as_mut() {
+                Some(g) => g,
+                None => return Ok(JsValue::NULL),
+            };
+
+            let event = match gossip.event_rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => return Ok(JsValue::NULL),
+                Err(TryRecvError::Disconnected) => return Ok(JsValue::NULL),
+            };
+
+            let js_event = match event {
+                GossipEvent::NeighborUp(id) => GossipEventJs::NeighborUp {
+                    node_id: id.to_string(),
+                },
+                GossipEvent::NeighborDown(id) => GossipEventJs::NeighborDown {
+                    node_id: id.to_string(),
+                },
+                GossipEvent::ChangeReceived { from, notification } => {
+                    GossipEventJs::ChangeReceived {
+                        from: from.to_string(),
+                        path: notification.path,
+                    }
+                }
+            };
+
+            serde_wasm_bindgen::to_value(&js_event).map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Broadcast a change notification to all vault peers.
+        ///
+        /// The notification is lightweight (path only, ~1KB). Peers who receive it
+        /// will open a QUIC stream to pull the actual sync data.
+        #[wasm_bindgen(js_name = broadcastChange)]
+        pub async fn broadcast_change(&self, path: &str) -> Result<(), JsError> {
+            let mut state = self.inner.borrow_mut();
+            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let gossip = state
+                .gossip
+                .as_mut()
+                .ok_or_else(|| JsError::new("Not joined to vault gossip"))?;
+            gossip
+                .broadcast_change(path)
+                .await
+                .map_err(|e| JsError::new(&format!("Broadcast failed: {e}")))
+        }
+
+        /// Poll for the next inbound sync request from a remote peer.
+        ///
+        /// Returns a JS object with `{ messageBytes: Uint8Array }`, or `null` if
+        /// no request is available. Call `replyInboundSync` with the response bytes
+        /// after processing the message.
+        ///
+        /// The plugin should pass `messageBytes` to `WasmVault.processSyncMessage`
+        /// and then reply with the resulting `response` bytes.
+        #[wasm_bindgen(js_name = pollInboundSync)]
+        pub fn poll_inbound_sync(&self) -> Result<JsValue, JsError> {
+            use tokio::sync::mpsc::error::TryRecvError;
+
+            let mut state = self.inner.borrow_mut();
+            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+
+            match state.node.inbound_sync_rx.try_recv() {
+                Ok(request) => {
+                    let message_bytes = bincode::serialize(&request.message)
+                        .map_err(|e| JsError::new(&format!("Failed to serialize sync message: {e}")))?;
+
+                    // Store the reply channel for `replyInboundSync`
+                    state.pending_reply = Some(request.reply_tx);
+
+                    let js_req = InboundSyncRequestJs { message_bytes };
+                    serde_wasm_bindgen::to_value(&js_req)
+                        .map_err(|e| JsError::new(&e.to_string()))
+                }
+                Err(TryRecvError::Empty) => Ok(JsValue::NULL),
+                Err(TryRecvError::Disconnected) => Ok(JsValue::NULL),
+            }
+        }
+
+        /// Send a reply to the current inbound sync request.
+        ///
+        /// Call this after processing the sync message via `WasmVault.processSyncMessage`.
+        /// Pass the `response` bytes from the process result (or omit if no response).
+        #[wasm_bindgen(js_name = replyInboundSync)]
+        pub fn reply_inbound_sync(&self, response_bytes: &[u8]) -> Result<(), JsError> {
+            let mut state = self.inner.borrow_mut();
+            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+
+            let reply_tx = state
+                .pending_reply
+                .take()
+                .ok_or_else(|| JsError::new("No pending inbound sync request"))?;
+
+            let message: sync_core::sync::SyncMessage = bincode::deserialize(response_bytes)
+                .map_err(|e| JsError::new(&format!("Failed to deserialize response: {e}")))?;
+
+            // Ignore send errors — the connection may have closed
+            let _ = reply_tx.send(message);
+            Ok(())
+        }
+
+        /// Open a QUIC stream to a peer and perform a sync round-trip.
+        ///
+        /// `peer_id` is the hex string `EndpointId` of the peer to connect to.
+        /// `request_bytes` are the serialized `SyncMessage` bytes to send.
+        ///
+        /// Returns the serialized response `SyncMessage` bytes.
+        #[wasm_bindgen(js_name = syncWithPeer)]
+        pub async fn sync_with_peer(
+            &self,
+            peer_id: &str,
+            request_bytes: &[u8],
+        ) -> Result<Vec<u8>, JsError> {
+            use iroh::EndpointId;
+            use std::str::FromStr;
+            use sync_core::network::streams::connect_and_sync;
+
+            let peer = EndpointId::from_str(peer_id)
+                .map_err(|e| JsError::new(&format!("Invalid peer_id: {e}")))?;
+
+            let request: sync_core::sync::SyncMessage = bincode::deserialize(request_bytes)
+                .map_err(|e| JsError::new(&format!("Failed to deserialize request: {e}")))?;
+
+            // Borrow the endpoint for the sync call
+            let endpoint = {
+                let state = self.inner.borrow();
+                let state = state.as_ref().ok_or_else(|| JsError::new("Node is shut down"))?;
+                state.node.endpoint.clone()
+            };
+
+            let response = connect_and_sync(&endpoint, peer, request)
+                .await
+                .map_err(|e| JsError::new(&format!("Sync failed: {e}")))?;
+
+            bincode::serialize(&response)
+                .map_err(|e| JsError::new(&format!("Failed to serialize response: {e}")))
+        }
+
+        /// Shut down the sync node, closing all connections.
+        #[wasm_bindgen]
+        pub async fn shutdown(&self) -> Result<(), JsError> {
+            let state = self.inner.borrow_mut().take();
+            if let Some(state) = state {
+                state
+                    .node
+                    .shutdown()
+                    .await
+                    .map_err(|e| JsError::new(&format!("Shutdown failed: {e}")))?;
+            }
+            Ok(())
+        }
+    }
+
     /// Result from processing a sync message
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]

@@ -9,7 +9,6 @@
 //! - Sync protocol between peers
 //! - FileSystem and SyncTransport trait abstractions
 
-#[cfg(feature = "native")]
 pub mod network;
 
 pub mod allowlist;
