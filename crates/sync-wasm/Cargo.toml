@@ -8,7 +8,9 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-sync-core = { path = "../sync-core" }
+# default-features = false excludes the `native` feature (iroh's QUIC stack + tokio)
+# which is not available in WASM. Only the WASM-compatible subset of sync-core is used.
+sync-core = { path = "../sync-core", default-features = false }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
