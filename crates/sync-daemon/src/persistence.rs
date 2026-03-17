@@ -211,7 +211,11 @@ impl DaemonConfig {
 struct DaemonConfigRaw {
     peer_id: PeerId,
     legacy_peer_id: Option<String>,
+    /// Parsed from disk but intentionally discarded on load — relay URL is runtime state
+    /// that gets re-written after the relay starts. A stale URL from a crashed run is meaningless.
+    #[allow(dead_code)]
     relay_url: Option<String>,
+    /// Parsed from disk but discarded — incarnation was removed with the SWIM protocol.
     #[allow(dead_code)]
     incarnation: Option<u64>,
 }

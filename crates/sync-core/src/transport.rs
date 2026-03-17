@@ -1,8 +1,4 @@
 //! SyncTransport trait for peer-to-peer networking.
-//!
-//! Implementations:
-//! - LAN: mDNS discovery + WebSocket (desktop only)
-//! - WebRTC: Signaling server + WebRTC DataChannel (all platforms)
 
 use async_trait::async_trait;
 use thiserror::Error;
