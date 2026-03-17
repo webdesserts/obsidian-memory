@@ -15,6 +15,7 @@ use crate::daemon_lock::DaemonLock;
 use crate::http;
 use crate::native_fs::NativeFs;
 use crate::persistence::DaemonConfig;
+use crate::relay::EmbeddedRelay;
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 
 use sync_core::fs::FileSystem;
@@ -34,6 +35,11 @@ pub struct DaemonRunConfig {
     pub bootstrap_peers: Vec<String>,
     /// If set, serve a `/health` endpoint on this address (e.g. `"127.0.0.1:8081"`).
     pub health_listen: Option<String>,
+    /// If set, start an embedded iroh relay server on this address (e.g. `"0.0.0.0:3340"`).
+    ///
+    /// Relay startup failure is non-fatal — the daemon will log a warning and continue
+    /// without relay support rather than refusing to start.
+    pub relay_listen: Option<String>,
 }
 
 /// Daemon state holding all components.
@@ -333,8 +339,35 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
 
+    // Start the embedded relay before the SyncNode so we can pass its URL in.
+    // Failure is non-fatal: the daemon continues without relay support.
+    let embedded_relay: Option<EmbeddedRelay> = if let Some(ref addr_str) = config.relay_listen {
+        match addr_str.parse() {
+            Ok(bind_addr) => {
+                match EmbeddedRelay::start(bind_addr).await {
+                    Ok(relay) => {
+                        info!(url = %relay.relay_url(), "Embedded relay started");
+                        Some(relay)
+                    }
+                    Err(e) => {
+                        warn!("Failed to start embedded relay, continuing without: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Invalid relay-listen address '{}': {}, continuing without relay", addr_str, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let relay_url = embedded_relay.as_ref().map(|r| r.relay_url().clone());
+
     let secret_key_bytes = identity_key.secret_key_bytes();
-    let sync_node = SyncNode::new(secret_key_bytes)
+    let sync_node = SyncNode::new(secret_key_bytes, relay_url.as_ref())
         .await
         .context("Failed to create iroh SyncNode")?;
 
@@ -417,6 +450,9 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     // Graceful shutdown
     if let Err(e) = daemon.sync_node.shutdown().await {
         warn!("Error during iroh node shutdown: {}", e);
+    }
+    if let Some(relay) = embedded_relay {
+        relay.shutdown().await;
     }
 
     Ok(())

@@ -25,6 +25,10 @@ struct Args {
     #[arg(long)]
     health_listen: Option<String>,
 
+    /// Start an embedded iroh relay on this address (e.g. 0.0.0.0:3340)
+    #[arg(long)]
+    relay_listen: Option<String>,
+
     /// Path to an alternate ed25519 identity key file (default: .sync/daemon.key)
     #[arg(long)]
     identity_key: Option<PathBuf>,
@@ -41,6 +45,7 @@ impl From<Args> for DaemonRunConfig {
             identity_key: args.identity_key,
             bootstrap_peers: args.bootstrap,
             health_listen: args.health_listen,
+            relay_listen: args.relay_listen,
         }
     }
 }

@@ -597,6 +597,10 @@ enum SyncAction {
         #[arg(long)]
         identity_key: Option<std::path::PathBuf>,
 
+        /// Start an embedded iroh relay on this address (e.g. 0.0.0.0:3340)
+        #[arg(long)]
+        relay_listen: Option<String>,
+
         /// Enable verbose logging
         #[arg(long)]
         verbose: bool,
@@ -805,6 +809,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bootstrap,
                 health_listen,
                 identity_key,
+                relay_listen,
                 verbose,
             } => {
                 memory_common::init_tracing(verbose, "sync_daemon");
@@ -813,6 +818,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     identity_key,
                     bootstrap_peers: bootstrap,
                     health_listen,
+                    relay_listen,
                 })
                 .await?;
                 Ok(())
@@ -844,6 +850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 identity_key: None,
                 bootstrap_peers: bootstrap,
                 health_listen,
+                relay_listen: None,
             };
             let sync_handle = tokio::spawn(async move {
                 if let Err(e) = sync_daemon::daemon::run(sync_config).await {

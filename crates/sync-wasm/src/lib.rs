@@ -775,7 +775,7 @@ mod wasm_impl {
                 .try_into()
                 .map_err(|_| JsError::new("secret_key must be exactly 32 bytes"))?;
 
-            let node = sync_core::network::SyncNode::new(key_bytes)
+            let node = sync_core::network::SyncNode::new(key_bytes, None)
                 .await
                 .map_err(|e| JsError::new(&format!("Failed to create sync node: {e}")))?;
 

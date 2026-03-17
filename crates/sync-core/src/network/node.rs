@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh_gossip::{Gossip, TopicId};
@@ -65,13 +65,22 @@ impl SyncNode {
     ///
     /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
     /// The endpoint binds to a random available port.
-    pub async fn new(secret_key_bytes: [u8; 32]) -> Result<Self> {
+    ///
+    /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
+    /// only this relay URL instead of the default number 0 relay servers. Pass this
+    /// when the daemon is running its own embedded relay so peers can route through it.
+    pub async fn new(secret_key_bytes: [u8; 32], extra_relay: Option<&RelayUrl>) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
+        let relay_mode = match extra_relay {
+            Some(url) => RelayMode::Custom(RelayMap::from_iter([url.clone()])),
+            None => RelayMode::Default,
+        };
+
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .relay_mode(RelayMode::Default)
+            .relay_mode(relay_mode)
             .bind()
             .await
             .context("Failed to create iroh endpoint")?;
