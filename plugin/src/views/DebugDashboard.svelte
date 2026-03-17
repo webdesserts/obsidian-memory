@@ -42,7 +42,7 @@
   let eventRef: EventRef | null = null;
 
   /**
-   * Truncate a 16-char peer ID to a readable format: first6...last4
+   * Truncate a 64-char peer ID to a readable format: first6...last4
    */
   function truncatePeerId(id: string): string {
     if (id.length <= 10) return id;

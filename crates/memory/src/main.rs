@@ -605,9 +605,9 @@ enum SyncAction {
         #[arg(long)]
         client_only: bool,
 
-        /// Peer ID (generated if not provided)
+        /// Path to an alternate ed25519 identity key file (default: .sync/daemon.key)
         #[arg(long)]
-        peer_id: Option<String>,
+        identity_key: Option<std::path::PathBuf>,
 
         /// Enable verbose logging
         #[arg(long)]
@@ -818,7 +818,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 advertise,
                 bootstrap,
                 client_only,
-                peer_id,
+                identity_key,
                 verbose,
             } => {
                 memory_common::init_tracing(verbose, "sync_daemon");
@@ -828,7 +828,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     advertise,
                     bootstrap,
                     client_only,
-                    peer_id,
+                    identity_key,
                 })
                 .await?;
                 Ok(())
@@ -862,7 +862,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 advertise,
                 bootstrap,
                 client_only: false,
-                peer_id: None,
+                identity_key: None,
             };
             let sync_handle = tokio::spawn(async move {
                 if let Err(e) = sync_daemon::daemon::run(sync_config).await {

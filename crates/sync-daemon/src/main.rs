@@ -36,9 +36,9 @@ struct Args {
     #[arg(long)]
     client_only: bool,
 
-    /// Peer ID (generated if not provided)
+    /// Path to an alternate ed25519 identity key file (default: .sync/daemon.key)
     #[arg(long)]
-    peer_id: Option<String>,
+    identity_key: Option<PathBuf>,
 
     /// Enable verbose logging
     #[arg(long)]
@@ -62,7 +62,7 @@ impl From<Args> for DaemonRunConfig {
             advertise: args.advertise,
             bootstrap: args.bootstrap,
             client_only: args.client_only,
-            peer_id: args.peer_id,
+            identity_key: args.identity_key,
         }
     }
 }

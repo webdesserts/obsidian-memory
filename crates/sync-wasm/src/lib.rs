@@ -208,7 +208,7 @@ mod wasm_impl {
 
     /// Generate a new random peer ID.
     ///
-    /// Returns a 16-character hex string that uniquely identifies this peer.
+    /// Returns a 64-character hex string that uniquely identifies this peer.
     /// Store this in settings and pass to `init()` or `load()`.
     #[wasm_bindgen(js_name = generatePeerId)]
     pub fn generate_peer_id() -> String {

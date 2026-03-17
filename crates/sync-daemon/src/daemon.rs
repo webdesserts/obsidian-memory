@@ -31,7 +31,9 @@ pub struct DaemonRunConfig {
     pub advertise: Option<String>,
     pub bootstrap: Vec<String>,
     pub client_only: bool,
-    pub peer_id: Option<String>,
+    /// Optional path to an alternate identity key file (replaces `--peer-id` flag).
+    /// If None, the default `.sync/daemon.key` is used.
+    pub identity_key: Option<PathBuf>,
 }
 
 /// Daemon state holding all components.
@@ -374,11 +376,10 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     info!("Vault loaded, vault ID: {}", vault.vault_id());
 
-    let cli_peer_id: Option<PeerId> = match config.peer_id {
-        Some(id_str) => Some(id_str.parse().context("Invalid peer ID")?),
-        None => None,
-    };
-    let daemon_config = DaemonConfig::load_or_generate(&config.vault, cli_peer_id)?;
+    let daemon_config = DaemonConfig::load_or_generate(
+        &config.vault,
+        config.identity_key.as_deref(),
+    )?;
     let peer_id = daemon_config.peer_id;
 
     let server = WebSocketServer::new(peer_id.to_string(), config.advertise.clone());

@@ -40,6 +40,10 @@ uuid = { version = "1", features = ["v4"] }
 # File locking (flock-based daemon lock)
 fs2 = "0.4"
 
+# Ed25519 keypairs for peer identity
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+
 [package.metadata.dist]
 dist = false
 
