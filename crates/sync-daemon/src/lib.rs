@@ -3,6 +3,7 @@
 //! This is a thin library layer over the daemon components,
 //! allowing integration tests to access internal types.
 
+pub mod allowlist;
 pub mod connection;
 pub mod daemon;
 pub mod daemon_lock;
@@ -17,6 +18,7 @@ pub mod server;
 pub mod watcher;
 
 // Re-export key types for convenience
+pub use allowlist::FileAllowlistStorage;
 pub use connection::{ConnectionEvent, IncomingMessage, PeerConnection};
 pub use key_storage::FileKeyStorage;
 pub use manager::{ConnectionManager, ManagerEvent};

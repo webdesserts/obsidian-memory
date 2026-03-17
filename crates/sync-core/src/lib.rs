@@ -9,11 +9,13 @@
 //! - Sync protocol between peers
 //! - FileSystem and SyncTransport trait abstractions
 
+pub mod allowlist;
 pub mod document;
 pub mod events;
 pub mod fs;
 pub mod key_storage;
 pub mod markdown;
+pub mod pairing;
 pub mod peer_id;
 pub mod peers;
 pub mod protocol;
@@ -22,10 +24,12 @@ pub mod sync_engine;
 pub mod transport;
 pub mod vault;
 
+pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use key_storage::{KeyStorage, KeyStorageError};
+pub use pairing::{PairingConfirmation, PairingRequest};
 pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use protocol::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 pub use peers::{ConnectedPeer, ConnectionDirection, PeerError, PeerRegistry};
