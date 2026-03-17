@@ -535,17 +535,13 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:3000")]
         listen: String,
 
-        /// Address for sync daemon to listen on
-        #[arg(long, default_value = "0.0.0.0:8080")]
-        sync_listen: String,
-
-        /// Address to advertise to other sync peers
-        #[arg(long)]
-        advertise: Option<String>,
-
-        /// Bootstrap peer(s) to connect to on startup
+        /// Bootstrap peer(s) to connect to on startup (iroh EndpointId hex strings)
         #[arg(long)]
         bootstrap: Vec<String>,
+
+        /// Address for the sync daemon health endpoint (optional)
+        #[arg(long)]
+        health_listen: Option<String>,
 
         /// Enable verbose logging
         #[arg(long)]
@@ -589,21 +585,13 @@ enum SyncAction {
         #[arg(long)]
         vault: PathBuf,
 
-        /// Address to listen on for incoming connections
-        #[arg(long, default_value = "0.0.0.0:8080")]
-        listen: String,
-
-        /// Address to advertise to other peers
-        #[arg(long)]
-        advertise: Option<String>,
-
-        /// Bootstrap peer(s) to connect to on startup
+        /// Bootstrap peer(s) to connect to on startup (iroh EndpointId hex strings)
         #[arg(long)]
         bootstrap: Vec<String>,
 
-        /// Run in client-only mode (don't listen for incoming connections)
+        /// Address for the health endpoint (optional, e.g. 127.0.0.1:8081)
         #[arg(long)]
-        client_only: bool,
+        health_listen: Option<String>,
 
         /// Path to an alternate ed25519 identity key file (default: .sync/daemon.key)
         #[arg(long)]
@@ -814,21 +802,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Sync { action }) => match action {
             SyncAction::Up {
                 vault,
-                listen,
-                advertise,
                 bootstrap,
-                client_only,
+                health_listen,
                 identity_key,
                 verbose,
             } => {
                 memory_common::init_tracing(verbose, "sync_daemon");
                 sync_daemon::daemon::run(sync_daemon::daemon::DaemonRunConfig {
                     vault,
-                    listen,
-                    advertise,
-                    bootstrap,
-                    client_only,
                     identity_key,
+                    bootstrap_peers: bootstrap,
+                    health_listen,
                 })
                 .await?;
                 Ok(())
@@ -846,9 +830,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Up {
             vault,
             listen,
-            sync_listen,
-            advertise,
             bootstrap,
+            health_listen,
             verbose,
         }) => {
             memory_common::init_tracing(verbose, "memory");
@@ -858,11 +841,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Spawn sync daemon as background task
             let sync_config = sync_daemon::daemon::DaemonRunConfig {
                 vault,
-                listen: sync_listen,
-                advertise,
-                bootstrap,
-                client_only: false,
                 identity_key: None,
+                bootstrap_peers: bootstrap,
+                health_listen,
             };
             let sync_handle = tokio::spawn(async move {
                 if let Err(e) = sync_daemon::daemon::run(sync_config).await {

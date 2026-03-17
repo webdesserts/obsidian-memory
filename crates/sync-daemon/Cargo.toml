@@ -9,7 +9,7 @@ name = "sync-daemon"
 path = "src/main.rs"
 
 [dependencies]
-sync-core = { path = "../sync-core" }
+sync-core = { path = "../sync-core", features = ["native"] }
 memory-common = { path = "../memory-common" }
 tokio.workspace = true
 bincode.workspace = true
@@ -30,12 +30,8 @@ notify-debouncer-mini.workspace = true
 # CLI
 clap.workspace = true
 
-# Networking (WebSocket + HTTP)
-tokio-tungstenite = "0.28"
-axum = { workspace = true, features = ["ws"] }
-
-# UUID generation
-uuid = { version = "1", features = ["v4"] }
+# Health endpoint HTTP server
+axum.workspace = true
 
 # File locking (flock-based daemon lock)
 fs2 = "0.4"
@@ -44,9 +40,14 @@ fs2 = "0.4"
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 
+# Iroh node IDs (for EndpointId parsing)
+iroh = { version = "0.97", default-features = false }
+
 [package.metadata.dist]
 dist = false
 
 [dev-dependencies]
 reqwest = "0.13.2"
 tempfile.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
