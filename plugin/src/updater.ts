@@ -15,7 +15,6 @@ const RELEASES_URL =
 const ASSET_FILE_MAP: Record<string, string> = {
   "obsidian-plugin-main.js": "main.js",
   "obsidian-plugin-manifest.json": "manifest.json",
-  "obsidian-plugin-ws-server.js": "ws-server.js",
 };
 
 /**
@@ -112,8 +111,6 @@ async function doUpdateCheck(
   for (const [assetName, localName] of Object.entries(ASSET_FILE_MAP)) {
     const asset = assets.find((a) => a.name === assetName);
     if (!asset) {
-      // ws-server.js is optional on mobile
-      if (assetName === "obsidian-plugin-ws-server.js") continue;
       log.warn(`Missing release asset: ${assetName}`);
       return;
     }
@@ -154,11 +151,11 @@ async function doUpdateCheck(
   if (isUnloaded()) return;
 
   // Atomic writes: .tmp suffix then rename
-  // Write order: ws-server.js → manifest.json → main.js (main.js last since it's the entry point)
+  // Write order: manifest.json → main.js (main.js last since it's the entry point)
   const pluginDir = getPluginDir(plugin);
   if (!pluginDir) return;
 
-  const writeOrder = ["ws-server.js", "manifest.json", "main.js"];
+  const writeOrder = ["manifest.json", "main.js"];
   const sorted = downloads.sort(
     (a, b) => writeOrder.indexOf(a.localName) - writeOrder.indexOf(b.localName)
   );

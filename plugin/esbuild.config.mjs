@@ -9,18 +9,6 @@ import { dirname, resolve } from "path";
 const prod = process.argv[2] === "production";
 const outdir = "dist/obsidian-p2p-sync";
 
-// Build the desktop-only WebSocket server module separately (Node.js platform)
-await esbuild.build({
-  entryPoints: ["src/network/WebSocketServer.ts"],
-  bundle: true,
-  platform: "node",
-  format: "cjs",
-  external: [...builtins],
-  outfile: `${outdir}/ws-server.js`,
-  minify: prod,
-  sourcemap: prod ? false : "inline",
-});
-
 // Custom plugin to handle WASM binary imports.
 // Loads .wasm files as base64-encoded ArrayBuffers that can be passed to initSync().
 const wasmPlugin = {
@@ -68,8 +56,6 @@ const context = await esbuild.context({
     "@lezer/highlight",
     "@lezer/lr",
     ...builtins,
-    // Exclude ws-server - it's built separately and loaded at runtime on desktop
-    "./ws-server.js",
   ],
   format: "cjs",
   target: "es2020",
