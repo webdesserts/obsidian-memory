@@ -444,13 +444,13 @@ fn loro_value_to_json(value: &loro::LoroValue) -> std::result::Result<serde_json
         loro::LoroValue::Double(n) => Ok(serde_json::json!(*n)),
         loro::LoroValue::String(s) => Ok(serde_json::Value::String(s.to_string())),
         loro::LoroValue::List(arr) => {
-            let items: std::result::Result<Vec<_>, _> = arr.iter().map(loro_value_to_json).collect();
+            let items: std::result::Result<Vec<_>, ()> = arr.iter().map(loro_value_to_json).collect();
             Ok(serde_json::Value::Array(items?))
         }
         loro::LoroValue::Map(map) => {
-            let obj: std::result::Result<serde_json::Map<String, serde_json::Value>, _> = map
+            let obj: std::result::Result<serde_json::Map<String, serde_json::Value>, ()> = map
                 .iter()
-                .map(|(k, v)| Ok((k.clone(), loro_value_to_json(v)?)))
+                .map(|(k, v)| -> std::result::Result<_, ()> { Ok((k.clone(), loro_value_to_json(v)?)) })
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }
