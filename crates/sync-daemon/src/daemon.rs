@@ -331,7 +331,7 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     let vault_id = vault.vault_id();
     info!("Vault loaded, vault ID: {}", vault_id);
 
-    let (daemon_config, identity_key) = DaemonConfig::load_or_generate(
+    let (mut daemon_config, identity_key) = DaemonConfig::load_or_generate(
         &config.vault,
         config.identity_key.as_deref(),
     )
@@ -365,6 +365,14 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     };
 
     let relay_url = embedded_relay.as_ref().map(|r| r.relay_url().clone());
+
+    // Persist the relay URL so plugin peers can discover it.
+    // We also clear it on shutdown so the file doesn't advertise a stale URL.
+    if let Some(ref url) = relay_url {
+        if let Err(e) = daemon_config.set_relay_url(Some(url.to_string()), &config.vault) {
+            warn!("Failed to persist relay URL to daemon.toml: {}", e);
+        }
+    }
 
     let secret_key_bytes = identity_key.secret_key_bytes();
     let sync_node = SyncNode::new(secret_key_bytes, relay_url.as_ref())
@@ -453,6 +461,10 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     }
     if let Some(relay) = embedded_relay {
         relay.shutdown().await;
+        // Clear the relay URL from daemon.toml so the plugin doesn't try to use a dead relay.
+        if let Err(e) = daemon_config.set_relay_url(None, &config.vault) {
+            warn!("Failed to clear relay URL from daemon.toml: {}", e);
+        }
     }
 
     Ok(())

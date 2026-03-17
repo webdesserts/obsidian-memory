@@ -91,6 +91,12 @@ pub struct DaemonConfig {
     /// Stored for reference only — orphaned Loro version-vector entries are harmless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_peer_id: Option<String>,
+    /// URL of the embedded relay server, written on startup and cleared on shutdown.
+    ///
+    /// Plugin peers read this to discover the daemon's relay and route through it.
+    /// Absent when the relay is not running (relay_listen was not set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 impl DaemonConfig {
@@ -155,6 +161,10 @@ impl DaemonConfig {
             let config = DaemonConfig {
                 peer_id: existing.peer_id,
                 legacy_peer_id: existing.legacy_peer_id,
+                // Relay URL is runtime state — always start with None and let the
+                // daemon write it after the relay starts. A stale URL left from a
+                // previous (crashed) run is meaningless after restart.
+                relay_url: None,
             };
             info!(peer_id = %config.peer_id, "Loaded daemon config");
             config
@@ -162,6 +172,7 @@ impl DaemonConfig {
             let config = DaemonConfig {
                 peer_id: new_peer_id,
                 legacy_peer_id: None,
+                relay_url: None,
             };
             info!(peer_id = %config.peer_id, "Generated new daemon config");
             config
@@ -171,6 +182,15 @@ impl DaemonConfig {
         config.save(vault_path)?;
 
         Ok((config, identity_key))
+    }
+
+    /// Write the relay URL to daemon.toml.
+    ///
+    /// Called after the embedded relay starts so plugin peers can discover it.
+    /// Pass `None` to clear (written on daemon shutdown).
+    pub fn set_relay_url(&mut self, url: Option<String>, vault_path: &Path) -> Result<()> {
+        self.relay_url = url;
+        self.save(vault_path)
     }
 
     /// Save the current config to `.sync/daemon.toml`.
@@ -185,12 +205,13 @@ impl DaemonConfig {
     }
 }
 
-/// Raw deserialization type for migration — accepts optional `incarnation` and
-/// `legacy_peer_id` fields from older `daemon.toml` files without failing.
+/// Raw deserialization type for migration — accepts optional `incarnation`,
+/// `legacy_peer_id`, and `relay_url` fields from older `daemon.toml` files without failing.
 #[derive(Deserialize)]
 struct DaemonConfigRaw {
     peer_id: PeerId,
     legacy_peer_id: Option<String>,
+    relay_url: Option<String>,
     #[allow(dead_code)]
     incarnation: Option<u64>,
 }
@@ -734,6 +755,49 @@ incarnation = 3
 
         // daemon.key should now exist
         assert!(sync_dir.join("daemon.key").exists());
+    }
+
+    #[tokio::test]
+    async fn test_daemon_config_relay_url_persists() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+
+        // Write relay URL
+        config.set_relay_url(Some("http://127.0.0.1:3340/".into()), vault_path).unwrap();
+
+        // Reload and verify the URL is stored in the file
+        let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
+        assert!(contents.contains("relay_url"), "relay_url should be in daemon.toml");
+        assert!(contents.contains("3340"), "relay URL should contain port");
+
+        // Clear the URL
+        config.set_relay_url(None, vault_path).unwrap();
+
+        let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
+        assert!(!contents.contains("relay_url"), "relay_url should be absent after clearing");
+    }
+
+    #[tokio::test]
+    async fn test_daemon_config_loads_without_relay_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        // Simulate an older daemon.toml without relay_url
+        let sync_dir = vault_path.join(".sync");
+        fs::create_dir_all(&sync_dir).unwrap();
+
+        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
+        let peer_id = key.peer_id();
+        fs::write(
+            sync_dir.join("daemon.toml"),
+            format!("peer_id = \"{peer_id}\"\n"),
+        ).unwrap();
+
+        // Should load without error — relay_url field is optional
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        assert!(config.relay_url.is_none());
     }
 
     #[tokio::test]
