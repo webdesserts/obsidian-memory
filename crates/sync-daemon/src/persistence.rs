@@ -9,9 +9,12 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use sync_core::key_storage::KeyStorage;
 use sync_core::peer_id::PeerId;
 use sync_core::swim::PeerInfo;
 use tracing::{info, warn};
+
+use crate::key_storage::FileKeyStorage;
 
 const DAEMON_KEY_FILE: &str = ".sync/daemon.key";
 const DAEMON_CONFIG_FILE: &str = ".sync/daemon.toml";
@@ -26,25 +29,22 @@ pub struct IdentityKey {
 }
 
 impl IdentityKey {
-    /// Generate a new random identity key and save it to `.sync/daemon.key`.
-    pub fn generate(vault_path: &Path) -> Result<Self> {
-        let key = Self::from_random_seed()?;
-        key.save(vault_path)?;
+    /// Load or generate the default identity key at `.sync/daemon.key`.
+    ///
+    /// Delegates I/O to `FileKeyStorage`, which handles file creation,
+    /// permissions, and atomic loading.
+    pub async fn load_or_generate(vault_path: &Path) -> Result<Self> {
+        let storage = FileKeyStorage::new(vault_path);
+        let bytes = storage
+            .load_or_generate()
+            .await
+            .map_err(|e| anyhow::anyhow!("Key storage error: {}", e))?;
+        let key = Self::from_bytes(bytes);
+        info!(peer_id = %key.peer_id(), "Loaded or generated daemon identity key");
         Ok(key)
     }
 
-    /// Generate an identity key from cryptographically secure random bytes.
-    fn from_random_seed() -> Result<Self> {
-        let mut seed = [0u8; 32];
-        // Use getrandom directly to avoid rand_core version conflicts between
-        // rand 0.9 (rand_core 0.9) and ed25519-dalek 2.x (rand_core 0.6).
-        getrandom::getrandom(&mut seed)
-            .map_err(|e| anyhow::anyhow!("Failed to generate random bytes: {}", e))?;
-        let signing_key = SigningKey::from_bytes(&seed);
-        Ok(Self { signing_key })
-    }
-
-    /// Load an identity key from a key file path.
+    /// Load an identity key from a custom key file path.
     ///
     /// The file must contain exactly 32 bytes (the ed25519 secret key).
     pub fn load_from(key_path: &Path) -> Result<Self> {
@@ -53,37 +53,14 @@ impl IdentityKey {
         let bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("Key file must be exactly 32 bytes: {}", key_path.display()))?;
-        let signing_key = SigningKey::from_bytes(&bytes);
-        Ok(Self { signing_key })
+        Ok(Self::from_bytes(bytes))
     }
 
-    /// Load or generate the default identity key at `.sync/daemon.key`.
-    pub fn load_or_generate(vault_path: &Path) -> Result<Self> {
-        let key_path = vault_path.join(DAEMON_KEY_FILE);
-        if key_path.exists() {
-            let key = Self::load_from(&key_path)?;
-            info!(peer_id = %key.peer_id(), "Loaded daemon identity key");
-            Ok(key)
-        } else {
-            let key = Self::generate(vault_path)?;
-            info!(peer_id = %key.peer_id(), "Generated new daemon identity key");
-            Ok(key)
+    /// Build an `IdentityKey` from raw secret key bytes.
+    fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&bytes),
         }
-    }
-
-    /// Save the secret key bytes to `.sync/daemon.key`.
-    fn save(&self, vault_path: &Path) -> Result<()> {
-        let key_path = vault_path.join(DAEMON_KEY_FILE);
-        if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&key_path, self.signing_key.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
     }
 
     /// Derive the `PeerId` from this identity key's public key.
@@ -117,7 +94,7 @@ impl DaemonConfig {
     ///
     /// `identity_key_path` — if provided, loads a custom key file instead of the
     /// default `.sync/daemon.key`. This replaces the old `--peer-id` flag.
-    pub fn load_or_generate(vault_path: &Path, identity_key_path: Option<&Path>) -> Result<Self> {
+    pub async fn load_or_generate(vault_path: &Path, identity_key_path: Option<&Path>) -> Result<Self> {
         let config_path = vault_path.join(DAEMON_CONFIG_FILE);
         let key_path = vault_path.join(DAEMON_KEY_FILE);
 
@@ -132,7 +109,7 @@ impl DaemonConfig {
                 info!(peer_id = %key.peer_id(), key_path = %path.display(), "Loaded custom identity key");
                 key
             }
-            None => IdentityKey::load_or_generate(vault_path)?,
+            None => IdentityKey::load_or_generate(vault_path).await?,
         };
 
         let new_peer_id = identity_key.peer_id();
@@ -613,12 +590,12 @@ mod tests {
 
     // ==================== IdentityKey tests ====================
 
-    #[test]
-    fn test_identity_key_generates_and_saves() {
+    #[tokio::test]
+    async fn test_identity_key_generates_and_saves() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let key = IdentityKey::generate(vault_path).unwrap();
+        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
         let peer_id = key.peer_id();
 
         // Key file should exist with 32 bytes
@@ -631,29 +608,30 @@ mod tests {
         assert_ne!(peer_id.as_u64(), 0);
     }
 
-    #[test]
-    fn test_identity_key_loads_and_matches() {
+    #[tokio::test]
+    async fn test_identity_key_loads_and_matches() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let key1 = IdentityKey::generate(vault_path).unwrap();
+        let key1 = IdentityKey::load_or_generate(vault_path).await.unwrap();
         let peer_id1 = key1.peer_id();
 
-        let key2 = IdentityKey::load_or_generate(vault_path).unwrap();
+        // Second call should load the same key from disk
+        let key2 = IdentityKey::load_or_generate(vault_path).await.unwrap();
         let peer_id2 = key2.peer_id();
 
         // Should produce the same PeerId after loading
         assert_eq!(peer_id1, peer_id2);
     }
 
-    #[test]
-    fn test_identity_key_load_from_custom_path() {
+    #[tokio::test]
+    async fn test_identity_key_load_from_custom_path() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        // Generate an alternate key in a custom location
+        // Generate a key in a separate location via load_or_generate
         let alt_dir = TempDir::new().unwrap();
-        let alt_key = IdentityKey::generate(alt_dir.path()).unwrap();
+        let alt_key = IdentityKey::load_or_generate(alt_dir.path()).await.unwrap();
         let alt_key_path = alt_dir.path().join(".sync/daemon.key");
         let alt_peer_id = alt_key.peer_id();
 
@@ -662,18 +640,18 @@ mod tests {
         assert_eq!(loaded.peer_id(), alt_peer_id);
 
         // Should differ from what a default generate would produce
-        let default_key = IdentityKey::load_or_generate(vault_path).unwrap();
+        let default_key = IdentityKey::load_or_generate(vault_path).await.unwrap();
         assert_ne!(default_key.peer_id(), alt_peer_id);
     }
 
     // ==================== DaemonConfig tests ====================
 
-    #[test]
-    fn test_daemon_config_generates_new() {
+    #[tokio::test]
+    async fn test_daemon_config_generates_new() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Should have a valid PeerId (64-char hex, non-zero as_u64) and incarnation at 1
         assert_eq!(config.peer_id.to_string().len(), 64);
@@ -686,47 +664,47 @@ mod tests {
         assert!(vault_path.join(".sync/daemon.toml").exists());
     }
 
-    #[test]
-    fn test_daemon_config_persists_across_restarts() {
+    #[tokio::test]
+    async fn test_daemon_config_persists_across_restarts() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let config1 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config1 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Simulate restart — should load same PeerId from key file
-        let config2 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config2 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         assert_eq!(config1.peer_id, config2.peer_id);
         assert_eq!(config2.incarnation, 1);
     }
 
-    #[test]
-    fn test_daemon_config_identity_key_override() {
+    #[tokio::test]
+    async fn test_daemon_config_identity_key_override() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
         // First start with default key
-        let config1 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config1 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Generate an alternate key in a separate location
         let alt_dir = TempDir::new().unwrap();
-        let alt_key = IdentityKey::generate(alt_dir.path()).unwrap();
+        let alt_key = IdentityKey::load_or_generate(alt_dir.path()).await.unwrap();
         let alt_peer_id = alt_key.peer_id();
         assert_ne!(alt_peer_id, config1.peer_id);
 
         // Start with alternate key — should update PeerId in config
         let alt_key_path = alt_dir.path().join(".sync/daemon.key");
-        let config2 = DaemonConfig::load_or_generate(vault_path, Some(&alt_key_path)).unwrap();
+        let config2 = DaemonConfig::load_or_generate(vault_path, Some(&alt_key_path)).await.unwrap();
         assert_eq!(config2.peer_id, alt_peer_id);
 
         // After using the alternate key, the config reflects the alternate PeerId.
         // Default restart now uses the default key again (config tracks last used PeerId).
-        let config3 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config3 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
         assert_eq!(config3.peer_id, config1.peer_id);
     }
 
-    #[test]
-    fn test_daemon_config_migrates_legacy_peer_id() {
+    #[tokio::test]
+    async fn test_daemon_config_migrates_legacy_peer_id() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
@@ -742,7 +720,7 @@ incarnation = 3
         fs::write(sync_dir.join("known_peers.json"), r#"{"peers":[]}"#).unwrap();
 
         // Load with new code — should generate a new ed25519 key and migrate
-        let config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // New PeerId should be 64-char hex (ed25519)
         assert_eq!(config.peer_id.to_string().len(), 64);
@@ -760,12 +738,12 @@ incarnation = 3
         assert!(sync_dir.join("daemon.key").exists());
     }
 
-    #[test]
-    fn test_daemon_config_incarnation_bump() {
+    #[tokio::test]
+    async fn test_daemon_config_incarnation_bump() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let mut config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let mut config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
         assert_eq!(config.incarnation, 1);
 
         // Simulate incarnation bump from SWIM refutation
@@ -773,16 +751,16 @@ incarnation = 3
         assert_eq!(config.incarnation, 5);
 
         // Reload should see the new incarnation
-        let config2 = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let config2 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
         assert_eq!(config2.incarnation, 5);
     }
 
-    #[test]
-    fn test_daemon_config_incarnation_no_change_skips_save() {
+    #[tokio::test]
+    async fn test_daemon_config_incarnation_no_change_skips_save() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let mut config = DaemonConfig::load_or_generate(vault_path, None).unwrap();
+        let mut config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         // Same incarnation — should be a no-op (no error, no write)
         config.save_if_incarnation_changed(1, vault_path).unwrap();

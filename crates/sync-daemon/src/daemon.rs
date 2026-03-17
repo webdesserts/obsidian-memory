@@ -379,7 +379,8 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     let daemon_config = DaemonConfig::load_or_generate(
         &config.vault,
         config.identity_key.as_deref(),
-    )?;
+    )
+    .await?;
     let peer_id = daemon_config.peer_id;
 
     let server = WebSocketServer::new(peer_id.to_string(), config.advertise.clone());

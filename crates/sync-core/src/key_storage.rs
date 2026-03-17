@@ -82,10 +82,12 @@ pub trait KeyStorage {
 }
 
 /// Generate a new random ed25519 secret key using cryptographically secure randomness.
+///
+/// Uses `getrandom` directly to avoid rand_core version conflicts between
+/// rand 0.9 (rand_core 0.9) and ed25519-dalek 2.x (rand_core 0.6).
 fn generate_key() -> [u8; 32] {
-    use rand::RngCore;
     let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
+    getrandom::getrandom(&mut key).expect("getrandom failed");
     key
 }
 
