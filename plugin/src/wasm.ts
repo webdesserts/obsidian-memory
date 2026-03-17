@@ -13,6 +13,7 @@ import {
   generatePeerId as wasmGeneratePeerId,
   JsFileSystemBridge,
   WasmVault,
+  WasmSyncNode,
   WasmSubscription as WasmSubscriptionImpl,
 } from "../pkg/sync_wasm.js";
 
@@ -22,39 +23,8 @@ import wasmBinary from "../pkg/sync_wasm_bg.wasm";
 import { log } from "./logger";
 
 // Re-export types
-export { JsFileSystemBridge, WasmVault };
+export { JsFileSystemBridge, WasmVault, WasmSyncNode };
 export type { WasmSubscriptionImpl as WasmSubscription };
-
-// ========== Peer Types ==========
-
-/** Connection direction from our perspective */
-export type ConnectionDirection = "incoming" | "outgoing";
-
-/** Connection state for a peer */
-export type ConnectionState = "connecting" | "connected" | "disconnected";
-
-/** Reason for disconnection */
-export type DisconnectReason = "userRequested" | "networkError" | "remoteClosed" | "protocolError";
-
-/** Tracked state for a peer in the registry */
-export interface ConnectedPeer {
-  /** Peer's unique identifier (from handshake) */
-  id: string;
-  /** Connection address (IP:port or URL) */
-  address: string;
-  /** Connection direction */
-  direction: ConnectionDirection;
-  /** Connection state */
-  state: ConnectionState;
-  /** Reason for disconnection (if disconnected) */
-  disconnectReason?: DisconnectReason;
-  /** When first seen this session (ms since epoch) */
-  firstSeen: number;
-  /** When last activity observed (ms since epoch) */
-  lastSeen: number;
-  /** Times this peer has connected this session */
-  connectionCount: number;
-}
 
 // ========== Init Config Types ==========
 
@@ -156,7 +126,7 @@ export type SyncEvent =
       /** Connection address (IP:port or URL). */
       address: string;
       /** Connection direction ("incoming" or "outgoing"). */
-      direction: ConnectionDirection;
+      direction: string;
       /** When the connection completed, in milliseconds since Unix epoch. */
       timestamp: number;
     }

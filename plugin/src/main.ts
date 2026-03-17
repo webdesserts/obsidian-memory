@@ -1,34 +1,22 @@
-import { Notice, Plugin, Platform, FileSystemAdapter, Events, TFile } from "obsidian";
+import { Notice, Plugin, FileSystemAdapter, Events, TFile } from "obsidian";
 import { SyncView, VIEW_TYPE_SYNC } from "./views/SyncView";
 import { DebugModal } from "./views/DebugModal";
 import {
   initWasm,
   isWasmReady,
-  generatePeerId,
   WasmVault,
   WasmSubscription,
   SyncEvent,
-  ConnectedPeer,
-  DisconnectReason,
   LogEvent,
 } from "./wasm";
 import { createFsBridge } from "./fs/ObsidianFs";
-import { PeerManager, PeerInfo, VaultPeerManager } from "./network";
+import { NetworkManager, type PeerInfo } from "./network";
 import { VaultOperationQueue } from "./VaultOperationQueue";
 import { log } from "./logger";
 import { checkForUpdates } from "./updater";
 
-/** Result from processSyncMessage */
-interface SyncMessageResult {
-  response: Uint8Array | null;
-  modifiedPaths: string[];
-}
-
-/** Key for storing peer ID in local storage */
-const PEER_ID_KEY = "p2p-sync-peer-id";
-
-/** Default WebSocket server port */
-const DEFAULT_PORT = 8765;
+/** Key for storing secret key (hex) in local storage */
+const SECRET_KEY_KEY = "p2p-sync-secret-key";
 
 /** Maximum file size to sync (10MB). Files larger than this are skipped. */
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -36,31 +24,25 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024;
 /** Maximum number of sync events to keep in the debug buffer */
 const MAX_DEBUG_EVENTS = 50;
 
-/** Maximum sync message size (50MB). Messages larger than this are rejected. */
-const MAX_SYNC_MESSAGE_SIZE = 50 * 1024 * 1024;
-
 /** Minimum time between broadcasts for the same file (ms). Prevents flooding. */
 const BROADCAST_THROTTLE_MS = 1000;
-
-/** A saved peer address for auto-reconnect */
-export interface KnownPeer {
-  /** Full WebSocket URL (ws:// or wss://) */
-  url: string;
-  /** Display label (hostname:port or full URL for proxied connections) */
-  label: string;
-}
 
 /** Path to settings file within the vault's .sync directory */
 const SETTINGS_PATH = ".sync/settings.json";
 
-/** Plugin settings persisted per-vault in .sync/settings.json */
+/**
+ * Plugin settings persisted per-vault in .sync/settings.json.
+ *
+ * `bootstrapPeers` are iroh EndpointId hex strings used on startup to join
+ * the vault gossip swarm. Peers exchange their node IDs out-of-band (e.g.,
+ * copy-paste) and add each other as bootstrap peers.
+ */
 interface P2PSyncSettings {
-  /** Peers to auto-reconnect to on plugin load */
-  knownPeers: KnownPeer[];
+  bootstrapPeers: string[];
 }
 
 const DEFAULT_SETTINGS: P2PSyncSettings = {
-  knownPeers: [],
+  bootstrapPeers: [],
 };
 
 /**
@@ -77,18 +59,15 @@ export default class P2PSyncPlugin extends Plugin {
   /** The vault manager from WASM */
   vault: WasmVault | null = null;
 
-  /** Our unique peer identifier */
-  peerId: string | null = null;
+  /** Network manager (iroh-based P2P) */
+  networkManager: NetworkManager | null = null;
 
-  /** Peer connection manager */
-  peerManager: PeerManager | null = null;
-
-  /** Status bar element (desktop only) */
+  /** Status bar element */
   private statusBarEl: HTMLElement | null = null;
 
   /**
    * Whether the plugin is disabled due to Obsidian Sync being active.
-   * When true, the plugin will not initialize vault or peer manager.
+   * When true, the plugin will not initialize vault or network manager.
    */
   disabledReason: string | null = null;
 
@@ -127,18 +106,11 @@ export default class P2PSyncPlugin extends Plugin {
    */
   private readonly MAX_MAP_ENTRIES = 10000;
 
-  /**
-   * Clean up old entries from Maps when they grow too large.
-   * Uses approximate LRU by removing oldest entries (for timestamp maps).
-   * Only called when Maps exceed MAX_MAP_ENTRIES to prevent unbounded growth.
-   */
   private cleanupMaps(): void {
-    // Clean timestamp-based maps (can sort by value)
     const cleanupTimestamps = <K>(map: Map<K, number>, maxSize: number): void => {
       if (map.size <= maxSize) return;
       const toRemove = map.size - maxSize;
-      const entries = Array.from(map.entries())
-        .sort((a, b) => a[1] - b[1]);
+      const entries = Array.from(map.entries()).sort((a, b) => a[1] - b[1]);
       for (let i = 0; i < toRemove && i < entries.length; i++) {
         map.delete(entries[i][0]);
       }
@@ -154,21 +126,13 @@ export default class P2PSyncPlugin extends Plugin {
     // Check if Obsidian Sync is enabled - block P2P sync to prevent conflicts
     if (this.isObsidianSyncEnabled()) {
       log.info("Obsidian Sync is enabled, disabling P2P Sync");
-      this.disabledReason = "Obsidian Sync is enabled. P2P Sync cannot run at the same time to prevent vault corruption. Please disable Obsidian Sync in Settings → Core plugins if you want to use P2P Sync.";
-      
-      // Still register the view so users can see why it's disabled
-      this.registerView(VIEW_TYPE_SYNC, (leaf) => new SyncView(leaf, this));
-      
-      // Add ribbon icon
-      this.addRibbonIcon("refresh-cw", "Open P2P Sync", () => {
-        this.activateView();
-      });
+      this.disabledReason =
+        "Obsidian Sync is enabled. P2P Sync cannot run at the same time to prevent vault corruption. Please disable Obsidian Sync in Settings → Core plugins if you want to use P2P Sync.";
 
-      // Add status bar showing disabled state (desktop only)
-      if (!Platform.isMobile) {
-        this.statusBarEl = this.addStatusBarItem();
-        this.updateStatusBar("Disabled");
-      }
+      this.registerView(VIEW_TYPE_SYNC, (leaf) => new SyncView(leaf, this));
+      this.addRibbonIcon("refresh-cw", "Open P2P Sync", () => { this.activateView(); });
+      this.statusBarEl = this.addStatusBarItem();
+      this.updateStatusBar("Disabled");
 
       log.info("Plugin loaded (disabled due to Obsidian Sync)");
       return;
@@ -178,26 +142,22 @@ export default class P2PSyncPlugin extends Plugin {
     try {
       const debugLogPath = ".sync/debug.log";
 
-      // Ensure .sync directory exists for debug log
-      if (!await this.app.vault.adapter.exists(".sync")) {
+      if (!(await this.app.vault.adapter.exists(".sync"))) {
         await this.app.vault.adapter.mkdir(".sync");
       }
 
-      // Reset debug log on plugin init (prevents unbounded growth)
       await this.app.vault.adapter.write(
         debugLogPath,
         `--- Log started ${new Date().toISOString()} ---\n`
       );
 
-      // Initialize WASM with logger callback that writes to file
       await initWasm({
         logger: (event: LogEvent) => {
           const line = `${new Date(event.timestamp).toISOString()} [${event.level}] ${event.target}: ${event.message}\n`;
-          // Fire-and-forget append (don't await to avoid blocking sync)
           this.app.vault.adapter.append(debugLogPath, line).catch((err) => {
             console.error("Failed to write debug log:", err);
           });
-        }
+        },
       });
       log.info("WASM initialized");
     } catch (err) {
@@ -206,73 +166,39 @@ export default class P2PSyncPlugin extends Plugin {
       return;
     }
 
-    // Get or generate peer ID
-    this.peerId = this.loadPeerId();
-    log.info("Peer ID:", this.peerId);
-
-    // Load settings (known peers, etc.)
     await this.loadSettings();
 
-    // Register the sidebar view
     this.registerView(VIEW_TYPE_SYNC, (leaf) => new SyncView(leaf, this));
+    this.addRibbonIcon("refresh-cw", "Open P2P Sync", () => { this.activateView(); });
+    this.statusBarEl = this.addStatusBarItem();
+    this.updateStatusBar("ready");
 
-    // Add ribbon icon (left sidebar button)
-    this.addRibbonIcon("refresh-cw", "Open P2P Sync", () => {
-      this.activateView();
-    });
-
-    // Add status bar item (desktop only)
-    if (!Platform.isMobile) {
-      this.statusBarEl = this.addStatusBarItem();
-      this.updateStatusBar("ready");
-    }
-
-    // Add commands
     this.addCommand({
       id: "p2p-sync-open",
       name: "Open Sync Panel",
-      callback: () => {
-        this.activateView();
-      },
-    });
-
-    this.addCommand({
-      id: "p2p-sync-now",
-      name: "Sync Now",
-      callback: () => {
-        this.triggerSync();
-      },
+      callback: () => { this.activateView(); },
     });
 
     this.addCommand({
       id: "p2p-sync-debug",
       name: "Open Debug Panel",
-      callback: () => {
-        new DebugModal(this.app, this).open();
-      },
+      callback: () => { new DebugModal(this.app, this).open(); },
     });
 
-    // Try to load existing vault and start peer manager on startup
     this.app.workspace.onLayoutReady(async () => {
       await this.tryLoadVault();
-      await this.startPeerManager();
+      await this.startNetworkManager();
       this.registerFileEvents();
     });
 
     log.info("Plugin loaded");
-
     checkForUpdates(this);
   }
 
-  /**
-   * Check if Obsidian Sync (core plugin) is enabled.
-   */
   private isObsidianSyncEnabled(): boolean {
     try {
-      // Access internal plugins API (not officially documented but stable)
       const internalPlugins = (this.app as any).internalPlugins;
       if (!internalPlugins) return false;
-      
       const syncPlugin = internalPlugins.getPluginById?.("sync");
       return syncPlugin?.enabled ?? false;
     } catch (err) {
@@ -282,19 +208,16 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   async onunload() {
-    // Stop debug event subscription
     if (this.debugEventSubscription) {
       this.debugEventSubscription.dispose();
       this.debugEventSubscription = null;
     }
 
-    // Stop peer manager
-    if (this.peerManager) {
-      await this.peerManager.stop();
-      this.peerManager = null;
+    if (this.networkManager) {
+      await this.networkManager.stop();
+      this.networkManager = null;
     }
 
-    // Clean up vault
     if (this.vault) {
       this.vault.free();
       this.vault = null;
@@ -302,272 +225,124 @@ export default class P2PSyncPlugin extends Plugin {
     log.info("Plugin unloaded");
   }
 
-  /**
-   * Subscribe to WASM sync events for the debug buffer.
-   * Called after vault is initialized/loaded.
-   */
   private subscribeToDebugEvents(): void {
     if (!this.vault || this.debugEventSubscription) return;
 
     this.debugEventSubscription = this.vault.subscribeSyncEvents((event: SyncEvent) => {
-      // Add to front of buffer
-      this.debugEvents.unshift({
-        event,
-        id: this.debugEventIdCounter++,
-      });
-
-      // Trim to max size
+      this.debugEvents.unshift({ event, id: this.debugEventIdCounter++ });
       if (this.debugEvents.length > MAX_DEBUG_EVENTS) {
         this.debugEvents.length = MAX_DEBUG_EVENTS;
       }
-
-      // Emit state change so debug panel can update
       this.events.trigger("state-changed");
     });
 
     log.debug("Subscribed to sync events for debug buffer");
   }
 
-  /**
-   * Clear the debug event buffer.
-   */
   clearDebugEvents(): void {
     this.debugEvents = [];
     this.debugEventIdCounter = 0;
   }
 
   /**
-   * Start the peer manager (WebSocket server + connection handling).
+   * Start the network manager (iroh sync node + gossip).
    */
-  private async startPeerManager(): Promise<void> {
-    if (!this.peerId) return;
+  private async startNetworkManager(): Promise<void> {
+    const vaultId = this.vault?.peerId() ?? null;
 
-    // Get the plugin directory for loading ws-server.js on desktop
-    const pluginDir = this.getPluginDir();
-
-    this.peerManager = new PeerManager(this.peerId, pluginDir);
-
-    // Set vault adapter for Rust-driven peer state management
-    if (this.vault) {
-      this.peerManager.setVault(this.createVaultPeerManager(this.vault));
-    }
-
-    // peer-connected is now emitted after handshake (not on socket open)
-    // and provides full ConnectedPeer info from Rust
-    this.peerManager.on("peer-connected", async (peer: ConnectedPeer) => {
-      log.info(`Peer connected: ${peer.id} (${peer.direction})`);
-      this.updateStatusBar(`${this.peerManager?.peerCount ?? 0} peers`);
-      this.events.trigger("state-changed");
-
-      // Send sync request to the new peer
-      await this.sendSyncRequest(peer.id);
-    });
-
-    this.peerManager.on("peer-disconnected", (peerId: string) => {
-      log.info(`Peer disconnected: ${peerId}`);
-      this.updateStatusBar(`${this.peerManager?.peerCount ?? 0} peers`);
-      this.events.trigger("state-changed");
-      // Rust state is already updated by PeerManager - no need to call vault here
-    });
-
-    this.peerManager.on("message", async (peerId: string, data: Uint8Array) => {
-      log.debug(`Message from ${peerId}:`, data.length, "bytes");
-      this.peerManager?.updatePeerActivity(peerId);
-      await this.handleSyncMessage(peerId, data);
-    });
-
-    this.peerManager.on("peer-activity", () => {
-      this.events.trigger("state-changed");
-    });
-
-    this.peerManager.on("error", (err: Error) => {
-      log.error("Peer manager error:", err);
-    });
-
-    try {
-      const actualPort = await this.peerManager.start(DEFAULT_PORT);
-      log.info(`Peer manager started on port ${actualPort}`);
-
-      // Advertise our LAN address so peers can see it in handshakes
-      if (Platform.isDesktop && this.peerManager.isServerRunning) {
-        const addresses = this.peerManager.getLanAddresses();
-        if (addresses.length > 0) {
-          const advertisedAddress = `ws://${addresses[0]}:${actualPort}`;
-          this.peerManager.setAdvertisedAddress(advertisedAddress);
-          log.info(`Advertising address: ${advertisedAddress}`);
-        }
-      }
-
-      this.events.trigger("state-changed");
-    } catch (err) {
-      log.error("Failed to start peer manager:", err);
-      // Non-fatal - can still work as client
-    }
-
-    // Auto-reconnect to known peers (fire-and-forget, don't block startup)
-    this.reconnectToKnownPeers();
-  }
-
-  /**
-   * Create a VaultPeerManager adapter for the WASM vault.
-   */
-  private createVaultPeerManager(vault: WasmVault): VaultPeerManager {
-    return {
-      peerConnecting: (connectionId: string, address: string, direction: string): ConnectedPeer => {
-        return vault.peerConnecting(connectionId, address, direction) as ConnectedPeer;
-      },
-      peerHandshakeComplete: (connectionId: string, peerId: string): ConnectedPeer => {
-        return vault.peerHandshakeComplete(connectionId, peerId) as ConnectedPeer;
-      },
-      peerDisconnected: (id: string, reason: DisconnectReason): void => {
-        vault.peerDisconnected(id, reason);
-      },
-      resolvePeerId: (connectionId: string): string => {
-        return vault.resolvePeerId(connectionId);
-      },
-      getKnownPeers: (): ConnectedPeer[] => {
-        return vault.getKnownPeers() as ConnectedPeer[];
-      },
-      getConnectedPeers: (): ConnectedPeer[] => {
-        return vault.getConnectedPeers() as ConnectedPeer[];
-      },
-    };
-  }
-
-  /**
-   * Attempt to reconnect to all known peers in parallel.
-   * Runs in background - failures are logged but don't block startup.
-   */
-  private async reconnectToKnownPeers(): Promise<void> {
-    if (this.settings.knownPeers.length === 0) {
+    if (!vaultId) {
+      log.info("Vault not initialized — skipping network manager startup");
       return;
     }
 
-    log.info(`Auto-reconnecting to ${this.settings.knownPeers.length} known peer(s)...`);
+    const secretKey = this.loadOrGenerateSecretKey();
 
-    // Connect to all peers in parallel
-    const results = await Promise.allSettled(
-      this.settings.knownPeers.map(async (peer) => {
-        await this.peerManager?.connectToUrl(peer.url);
-        return peer.label;
-      })
-    );
+    this.networkManager = new NetworkManager();
 
-    // Log results
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        log.info(`Reconnected to ${result.value}`);
-      } else {
-        log.warn(`Failed to reconnect:`, result.reason);
+    if (this.vault) {
+      this.networkManager.setVault(this.vault);
+    }
+
+    this.networkManager.on("peer-connected", (nodeId: string) => {
+      log.info(`Peer joined swarm: ${nodeId}`);
+      this.updateStatusBar(`${this.networkManager?.peerCount ?? 0} peers`);
+      this.events.trigger("state-changed");
+    });
+
+    this.networkManager.on("peer-disconnected", (nodeId: string) => {
+      log.info(`Peer left swarm: ${nodeId}`);
+      this.updateStatusBar(`${this.networkManager?.peerCount ?? 0} peers`);
+      this.events.trigger("state-changed");
+    });
+
+    this.networkManager.on("change-received", (from: string, path: string) => {
+      log.debug(`Change notification from ${from}: ${path}`);
+      this.events.trigger("state-changed");
+    });
+
+    this.networkManager.on("files-modified", async (paths: string[]) => {
+      log.info(`${paths.length} file(s) updated from sync`);
+      for (const path of paths) {
+        await this.reloadFileFromDisk(path);
       }
+      this.events.trigger("state-changed");
+    });
+
+    this.networkManager.on("sync-completed", () => {
+      this.events.trigger("state-changed");
+    });
+
+    try {
+      await this.networkManager.start(secretKey, vaultId, this.settings.bootstrapPeers);
+      log.info("Network manager started");
+      this.events.trigger("state-changed");
+    } catch (err) {
+      log.error("Failed to start network manager:", err);
     }
   }
 
   /**
-   * Connect to a peer at the given address.
+   * Load or generate the 32-byte ed25519 secret key for this node.
+   *
+   * Stored as a 64-char hex string in localStorage, keyed by vault name.
    */
-  async connectToPeer(address: string, port: number = DEFAULT_PORT): Promise<void> {
-    if (!this.peerManager) {
-      throw new Error("Peer manager not started");
+  private loadOrGenerateSecretKey(): Uint8Array {
+    const vaultKey = `${SECRET_KEY_KEY}:${this.app.vault.getName()}`;
+    const stored = localStorage.getItem(vaultKey);
+
+    if (stored && stored.length === 64) {
+      const bytes = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        bytes[i] = parseInt(stored.slice(i * 2, i * 2 + 2), 16);
+      }
+      return bytes;
     }
 
-    await this.peerManager.connectToPeer(address, port);
+    const key = new Uint8Array(32);
+    crypto.getRandomValues(key);
 
-    // Save to known peers for auto-reconnect
-    const url = `ws://${address}:${port}`;
-    const label = port === DEFAULT_PORT ? address : `${address}:${port}`;
-    await this.addKnownPeer(url, label);
+    const hex = Array.from(key)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    localStorage.setItem(vaultKey, hex);
+
+    return key;
   }
 
   /**
-   * Connect to a peer using a full WebSocket URL.
-   * Use this for connecting through reverse proxies or with custom paths.
-   */
-  async connectToUrl(url: string): Promise<void> {
-    if (!this.peerManager) {
-      throw new Error("Peer manager not started");
-    }
-
-    await this.peerManager.connectToUrl(url);
-
-    // Save to known peers for auto-reconnect
-    // Build a readable label from the URL
-    const parsed = new URL(url);
-    let label = parsed.hostname;
-    // Include port if non-default
-    if (parsed.port && parsed.port !== '443' && parsed.port !== '80') {
-      label += `:${parsed.port}`;
-    }
-    // Include path if not root
-    if (parsed.pathname && parsed.pathname !== '/') {
-      label += parsed.pathname;
-    }
-    await this.addKnownPeer(url, label);
-  }
-
-  /**
-   * Get the list of connected peers.
+   * Get the list of peers visible in the gossip swarm.
    */
   getConnectedPeers(): PeerInfo[] {
-    return this.peerManager?.getConnectedPeers() ?? [];
+    return this.networkManager?.getConnectedPeers() ?? [];
   }
 
   /**
-   * Disconnect from a specific peer.
+   * Get this node's iroh EndpointId (hex string).
    */
-  disconnectPeer(peerId: string): void {
-    if (!this.peerManager) return;
-    try {
-      this.peerManager.disconnectPeer(peerId);
-    } catch (e) {
-      log.error("Failed to disconnect peer:", e);
-    }
+  getNodeId(): string | null {
+    return this.networkManager?.nodeId ?? null;
   }
 
-  /**
-   * Get the server port.
-   */
-  getServerPort(): number {
-    return this.peerManager?.port ?? DEFAULT_PORT;
-  }
-
-  /**
-   * Get the LAN URL for other devices to connect to this one.
-   * Returns null on mobile or if no server is running.
-   */
-  getLanUrl(): string | null {
-    if (!this.peerManager?.isServerRunning) return null;
-
-    const addresses = this.peerManager.getLanAddresses();
-    if (addresses.length === 0) return null;
-
-    const port = this.peerManager.port;
-    // Return first LAN address (usually the primary network interface)
-    return `ws://${addresses[0]}:${port}`;
-  }
-
-  /**
-   * Load peer ID from local storage, or generate a new one.
-   * Uses vault-specific key so each vault has its own peer ID.
-   */
-  private loadPeerId(): string {
-    const vaultKey = `${PEER_ID_KEY}:${this.app.vault.getName()}`;
-    
-    // Try to load from Obsidian's localStorage
-    const stored = localStorage.getItem(vaultKey);
-    if (stored) {
-      return stored;
-    }
-
-    // Generate new peer ID and store it
-    const newId = generatePeerId();
-    localStorage.setItem(vaultKey, newId);
-    return newId;
-  }
-
-  /**
-   * Load plugin settings from .sync/settings.json.
-   */
   private async loadSettings(): Promise<void> {
     try {
       if (await this.app.vault.adapter.exists(SETTINGS_PATH)) {
@@ -582,37 +357,16 @@ export default class P2PSyncPlugin extends Plugin {
       this.settings = { ...DEFAULT_SETTINGS };
     }
 
-    // Validate knownPeers array
-    if (!Array.isArray(this.settings.knownPeers)) {
-      log.warn("Invalid knownPeers in settings, resetting to empty array");
-      this.settings.knownPeers = [];
-    } else {
-      // Filter out invalid entries and deduplicate by normalized URL
-      const seen = new Set<string>();
-      this.settings.knownPeers = this.settings.knownPeers.filter(p => {
-        if (!p || typeof p.url !== 'string' || typeof p.label !== 'string') {
-          return false;
-        }
-        const normalized = this.normalizeWsUrl(p.url);
-        if (seen.has(normalized)) {
-          return false;
-        }
-        seen.add(normalized);
-        return true;
-      });
+    if (!Array.isArray(this.settings.bootstrapPeers)) {
+      this.settings.bootstrapPeers = [];
     }
   }
 
-  /**
-   * Save plugin settings to .sync/settings.json.
-   */
   private async saveSettings(): Promise<void> {
     try {
-      // Ensure .sync directory exists
-      if (!await this.app.vault.adapter.exists(".sync")) {
+      if (!(await this.app.vault.adapter.exists(".sync"))) {
         await this.app.vault.adapter.mkdir(".sync");
       }
-
       const json = JSON.stringify(this.settings, null, 2);
       await this.app.vault.adapter.write(SETTINGS_PATH, json);
     } catch (e) {
@@ -621,62 +375,23 @@ export default class P2PSyncPlugin extends Plugin {
   }
 
   /**
-   * Normalize a WebSocket URL for consistent storage and comparison.
-   * Must match PeerManager.normalizeUrl() exactly for peer matching to work.
-   * Removes default ports, query strings, fragments, and trailing slashes.
+   * Add an iroh EndpointId as a bootstrap peer for future startups.
    */
-  private normalizeWsUrl(url: string): string {
-    try {
-      const parsed = new URL(url);
-      // Remove default ports
-      if ((parsed.protocol === 'wss:' && parsed.port === '443') ||
-          (parsed.protocol === 'ws:' && parsed.port === '80')) {
-        parsed.port = '';
-      }
-      // Remove query and hash (PeerManager strips these)
-      parsed.search = '';
-      parsed.hash = '';
-      // Remove trailing slash (URL.href always adds one for root paths)
-      return parsed.href.replace(/\/$/, '');
-    } catch {
-      return url;
+  async addBootstrapPeer(nodeId: string): Promise<void> {
+    if (!this.settings.bootstrapPeers.includes(nodeId)) {
+      this.settings.bootstrapPeers.push(nodeId);
+      await this.saveSettings();
     }
   }
 
   /**
-   * Add a peer to known peers (for auto-reconnect).
+   * Remove a bootstrap peer.
    */
-  private async addKnownPeer(url: string, label: string): Promise<void> {
-    // Normalize URL for consistent comparison
-    const normalizedUrl = this.normalizeWsUrl(url);
-
-    // Don't add duplicates
-    if (this.settings.knownPeers.some(p => p.url === normalizedUrl)) {
-      return;
-    }
-    this.settings.knownPeers.push({ url: normalizedUrl, label });
+  async removeBootstrapPeer(nodeId: string): Promise<void> {
+    this.settings.bootstrapPeers = this.settings.bootstrapPeers.filter((p) => p !== nodeId);
     await this.saveSettings();
   }
 
-  /**
-   * Remove a peer from known peers.
-   */
-  async removeKnownPeer(url: string): Promise<void> {
-    const normalizedUrl = this.normalizeWsUrl(url);
-    this.settings.knownPeers = this.settings.knownPeers.filter(p => p.url !== normalizedUrl);
-    await this.saveSettings();
-  }
-
-  /**
-   * Get the list of known peers (for UI display).
-   */
-  getKnownPeers(): KnownPeer[] {
-    return this.settings.knownPeers;
-  }
-
-  /**
-   * Try to load an existing vault (if .sync directory exists).
-   */
   private async tryLoadVault(): Promise<void> {
     try {
       const fsBridge = createFsBridge(this.app.vault);
@@ -698,8 +413,6 @@ export default class P2PSyncPlugin extends Plugin {
 
   /**
    * Initialize a new vault.
-   *
-   * Creates the .sync directory and initializes Loro documents.
    */
   async initializeVault(): Promise<void> {
     if (this.vault) {
@@ -713,166 +426,60 @@ export default class P2PSyncPlugin extends Plugin {
     this.updateStatusBar("initialized");
     this.subscribeToDebugEvents();
     this.events.trigger("state-changed");
+
+    // Start network manager now that vault is available
+    await this.startNetworkManager();
   }
 
-  /**
-   * Check if the vault is initialized.
-   */
   isVaultInitialized(): boolean {
     return this.vault !== null;
   }
 
   /**
-   * Trigger a manual sync with all connected peers.
+   * Broadcast a file change notification to all connected peers.
+   * Throttled per-file to prevent flooding.
    */
-  private async triggerSync(): Promise<void> {
-    if (!this.vault) {
-      new Notice("P2P Sync: Vault not initialized");
-      return;
-    }
-
-    const peers = this.getConnectedPeers();
-    if (peers.length === 0) {
-      new Notice("P2P Sync: No peers connected");
-      return;
-    }
-
-    // Send sync request to all peers
-    for (const peer of peers) {
-      await this.sendSyncRequest(peer.id);
-    }
-
-    new Notice(`P2P Sync: Syncing with ${peers.length} peer(s)...`);
-  }
-
-  /**
-   * Send a sync request to a specific peer.
-   */
-  private async sendSyncRequest(peerId: string): Promise<void> {
-    if (!this.vault || !this.peerManager) {
-      log.debug(`Cannot send sync request - vault=${!!this.vault}, peerManager=${!!this.peerManager}`);
-      return;
-    }
-
-    try {
-      // Queue the WASM call to prevent concurrent &mut self borrows
-      const request = await this.vaultQueue.run(() =>
-        this.vault!.prepareSyncRequest()
-      );
-      this.peerManager.send(peerId, request);
-      log.debug(`Sent sync request to ${peerId}`);
-    } catch (err) {
-      log.error(`Failed to send sync request to ${peerId}:`, err);
-    }
-  }
-
-  /**
-   * Handle an incoming sync message from a peer.
-   */
-  private async handleSyncMessage(peerId: string, data: Uint8Array): Promise<void> {
-    if (!this.vault || !this.peerManager) {
-      log.debug(`Cannot handle sync message - vault=${!!this.vault}, peerManager=${!!this.peerManager}`);
-      return;
-    }
-
-    // Reject excessively large messages to prevent memory issues
-    if (data.length > MAX_SYNC_MESSAGE_SIZE) {
-      log.warn(`Rejecting oversized sync message from ${peerId}: ${Math.round(data.length / 1024 / 1024)}MB`);
-      return;
-    }
-
-    try {
-      // Queue the WASM call to prevent concurrent &mut self borrows
-      const result = await this.vaultQueue.run(() =>
-        this.vault!.processSyncMessage(data)
-      ) as SyncMessageResult;
-      
-      log.debug(`Sync result - response=${result.response ? result.response.length + ' bytes' : 'null'}, modifiedPaths=${JSON.stringify(result.modifiedPaths)}`);
-
-      if (result.response) {
-        this.peerManager.send(peerId, result.response);
-        log.debug(`Sent sync response to ${peerId}`);
-      }
-
-      // If files were modified, reload them in Obsidian
-      if (result.modifiedPaths.length > 0) {
-        log.info(`${result.modifiedPaths.length} file(s) synced from ${peerId}:`, result.modifiedPaths);
-        
-        for (const path of result.modifiedPaths) {
-          await this.reloadFileFromDisk(path);
-        }
-      }
-    } catch (err) {
-      log.error(`Failed to process sync message from ${peerId}:`, err);
-    }
-  }
-
-  /**
-   * Broadcast a document update to all connected peers.
-   * Also flushes pending broadcasts if throttle window has passed.
-   */
-  private async broadcastDocumentUpdate(path: string): Promise<void> {
-    if (!this.vault || !this.peerManager) return;
-    if (this.peerManager.peerCount === 0) return;
+  private async broadcastChange(path: string): Promise<void> {
+    if (!this.networkManager) return;
+    if (this.networkManager.peerCount === 0) return;
 
     const now = Date.now();
-
-    // Check if this file has pending (throttled) updates that need flushing
     const pendingTime = this.pendingBroadcasts.get(path);
 
     if (pendingTime) {
       if (now - pendingTime >= BROADCAST_THROTTLE_MS) {
-        // Throttle window passed, clear pending and proceed to broadcast
         this.pendingBroadcasts.delete(path);
         this.lastBroadcastTime.set(path, now);
       } else {
-        // Throttle window hasn't passed yet, skip this broadcast
         log.debug(`Skipping broadcast (still throttling): ${path}`);
         return;
       }
     } else {
-      // No pending entry - check if we need to throttle based on last broadcast time
       const lastBroadcast = this.lastBroadcastTime.get(path) ?? 0;
       if (now - lastBroadcast < BROADCAST_THROTTLE_MS) {
-        // Still in throttle window, queue for later
         log.debug(`Queuing broadcast (throttle window): ${path}`);
         this.pendingBroadcasts.set(path, now);
         return;
       }
-      // Throttle window passed, proceed to broadcast
       this.lastBroadcastTime.set(path, now);
     }
 
-    // Clean up old entries before performing the broadcast
     this.cleanupMaps();
 
     try {
-      // Queue the WASM call to prevent concurrent &mut self borrows
-      const update = await this.vaultQueue.run(() =>
-        this.vault!.prepareDocumentUpdate(path)
-      );
-      if (update) {
-        this.peerManager.broadcast(update);
-        log.debug(`Broadcast update for ${path} to ${this.peerManager.peerCount} peer(s)`);
-      }
+      await this.networkManager.broadcastChange(path);
+      log.debug(`Broadcast change for ${path} to ${this.networkManager.peerCount} peer(s)`);
     } catch (err) {
-      log.error(`Failed to broadcast document update for ${path}:`, err);
+      log.error(`Failed to broadcast change for ${path}:`, err);
     }
   }
 
-  /**
-   * Update the status bar text.
-   */
   private updateStatusBar(status: string): void {
     if (this.statusBarEl) {
       this.statusBarEl.setText(`P2P: ${status}`);
     }
   }
 
-  /**
-   * Get the vault's base path on the filesystem.
-   * Returns null on mobile where direct filesystem access isn't available.
-   */
   getVaultBasePath(): string | null {
     const adapter = this.app.vault.adapter;
     if (adapter instanceof FileSystemAdapter) {
@@ -881,63 +488,32 @@ export default class P2PSyncPlugin extends Plugin {
     return null;
   }
 
-  /**
-   * Get the plugin's installation directory.
-   * Returns null on mobile where direct filesystem access isn't available.
-   */
-  private getPluginDir(): string | null {
-    const basePath = this.getVaultBasePath();
-    if (!basePath) return null;
-    return `${basePath}/.obsidian/plugins/obsidian-p2p-sync`;
-  }
-
-  /**
-   * Validate that a path is safe and within the vault.
-   * Prevents path traversal attacks.
-   */
   private isValidVaultPath(path: string): boolean {
-    // Check for path traversal sequences
     if (path.includes("..") || path.startsWith("/") || path.startsWith("\\")) {
       return false;
     }
-    // Normalize and verify it doesn't escape vault
     const normalized = path.replace(/\\/g, "/");
-    // Reject leading/trailing whitespace (filesystem inconsistencies)
     if (normalized !== normalized.trim()) return false;
-    // Allow alphanumerics, common filename characters, and path separators
-    // Excludes: .. (path traversal), leading slashes, control chars, ?% (URL-like)
-    // TODO: Add Unicode support (\p{L}\p{N}\p{M} with u flag) for international filenames
     return /^[a-zA-Z0-9_\-\./ '(),&#@+\[\]]+$/.test(normalized);
   }
 
-  /**
-   * Reload a file from disk into Obsidian's cache.
-   *
-   * Called after sync writes a file to ensure Obsidian picks up the changes.
-   * For new files, this creates the file in Obsidian's index.
-   */
   private async reloadFileFromDisk(path: string): Promise<void> {
-    // Validate path to prevent path traversal attacks
     if (!this.isValidVaultPath(path)) {
       log.error(`Invalid path rejected: ${path}`);
       return;
     }
-    
+
     const abstractFile = this.app.vault.getAbstractFileByPath(path);
-    
+
     try {
       if (abstractFile instanceof TFile) {
-        // File exists in Obsidian - read fresh content from disk and update
         const content = await this.app.vault.adapter.read(path);
-        // Use modify to update Obsidian's internal cache
         await this.app.vault.modify(abstractFile, content);
         log.debug(`Reloaded ${path} from disk`);
       } else if (!abstractFile) {
-        // File doesn't exist in Obsidian - check if it exists on disk
         const exists = await this.app.vault.adapter.exists(path);
         if (exists) {
           const content = await this.app.vault.adapter.read(path);
-          // Ensure parent directories exist in Obsidian
           const dir = path.substring(0, path.lastIndexOf("/"));
           if (dir) {
             const dirExists = this.app.vault.getAbstractFileByPath(dir);
@@ -954,24 +530,15 @@ export default class P2PSyncPlugin extends Plugin {
     }
   }
 
-  /**
-   * Check if WASM module is ready for use.
-   */
   isWasmReady(): boolean {
     return isWasmReady();
   }
 
-  /**
-   * Activate (open/reveal) the sync sidebar view.
-   */
   async activateView(): Promise<void> {
     const { workspace } = this.app;
-
-    // Check if view already exists
     let leaf = workspace.getLeavesOfType(VIEW_TYPE_SYNC)[0];
 
     if (!leaf) {
-      // Create in right sidebar
       const rightLeaf = workspace.getRightLeaf(false);
       if (rightLeaf) {
         await rightLeaf.setViewState({ type: VIEW_TYPE_SYNC, active: true });
@@ -979,21 +546,18 @@ export default class P2PSyncPlugin extends Plugin {
       }
     }
 
-    // Reveal and focus
     if (leaf) {
       workspace.revealLeaf(leaf);
     }
   }
 
   private registerFileEvents(): void {
-    // File change events - will trigger sync later
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
         if (!this.vault) return;
         if (!(file instanceof TFile)) return;
         if (!file.path.endsWith(".md")) return;
-        
-        // Skip files that are too large to prevent memory issues
+
         if (file.stat.size > MAX_FILE_SIZE) {
           const sizeMB = Math.round(file.stat.size / 1024 / 1024);
           log.warn(`Skipping large file (${sizeMB}MB): ${file.path}`);
@@ -1003,18 +567,16 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File modified:", file.path);
         try {
-          // Check if this was synced (consume flag) - must go through queue to avoid borrow conflicts
-          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
+          const wasSynced = await this.vaultQueue.run(async () =>
+            this.vault!.consumeSyncFlag(file.path)
+          );
           if (wasSynced) {
             log.debug("Skipping broadcast for synced file:", file.path);
             return;
           }
 
-          // Update the Loro document with the new content
           await this.vaultQueue.run(() => this.vault!.onFileChanged(file.path));
-
-          // Broadcast the update to all connected peers (handles throttling internally)
-          await this.broadcastDocumentUpdate(file.path);
+          await this.broadcastChange(file.path);
         } catch (err) {
           log.error("Failed to handle file change:", err);
         }
@@ -1026,8 +588,7 @@ export default class P2PSyncPlugin extends Plugin {
         if (!this.vault) return;
         if (!(file instanceof TFile)) return;
         if (!file.path.endsWith(".md")) return;
-        
-        // Skip files that are too large
+
         if (file.stat.size > MAX_FILE_SIZE) {
           const sizeMB = Math.round(file.stat.size / 1024 / 1024);
           log.warn(`Skipping large file (${sizeMB}MB): ${file.path}`);
@@ -1037,17 +598,16 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File created:", file.path);
         try {
-          // Check if this is a file being created from sync (consume flag) - must go through queue
-          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
+          const wasSynced = await this.vaultQueue.run(async () =>
+            this.vault!.consumeSyncFlag(file.path)
+          );
           if (wasSynced) {
             log.debug("Skipping broadcast for synced new file:", file.path);
             return;
           }
 
-          // Queue the WASM call to prevent concurrent &mut self borrows
           await this.vaultQueue.run(() => this.vault!.onFileChanged(file.path));
-          // Broadcast the new file to all connected peers
-          await this.broadcastDocumentUpdate(file.path);
+          await this.broadcastChange(file.path);
         } catch (err) {
           log.error("Failed to handle file create:", err);
         }
@@ -1062,23 +622,19 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File deleted:", file.path);
         try {
-          // Check if this deletion was from sync (consume flag) - must go through queue
-          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
+          const wasSynced = await this.vaultQueue.run(async () =>
+            this.vault!.consumeSyncFlag(file.path)
+          );
           if (wasSynced) {
             log.debug("Skipping broadcast for synced deletion:", file.path);
             return;
           }
 
-          // Delete file from tree (CRDT operation)
           await this.vaultQueue.run(() => this.vault!.deleteFile(file.path));
           log.info(`Deleted ${file.path} from registry tree`);
 
-          // Broadcast deletion to peers
-          if (this.peerManager && this.peerManager.peerCount > 0) {
-            const msg = this.vault!.prepareFileDeleted(file.path);
-            this.peerManager.broadcast(msg);
-            log.debug(`Broadcast deletion of ${file.path} to ${this.peerManager.peerCount} peer(s)`);
-          }
+          // Notify peers so they can reconcile the deletion
+          await this.broadcastChange(file.path);
         } catch (err) {
           log.error("Failed to handle file delete:", err);
         }
@@ -1093,23 +649,19 @@ export default class P2PSyncPlugin extends Plugin {
 
         log.debug("File renamed:", oldPath, "->", file.path);
         try {
-          // Check if this rename was from sync (consume flag on new path) - must go through queue
-          const wasSynced = await this.vaultQueue.run(async () => this.vault!.consumeSyncFlag(file.path));
+          const wasSynced = await this.vaultQueue.run(async () =>
+            this.vault!.consumeSyncFlag(file.path)
+          );
           if (wasSynced) {
             log.debug("Skipping broadcast for synced rename:", oldPath, "->", file.path);
             return;
           }
 
-          // Rename file in tree (CRDT operation)
           await this.vaultQueue.run(() => this.vault!.renameFile(oldPath, file.path));
           log.info(`Renamed ${oldPath} -> ${file.path} in registry tree`);
 
-          // Broadcast rename to peers
-          if (this.peerManager && this.peerManager.peerCount > 0) {
-            const msg = this.vault!.prepareFileRenamed(oldPath, file.path);
-            this.peerManager.broadcast(msg);
-            log.debug(`Broadcast rename ${oldPath} -> ${file.path} to ${this.peerManager.peerCount} peer(s)`);
-          }
+          // Notify peers of the new path so they can reconcile
+          await this.broadcastChange(file.path);
         } catch (err) {
           log.error("Failed to handle file rename:", err);
         }

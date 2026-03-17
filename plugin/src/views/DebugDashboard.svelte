@@ -3,7 +3,7 @@
   import type { PeerInfo } from "../network";
   import type { SyncEvent, RegistryStats, VersionVector } from "../wasm";
   import type { EventRef } from "obsidian";
-  import { Platform, setIcon } from "obsidian";
+  import { setIcon } from "obsidian";
   import { onMount, onDestroy } from "svelte";
 
   /** Svelte action to render a Lucide icon */
@@ -19,7 +19,7 @@
 
   // Self info
   let peerId: string | null = null;
-  let serverStatus: string = "Not running";
+  let nodeId: string | null = null;
   let fileCount: number = 0;
 
   // Registry stats
@@ -124,17 +124,9 @@
       const files = await vault.listFiles();
       fileCount = Array.isArray(files) ? files.length : 0;
 
-      // TypeScript API: server status
-      if (!Platform.isDesktop) {
-        serverStatus = "N/A (mobile)";
-      } else if (plugin.peerManager?.isServerRunning) {
-        serverStatus = `Running on :${plugin.peerManager.port}`;
-      } else {
-        serverStatus = "Not running";
-      }
-
-      // TypeScript API: connected peers
-      connectedPeers = plugin.peerManager?.getConnectedPeers() ?? [];
+      // TypeScript API: node ID and connected peers
+      nodeId = plugin.getNodeId();
+      connectedPeers = plugin.getConnectedPeers();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       console.error("p2p-sync: Error loading debug data", e);
@@ -168,7 +160,7 @@
       // Refresh events from plugin buffer
       recentEvents = plugin.debugEvents;
       // Also refresh peer data (in case peers changed)
-      connectedPeers = plugin.peerManager?.getConnectedPeers() ?? [];
+      connectedPeers = plugin.getConnectedPeers();
     });
   });
 
@@ -199,12 +191,12 @@
       <h3 class="debug-section-title">Self</h3>
       <div class="debug-table">
         <div class="debug-row">
-          <span class="debug-label">Peer ID</span>
+          <span class="debug-label">Vault ID</span>
           <code class="debug-value" title={peerId ?? ""}>{peerId ?? "N/A"}</code>
         </div>
         <div class="debug-row">
-          <span class="debug-label">Server</span>
-          <span class="debug-value">{serverStatus}</span>
+          <span class="debug-label">Node ID</span>
+          <code class="debug-value" title={nodeId ?? ""}>{nodeId ? truncatePeerId(nodeId) : "N/A"}</code>
         </div>
         <div class="debug-row">
           <span class="debug-label">Files</span>
@@ -257,21 +249,17 @@
           {#each connectedPeers as peer}
             <div class="debug-peer-item">
               <div class="debug-peer-main">
-                <span class="debug-state-dot" class:connected={peer.state === "connected"} class:connecting={peer.state === "connecting"} class:failed={peer.state === "disconnected" && (peer.disconnectReason === "networkError" || peer.disconnectReason === "protocolError")} title={peer.state}></span>
+                <span class="debug-state-dot connected" title="in swarm"></span>
                 <code class="debug-peer-id">{peer.id}</code>
-                {#if peer.connectionCount > 1}
-                  <span class="debug-reconnect-count">reconnects: {peer.connectionCount - 1}</span>
-                {/if}
               </div>
               <div class="debug-peer-address">
-                <span class="debug-direction-icon" use:icon={peer.direction === "outgoing" ? "arrow-right-from-line" : "arrow-left-to-line"}></span>
-                {peer.address}
+                Last active: {new Date(peer.lastActivityAt).toLocaleTimeString()}
               </div>
             </div>
           {/each}
         </div>
       {:else}
-        <div class="debug-empty">No peers connected</div>
+        <div class="debug-empty">No peers in swarm</div>
       {/if}
     </section>
 
