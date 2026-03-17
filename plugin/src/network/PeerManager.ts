@@ -15,7 +15,7 @@
 import { Events, Platform } from "obsidian";
 import { SyncWebSocketClient } from "./WebSocketClient";
 import { log } from "../logger";
-import type { ConnectedPeer, DisconnectReason, GossipUpdate, ProcessedGossip, SwimPeerInfo, SwimMember } from "../wasm";
+import type { ConnectedPeer, DisconnectReason } from "../wasm";
 
 // Type for dynamically loaded WebSocket server
 interface SyncWebSocketServer {
@@ -73,21 +73,6 @@ export interface PeerInfo {
  * - 'message': Message received from peer (peerId: string, data: Uint8Array)
  * - 'error': Error occurred (Error)
  */
-/** Type for lazily-loaded WasmMembership */
-interface MembershipLike {
-  localIncarnation(): bigint;
-  memberCount(): number;
-  getAliveMembers(): unknown;
-  contains(peerId: string): boolean;
-  getMemberIncarnation(peerId: string): number | undefined;
-  processGossip(gossipJson: string, fromPeerId: string): string;
-  drainGossip(): string;
-  generateFullGossip(): string;
-  markDead(peerId: string): boolean;
-  setLocalAddress(address: string): void;
-  onPeerConnected(peerId: string, address?: string): string;
-}
-
 export class PeerManager extends Events {
   private server: SyncWebSocketServer | null = null;
   private connections: Map<string, Connection> = new Map();
@@ -95,55 +80,16 @@ export class PeerManager extends Events {
   private ownPeerId: string;
   private pluginDir: string | null;
   private vault: VaultPeerManager | null = null;
-
-  /** SWIM membership list for gossip-based peer discovery (lazy-loaded) */
-  private _membership: MembershipLike | null = null;
-  private membershipAddress: string | null;
-  private membershipIncarnation: number;
-
-  /** Peers currently being connected to (prevents duplicate connection attempts) */
-  private connectingPeers: Set<string> = new Set();
+  private advertisedAddress: string | null = null;
 
   /**
    * @param peerId - Our unique peer identifier
    * @param pluginDir - Absolute path to the plugin directory (for loading ws-server.js on desktop)
-   * @param address - Our advertised address for incoming connections (null for client-only)
-   * @param incarnation - Our incarnation number (use saved value or 1 for new peers)
    */
-  constructor(
-    peerId: string,
-    pluginDir: string | null = null,
-    address: string | null = null,
-    incarnation: number = 1
-  ) {
+  constructor(peerId: string, pluginDir: string | null = null) {
     super();
     this.ownPeerId = peerId;
     this.pluginDir = pluginDir;
-    this.membershipAddress = address;
-    this.membershipIncarnation = incarnation;
-  }
-
-  /**
-   * Get the SWIM membership list, creating it lazily on first access.
-   * Returns null if WASM is not available (e.g., in tests).
-   */
-  private getMembership(): MembershipLike | null {
-    if (this._membership) return this._membership;
-
-    try {
-      // Dynamic import to avoid loading WASM at module initialization
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { WasmMembership } = require("../wasm");
-      this._membership = new WasmMembership(
-        this.ownPeerId,
-        this.membershipAddress ?? undefined,
-        BigInt(this.membershipIncarnation)
-      );
-      return this._membership;
-    } catch {
-      log.warn("WASM membership not available - gossip disabled");
-      return null;
-    }
   }
 
   /**
@@ -370,7 +316,6 @@ export class PeerManager extends Events {
 
   /**
    * Broadcast data to all connected peers except the specified one.
-   * Used for gossip relay (exclude sender) and alive broadcasts (exclude new peer).
    */
   broadcastExcept(data: Uint8Array, excludePeerId: string): void {
     if (!this.vault) return;
@@ -459,196 +404,17 @@ export class PeerManager extends Events {
     }
   }
 
-  // ========== SWIM Gossip Methods ==========
-
   /**
-   * Get our local incarnation number for persistence.
-   */
-  get localIncarnation(): number {
-    const membership = this.getMembership();
-    return membership ? Number(membership.localIncarnation()) : this.membershipIncarnation;
-  }
-
-  /**
-   * Set our advertised address for peer discovery.
-   *
-   * Call this after the server starts to advertise our address in gossip.
+   * Set our advertised address (used in handshake for peer discovery).
    */
   setAdvertisedAddress(address: string): void {
-    this.membershipAddress = address;
-    // Update existing membership if already created
-    if (this._membership) {
-      this._membership.setLocalAddress(address);
-    }
-  }
-
-  /**
-   * Get SWIM membership count (excluding ourselves).
-   */
-  get memberCount(): number {
-    const membership = this.getMembership();
-    return membership?.memberCount() ?? 0;
-  }
-
-  /**
-   * Get list of SWIM members for debug display.
-   */
-  getSwimMembers(): SwimMember[] {
-    const membership = this.getMembership();
-    if (!membership) return [];
-    try {
-      return membership.getAliveMembers() as SwimMember[];
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Check if a peer is known in the SWIM membership.
-   */
-  isKnownPeer(peerId: string): boolean {
-    const membership = this.getMembership();
-    return membership?.contains(peerId) ?? false;
-  }
-
-  /**
-   * Process incoming gossip updates from a peer.
-   *
-   * Automatically triggers connection to newly discovered server peers.
-   * Returns list of newly discovered peers.
-   */
-  handleGossip(updates: GossipUpdate[], fromPeerId: string): SwimPeerInfo[] {
-    const membership = this.getMembership();
-    if (!membership || updates.length === 0) return [];
-
-    const gossipJson = JSON.stringify(updates);
-    const { newPeers, relay }: ProcessedGossip = JSON.parse(membership.processGossip(gossipJson, fromPeerId));
-
-    // Relay state-changing updates only (API prevents amplification by design)
-    if (this.peerCount > 1 && relay.length > 0) {
-      const relayMsg = JSON.stringify({ type: "gossip", updates: relay });
-      this.broadcastExcept(new TextEncoder().encode(relayMsg), fromPeerId);
-      log.debug(`Relayed ${relay.length} gossip updates to ${this.peerCount - 1} other peer(s)`);
-    }
-
-    // Auto-connect to newly discovered server peers
-    for (const peer of newPeers) {
-      // Skip if already connected or connection in progress
-      if (peer.address && !this.isConnectedTo(peer.peerId) && !this.connectingPeers.has(peer.peerId)) {
-        log.info(`Discovered peer via gossip: ${peer.peerId} at ${peer.address}`);
-        this.connectingPeers.add(peer.peerId);
-        this.connectToUrl(peer.address, { reconnect: false })
-          .catch((err) => {
-            log.warn(`Failed to auto-connect to discovered peer ${peer.peerId}:`, err);
-          })
-          .finally(() => {
-            this.connectingPeers.delete(peer.peerId);
-          });
-      }
-    }
-
-    return newPeers;
-  }
-
-  /**
-   * Send sync data to a peer with piggybacked gossip.
-   *
-   * This wraps the binary sync data in a JSON envelope that includes
-   * any pending gossip updates for efficient propagation.
-   */
-  sendWithGossip(peerId: string, syncData: Uint8Array): void {
-    const { data, gossipCount } = this.prepareWithGossip(syncData);
-    if (gossipCount > 0) {
-      log.debug(`Sent sync with ${gossipCount} gossip updates to ${peerId}`);
-    }
-    this.send(peerId, data);
-  }
-
-  /**
-   * Broadcast sync data to all peers with piggybacked gossip.
-   */
-  broadcastWithGossip(syncData: Uint8Array): void {
-    const { data, gossipCount } = this.prepareWithGossip(syncData);
-    if (gossipCount > 0) {
-      log.debug(`Broadcast sync with ${gossipCount} gossip updates`);
-    }
-    this.broadcast(data);
-  }
-
-  /**
-   * Check if we are already connected to a peer.
-   */
-  private isConnectedTo(peerId: string): boolean {
-    // Check local connections map
-    const conn = this.connections.get(peerId);
-    if (conn?.socket?.isConnected) return true;
-
-    // Check via vault
-    if (this.vault) {
-      const peers = this.vault.getConnectedPeers();
-      return peers.some((p) => p.id === peerId && p.state === "connected");
-    }
-    return false;
-  }
-
-  /**
-   * Called when a peer disconnects. Marks the peer as Dead in SWIM membership
-   * and immediately broadcasts the dead gossip to remaining peers.
-   */
-  private onPeerDisconnected(peerId: string): void {
-    const membership = this.getMembership();
-    if (!membership) return;
-
-    const incarnation = membership.getMemberIncarnation(peerId);
-    const changed = membership.markDead(peerId);
-    if (changed) {
-      log.debug(`Marked ${peerId} as Dead in SWIM membership`);
-
-      if (incarnation != null) {
-        const deadMsg = JSON.stringify({
-          type: "gossip",
-          updates: [{ type: "dead", peerId, incarnation }],
-        });
-        this.broadcast(new TextEncoder().encode(deadMsg));
-      }
-    }
-  }
-
-  /**
-   * Called after handshake completes. Registers the peer in SWIM membership
-   * via the Rust `onPeerConnected()` binding, sends full gossip to the new
-   * peer, and broadcasts the new peer's alive status to existing peers.
-   */
-  private onHandshakeComplete(
-    connectionId: string,
-    peerId: string,
-    address?: string
-  ): void {
-    const membership = this.getMembership();
-    if (!membership) return;
-
-    try {
-      const result = JSON.parse(
-        membership.onPeerConnected(peerId, address ?? undefined)
-      );
-
-      // Send full gossip to the new peer
-      const forNewPeer = new TextEncoder().encode(JSON.stringify(result.forNewPeer));
-      this.send(connectionId, forNewPeer);
-      log.debug(`Sent full gossip to ${peerId}: ${result.forNewPeer.updates.length} updates`);
-
-      // Broadcast alive status to existing peers (previously missing!)
-      const forExisting = new TextEncoder().encode(JSON.stringify(result.forExistingPeers));
-      this.broadcastExcept(forExisting, peerId);
-    } catch (err) {
-      log.warn(`Failed gossip exchange with ${peerId}:`, err);
-    }
+    this.advertisedAddress = address;
   }
 
   // ========== Private Helpers ==========
 
   /**
-   * Clean up a connection and notify vault/SWIM of the disconnect.
+   * Clean up a connection and notify vault of the disconnect.
    */
   private cleanupConnection(connectionId: string, reason: DisconnectReason): void {
     const conn = this.connections.get(connectionId);
@@ -658,8 +424,6 @@ export class PeerManager extends Events {
     if (conn?.peerId && conn.peerId !== connectionId) {
       this.connections.delete(conn.peerId);
     }
-
-    this.onPeerDisconnected(peerId);
 
     if (this.vault) {
       this.vault.peerDisconnected(peerId, reason);
@@ -709,33 +473,6 @@ export class PeerManager extends Events {
   }
 
   /**
-   * Wrap sync data in a gossip envelope if there are pending gossip updates.
-   * Returns the ready-to-send bytes (either raw sync data or JSON envelope).
-   */
-  private prepareWithGossip(syncData: Uint8Array): { data: Uint8Array; gossipCount: number } {
-    const membership = this.getMembership();
-
-    if (membership) {
-      const gossipJson = membership.drainGossip();
-      const gossip = gossipJson ? JSON.parse(gossipJson) : [];
-
-      if (gossip.length > 0) {
-        const message = {
-          type: "sync",
-          data: Array.from(syncData),
-          gossip,
-        };
-        return {
-          data: new TextEncoder().encode(JSON.stringify(message)),
-          gossipCount: gossip.length,
-        };
-      }
-    }
-
-    return { data: syncData, gossipCount: 0 };
-  }
-
-  /**
    * Resolve a peer ID to its connection entry, checking vault for mapping.
    */
   private resolveConnection(peerId: string): { conn: Connection | undefined; connectionId: string } {
@@ -764,8 +501,8 @@ export class PeerManager extends Events {
       peerId: this.ownPeerId,
       role,
     };
-    if (this.membershipAddress) {
-      handshake.address = this.membershipAddress;
+    if (this.advertisedAddress) {
+      handshake.address = this.advertisedAddress;
     }
     const data = new TextEncoder().encode(JSON.stringify(handshake));
     this.send(connectionId, data);
@@ -797,44 +534,10 @@ export class PeerManager extends Events {
           peer = this.vault.peerHandshakeComplete(connectionId, msg.peerId);
         }
 
-        // Add peer to SWIM membership as Alive and exchange gossip.
-        // Prefer address from handshake (direct from peer) over vault address.
-        this.onHandshakeComplete(connectionId, msg.peerId, msg.address ?? peer?.address);
-
         // Emit peer-connected event (now fired after handshake, not on socket open)
         if (peer) {
           this.trigger("peer-connected", peer);
         }
-        return;
-      }
-
-      // Handle gossip message
-      if (msg.type === "gossip" && Array.isArray(msg.updates)) {
-        const conn = this.connections.get(connectionId);
-        // Ignore gossip before handshake completes (peerId not yet set)
-        if (!conn?.peerId) {
-          log.debug("Ignoring gossip before handshake complete");
-          return;
-        }
-        log.debug(`Received gossip from ${conn.peerId}: ${msg.updates.length} updates`);
-        this.handleGossip(msg.updates as GossipUpdate[], conn.peerId);
-        return;
-      }
-
-      // Handle sync message with piggybacked gossip
-      if (msg.type === "sync" && Array.isArray(msg.data)) {
-        const conn = this.connections.get(connectionId);
-        const fromPeerId = conn?.peerId ?? connectionId;
-
-        // Process piggybacked gossip if present (only after handshake)
-        if (conn?.peerId && Array.isArray(msg.gossip) && msg.gossip.length > 0) {
-          log.debug(`Received sync with ${msg.gossip.length} piggybacked gossip from ${fromPeerId}`);
-          this.handleGossip(msg.gossip as GossipUpdate[], fromPeerId);
-        }
-
-        // Forward the sync data to listeners
-        const syncData = new Uint8Array(msg.data);
-        this.trigger("message", fromPeerId, syncData);
         return;
       }
     } catch {

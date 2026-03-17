@@ -1,7 +1,7 @@
 //! Persistence for daemon state and known peers.
 //!
 //! - **`IdentityKey`** (`.sync/daemon.key`): Ed25519 secret key for the daemon's network identity
-//! - **`DaemonConfig`** (`.sync/daemon.toml`): Daemon config including derived PeerId and SWIM incarnation
+//! - **`DaemonConfig`** (`.sync/daemon.toml`): Daemon config including the derived PeerId
 //! - **`PeerStorage`** (`.sync/known_peers.json`): Known peers for recovery after restarts
 
 use anyhow::{Context, Result};
@@ -11,7 +11,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use sync_core::key_storage::KeyStorage;
 use sync_core::peer_id::PeerId;
-use sync_core::swim::PeerInfo;
 use tracing::{info, warn};
 
 use crate::key_storage::FileKeyStorage;
@@ -71,9 +70,8 @@ impl IdentityKey {
 
 /// Daemon-specific configuration persisted in `.sync/daemon.toml`.
 ///
-/// Contains the daemon's PeerId (derived from the identity key) and SWIM
-/// incarnation number. Separate from vault-level metadata (VaultId in
-/// `metadata.toml`).
+/// Contains the daemon's PeerId (derived from the identity key). Separate from
+/// vault-level metadata (VaultId in `metadata.toml`).
 ///
 /// On upgrade from old u64 PeerIds, the old value is saved as `legacy_peer_id`
 /// for reference. New peer_id is the 64-char hex ed25519 pubkey.
@@ -85,8 +83,6 @@ pub struct DaemonConfig {
     /// Stored for reference only — orphaned Loro version-vector entries are harmless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_peer_id: Option<String>,
-    /// SWIM incarnation number, bumped on refutation to override stale suspicions
-    pub incarnation: u64,
 }
 
 impl DaemonConfig {
@@ -116,7 +112,8 @@ impl DaemonConfig {
 
         let config = if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
-            let mut existing: DaemonConfig = toml::from_str(&contents)
+            // Parse with optional incarnation field for migration from older config files
+            let mut existing: DaemonConfigRaw = toml::from_str(&contents)
                 .map_err(|e| anyhow::anyhow!("Corrupt daemon.toml: {}", e))?;
 
             if is_legacy_upgrade {
@@ -144,13 +141,16 @@ impl DaemonConfig {
                 existing.peer_id = new_peer_id;
             }
 
-            info!(peer_id = %existing.peer_id, incarnation = existing.incarnation, "Loaded daemon config");
-            existing
+            let config = DaemonConfig {
+                peer_id: existing.peer_id,
+                legacy_peer_id: existing.legacy_peer_id,
+            };
+            info!(peer_id = %config.peer_id, "Loaded daemon config");
+            config
         } else {
             let config = DaemonConfig {
                 peer_id: new_peer_id,
                 legacy_peer_id: None,
-                incarnation: 1,
             };
             info!(peer_id = %config.peer_id, "Generated new daemon config");
             config
@@ -172,16 +172,16 @@ impl DaemonConfig {
         fs::write(&config_path, contents)?;
         Ok(())
     }
+}
 
-    /// Save only if incarnation has changed (called after gossip processing).
-    pub fn save_if_incarnation_changed(&mut self, new_incarnation: u64, vault_path: &Path) -> Result<()> {
-        if new_incarnation != self.incarnation {
-            info!(old = self.incarnation, new = new_incarnation, "Incarnation bumped, saving daemon config");
-            self.incarnation = new_incarnation;
-            self.save(vault_path)?;
-        }
-        Ok(())
-    }
+/// Raw deserialization type for migration — accepts optional `incarnation` and
+/// `legacy_peer_id` fields from older `daemon.toml` files without failing.
+#[derive(Deserialize)]
+struct DaemonConfigRaw {
+    peer_id: PeerId,
+    legacy_peer_id: Option<String>,
+    #[allow(dead_code)]
+    incarnation: Option<u64>,
 }
 
 /// Clear `known_peers.json` after a PeerId migration.
@@ -210,27 +210,6 @@ pub struct PersistedPeer {
     pub last_seen: u64,
     /// Peer ID of who told us about this peer (for debugging)
     pub discovered_via: Option<String>,
-}
-
-impl PersistedPeer {
-    /// Create from PeerInfo and current time.
-    pub fn from_peer_info(info: &PeerInfo, now_ms: u64, discovered_via: Option<PeerId>) -> Self {
-        Self {
-            peer_id: info.peer_id.to_string(),
-            address: info.address.clone(),
-            last_seen: now_ms,
-            discovered_via: discovered_via.map(|p| p.to_string()),
-        }
-    }
-
-    /// Convert back to PeerInfo.
-    pub fn to_peer_info(&self) -> Result<PeerInfo> {
-        let peer_id: PeerId = self.peer_id.parse()?;
-        Ok(PeerInfo {
-            peer_id,
-            address: self.address.clone(),
-        })
-    }
 }
 
 /// Collection of persisted peers.
@@ -653,10 +632,9 @@ mod tests {
 
         let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
-        // Should have a valid PeerId (64-char hex, non-zero as_u64) and incarnation at 1
+        // Should have a valid PeerId (64-char hex, non-zero as_u64)
         assert_eq!(config.peer_id.to_string().len(), 64);
         assert_ne!(config.peer_id.as_u64(), 0);
-        assert_eq!(config.incarnation, 1);
         assert!(config.legacy_peer_id.is_none());
 
         // Both key file and config file should exist
@@ -675,7 +653,6 @@ mod tests {
         let config2 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
 
         assert_eq!(config1.peer_id, config2.peer_id);
-        assert_eq!(config2.incarnation, 1);
     }
 
     #[tokio::test]
@@ -728,9 +705,6 @@ incarnation = 3
         // Legacy peer_id should be recorded (the raw 16-char string from the old config)
         assert_eq!(config.legacy_peer_id.as_deref(), Some("a1b2c3d4e5f67890"));
 
-        // Incarnation should be preserved from old config
-        assert_eq!(config.incarnation, 3);
-
         // known_peers.json should be cleared
         assert!(!sync_dir.join("known_peers.json").exists());
 
@@ -739,31 +713,31 @@ incarnation = 3
     }
 
     #[tokio::test]
-    async fn test_daemon_config_incarnation_bump() {
+    async fn test_daemon_config_ignores_incarnation_field() {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let mut config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
-        assert_eq!(config.incarnation, 1);
+        // Write an old-style daemon.toml with incarnation field and a pre-existing key
+        let sync_dir = vault_path.join(".sync");
+        fs::create_dir_all(&sync_dir).unwrap();
 
-        // Simulate incarnation bump from SWIM refutation
-        config.save_if_incarnation_changed(5, vault_path).unwrap();
-        assert_eq!(config.incarnation, 5);
+        // Generate a key first so this isn't treated as a legacy upgrade
+        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
+        let peer_id = key.peer_id();
 
-        // Reload should see the new incarnation
-        let config2 = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
-        assert_eq!(config2.incarnation, 5);
-    }
+        let config_path = sync_dir.join("daemon.toml");
+        fs::write(
+            &config_path,
+            format!("peer_id = \"{peer_id}\"\nincarnation = 5\n"),
+        )
+        .unwrap();
 
-    #[tokio::test]
-    async fn test_daemon_config_incarnation_no_change_skips_save() {
-        let temp_dir = TempDir::new().unwrap();
-        let vault_path = temp_dir.path();
+        // Should load without error, ignoring incarnation
+        let config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        assert_eq!(config.peer_id, peer_id);
 
-        let mut config = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
-
-        // Same incarnation — should be a no-op (no error, no write)
-        config.save_if_incarnation_changed(1, vault_path).unwrap();
-        assert_eq!(config.incarnation, 1);
+        // Saved file should no longer have incarnation field
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("incarnation"));
     }
 }

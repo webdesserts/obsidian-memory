@@ -2,8 +2,6 @@
 //!
 //! Manages both incoming and outgoing WebSocket connections, providing:
 //! - Unified interface for sending/broadcasting messages
-//! - Integration with SWIM gossip protocol
-//! - Priority queuing (SWIM messages sent before sync data)
 //! - Connection deduplication
 //! - Automatic reconnection for outgoing connections
 

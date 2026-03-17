@@ -47,7 +47,7 @@ fn default_protocol_version() -> u32 {
 /// Versioned handshake message.
 ///
 /// Sent immediately after WebSocket connection is established.
-/// Both peers send their handshake, then continue with SWIM gossip.
+/// Both peers exchange handshakes, then proceed to bincode-encoded sync messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Handshake {

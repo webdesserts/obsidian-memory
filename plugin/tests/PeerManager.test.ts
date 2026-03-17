@@ -78,37 +78,6 @@ function createMockVault(): VaultPeerManager & {
   };
 }
 
-/** Create a mock SWIM membership for testing gossip behavior without WASM */
-function createMockMembership() {
-  return {
-    localIncarnation: vi.fn(() => BigInt(1)),
-    memberCount: vi.fn(() => 0),
-    getAliveMembers: vi.fn(() => []),
-    contains: vi.fn(() => false),
-    getMemberIncarnation: vi.fn(() => undefined as number | undefined),
-    processGossip: vi.fn(() => JSON.stringify({ newPeers: [], relay: [] })),
-    drainGossip: vi.fn(() => "[]"),
-    generateFullGossip: vi.fn(() => "[]"),
-    markDead: vi.fn(() => false),
-    setLocalAddress: vi.fn(),
-    onPeerConnected: vi.fn(() =>
-      JSON.stringify({
-        forNewPeer: {
-          type: "gossip",
-          updates: [
-            { type: "alive", peer: { peerId: "test-client-id", address: null }, incarnation: 1 },
-          ],
-        },
-        forExistingPeers: {
-          type: "gossip",
-          updates: [
-            { type: "alive", peer: { peerId: "new-peer", address: null }, incarnation: 1 },
-          ],
-        },
-      })
-    ),
-  };
-}
 
 describe("PeerManager", () => {
   let manager: PeerManager;
@@ -417,9 +386,10 @@ describe("PeerManager", () => {
   });
 
   describe("sendHandshake()", () => {
-    describe("Given membershipAddress is set", () => {
+    describe("Given advertisedAddress is set", () => {
       it("should include address in handshake message", async () => {
-        const pmWithAddr = new PeerManager("test-client-id", null, "ws://192.168.1.10:9427");
+        const pmWithAddr = new PeerManager("test-client-id", null);
+        pmWithAddr.setAdvertisedAddress("ws://192.168.1.10:9427");
         pmWithAddr.setVault(mockVault);
 
         const connectPromise = pmWithAddr.connectToUrl("wss://example.com/sync");
@@ -442,7 +412,7 @@ describe("PeerManager", () => {
       });
     });
 
-    describe("Given membershipAddress is null", () => {
+    describe("Given advertisedAddress is not set", () => {
       it("should omit address from handshake message", async () => {
         const connectPromise = manager.connectToUrl("wss://example.com/sync");
         const socket = socketFactory.getLatest()!;
@@ -465,117 +435,45 @@ describe("PeerManager", () => {
     });
   });
 
-  describe("received handshake address", () => {
-    it("should pass handshake address to onHandshakeComplete", async () => {
-      const spy = vi.spyOn(manager as any, "onHandshakeComplete");
-
-      const connectPromise = manager.connectToUrl("wss://example.com/sync");
-      const socket = socketFactory.getLatest()!;
-      socket.simulateOpen();
-      await connectPromise;
-
-      // Simulate receiving handshake WITH address field
-      const serverHandshake = new TextEncoder().encode(
-        JSON.stringify({
-          type: "handshake",
-          peerId: "server-abc",
-          role: "server",
-          address: "ws://10.0.0.5:9427",
-        })
-      );
-      socket.simulateMessage(serverHandshake);
-
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringMatching(/^url-/),
-        "server-abc",
-        "ws://10.0.0.5:9427"
-      );
-    });
-
-    it("should fall back to vault address when handshake has no address", async () => {
-      const spy = vi.spyOn(manager as any, "onHandshakeComplete");
-
-      const connectPromise = manager.connectToUrl("wss://example.com/sync");
-      const socket = socketFactory.getLatest()!;
-      socket.simulateOpen();
-      await connectPromise;
-
-      // Simulate receiving handshake WITHOUT address field
-      const serverHandshake = new TextEncoder().encode(
-        JSON.stringify({
-          type: "handshake",
-          peerId: "server-abc",
-          role: "server",
-        })
-      );
-      socket.simulateMessage(serverHandshake);
-
-      // Should fall back to vault's peer.address ("test-address" from mock)
-      expect(spy).toHaveBeenCalledWith(
-        expect.stringMatching(/^url-/),
-        "server-abc",
-        "test-address"
-      );
-    });
-  });
-
   describe("setAdvertisedAddress()", () => {
-    it("should update membershipAddress for future membership instances", () => {
-      const pm = new PeerManager("test-peer", null, null, 1);
+    it("should store address for use in future handshakes", () => {
+      const pm = new PeerManager("test-peer", null);
       pm.setAdvertisedAddress("ws://192.168.1.10:9427");
 
-      // The address is stored - next membership creation will use it
-      // (Can't easily verify without WASM, but we can check it doesn't throw)
+      // Verify it doesn't throw and updates correctly
       expect(() => pm.setAdvertisedAddress("ws://192.168.1.10:9428")).not.toThrow();
     });
   });
 
-  describe("gossip handling", () => {
-    it("should ignore gossip before handshake completes", async () => {
+  describe("unknown JSON message types", () => {
+    it("should forward unknown JSON messages to the 'message' event", async () => {
       const connectPromise = manager.connectToUrl("wss://example.com/sync");
       const socket = socketFactory.getLatest()!;
       socket.simulateOpen();
       await connectPromise;
 
-      // Send gossip BEFORE handshake (no peer ID set yet)
-      const gossipMsg = new TextEncoder().encode(
-        JSON.stringify({
-          type: "gossip",
-          updates: [{ type: "alive", peer: { peerId: "other-peer", address: null }, incarnation: 1 }],
-        })
-      );
-      socket.simulateMessage(gossipMsg);
-
-      // Should not throw and should not crash - gossip is silently dropped
-      // The membership list would still be empty since gossip was ignored
-    });
-
-    it("should process gossip after handshake completes", async () => {
-      const connectPromise = manager.connectToUrl("wss://example.com/sync");
-      const socket = socketFactory.getLatest()!;
-      socket.simulateOpen();
-      await connectPromise;
-
-      // Complete handshake first
-      const serverHandshake = new TextEncoder().encode(
-        JSON.stringify({
-          type: "handshake",
-          peerId: "server-abc",
-          role: "server",
-        })
-      );
-      socket.simulateMessage(serverHandshake);
-
-      // Now send gossip (should be processed since handshake is complete)
-      const gossipMsg = new TextEncoder().encode(
-        JSON.stringify({
-          type: "gossip",
-          updates: [{ type: "alive", peer: { peerId: "other-peer", address: "ws://other:8765" }, incarnation: 1 }],
-        })
+      // Complete handshake
+      socket.simulateMessage(
+        new TextEncoder().encode(
+          JSON.stringify({ type: "handshake", peerId: "server-abc", role: "server" })
+        )
       );
 
-      // Should not throw - gossip is processed
-      expect(() => socket.simulateMessage(gossipMsg)).not.toThrow();
+      // Collect message events
+      const receivedMessages: Array<{ peerId: string; data: Uint8Array }> = [];
+      manager.on("message", (peerId: string, data: Uint8Array) => {
+        receivedMessages.push({ peerId, data });
+      });
+
+      // Send an unknown JSON message (e.g., legacy gossip from old peer)
+      const unknownMsg = new TextEncoder().encode(
+        JSON.stringify({ type: "gossip", updates: [] })
+      );
+      expect(() => socket.simulateMessage(unknownMsg)).not.toThrow();
+
+      // Unknown messages are forwarded as-is to the sync engine
+      expect(receivedMessages).toHaveLength(1);
+      expect(receivedMessages[0].peerId).toBe("server-abc");
     });
   });
 
@@ -629,253 +527,8 @@ describe("PeerManager", () => {
     });
   });
 
-  describe("onHandshakeComplete()", () => {
-    describe("Given membership is available", () => {
-      let mockMembership: ReturnType<typeof createMockMembership>;
-
-      beforeEach(() => {
-        mockMembership = createMockMembership();
-        (manager as any)._membership = mockMembership;
-      });
-
-      it("should call onPeerConnected with peer ID and address", async () => {
-        const connectPromise = manager.connectToUrl("wss://example.com/sync");
-        const socket = socketFactory.getLatest()!;
-        socket.simulateOpen();
-        await connectPromise;
-
-        socket.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({
-              type: "handshake",
-              peerId: "server-abc",
-              role: "server",
-              address: "ws://10.0.0.5:9427",
-            })
-          )
-        );
-
-        expect(mockMembership.onPeerConnected).toHaveBeenCalledWith(
-          "server-abc",
-          "ws://10.0.0.5:9427"
-        );
-      });
-
-      it("should send forNewPeer gossip to the connecting peer", async () => {
-        const connectPromise = manager.connectToUrl("wss://example.com/sync");
-        const socket = socketFactory.getLatest()!;
-        socket.simulateOpen();
-        await connectPromise;
-        socket.clearSentMessages();
-
-        socket.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({
-              type: "handshake",
-              peerId: "server-abc",
-              role: "server",
-            })
-          )
-        );
-
-        // Should have sent forNewPeer gossip to the new peer
-        expect(socket.sentMessages.length).toBeGreaterThanOrEqual(1);
-        const sentMsg = JSON.parse(new TextDecoder().decode(socket.sentMessages[0]));
-        expect(sentMsg.type).toBe("gossip");
-        expect(sentMsg.updates).toHaveLength(1);
-        expect(sentMsg.updates[0].peer.peerId).toBe("test-client-id");
-      });
-
-      it("should broadcast forExistingPeers to other connected peers", async () => {
-        // Connect peer A first
-        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
-        const socketA = socketFactory.getLatest()!;
-        socketA.simulateOpen();
-        await connectA;
-
-        socketA.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
-          )
-        );
-        socketA.clearSentMessages();
-
-        // Now connect peer B — onHandshakeComplete should broadcast to peer A
-        // Update mock to return peer-b-specific gossip
-        mockMembership.onPeerConnected.mockReturnValue(
-          JSON.stringify({
-            forNewPeer: {
-              type: "gossip",
-              updates: [
-                { type: "alive", peer: { peerId: "test-client-id", address: null }, incarnation: 1 },
-                { type: "alive", peer: { peerId: "peer-a", address: null }, incarnation: 1 },
-              ],
-            },
-            forExistingPeers: {
-              type: "gossip",
-              updates: [
-                { type: "alive", peer: { peerId: "peer-b", address: "ws://peer-b:8765" }, incarnation: 1 },
-              ],
-            },
-          })
-        );
-
-        const connectB = manager.connectToUrl("wss://peer-b.com/sync");
-        const socketB = socketFactory.getLatest()!;
-        socketB.simulateOpen();
-        await connectB;
-
-        socketB.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({
-              type: "handshake",
-              peerId: "peer-b",
-              role: "server",
-              address: "ws://peer-b:8765",
-            })
-          )
-        );
-
-        // Peer A should have received the forExistingPeers broadcast
-        expect(socketA.sentMessages).toHaveLength(1);
-        const broadcastMsg = JSON.parse(new TextDecoder().decode(socketA.sentMessages[0]));
-        expect(broadcastMsg.type).toBe("gossip");
-        expect(broadcastMsg.updates[0].peer.peerId).toBe("peer-b");
-      });
-    });
-  });
-
-  describe("handleGossip()", () => {
-    describe("Given multiple peers connected", () => {
-      it("should relay state-changing gossip to other peers, excluding sender", async () => {
-        const mockMembership = createMockMembership();
-        (manager as any)._membership = mockMembership;
-
-        // Connect peer A
-        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
-        const socketA = socketFactory.getLatest()!;
-        socketA.simulateOpen();
-        await connectA;
-        socketA.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
-          )
-        );
-
-        // Connect peer B
-        const connectB = manager.connectToUrl("wss://peer-b.com/sync");
-        const socketB = socketFactory.getLatest()!;
-        socketB.simulateOpen();
-        await connectB;
-        socketB.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
-          )
-        );
-
-        socketA.clearSentMessages();
-        socketB.clearSentMessages();
-
-        // Simulate processGossip() returning state-changing relay updates
-        const relayUpdate = { type: "alive", peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 };
-        mockMembership.processGossip.mockReturnValueOnce(
-          JSON.stringify({ newPeers: [], relay: [relayUpdate] })
-        );
-
-        const updates = [
-          { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
-        ];
-        manager.handleGossip(updates, "peer-a");
-
-        // Peer B should have received only the state-changing relay updates
-        expect(socketB.sentMessages).toHaveLength(1);
-        const relayedMsg = JSON.parse(new TextDecoder().decode(socketB.sentMessages[0]));
-        expect(relayedMsg.type).toBe("gossip");
-        expect(relayedMsg.updates).toEqual([relayUpdate]);
-
-        // Peer A (the sender) should NOT have received the relay
-        expect(socketA.sentMessages).toHaveLength(0);
-      });
-
-      it("should not relay already-known gossip (prevents amplification)", async () => {
-        const mockMembership = createMockMembership();
-        (manager as any)._membership = mockMembership;
-
-        // Connect peer A and peer B
-        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
-        const socketA = socketFactory.getLatest()!;
-        socketA.simulateOpen();
-        await connectA;
-        socketA.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
-          )
-        );
-
-        const connectB = manager.connectToUrl("wss://peer-b.com/sync");
-        const socketB = socketFactory.getLatest()!;
-        socketB.simulateOpen();
-        await connectB;
-        socketB.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
-          )
-        );
-
-        socketA.clearSentMessages();
-        socketB.clearSentMessages();
-
-        // Default mock returns empty relay — gossip was already known, no state change
-        const updates = [
-          { type: "alive" as const, peer: { peerId: "peer-c", address: "ws://peer-c:8765" }, incarnation: 1 },
-        ];
-        manager.handleGossip(updates, "peer-a");
-
-        // No relay should happen — prevents infinite amplification in mesh
-        expect(socketA.sentMessages).toHaveLength(0);
-        expect(socketB.sentMessages).toHaveLength(0);
-      });
-    });
-
-    describe("Given only one peer connected", () => {
-      it("should not relay gossip when only sender is connected", async () => {
-        const mockMembership = createMockMembership();
-        (manager as any)._membership = mockMembership;
-
-        // Connect only peer A
-        const connectA = manager.connectToUrl("wss://peer-a.com/sync");
-        const socketA = socketFactory.getLatest()!;
-        socketA.simulateOpen();
-        await connectA;
-        socketA.simulateMessage(
-          new TextEncoder().encode(
-            JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
-          )
-        );
-
-        socketA.clearSentMessages();
-
-        // Simulate gossip arriving from peer A
-        const updates = [
-          { type: "alive" as const, peer: { peerId: "peer-b", address: null }, incarnation: 1 },
-        ];
-        manager.handleGossip(updates, "peer-a");
-
-        // Peer A should not receive anything (no relay needed with only 1 peer)
-        expect(socketA.sentMessages).toHaveLength(0);
-      });
-    });
-  });
-
-  describe("onPeerDisconnected()", () => {
-    it("should broadcast dead gossip immediately when a known peer disconnects", async () => {
-      const mockMembership = createMockMembership();
-      (manager as any)._membership = mockMembership;
-
-      // Peer is known in membership with incarnation 3
-      mockMembership.getMemberIncarnation.mockReturnValue(3);
-      mockMembership.markDead.mockReturnValue(true);
-
+  describe("peer disconnection", () => {
+    it("should not send any broadcast when a peer disconnects", async () => {
       // Connect peer A and peer B
       const connectA = manager.connectToUrl("wss://peer-a.com/sync");
       const socketA = socketFactory.getLatest()!;
@@ -900,148 +553,11 @@ describe("PeerManager", () => {
       socketA.clearSentMessages();
       socketB.clearSentMessages();
 
-      // Peer A disconnects
+      // Peer A disconnects — no broadcast should happen
       socketA.simulateClose();
 
-      // Peer B should receive exactly one dead gossip broadcast about peer A
-      expect(socketB.sentMessages).toHaveLength(1);
-      const deadMsg = JSON.parse(new TextDecoder().decode(socketB.sentMessages[0]));
-      expect(deadMsg.type).toBe("gossip");
-      expect(deadMsg.updates).toHaveLength(1);
-      expect(deadMsg.updates[0]).toEqual({
-        type: "dead",
-        peerId: "peer-a",
-        incarnation: 3,
-      });
-    });
-
-    it("should not broadcast if peer was not in membership", async () => {
-      const mockMembership = createMockMembership();
-      (manager as any)._membership = mockMembership;
-
-      // Peer not known — markDead returns false
-      mockMembership.markDead.mockReturnValue(false);
-
-      // Connect peer A and peer B
-      const connectA = manager.connectToUrl("wss://peer-a.com/sync");
-      const socketA = socketFactory.getLatest()!;
-      socketA.simulateOpen();
-      await connectA;
-      socketA.simulateMessage(
-        new TextEncoder().encode(
-          JSON.stringify({ type: "handshake", peerId: "peer-a", role: "server" })
-        )
-      );
-
-      const connectB = manager.connectToUrl("wss://peer-b.com/sync");
-      const socketB = socketFactory.getLatest()!;
-      socketB.simulateOpen();
-      await connectB;
-      socketB.simulateMessage(
-        new TextEncoder().encode(
-          JSON.stringify({ type: "handshake", peerId: "peer-b", role: "server" })
-        )
-      );
-
-      socketA.clearSentMessages();
-      socketB.clearSentMessages();
-
-      // Peer A disconnects but wasn't in membership
-      socketA.simulateClose();
-
-      // No dead gossip should be broadcast
+      // No messages should be sent (gossip/dead notifications are gone)
       expect(socketB.sentMessages).toHaveLength(0);
-    });
-  });
-
-  describe("auto-connect", () => {
-    it("should use one-shot connection (no reconnect) for gossip-discovered peers", async () => {
-      // Connect and complete handshake
-      const connectPromise = manager.connectToUrl("wss://example.com/sync");
-      const socket = socketFactory.getLatest()!;
-      socket.simulateOpen();
-      await connectPromise;
-
-      const serverHandshake = new TextEncoder().encode(
-        JSON.stringify({
-          type: "handshake",
-          peerId: "server-abc",
-          role: "server",
-        })
-      );
-      socket.simulateMessage(serverHandshake);
-
-      // Send gossip that discovers a new peer
-      const gossip = new TextEncoder().encode(
-        JSON.stringify({
-          type: "gossip",
-          updates: [{ type: "alive", peer: { peerId: "new-peer", address: "ws://new:8765" }, incarnation: 1 }],
-        })
-      );
-      socket.simulateMessage(gossip);
-
-      // Find the socket created for the gossip-discovered peer
-      const gossipSocket = socketFactory.instances.find((s) => s.url.includes("new:8765"));
-
-      if (gossipSocket) {
-        // Simulate successful connection then disconnect
-        gossipSocket.simulateOpen();
-
-        // After disconnect, should NOT attempt reconnection
-        gossipSocket.simulateClose();
-        await vi.advanceTimersByTimeAsync(10000);
-
-        // No new socket should have been created for this peer
-        const reconnectAttempts = socketFactory.instances
-          .filter((s) => s.url.includes("new:8765"));
-        expect(reconnectAttempts.length).toBe(1); // Only the original, no reconnect
-      }
-    });
-
-    it("should not attempt duplicate connections to same peer", async () => {
-      // Connect and complete handshake
-      const connectPromise = manager.connectToUrl("wss://example.com/sync");
-      const socket = socketFactory.getLatest()!;
-      socket.simulateOpen();
-      await connectPromise;
-
-      const serverHandshake = new TextEncoder().encode(
-        JSON.stringify({
-          type: "handshake",
-          peerId: "server-abc",
-          role: "server",
-        })
-      );
-      socket.simulateMessage(serverHandshake);
-
-      // Track connection attempts
-      const connectionAttempts: string[] = [];
-      const originalCreate = socketFactory.create.bind(socketFactory);
-      socketFactory.create = (url: string) => {
-        connectionAttempts.push(url);
-        return originalCreate(url);
-      };
-
-      // Send duplicate gossip updates for the same peer
-      const gossip1 = new TextEncoder().encode(
-        JSON.stringify({
-          type: "gossip",
-          updates: [{ type: "alive", peer: { peerId: "new-peer", address: "ws://new:8765" }, incarnation: 1 }],
-        })
-      );
-      const gossip2 = new TextEncoder().encode(
-        JSON.stringify({
-          type: "gossip",
-          updates: [{ type: "alive", peer: { peerId: "new-peer", address: "ws://new:8765" }, incarnation: 2 }],
-        })
-      );
-
-      socket.simulateMessage(gossip1);
-      socket.simulateMessage(gossip2);
-
-      // Should only attempt one connection (duplicate is prevented)
-      // Note: First gossip triggers connect, second is blocked by connectingPeers Set
-      expect(connectionAttempts.filter((url) => url.includes("new:8765")).length).toBeLessThanOrEqual(1);
     });
   });
 });

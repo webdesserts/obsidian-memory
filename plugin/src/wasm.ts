@@ -14,7 +14,6 @@ import {
   JsFileSystemBridge,
   WasmVault,
   WasmSubscription as WasmSubscriptionImpl,
-  WasmMembership,
 } from "../pkg/sync_wasm.js";
 
 // Import WASM binary as base64-encoded ArrayBuffer (via esbuild plugin)
@@ -23,7 +22,7 @@ import wasmBinary from "../pkg/sync_wasm_bg.wasm";
 import { log } from "./logger";
 
 // Re-export types
-export { JsFileSystemBridge, WasmVault, WasmMembership };
+export { JsFileSystemBridge, WasmVault };
 export type { WasmSubscriptionImpl as WasmSubscription };
 
 // ========== Peer Types ==========
@@ -75,44 +74,6 @@ export interface LogEvent {
 export interface InitConfig {
   /** Optional logger callback for routing logs to file/custom handler */
   logger?: (event: LogEvent) => void;
-}
-
-// ========== SWIM Gossip Types ==========
-
-/** Information about a peer in the SWIM mesh */
-export interface SwimPeerInfo {
-  /** Peer's unique identifier (hex string) */
-  peerId: string;
-  /** Advertised address for incoming connections (null for client-only) */
-  address: string | null;
-}
-
-/** SWIM membership state */
-export type MemberState = "alive" | "suspected" | "dead" | "removed";
-
-/** A member in the SWIM membership list */
-export interface SwimMember {
-  peerId: string;
-  address: string | null;
-  incarnation: number;
-}
-
-/**
- * Gossip update for membership state changes.
- * These are piggybacked on sync messages for efficient dissemination.
- */
-export type GossipUpdate =
-  | { type: "alive"; peer: SwimPeerInfo; incarnation: number }
-  | { type: "suspect"; peerId: string; incarnation: number }
-  | { type: "dead"; peerId: string; incarnation: number }
-  | { type: "removed"; peerId: string };
-
-/** Result of processing incoming gossip through the membership list. */
-export interface ProcessedGossip {
-  /** Newly discovered peers — use for auto-connect decisions */
-  newPeers: SwimPeerInfo[];
-  /** State-changing updates only — relay to other peers (excludes already-known gossip) */
-  relay: GossipUpdate[];
 }
 
 // ========== Debug API Types ==========

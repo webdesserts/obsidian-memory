@@ -4,11 +4,11 @@
 //! flag, while still keeping the standalone `sync-daemon` binary as a thin wrapper.
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::daemon_lock::DaemonLock;
 use crate::http;
@@ -20,8 +20,6 @@ use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 use crate::IncomingMessage;
 
 use sync_core::fs::FileSystem;
-use sync_core::protocol::{GossipMessage, PeerMessage};
-use sync_core::swim::{GossipUpdate, MembershipList, PeerInfo};
 use sync_core::{PeerId, Vault};
 
 /// Configuration for running the sync daemon.
@@ -42,8 +40,8 @@ struct Daemon {
     server: WebSocketServer,
     outgoing: ConnectionManager,
     watcher: FileWatcher,
-    membership: MembershipList,
-    daemon_config: DaemonConfig,
+    /// Currently connected peer IDs.
+    connected_peers: HashSet<PeerId>,
     vault_path: PathBuf,
 }
 
@@ -149,26 +147,11 @@ impl Daemon {
             msg.data.len()
         );
 
-        let sync_data = match PeerMessage::from_json(&msg.data) {
-            Some(PeerMessage::Gossip(gossip_msg)) => {
-                self.handle_gossip_updates(&gossip_msg.updates, peer_id)
-                    .await;
-                return;
-            }
-            Some(PeerMessage::Sync(envelope)) => {
-                if !envelope.gossip.is_empty() {
-                    self.handle_gossip_updates(&envelope.gossip, peer_id).await;
-                }
-                envelope.data
-            }
-            None => msg.data.clone(),
-        };
-
-        let should_relay_raw = self.is_file_lifecycle_message(&sync_data);
+        let should_relay_raw = self.is_file_lifecycle_message(&msg.data);
 
         let vault = self.vault.lock().await;
 
-        match vault.process_sync_message(&sync_data).await {
+        match vault.process_sync_message(&msg.data).await {
             Ok((response, modified_paths)) => {
                 if let Some(response_data) = response {
                     if let Err(e) = self.server.send(peer_id, &response_data).await {
@@ -179,7 +162,7 @@ impl Daemon {
                 if !modified_paths.is_empty() && self.server.peer_count() > 1 {
                     if should_relay_raw {
                         self.server
-                            .broadcast_except(&sync_data, peer_id)
+                            .broadcast_except(&msg.data, peer_id)
                             .await;
                         info!(
                             "Relayed file lifecycle event for {} to {} other peer(s)",
@@ -234,30 +217,11 @@ impl Daemon {
     }
 
     /// Handle a newly connected peer (after handshake).
-    async fn on_peer_connected(&mut self, peer_id: String, address: Option<String>) {
+    async fn on_peer_connected(&mut self, peer_id: String, _address: Option<String>) {
         info!("Peer connected: {}", peer_id);
 
         if let Ok(pid) = peer_id.parse::<PeerId>() {
-            let peer_info = PeerInfo::new(pid, address);
-            let messages = self.membership.on_peer_connected(peer_info);
-
-            if let Err(e) = self
-                .server
-                .send(&peer_id, &messages.for_new_peer.to_json())
-                .await
-            {
-                warn!("Failed to send gossip to {}: {}", peer_id, e);
-            } else {
-                debug!(
-                    "Sent full gossip ({} updates) to {}",
-                    messages.for_new_peer.updates.len(),
-                    peer_id
-                );
-            }
-
-            self.server
-                .broadcast_except(&messages.for_existing_peers.to_json(), &peer_id)
-                .await;
+            self.connected_peers.insert(pid);
         }
 
         let vault = self.vault.lock().await;
@@ -278,68 +242,9 @@ impl Daemon {
 
     fn on_peer_disconnected(&mut self, peer_id: &str) {
         if let Ok(pid) = peer_id.parse::<PeerId>() {
-            if self.membership.mark_dead(pid) {
-                debug!("Marked {} as Dead in SWIM membership", peer_id);
-            }
+            self.connected_peers.remove(&pid);
         }
-    }
-
-    async fn broadcast_dead_gossip(&mut self, peer_id: &str) {
-        if let Ok(pid) = peer_id.parse::<PeerId>() {
-            if let Some(member) = self.membership.get(&pid) {
-                let dead_update = GossipUpdate::dead(pid, member.incarnation);
-                let msg = GossipMessage::new(vec![dead_update]);
-                self.server.broadcast(&msg.to_json()).await;
-                info!("Broadcast dead gossip for {}", peer_id);
-            }
-        }
-    }
-
-    async fn handle_gossip_updates(&mut self, updates: &[GossipUpdate], from_peer_id: &str) {
-        if updates.is_empty() {
-            return;
-        }
-
-        if let Ok(from_pid) = from_peer_id.parse::<PeerId>() {
-            let result = self.membership.process_gossip(updates, from_pid);
-            debug!(
-                "Processed {} gossip updates from {}, discovered {} new peers",
-                updates.len(),
-                from_peer_id,
-                result.new_peers.len()
-            );
-
-            if let Err(e) = self.daemon_config.save_if_incarnation_changed(
-                self.membership.local_incarnation(),
-                &self.vault_path,
-            ) {
-                error!(
-                    "Failed to save daemon config after incarnation bump: {}",
-                    e
-                );
-            }
-
-            if self.server.peer_count() > 1 && !result.relay.is_empty() {
-                let relay_msg = GossipMessage::new(result.relay);
-                self.server
-                    .broadcast_except(&relay_msg.to_json(), from_peer_id)
-                    .await;
-                debug!(
-                    "Relayed {} gossip updates to {} other peer(s)",
-                    relay_msg.updates.len(),
-                    self.server.peer_count() - 1
-                );
-            }
-
-            for peer in result.new_peers {
-                if let Some(addr) = &peer.address {
-                    info!(
-                        "Discovered peer {} at {} (auto-connect TODO)",
-                        peer.peer_id, addr
-                    );
-                }
-            }
-        }
+        debug!("Peer disconnected: {}", peer_id);
     }
 }
 
@@ -399,19 +304,12 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     let watcher = FileWatcher::new(config.vault.clone())?;
     info!("File watcher started");
 
-    let membership = MembershipList::with_incarnation(
-        peer_id,
-        config.advertise.clone(),
-        daemon_config.incarnation,
-    );
-
     let mut daemon = Daemon {
         vault: Arc::new(Mutex::new(vault)),
         server,
         outgoing,
         watcher,
-        membership,
-        daemon_config,
+        connected_peers: HashSet::new(),
         vault_path: config.vault.clone(),
     };
 
@@ -426,9 +324,6 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     }
 
     info!("Daemon running. Press Ctrl+C to stop.");
-
-    let mut eviction_interval = tokio::time::interval(Duration::from_secs(60));
-    let eviction_ttl = Duration::from_secs(300);
 
     loop {
         tokio::select! {
@@ -451,7 +346,6 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
                     ServerEvent::PeerDisconnected { peer_id } => {
                         info!("Peer disconnected: {}", peer_id);
                         daemon.on_peer_disconnected(&peer_id);
-                        daemon.broadcast_dead_gossip(&peer_id).await;
                     }
                 }
             }
@@ -468,18 +362,10 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
                     ManagerEvent::ConnectionClosed { peer_id, reason } => {
                         info!("Outgoing connection closed: {} ({:?})", peer_id, reason);
                         daemon.on_peer_disconnected(&peer_id);
-                        daemon.broadcast_dead_gossip(&peer_id).await;
                     }
                     ManagerEvent::PeerDiscovered { peer_id, address } => {
                         info!("Discovered peer {} at {}", peer_id, address);
                     }
-                }
-            }
-
-            _ = eviction_interval.tick() => {
-                let evicted = daemon.membership.evict_dead_members(eviction_ttl);
-                if evicted > 0 {
-                    info!("Evicted {} dead member(s) past {}s TTL", evicted, eviction_ttl.as_secs());
                 }
             }
 

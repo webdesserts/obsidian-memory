@@ -17,7 +17,6 @@ pub mod markdown;
 pub mod peer_id;
 pub mod peers;
 pub mod protocol;
-pub mod swim;
 pub mod sync;
 pub mod sync_engine;
 pub mod transport;
@@ -28,10 +27,7 @@ pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use peer_id::{PeerId, PeerIdError, VaultId};
-pub use protocol::{
-    GossipMessage, Handshake, HandshakeRole, PeerMessage, SyncEnvelope, MAX_MESSAGE_SIZE,
-    PROTOCOL_VERSION,
-};
+pub use protocol::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 pub use peers::{ConnectedPeer, ConnectionDirection, PeerError, PeerRegistry};
 pub use sync::SyncMessage;
 pub use transport::{PeerConnection, PeerInfo, SyncTransport};

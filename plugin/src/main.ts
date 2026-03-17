@@ -57,13 +57,10 @@ const SETTINGS_PATH = ".sync/settings.json";
 interface P2PSyncSettings {
   /** Peers to auto-reconnect to on plugin load */
   knownPeers: KnownPeer[];
-  /** SWIM incarnation number for gossip protocol ordering */
-  swimIncarnation: number;
 }
 
 const DEFAULT_SETTINGS: P2PSyncSettings = {
   knownPeers: [],
-  swimIncarnation: 1,
 };
 
 /**
@@ -291,12 +288,6 @@ export default class P2PSyncPlugin extends Plugin {
       this.debugEventSubscription = null;
     }
 
-    // Save current incarnation for next session (increment to ensure ordering)
-    if (this.peerManager) {
-      this.settings.swimIncarnation = this.peerManager.localIncarnation + 1;
-      await this.saveSettings();
-    }
-
     // Stop peer manager
     if (this.peerManager) {
       await this.peerManager.stop();
@@ -354,10 +345,7 @@ export default class P2PSyncPlugin extends Plugin {
     // Get the plugin directory for loading ws-server.js on desktop
     const pluginDir = this.getPluginDir();
 
-    // On desktop, we'll advertise our LAN address once server starts
-    // For now, pass null - address will be updated after server starts
-    const incarnation = this.settings.swimIncarnation;
-    this.peerManager = new PeerManager(this.peerId, pluginDir, null, incarnation);
+    this.peerManager = new PeerManager(this.peerId, pluginDir);
 
     // Set vault adapter for Rust-driven peer state management
     if (this.vault) {
@@ -400,7 +388,7 @@ export default class P2PSyncPlugin extends Plugin {
       const actualPort = await this.peerManager.start(DEFAULT_PORT);
       log.info(`Peer manager started on port ${actualPort}`);
 
-      // Advertise our LAN address for peer discovery via gossip
+      // Advertise our LAN address so peers can see it in handshakes
       if (Platform.isDesktop && this.peerManager.isServerRunning) {
         const addresses = this.peerManager.getLanAddresses();
         if (addresses.length > 0) {
@@ -771,8 +759,7 @@ export default class P2PSyncPlugin extends Plugin {
       const request = await this.vaultQueue.run(() =>
         this.vault!.prepareSyncRequest()
       );
-      // Send with piggybacked gossip for peer discovery
-      this.peerManager.sendWithGossip(peerId, request);
+      this.peerManager.send(peerId, request);
       log.debug(`Sent sync request to ${peerId}`);
     } catch (err) {
       log.error(`Failed to send sync request to ${peerId}:`, err);
@@ -802,9 +789,8 @@ export default class P2PSyncPlugin extends Plugin {
       
       log.debug(`Sync result - response=${result.response ? result.response.length + ' bytes' : 'null'}, modifiedPaths=${JSON.stringify(result.modifiedPaths)}`);
 
-      // If there's a response, send it back with piggybacked gossip
       if (result.response) {
-        this.peerManager.sendWithGossip(peerId, result.response);
+        this.peerManager.send(peerId, result.response);
         log.debug(`Sent sync response to ${peerId}`);
       }
 
@@ -866,8 +852,7 @@ export default class P2PSyncPlugin extends Plugin {
         this.vault!.prepareDocumentUpdate(path)
       );
       if (update) {
-        // Broadcast with piggybacked gossip for peer discovery
-        this.peerManager.broadcastWithGossip(update);
+        this.peerManager.broadcast(update);
         log.debug(`Broadcast update for ${path} to ${this.peerManager.peerCount} peer(s)`);
       }
     } catch (err) {
