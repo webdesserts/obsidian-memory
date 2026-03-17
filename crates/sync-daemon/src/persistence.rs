@@ -78,6 +78,11 @@ impl IdentityKey {
             fs::create_dir_all(parent)?;
         }
         fs::write(&key_path, self.signing_key.to_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
