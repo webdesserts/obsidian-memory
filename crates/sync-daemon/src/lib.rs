@@ -4,27 +4,17 @@
 //! allowing integration tests to access internal types.
 
 pub mod allowlist;
-pub mod connection;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod http;
 pub mod key_storage;
-pub mod manager;
-pub mod message;
 pub mod native_fs;
-pub mod outgoing;
 pub mod persistence;
-pub mod server;
 pub mod watcher;
 
 // Re-export key types for convenience
 pub use allowlist::FileAllowlistStorage;
-pub use connection::{ConnectionEvent, IncomingMessage, PeerConnection};
 pub use key_storage::FileKeyStorage;
-pub use manager::{ConnectionManager, ManagerEvent};
-pub use message::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 pub use native_fs::NativeFs;
-pub use outgoing::{OutgoingConnection, OutgoingState, ReconnectConfig, ReconnectState};
 pub use persistence::{PeerStorage, PersistedPeer, PersistedPeers};
-pub use server::{ServerEvent, WebSocketServer};
 pub use watcher::{FileEvent, FileEventKind, FileWatcher};
