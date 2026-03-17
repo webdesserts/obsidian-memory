@@ -12,6 +12,7 @@
 pub mod document;
 pub mod events;
 pub mod fs;
+pub mod key_storage;
 pub mod markdown;
 pub mod peer_id;
 pub mod peers;
@@ -25,6 +26,7 @@ pub mod vault;
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
+pub use key_storage::{KeyStorage, KeyStorageError};
 pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use protocol::{
     GossipMessage, Handshake, HandshakeRole, PeerMessage, SyncEnvelope, MAX_MESSAGE_SIZE,

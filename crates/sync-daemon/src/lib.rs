@@ -7,6 +7,7 @@ pub mod connection;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod http;
+pub mod key_storage;
 pub mod manager;
 pub mod message;
 pub mod native_fs;
@@ -17,6 +18,7 @@ pub mod watcher;
 
 // Re-export key types for convenience
 pub use connection::{ConnectionEvent, IncomingMessage, PeerConnection};
+pub use key_storage::FileKeyStorage;
 pub use manager::{ConnectionManager, ManagerEvent};
 pub use message::{Handshake, HandshakeRole, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 pub use native_fs::NativeFs;
