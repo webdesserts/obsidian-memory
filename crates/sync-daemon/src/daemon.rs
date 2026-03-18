@@ -288,6 +288,27 @@ impl Daemon {
         }
     }
 
+    /// Handle an allowlist update received via gossip from a mesh member.
+    ///
+    /// Only processes the update if the sender is already in our allowlist —
+    /// we don't trust gossip from peers we haven't explicitly paired with.
+    async fn on_allowlist_update_received(&self, from: iroh::EndpointId, peer: sync_core::allowlist::AllowedPeer) {
+        let sender_id = PeerId::from_bytes(*from.as_bytes());
+        if !self.is_peer_allowed(&sender_id).await {
+            warn!(peer = %from, "Allowlist update from non-allowlisted peer, ignoring");
+            return;
+        }
+
+        match self.allowlist.add_peer(peer.node_id, &peer.device_name).await {
+            Ok(()) => {
+                info!(peer_id = %peer.node_id, device = %peer.device_name, "Added peer via gossip allowlist update");
+            }
+            Err(e) => {
+                error!("Failed to add peer {} from allowlist update: {}", peer.node_id, e);
+            }
+        }
+    }
+
     /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
     async fn on_inbound_sync(&mut self, inbound: InboundSyncRequest) {
         if !self.is_peer_allowed(&inbound.remote_id).await {
@@ -525,6 +546,9 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
                     }
                     GossipEvent::ChangeReceived { from, notification } => {
                         daemon.on_change_received(from, notification.path).await;
+                    }
+                    GossipEvent::AllowlistUpdate { from, peer } => {
+                        daemon.on_allowlist_update_received(from, peer).await;
                     }
                 }
             }
