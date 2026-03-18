@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-
+use crate::allowlist::FileAllowlistStorage;
 use crate::daemon_lock::DaemonLock;
 use crate::http;
 use crate::native_fs::NativeFs;
@@ -17,6 +17,7 @@ use crate::persistence::DaemonConfig;
 use crate::relay::EmbeddedRelay;
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 
+use sync_core::allowlist::AllowlistStorage;
 use sync_core::fs::FileSystem;
 use sync_core::network::{
     gossip::{GossipEvent, VaultGossip},
@@ -24,6 +25,13 @@ use sync_core::network::{
     SyncNode,
 };
 use sync_core::{PeerId, PeerRegistry, Vault};
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Configuration for running the sync daemon.
 pub struct DaemonRunConfig {
@@ -49,6 +57,8 @@ struct Daemon {
     watcher: FileWatcher,
     /// Tracks liveness state of all peers observed in the gossip swarm.
     peer_registry: PeerRegistry,
+    /// Controls which peers are allowed to sync. Empty = open to all (pre-pairing).
+    allowlist: FileAllowlistStorage,
     #[allow(dead_code)]
     vault_path: PathBuf,
 }
@@ -140,6 +150,14 @@ impl Daemon {
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
         self.peer_registry.on_neighbor_up(peer_id);
 
+        // Enforce allowlist: once any peer has been paired, only paired peers may sync.
+        // An empty allowlist means no pairing has happened yet — accept everyone.
+        let allowed_peers = self.allowlist.list_peers().await.unwrap_or_default();
+        if !allowed_peers.is_empty() && !allowed_peers.iter().any(|p| p.node_id == peer_id) {
+            warn!(peer = %node_id, "Peer not in allowlist, skipping sync");
+            return;
+        }
+
         let vault = self.vault.lock().await;
         let request_bytes = match vault.prepare_sync_request().await {
             Ok(bytes) => bytes,
@@ -171,6 +189,9 @@ impl Daemon {
         match vault.process_sync_message(&response_bytes).await {
             Ok((_, modified_paths)) => {
                 self.peer_registry.update_last_seen(&peer_id);
+                if let Err(e) = self.allowlist.update_last_seen(&peer_id, now_ms()).await {
+                    warn!("Failed to update allowlist last_seen for {}: {}", node_id, e);
+                }
                 if !modified_paths.is_empty() {
                     info!(
                         "Synced {} file(s) from {} on NeighborUp",
@@ -244,6 +265,16 @@ impl Daemon {
 
     /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
     async fn on_inbound_sync(&mut self, inbound: InboundSyncRequest) {
+        // Enforce allowlist: once any peer has been paired, only paired peers may sync.
+        // An empty allowlist means no pairing has happened yet — accept everyone.
+        let allowed_peers = self.allowlist.list_peers().await.unwrap_or_default();
+        if !allowed_peers.is_empty() && !allowed_peers.iter().any(|p| p.node_id == inbound.remote_id) {
+            warn!(peer = %inbound.remote_id, "Inbound sync from non-allowlisted peer, dropping");
+            // Dropping reply_tx closes the QUIC stream without a response.
+            drop(inbound.reply_tx);
+            return;
+        }
+
         let vault = self.vault.lock().await;
         match vault.process_sync_message(&inbound.message_bytes).await {
             Ok((response_bytes_opt, modified_paths)) => {
@@ -252,6 +283,9 @@ impl Daemon {
                 }
 
                 self.peer_registry.update_last_seen(&inbound.remote_id);
+                if let Err(e) = self.allowlist.update_last_seen(&inbound.remote_id, now_ms()).await {
+                    warn!("Failed to update allowlist last_seen for {}: {}", inbound.remote_id, e);
+                }
 
                 if let Some(resp_bytes) = response_bytes_opt {
                     // reply_tx being dropped closes the stream without a response — that's fine.
@@ -381,12 +415,15 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     let watcher = FileWatcher::new(config.vault.clone())?;
     info!("File watcher started");
 
+    let allowlist = FileAllowlistStorage::new(&config.vault);
+
     let mut daemon = Daemon {
         vault: Arc::new(Mutex::new(vault)),
         sync_node,
         vault_gossip,
         watcher,
         peer_registry: PeerRegistry::new(),
+        allowlist,
         vault_path: config.vault.clone(),
     };
 
