@@ -21,8 +21,8 @@
 //!
 //! The networking stack compiles for both native and WASM targets.
 //! On native, peers connect via direct QUIC sockets or relay-assisted hole punching.
-//! In WASM (Obsidian plugin), peers connect exclusively via relay WebSocket transport
-//! since browsers cannot bind UDP sockets.
+//! In WASM (Obsidian plugin), peers connect exclusively via relay-assisted QUIC
+//! since browsers cannot bind UDP sockets directly.
 //!
 //! mDNS local discovery requires OS-level networking and is native-only.
 

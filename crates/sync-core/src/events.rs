@@ -50,15 +50,11 @@ pub enum SyncEvent {
         /// When the operation occurred, in milliseconds since Unix epoch.
         timestamp: f64,
     },
-    /// A peer connected (handshake complete).
+    /// A peer connected.
     PeerConnected {
-        /// Peer's unique identifier (from handshake).
+        /// Peer's unique identifier.
         #[serde(rename = "peerId")]
         peer_id: String,
-        /// Connection address (IP:port or URL).
-        address: String,
-        /// Connection direction ("incoming" or "outgoing").
-        direction: String,
         /// When the connection completed, in milliseconds since Unix epoch.
         timestamp: f64,
     },

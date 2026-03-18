@@ -121,12 +121,8 @@ export type SyncEvent =
     }
   | {
       type: "peerConnected";
-      /** Peer's unique identifier (from handshake). */
+      /** Peer's unique identifier. */
       peerId: string;
-      /** Connection address (IP:port or URL). */
-      address: string;
-      /** Connection direction ("incoming" or "outgoing"). */
-      direction: string;
       /** When the connection completed, in milliseconds since Unix epoch. */
       timestamp: number;
     }

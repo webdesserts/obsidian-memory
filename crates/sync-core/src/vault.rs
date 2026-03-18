@@ -3,7 +3,6 @@
 use crate::document::NoteDocument;
 use crate::events::{EventBus, SyncEvent, Subscription};
 use crate::fs::{FileSystem, FsError};
-use crate::peers::{ConnectedPeer, ConnectionDirection, DisconnectReason, PeerError, PeerRegistry};
 use crate::{PeerId, VaultId};
 
 use loro::{LoroDoc, LoroTree, TreeID, TreeParentId, VersionVector};
@@ -370,13 +369,6 @@ pub struct Vault<F: FileSystem> {
     #[cfg(target_arch = "wasm32")]
     events: Rc<EventBus>,
 
-    /// Peer registry (native: Arc for multi-threaded Tokio)
-    #[cfg(not(target_arch = "wasm32"))]
-    peers: Arc<PeerRegistry>,
-
-    /// Peer registry (WASM: Rc for single-threaded browser)
-    #[cfg(target_arch = "wasm32")]
-    peers: Rc<PeerRegistry>,
 }
 
 impl<F: FileSystem> Vault<F> {
@@ -484,11 +476,6 @@ impl<F: FileSystem> Vault<F> {
         #[cfg(target_arch = "wasm32")]
         let events = Rc::new(EventBus::new());
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let peers = Arc::new(PeerRegistry::new());
-        #[cfg(target_arch = "wasm32")]
-        let peers = Rc::new(PeerRegistry::new());
-
         // Wrap fields in interior mutability containers
         #[cfg(target_arch = "wasm32")]
         let vault = Self {
@@ -499,7 +486,6 @@ impl<F: FileSystem> Vault<F> {
             vault_id,
             sync_state: SyncState::new(),
             events,
-            peers,
         };
         #[cfg(not(target_arch = "wasm32"))]
         let vault = Self {
@@ -510,7 +496,6 @@ impl<F: FileSystem> Vault<F> {
             vault_id,
             sync_state: SyncState::new(),
             events,
-            peers,
         };
 
         // Scan and index all existing markdown files
@@ -557,11 +542,6 @@ impl<F: FileSystem> Vault<F> {
         #[cfg(target_arch = "wasm32")]
         let events = Rc::new(EventBus::new());
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let peers = Arc::new(PeerRegistry::new());
-        #[cfg(target_arch = "wasm32")]
-        let peers = Rc::new(PeerRegistry::new());
-
         // Wrap fields in interior mutability containers
         #[cfg(target_arch = "wasm32")]
         let vault = Self {
@@ -572,7 +552,6 @@ impl<F: FileSystem> Vault<F> {
             vault_id,
             sync_state: SyncState::new(),
             events,
-            peers,
         };
         #[cfg(not(target_arch = "wasm32"))]
         let vault = Self {
@@ -583,7 +562,6 @@ impl<F: FileSystem> Vault<F> {
             vault_id,
             sync_state: SyncState::new(),
             events,
-            peers,
         };
 
         // Build path cache from loaded tree
@@ -1672,112 +1650,6 @@ impl<F: FileSystem> Vault<F> {
         }))
     }
 
-    // ========== Peer Management Methods ==========
-    //
-    // These methods update the peer registry AND emit events.
-    // The PeerRegistry is pure state management; Vault handles event emission.
-
-    /// Notify that a peer has connected (call after handshake completes).
-    ///
-    /// Updates the registry and emits a `PeerConnected` event.
-    /// Returns an error if the peer ID is empty.
-    pub fn peer_connected(
-        &self,
-        id: String,
-        address: String,
-        direction: ConnectionDirection,
-    ) -> std::result::Result<ConnectedPeer, PeerError> {
-        let timestamp = self.now_ms();
-        let peer = self.peers.peer_connected(id.clone(), address.clone(), direction, timestamp)?;
-
-        self.emit(SyncEvent::PeerConnected {
-            peer_id: id,
-            address,
-            direction: match direction {
-                ConnectionDirection::Incoming => "incoming".into(),
-                ConnectionDirection::Outgoing => "outgoing".into(),
-            },
-            timestamp,
-        });
-
-        Ok(peer)
-    }
-
-    /// Notify that a peer has disconnected.
-    ///
-    /// Updates the registry and emits a `PeerDisconnected` event if the peer was known.
-    pub fn peer_disconnected(&self, id: &str, reason: DisconnectReason) {
-        let timestamp = self.now_ms();
-        if self.peers.peer_disconnected(id, reason, timestamp) {
-            self.emit(SyncEvent::PeerDisconnected {
-                peer_id: id.to_string(),
-                timestamp,
-            });
-        }
-    }
-
-    /// Called when WebSocket opens (before handshake).
-    /// Creates peer in Connecting state, indexed by connection ID.
-    pub fn peer_connecting(
-        &self,
-        connection_id: String,
-        address: String,
-        direction: ConnectionDirection,
-    ) -> ConnectedPeer {
-        let timestamp = self.now_ms();
-        self.peers
-            .peer_connecting(connection_id, address, direction, timestamp)
-    }
-
-    /// Called when handshake completes. Maps connection_id to real peer_id.
-    /// Returns error if connection_id unknown.
-    pub fn peer_handshake_complete(
-        &self,
-        connection_id: &str,
-        peer_id: String,
-    ) -> std::result::Result<ConnectedPeer, PeerError> {
-        let timestamp = self.now_ms();
-        let peer = self
-            .peers
-            .peer_handshake_complete(connection_id, peer_id.clone(), timestamp)?;
-
-        self.emit(SyncEvent::PeerConnected {
-            peer_id: peer.id.clone(),
-            address: peer.address.clone(),
-            direction: match peer.direction {
-                ConnectionDirection::Incoming => "incoming".into(),
-                ConnectionDirection::Outgoing => "outgoing".into(),
-            },
-            timestamp,
-        });
-
-        Ok(peer)
-    }
-
-    /// Get peer by connection ID (for pre-handshake lookups).
-    pub fn get_peer_by_connection_id(&self, connection_id: &str) -> Option<ConnectedPeer> {
-        self.peers.get_peer_by_connection_id(connection_id)
-    }
-
-    /// Resolve connection ID to peer ID (returns connection_id if no mapping).
-    pub fn resolve_peer_id(&self, connection_id: &str) -> String {
-        self.peers.resolve_peer_id(connection_id)
-    }
-
-    /// Get all peers seen this session (connected and disconnected).
-    pub fn get_known_peers(&self) -> Vec<ConnectedPeer> {
-        self.peers.get_known_peers()
-    }
-
-    /// Get info for a specific peer.
-    pub fn get_peer_info(&self, id: &str) -> Option<ConnectedPeer> {
-        self.peers.get_peer(id)
-    }
-
-    /// Get currently connected peers only.
-    pub fn get_connected_peers(&self) -> Vec<ConnectedPeer> {
-        self.peers.get_connected_peers()
-    }
 }
 
 /// FNV-1a hash for deterministic file naming.

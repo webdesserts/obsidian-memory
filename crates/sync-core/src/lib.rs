@@ -7,7 +7,7 @@
 //! - Managing Loro documents for markdown notes
 //! - Parsing/serializing markdown with frontmatter
 //! - Sync protocol between peers
-//! - FileSystem and SyncTransport trait abstractions
+//! - FileSystem trait abstraction
 
 pub mod network;
 
@@ -19,10 +19,8 @@ pub mod key_storage;
 pub mod markdown;
 pub mod pairing;
 pub mod peer_id;
-pub mod peers;
 pub mod sync;
 pub mod sync_engine;
-pub mod transport;
 pub mod vault;
 
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
@@ -32,7 +30,5 @@ pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use pairing::{PairingConfirmation, PairingRequest};
 pub use peer_id::{PeerId, PeerIdError, VaultId};
-pub use peers::{ConnectedPeer, ConnectionDirection, PeerError, PeerRegistry};
 pub use sync::SyncMessage;
-pub use transport::{PeerConnection, PeerInfo, SyncTransport};
 pub use vault::{SyncMetadata, Vault};

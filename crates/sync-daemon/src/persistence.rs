@@ -222,8 +222,8 @@ struct DaemonConfigRaw {
 
 /// Clear `known_peers.json` after a PeerId migration.
 ///
-/// Old WebSocket addresses are still valid, but peer entries are keyed by old
-/// PeerIds that no longer match. Clearing is simpler than re-keying.
+/// Peer entries are keyed by old PeerIds that no longer match after migration.
+/// Clearing is simpler than re-keying.
 fn clear_known_peers(vault_path: &Path) {
     let peers_path = vault_path.join(".sync/known_peers.json");
     if peers_path.exists() {
