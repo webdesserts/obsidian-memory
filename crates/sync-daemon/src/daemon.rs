@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -24,7 +23,7 @@ use sync_core::network::{
     streams::InboundSyncRequest,
     SyncNode,
 };
-use sync_core::Vault;
+use sync_core::{PeerId, PeerRegistry, Vault};
 
 /// Configuration for running the sync daemon.
 pub struct DaemonRunConfig {
@@ -48,8 +47,8 @@ struct Daemon {
     sync_node: SyncNode,
     vault_gossip: VaultGossip,
     watcher: FileWatcher,
-    /// EndpointIds of peers currently in the gossip swarm for this vault.
-    connected_peers: HashSet<EndpointId>,
+    /// Tracks liveness state of all peers observed in the gossip swarm.
+    peer_registry: PeerRegistry,
     #[allow(dead_code)]
     vault_path: PathBuf,
 }
@@ -85,14 +84,14 @@ impl Daemon {
 
         drop(vault);
 
-        if !self.connected_peers.is_empty() {
+        if self.peer_registry.alive_count() > 0 {
             if let Err(e) = self.vault_gossip.broadcast_change(path).await {
                 error!("Failed to broadcast deletion of {}: {}", path, e);
             } else {
                 info!(
                     "Broadcast deletion of {} to {} peer(s)",
                     path,
-                    self.connected_peers.len()
+                    self.peer_registry.alive_count()
                 );
             }
         } else {
@@ -119,7 +118,7 @@ impl Daemon {
 
         drop(vault);
 
-        if self.connected_peers.is_empty() {
+        if self.peer_registry.alive_count() == 0 {
             return;
         }
 
@@ -130,7 +129,7 @@ impl Daemon {
             info!(
                 "Broadcast change for {} to {} peer(s)",
                 path,
-                self.connected_peers.len()
+                self.peer_registry.alive_count()
             );
         }
     }
@@ -138,7 +137,8 @@ impl Daemon {
     /// A peer joined the gossip swarm — initiate a full sync via QUIC.
     async fn on_neighbor_up(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
-        self.connected_peers.insert(node_id);
+        let peer_id = PeerId::from_bytes(*node_id.as_bytes());
+        self.peer_registry.on_neighbor_up(peer_id);
 
         let vault = self.vault.lock().await;
         let request_bytes = match vault.prepare_sync_request().await {
@@ -150,22 +150,14 @@ impl Daemon {
         };
         drop(vault);
 
-        let request: sync_core::SyncMessage = match bincode::deserialize(&request_bytes) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("Failed to deserialize prepared sync request: {}", e);
-                return;
-            }
-        };
-
-        let response = match sync_core::network::streams::connect_and_sync(
+        let response_bytes = match sync_core::network::streams::connect_and_sync_raw(
             &self.sync_node.endpoint,
             node_id,
-            request,
+            &request_bytes,
         )
         .await
         {
-            Ok(resp) => resp,
+            Ok(bytes) => bytes,
             Err(e) => {
                 // NeighborUp fires before the peer's QUIC listener is ready on some
                 // OS configurations. Log a warning and move on — the peer will initiate
@@ -175,17 +167,10 @@ impl Daemon {
             }
         };
 
-        let response_bytes = match bincode::serialize(&response) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("Failed to serialize sync response: {}", e);
-                return;
-            }
-        };
-
         let vault = self.vault.lock().await;
         match vault.process_sync_message(&response_bytes).await {
             Ok((_, modified_paths)) => {
+                self.peer_registry.update_last_seen(&peer_id);
                 if !modified_paths.is_empty() {
                     info!(
                         "Synced {} file(s) from {} on NeighborUp",
@@ -205,7 +190,8 @@ impl Daemon {
     /// A peer left the gossip swarm.
     fn on_neighbor_down(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborDown");
-        self.connected_peers.remove(&node_id);
+        let peer_id = PeerId::from_bytes(*node_id.as_bytes());
+        self.peer_registry.on_neighbor_down(&peer_id);
     }
 
     /// A change notification arrived via gossip — pull the changed file via QUIC.
@@ -222,39 +208,25 @@ impl Daemon {
         };
         drop(vault);
 
-        let request: sync_core::SyncMessage = match bincode::deserialize(&request_bytes) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("Failed to deserialize prepared sync request: {}", e);
-                return;
-            }
-        };
-
-        let response = match sync_core::network::streams::connect_and_sync(
+        let response_bytes = match sync_core::network::streams::connect_and_sync_raw(
             &self.sync_node.endpoint,
             from,
-            request,
+            &request_bytes,
         )
         .await
         {
-            Ok(resp) => resp,
+            Ok(bytes) => bytes,
             Err(e) => {
                 warn!("Failed to pull change from {}: {}", from, e);
                 return;
             }
         };
 
-        let response_bytes = match bincode::serialize(&response) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("Failed to serialize sync response: {}", e);
-                return;
-            }
-        };
-
+        let peer_id = PeerId::from_bytes(*from.as_bytes());
         let vault = self.vault.lock().await;
         match vault.process_sync_message(&response_bytes).await {
             Ok((_, modified_paths)) => {
+                self.peer_registry.update_last_seen(&peer_id);
                 if !modified_paths.is_empty() {
                     info!(
                         "Pulled {} file(s) from {} after change notification on {}",
@@ -272,31 +244,16 @@ impl Daemon {
 
     /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
     async fn on_inbound_sync(&self, inbound: InboundSyncRequest) {
-        let msg_bytes = match bincode::serialize(&inbound.message) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("Failed to serialize inbound sync message: {}", e);
-                return;
-            }
-        };
-
         let vault = self.vault.lock().await;
-        match vault.process_sync_message(&msg_bytes).await {
+        match vault.process_sync_message(&inbound.message_bytes).await {
             Ok((response_bytes_opt, modified_paths)) => {
                 if !modified_paths.is_empty() {
                     info!("Applied {} file(s) from inbound sync", modified_paths.len());
                 }
 
                 if let Some(resp_bytes) = response_bytes_opt {
-                    let response: sync_core::SyncMessage = match bincode::deserialize(&resp_bytes) {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            error!("Failed to deserialize sync response: {}", e);
-                            return;
-                        }
-                    };
                     // reply_tx being dropped closes the stream without a response — that's fine.
-                    let _ = inbound.reply_tx.send(response);
+                    let _ = inbound.reply_tx.send(resp_bytes);
                 }
             }
             Err(e) => {
@@ -427,7 +384,7 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
         sync_node,
         vault_gossip,
         watcher,
-        connected_peers: HashSet::new(),
+        peer_registry: PeerRegistry::new(),
         vault_path: config.vault.clone(),
     };
 
