@@ -97,6 +97,13 @@ pub struct DaemonConfig {
     /// Absent when the relay is not running (relay_listen was not set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
+    /// Human-readable name for this mesh, broadcast via mDNS.
+    ///
+    /// Defaults to `None`, which causes the daemon to fall back to the vault
+    /// directory name when advertising. Set this to override the displayed name
+    /// on peer devices during discovery and pairing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_name: Option<String>,
 }
 
 impl DaemonConfig {
@@ -165,6 +172,7 @@ impl DaemonConfig {
                 // daemon write it after the relay starts. A stale URL left from a
                 // previous (crashed) run is meaningless after restart.
                 relay_url: None,
+                mesh_name: existing.mesh_name,
             };
             info!(peer_id = %config.peer_id, "Loaded daemon config");
             config
@@ -173,6 +181,7 @@ impl DaemonConfig {
                 peer_id: new_peer_id,
                 legacy_peer_id: None,
                 relay_url: None,
+                mesh_name: None,
             };
             info!(peer_id = %config.peer_id, "Generated new daemon config");
             config
@@ -206,7 +215,8 @@ impl DaemonConfig {
 }
 
 /// Raw deserialization type for migration — accepts optional `incarnation`,
-/// `legacy_peer_id`, and `relay_url` fields from older `daemon.toml` files without failing.
+/// `legacy_peer_id`, `relay_url`, and `mesh_name` fields from older `daemon.toml`
+/// files without failing.
 #[derive(Deserialize)]
 struct DaemonConfigRaw {
     peer_id: PeerId,
@@ -218,6 +228,7 @@ struct DaemonConfigRaw {
     /// Parsed from disk but discarded — incarnation was removed with the SWIM protocol.
     #[allow(dead_code)]
     incarnation: Option<u64>,
+    mesh_name: Option<String>,
 }
 
 /// Clear `known_peers.json` after a PeerId migration.

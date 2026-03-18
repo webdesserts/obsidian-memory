@@ -20,6 +20,7 @@ use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::fs::FileSystem;
 use sync_core::network::{
+    discovery::MeshMetadata,
     gossip::{GossipEvent, VaultGossip},
     streams::InboundSyncRequest,
     SyncNode,
@@ -404,6 +405,22 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     info!(node_id = %sync_node.node_id(), "Iroh node started");
 
+    // Publish mesh info via mDNS so LAN peers can discover this mesh.
+    // mesh_name defaults to the vault directory name if not set in config.
+    let mesh_name = daemon_config.mesh_name.clone().unwrap_or_else(|| {
+        config.vault
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Obsidian Vault")
+            .to_string()
+    });
+    let mesh_metadata = MeshMetadata {
+        mesh: mesh_name,
+        vid: vault_id.to_string(),
+        ver: 1,
+    };
+    sync_node.publish_mesh_info(&mesh_metadata, relay_url.as_ref());
+
     // Parse bootstrap peers as EndpointId (iroh node ID hex strings)
     let bootstrap_ids: Vec<EndpointId> = config
         .bootstrap_peers
@@ -437,6 +454,48 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     info!("File watcher started");
 
     let allowlist = FileAllowlistStorage::new(&config.vault);
+
+    // Spawn mDNS discovery events into a channel so the main select loop stays uniform.
+    // Discovery is native-only; the channel is None when mDNS is unavailable.
+    let mut discovery_rx: Option<tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>> = {
+        use futures::StreamExt;
+        use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata};
+        use iroh::address_lookup::DiscoveryEvent;
+
+        if let Some(stream) = sync_node.subscribe_discovery().await {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            tokio::spawn(async move {
+                futures::pin_mut!(stream);
+                while let Some(event) = stream.next().await {
+                    match event {
+                        DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                            let metadata = endpoint_info
+                                .data
+                                .user_data()
+                                .and_then(|ud| serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok());
+
+                            if let Some(meta) = metadata {
+                                let mesh = DiscoveredMesh {
+                                    mesh_name: meta.mesh.clone(),
+                                    vault_id: meta.vid.clone(),
+                                    peers: vec![endpoint_info.endpoint_id],
+                                    online_count: 1,
+                                };
+                                // Non-blocking — drop events if the receiver is full.
+                                let _ = tx.try_send(mesh);
+                            }
+                        }
+                        DiscoveryEvent::Expired { endpoint_id } => {
+                            debug!(peer = %endpoint_id, "mDNS: peer expired");
+                        }
+                    }
+                }
+            });
+            Some(rx)
+        } else {
+            None
+        }
+    };
 
     let mut daemon = Daemon {
         vault: Arc::new(Mutex::new(vault)),
@@ -472,6 +531,20 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
             Some(inbound) = daemon.sync_node.inbound_sync_rx.recv() => {
                 daemon.on_inbound_sync(inbound).await;
+            }
+
+            Some(mesh) = async {
+                match discovery_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => None,
+                }
+            } => {
+                info!(
+                    mesh = %mesh.mesh_name,
+                    vid = %mesh.vault_id,
+                    peers = mesh.online_count,
+                    "mDNS: discovered mesh on LAN"
+                );
             }
 
             _ = memory_common::shutdown_signal() => {

@@ -1,39 +1,41 @@
-//! Local network discovery via mDNS.
+//! Local network mesh discovery via mDNS.
 //!
-//! Registers an mDNS-based address lookup with an iroh endpoint so that
-//! peers on the same LAN can find each other without a relay or DNS.
+//! Devices advertise their mesh (vault) on the LAN using iroh's `MdnsAddressLookup`
+//! with a custom service name `obsidian-sync`. Devices sharing the same `VaultId`
+//! form a single mesh — this is the foundation for the pairing flow (Item 5).
 //!
-//! mDNS support requires enabling the `address-lookup-mdns` feature of the
-//! `iroh` crate and adding `swarm-discovery` as a dependency. When not
-//! compiled in, this module is a no-op.
+//! mDNS is native-only (requires OS-level networking) and is gated by the
+//! `address-lookup-mdns` feature via the `native` feature set.
 
-use anyhow::Result;
-use iroh::Endpoint;
+use serde::{Deserialize, Serialize};
+use iroh::EndpointId;
 
-/// Register mDNS-based local discovery with the endpoint.
+/// Metadata broadcast via mDNS to identify a mesh (vault).
 ///
-/// After calling this, other iroh endpoints on the same LAN that also have
-/// mDNS enabled will be able to dial this node by `EndpointId` alone,
-/// without needing a relay URL or pre-known direct address.
-///
-/// Currently a no-op. To enable mDNS, add `address-lookup-mdns` to the
-/// `iroh` feature flags in `Cargo.toml` and enable the `iroh/address-lookup-mdns`
-/// feature in the `native` feature set, then uncomment the implementation below.
-pub fn enable_mdns(_endpoint: &Endpoint) -> Result<()> {
-    // To enable mDNS:
-    //
-    // 1. In Cargo.toml, add to the `native` feature:
-    //    native = [..., "iroh/address-lookup-mdns"]
-    //
-    // 2. Uncomment:
-    //    use iroh::address_lookup::MdnsAddressLookup;
-    //    let mdns = MdnsAddressLookup::builder()
-    //        .build(_endpoint.id())
-    //        .map_err(|e| anyhow::anyhow!("Failed to build mDNS lookup: {e}"))?;
-    //    _endpoint
-    //        .address_lookup()
-    //        .map_err(|e| anyhow::anyhow!("Failed to get address lookup: {e}"))?
-    //        .add(mdns);
+/// Serialized as compact JSON and carried in the mDNS `UserData` TXT record.
+/// The total serialized size must stay well under 245 bytes (the `UserData` limit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshMetadata {
+    /// Human-readable mesh name (e.g., "Michael's Notes").
+    pub mesh: String,
+    /// VaultId hex string — groups devices into the same mesh.
+    pub vid: String,
+    /// Protocol version for forward compatibility.
+    pub ver: u32,
+}
 
-    Ok(())
+/// A discovered mesh on the local network.
+///
+/// Aggregates all devices that share the same `VaultId` into one mesh entry.
+/// Built from `DiscoveryEvent::Discovered` events by the caller.
+#[derive(Debug, Clone)]
+pub struct DiscoveredMesh {
+    /// Mesh name from the metadata.
+    pub mesh_name: String,
+    /// VaultId for grouping (hex string).
+    pub vault_id: String,
+    /// Discovered peers in this mesh (their EndpointIds).
+    pub peers: Vec<EndpointId>,
+    /// Number of online devices (equal to `peers.len()` at discovery time).
+    pub online_count: usize,
 }

@@ -9,7 +9,7 @@ default = ["native"]
 # Native-only: direct QUIC sockets (require OS networking) and full tokio runtime.
 # iroh/default enables direct socket binding and portmapper — not available in WASM.
 # The network module itself (gossip, streams, node) compiles for both native and WASM.
-native = ["iroh/default", "tokio/rt", "tokio/macros"]
+native = ["iroh/default", "iroh/address-lookup-mdns", "tokio/rt", "tokio/macros"]
 
 [dependencies]
 loro.workspace = true

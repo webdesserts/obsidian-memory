@@ -22,6 +22,13 @@ use crate::network::streams::{InboundSyncRx, SyncStreamHandler};
 /// based on ALPN. This ALPN routes to our QUIC stream sync handler.
 pub const SYNC_ALPN: &[u8] = b"obsidian-memory/sync/1";
 
+/// The mDNS service name for obsidian-sync mesh discovery.
+///
+/// Peers using the same service name can discover each other on the LAN.
+/// Peers on a different service name are invisible to each other.
+#[cfg(not(target_arch = "wasm32"))]
+const MDNS_SERVICE_NAME: &str = "obsidian-sync";
+
 /// The iroh-based sync node.
 ///
 /// Owns the QUIC endpoint, gossip instance, and protocol router.
@@ -39,6 +46,9 @@ pub struct SyncNode {
     pub inbound_sync_rx: InboundSyncRx,
     /// The protocol router (dispatches by ALPN).
     router: Router,
+    /// mDNS address lookup for LAN mesh discovery (native only).
+    #[cfg(not(target_arch = "wasm32"))]
+    mdns: Option<iroh::address_lookup::MdnsAddressLookup>,
 }
 
 impl SyncNode {
@@ -58,6 +68,8 @@ impl SyncNode {
             gossip,
             inbound_sync_rx,
             router,
+            #[cfg(not(target_arch = "wasm32"))]
+            mdns: None,
         }
     }
 
@@ -87,6 +99,27 @@ impl SyncNode {
 
         info!(node_id = %endpoint.id(), "Iroh endpoint created");
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let mdns = {
+            use iroh::address_lookup::MdnsAddressLookup;
+            match MdnsAddressLookup::builder()
+                .service_name(MDNS_SERVICE_NAME)
+                .build(endpoint.id())
+            {
+                Ok(mdns) => {
+                    if let Ok(lookup) = endpoint.address_lookup() {
+                        lookup.add(mdns.clone());
+                        info!("mDNS mesh discovery enabled");
+                    }
+                    Some(mdns)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create mDNS address lookup, mesh discovery disabled: {e}");
+                    None
+                }
+            }
+        };
+
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
 
@@ -100,6 +133,8 @@ impl SyncNode {
             gossip,
             inbound_sync_rx,
             router,
+            #[cfg(not(target_arch = "wasm32"))]
+            mdns,
         })
     }
 
@@ -137,6 +172,8 @@ impl SyncNode {
             gossip,
             inbound_sync_rx,
             router,
+            #[cfg(not(target_arch = "wasm32"))]
+            mdns: None,
         })
     }
 
@@ -173,6 +210,65 @@ impl SyncNode {
             .context("Failed to subscribe to vault gossip topic")?;
 
         Ok(crate::network::gossip::VaultGossip::new(handle, topic))
+    }
+
+    /// Publish this node's mesh metadata via mDNS so LAN peers can discover it.
+    ///
+    /// Other devices running obsidian-sync on the same LAN will see this
+    /// node's `MeshMetadata` in their `subscribe_discovery()` stream.
+    /// Devices with the same `VaultId` belong to the same mesh.
+    ///
+    /// Relay URL is included when provided so discovered peers can connect
+    /// even without direct address information.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn publish_mesh_info(
+        &self,
+        metadata: &crate::network::discovery::MeshMetadata,
+        relay_url: Option<&RelayUrl>,
+    ) {
+        use iroh::address_lookup::{AddressLookup, EndpointData};
+
+        let Some(ref mdns) = self.mdns else {
+            tracing::debug!("mDNS not available, skipping mesh info publish");
+            return;
+        };
+
+        let json = match serde_json::to_string(metadata) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to serialize MeshMetadata for mDNS: {e}");
+                return;
+            }
+        };
+
+        let user_data = match json.parse::<iroh::address_lookup::UserData>() {
+            Ok(ud) => ud,
+            Err(e) => {
+                tracing::warn!("MeshMetadata JSON too long for mDNS UserData ({} bytes): {e}", json.len());
+                return;
+            }
+        };
+
+        let data = EndpointData::new([])
+            .with_user_data(Some(user_data))
+            .with_relay_url(relay_url.cloned());
+
+        mdns.publish(&data);
+        info!(mesh = %metadata.mesh, vid = %metadata.vid, "Published mesh info via mDNS");
+    }
+
+    /// Subscribe to mDNS discovery events for nearby meshes.
+    ///
+    /// Each `DiscoveryEvent::Discovered` event carries a peer's `EndpointInfo`,
+    /// including their `UserData` which contains JSON-encoded `MeshMetadata`.
+    /// Parse the `UserData` to extract the mesh name and VaultId, then group
+    /// peers by VaultId to form `DiscoveredMesh` entries.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn subscribe_discovery(
+        &self,
+    ) -> Option<impl n0_future::Stream<Item = iroh::address_lookup::DiscoveryEvent> + Unpin + use<>> {
+        let mdns = self.mdns.as_ref()?;
+        Some(mdns.subscribe().await)
     }
 
     /// Shut down the node, closing all connections.
