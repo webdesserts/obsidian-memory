@@ -243,13 +243,15 @@ impl Daemon {
     }
 
     /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
-    async fn on_inbound_sync(&self, inbound: InboundSyncRequest) {
+    async fn on_inbound_sync(&mut self, inbound: InboundSyncRequest) {
         let vault = self.vault.lock().await;
         match vault.process_sync_message(&inbound.message_bytes).await {
             Ok((response_bytes_opt, modified_paths)) => {
                 if !modified_paths.is_empty() {
                     info!("Applied {} file(s) from inbound sync", modified_paths.len());
                 }
+
+                self.peer_registry.update_last_seen(&inbound.remote_id);
 
                 if let Some(resp_bytes) = response_bytes_opt {
                     // reply_tx being dropped closes the stream without a response — that's fine.

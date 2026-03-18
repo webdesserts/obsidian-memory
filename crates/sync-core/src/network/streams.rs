@@ -29,6 +29,8 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+use crate::peer_id::PeerId;
+
 /// Maximum byte length for a framed sync message.
 ///
 /// 64 MiB covers a realistic worst case of syncing a large vault in one batch.
@@ -49,6 +51,8 @@ pub struct InboundSyncRequest {
     pub message_bytes: Vec<u8>,
     /// Send the raw response bytes back through here.
     pub reply_tx: oneshot::Sender<Vec<u8>>,
+    /// The remote peer's identity, extracted from the QUIC connection's TLS certificate.
+    pub remote_id: PeerId,
 }
 
 /// Receives inbound sync requests from remote peers.
@@ -91,6 +95,9 @@ impl ProtocolHandler for SyncStreamHandler {
     /// Reads a length-prefixed message as raw bytes, forwards them to the
     /// inbound channel, then writes the raw response bytes back to the stream.
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let remote_endpoint_id = connection.remote_id();
+        let remote_id = PeerId::from_bytes(*remote_endpoint_id.as_bytes());
+
         let (mut send, mut recv) = connection
             .accept_bi()
             .await
@@ -99,10 +106,10 @@ impl ProtocolHandler for SyncStreamHandler {
         let message_bytes = read_length_prefixed(&mut recv)
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))?;
-        debug!("Inbound sync message: {} bytes", message_bytes.len());
+        debug!(peer = %remote_endpoint_id, "Inbound sync message: {} bytes", message_bytes.len());
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        let request = InboundSyncRequest { message_bytes, reply_tx };
+        let request = InboundSyncRequest { message_bytes, reply_tx, remote_id };
 
         if self.inbound_tx.send(request).is_err() {
             // No one is listening for inbound requests — close the stream.

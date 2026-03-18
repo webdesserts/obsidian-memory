@@ -610,6 +610,8 @@ mod wasm_impl {
     struct InboundSyncRequestJs {
         /// The encoded SyncMessage bytes to pass to WasmVault.processSyncMessage.
         message_bytes: Vec<u8>,
+        /// The remote peer's PeerId (64-char hex string).
+        remote_id: String,
     }
 
     /// iroh-based P2P sync node exposed to JavaScript.
@@ -809,11 +811,12 @@ mod wasm_impl {
                 Ok(request) => {
                     // Raw bytes from the transport — pass directly to JS without re-serializing.
                     let message_bytes = request.message_bytes;
+                    let remote_id = request.remote_id.to_string();
 
                     // Store the reply channel for `replyInboundSync`
                     state.pending_reply = Some(request.reply_tx);
 
-                    let js_req = InboundSyncRequestJs { message_bytes };
+                    let js_req = InboundSyncRequestJs { message_bytes, remote_id };
                     serde_wasm_bindgen::to_value(&js_req)
                         .map_err(|e| JsError::new(&e.to_string()))
                 }
