@@ -19,7 +19,7 @@ mod network_integration {
     use iroh::protocol::Router;
     use sync_core::network::{
         gossip::GossipEvent,
-        streams::{connect_and_sync, SyncStreamHandler},
+        streams::{connect_and_sync_raw, SyncStreamHandler},
         SyncNode,
     };
     use sync_core::network::SYNC_ALPN;
@@ -185,15 +185,18 @@ mod network_integration {
 
     // ── QUIC bi-stream sync round-trip ────────────────────────────────────────
 
-    /// A client node can open a QUIC bi-stream to a server node, send a
-    /// `SyncRequest`, and receive a `SyncResponse` back.
+    /// A client node can open a QUIC bi-stream to a server node, send raw
+    /// sync bytes, and receive raw response bytes back.
+    ///
+    /// The test serializes `SyncMessage` values manually to mirror how the
+    /// vault layer uses the raw transport.
     #[tokio::test]
     async fn sync_request_response_round_trips() -> anyhow::Result<()> {
         let (node_server, node_client, _addr_server, _addr_client) = make_test_pair().await?;
         let addr_server = node_server.endpoint.addr();
 
         // Drive the server's inbound request handler in a background task.
-        // For each inbound request, respond with a fixed SyncResponse.
+        // For each inbound request, respond with a fixed SyncResponse (raw bytes).
         let expected_response = SyncMessage::SyncResponse {
             registry_updates: None,
             document_updates: HashMap::from([(
@@ -201,29 +204,32 @@ mod network_integration {
                 b"update-bytes".to_vec(),
             )]),
         };
-        let response_clone = expected_response.clone();
+        let response_bytes = bincode::serialize(&expected_response)?;
+        let response_bytes_clone = response_bytes.clone();
 
         let mut inbound_rx = node_server.inbound_sync_rx;
         tokio::spawn(async move {
             while let Some(req) = inbound_rx.recv().await {
-                let _ = req.reply_tx.send(response_clone.clone());
+                let _ = req.reply_tx.send(response_bytes_clone.clone());
             }
         });
 
-        // Client sends a SyncRequest.
+        // Client sends a SyncRequest as raw bytes.
         let request = SyncMessage::SyncRequest {
             registry_version: vec![1, 2, 3],
             document_versions: HashMap::from([("notes/hello.md".to_string(), vec![0u8; 4])]),
         };
+        let request_bytes = bincode::serialize(&request)?;
 
-        let response = tokio::time::timeout(
+        let received_bytes = tokio::time::timeout(
             Duration::from_secs(10),
-            connect_and_sync(&node_client.endpoint, addr_server, request),
+            connect_and_sync_raw(&node_client.endpoint, addr_server, &request_bytes),
         )
         .await
         .expect("timed out waiting for sync response")?;
 
-        // Verify the response matches what the server sent.
+        // Decode the raw response and verify it matches what the server sent.
+        let response: SyncMessage = bincode::deserialize(&received_bytes)?;
         match (response, expected_response) {
             (
                 SyncMessage::SyncResponse {
@@ -255,12 +261,13 @@ mod network_integration {
             registry_updates: None,
             document_updates: HashMap::from([("big.md".to_string(), large_data)]),
         };
-        let response_clone = response_msg.clone();
+        let response_bytes = bincode::serialize(&response_msg)?;
+        let response_bytes_clone = response_bytes.clone();
 
         let mut inbound_rx = node_server.inbound_sync_rx;
         tokio::spawn(async move {
             while let Some(req) = inbound_rx.recv().await {
-                let _ = req.reply_tx.send(response_clone.clone());
+                let _ = req.reply_tx.send(response_bytes_clone.clone());
             }
         });
 
@@ -268,14 +275,16 @@ mod network_integration {
             registry_version: vec![],
             document_versions: HashMap::new(),
         };
+        let request_bytes = bincode::serialize(&request)?;
 
-        let response = tokio::time::timeout(
+        let received_bytes = tokio::time::timeout(
             Duration::from_secs(15),
-            connect_and_sync(&node_client.endpoint, addr_server, request),
+            connect_and_sync_raw(&node_client.endpoint, addr_server, &request_bytes),
         )
         .await
         .expect("timed out")?;
 
+        let response: SyncMessage = bincode::deserialize(&received_bytes)?;
         match response {
             SyncMessage::SyncResponse { document_updates, .. } => {
                 let data = document_updates.get("big.md").expect("missing big.md");
@@ -301,7 +310,8 @@ mod network_integration {
                     registry_updates: None,
                     document_updates: HashMap::new(),
                 };
-                let _ = req.reply_tx.send(response);
+                let bytes = bincode::serialize(&response).expect("serialization failed");
+                let _ = req.reply_tx.send(bytes);
             }
         });
 
@@ -310,14 +320,16 @@ mod network_integration {
                 registry_version: vec![i],
                 document_versions: HashMap::new(),
             };
+            let request_bytes = bincode::serialize(&request)?;
 
-            let response = tokio::time::timeout(
+            let received_bytes = tokio::time::timeout(
                 Duration::from_secs(10),
-                connect_and_sync(&node_client.endpoint, addr_server.clone(), request),
+                connect_and_sync_raw(&node_client.endpoint, addr_server.clone(), &request_bytes),
             )
             .await
             .expect("timed out")?;
 
+            let response: SyncMessage = bincode::deserialize(&received_bytes)?;
             assert!(
                 matches!(response, SyncMessage::SyncResponse { .. }),
                 "round trip {i}: expected SyncResponse"

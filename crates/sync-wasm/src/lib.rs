@@ -639,8 +639,8 @@ mod wasm_impl {
         node: sync_core::network::SyncNode,
         gossip: Option<sync_core::network::gossip::VaultGossip>,
         /// Pending reply sender for the current inbound sync request.
-        /// The plugin calls `replyInboundSync` to send the response.
-        pending_reply: Option<tokio::sync::oneshot::Sender<sync_core::sync::SyncMessage>>,
+        /// The plugin calls `replyInboundSync` with raw response bytes to complete the exchange.
+        pending_reply: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     }
 
     #[wasm_bindgen]
@@ -807,8 +807,8 @@ mod wasm_impl {
 
             match state.node.inbound_sync_rx.try_recv() {
                 Ok(request) => {
-                    let message_bytes = bincode::serialize(&request.message)
-                        .map_err(|e| JsError::new(&format!("Failed to serialize sync message: {e}")))?;
+                    // Raw bytes from the transport — pass directly to JS without re-serializing.
+                    let message_bytes = request.message_bytes;
 
                     // Store the reply channel for `replyInboundSync`
                     state.pending_reply = Some(request.reply_tx);
@@ -836,11 +836,9 @@ mod wasm_impl {
                 .take()
                 .ok_or_else(|| JsError::new("No pending inbound sync request"))?;
 
-            let message: sync_core::sync::SyncMessage = bincode::deserialize(response_bytes)
-                .map_err(|e| JsError::new(&format!("Failed to deserialize response: {e}")))?;
-
-            // Ignore send errors — the connection may have closed
-            let _ = reply_tx.send(message);
+            // Pass raw bytes directly — the transport layer handles framing.
+            // Ignore send errors — the connection may have closed.
+            let _ = reply_tx.send(response_bytes.to_vec());
             Ok(())
         }
 
@@ -858,13 +856,10 @@ mod wasm_impl {
         ) -> Result<Vec<u8>, JsError> {
             use iroh::EndpointId;
             use std::str::FromStr;
-            use sync_core::network::streams::connect_and_sync;
+            use sync_core::network::streams::connect_and_sync_raw;
 
             let peer = EndpointId::from_str(peer_id)
                 .map_err(|e| JsError::new(&format!("Invalid peer_id: {e}")))?;
-
-            let request: sync_core::sync::SyncMessage = bincode::deserialize(request_bytes)
-                .map_err(|e| JsError::new(&format!("Failed to deserialize request: {e}")))?;
 
             // Borrow the endpoint for the sync call
             let endpoint = {
@@ -873,12 +868,10 @@ mod wasm_impl {
                 state.node.endpoint.clone()
             };
 
-            let response = connect_and_sync(&endpoint, peer, request)
+            // Pass raw bytes directly — no serialization step needed here.
+            connect_and_sync_raw(&endpoint, peer, request_bytes)
                 .await
-                .map_err(|e| JsError::new(&format!("Sync failed: {e}")))?;
-
-            bincode::serialize(&response)
-                .map_err(|e| JsError::new(&format!("Failed to serialize response: {e}")))
+                .map_err(|e| JsError::new(&format!("Sync failed: {e}")))
         }
 
         /// Shut down the sync node, closing all connections.
