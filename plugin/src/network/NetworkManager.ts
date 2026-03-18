@@ -224,13 +224,10 @@ export class NetworkManager extends Events {
             modifiedPaths: string[];
           };
 
-          // Reply with the response (even if null, we need to reply to close the stream)
           if (result.response) {
             this.syncNode?.replyInboundSync(result.response);
-          } else {
-            // Empty response — send zero bytes so the peer's QUIC stream can close
-            this.syncNode?.replyInboundSync(new Uint8Array(0));
           }
+          // If null, don't reply — dropping the reply handle closes the stream cleanly
 
           if (result.modifiedPaths.length > 0) {
             log.info(`${result.modifiedPaths.length} file(s) updated from inbound sync`);

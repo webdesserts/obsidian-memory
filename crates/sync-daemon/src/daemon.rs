@@ -339,6 +339,15 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
 
+    // Clear any stale relay_url left by a previous crash — relay_url is runtime state
+    // that must be re-established each run. A stale URL would advertise a dead relay.
+    if daemon_config.relay_url.is_some() {
+        info!("Clearing stale relay URL from previous run");
+        if let Err(e) = daemon_config.set_relay_url(None, &config.vault) {
+            warn!("Failed to clear stale relay URL: {}", e);
+        }
+    }
+
     // Start the embedded relay before the SyncNode so we can pass its URL in.
     // Failure is non-fatal: the daemon continues without relay support.
     let embedded_relay: Option<EmbeddedRelay> = if let Some(ref addr_str) = config.relay_listen {

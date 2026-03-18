@@ -125,8 +125,15 @@ impl ProtocolHandler for SyncStreamHandler {
 
         // Wait for the client to close the connection. Without this, the connection
         // is dropped when accept() returns, potentially before the client finishes
-        // reading the response we just sent.
-        connection.closed().await;
+        // reading the response we just sent. Cap at 30 seconds to avoid hanging
+        // on a peer that crashes after receiving its response.
+        tokio::select! {
+            _ = connection.closed() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                debug!("Closing idle inbound connection after 30s timeout");
+                connection.close(0u32.into(), b"timeout");
+            }
+        }
 
         Ok(())
     }
