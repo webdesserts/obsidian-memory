@@ -64,6 +64,25 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// Check whether a peer is allowed to sync.
+    ///
+    /// Returns `true` if:
+    /// - The allowlist is empty (no peers paired yet — open to all), OR
+    /// - The peer is in the allowlist.
+    ///
+    /// Returns `false` if:
+    /// - The allowlist is non-empty and the peer is not in it, OR
+    /// - The allowlist cannot be read (fail-closed for safety).
+    async fn is_peer_allowed(&self, peer_id: &PeerId) -> bool {
+        match self.allowlist.list_peers().await {
+            Ok(peers) => peers.is_empty() || peers.iter().any(|p| &p.node_id == peer_id),
+            Err(e) => {
+                error!("Failed to read allowlist, denying sync: {}", e);
+                false
+            }
+        }
+    }
+
     /// Handle a file change event from the watcher.
     async fn on_file_changed(&mut self, event: FileEvent) {
         match event.kind {
@@ -150,10 +169,7 @@ impl Daemon {
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
         self.peer_registry.on_neighbor_up(peer_id);
 
-        // Enforce allowlist: once any peer has been paired, only paired peers may sync.
-        // An empty allowlist means no pairing has happened yet — accept everyone.
-        let allowed_peers = self.allowlist.list_peers().await.unwrap_or_default();
-        if !allowed_peers.is_empty() && !allowed_peers.iter().any(|p| p.node_id == peer_id) {
+        if !self.is_peer_allowed(&peer_id).await {
             warn!(peer = %node_id, "Peer not in allowlist, skipping sync");
             return;
         }
@@ -218,6 +234,12 @@ impl Daemon {
     /// A change notification arrived via gossip — pull the changed file via QUIC.
     async fn on_change_received(&mut self, from: EndpointId, path: String) {
         debug!(peer = %from, path = %path, "Change notification received — pulling update");
+        let peer_id = PeerId::from_bytes(*from.as_bytes());
+
+        if !self.is_peer_allowed(&peer_id).await {
+            warn!(peer = %from, "Change notification from non-allowlisted peer, ignoring");
+            return;
+        }
 
         let vault = self.vault.lock().await;
         let request_bytes = match vault.prepare_sync_request().await {
@@ -243,11 +265,13 @@ impl Daemon {
             }
         };
 
-        let peer_id = PeerId::from_bytes(*from.as_bytes());
         let vault = self.vault.lock().await;
         match vault.process_sync_message(&response_bytes).await {
             Ok((_, modified_paths)) => {
                 self.peer_registry.update_last_seen(&peer_id);
+                if let Err(e) = self.allowlist.update_last_seen(&peer_id, now_ms()).await {
+                    warn!("Failed to update allowlist last_seen for {}: {}", from, e);
+                }
                 if !modified_paths.is_empty() {
                     info!(
                         "Pulled {} file(s) from {} after change notification on {}",
@@ -265,10 +289,7 @@ impl Daemon {
 
     /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
     async fn on_inbound_sync(&mut self, inbound: InboundSyncRequest) {
-        // Enforce allowlist: once any peer has been paired, only paired peers may sync.
-        // An empty allowlist means no pairing has happened yet — accept everyone.
-        let allowed_peers = self.allowlist.list_peers().await.unwrap_or_default();
-        if !allowed_peers.is_empty() && !allowed_peers.iter().any(|p| p.node_id == inbound.remote_id) {
+        if !self.is_peer_allowed(&inbound.remote_id).await {
             warn!(peer = %inbound.remote_id, "Inbound sync from non-allowlisted peer, dropping");
             // Dropping reply_tx closes the QUIC stream without a response.
             drop(inbound.reply_tx);
