@@ -27,6 +27,7 @@
 //! mDNS local discovery requires OS-level networking and is native-only.
 
 pub mod gossip;
+pub mod pairing;
 pub mod streams;
 pub use node::{SyncNode, SYNC_ALPN};
 mod node;

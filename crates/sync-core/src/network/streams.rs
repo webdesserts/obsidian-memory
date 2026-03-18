@@ -171,7 +171,7 @@ pub async fn connect_and_sync_raw(
 /// Write a length-prefixed byte slice to the stream.
 ///
 /// Format: `[u32 little-endian length][bytes]`
-pub(super) async fn write_length_prefixed(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
+pub(crate) async fn write_length_prefixed(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| anyhow::anyhow!("Message too large to frame: {} bytes", bytes.len()))?;
     send.write_all(&len.to_le_bytes()).await?;
@@ -182,7 +182,7 @@ pub(super) async fn write_length_prefixed(send: &mut SendStream, bytes: &[u8]) -
 /// Read a length-prefixed byte slice from the stream.
 ///
 /// Format: `[u32 little-endian length][bytes]`
-pub(super) async fn read_length_prefixed(recv: &mut RecvStream) -> Result<Vec<u8>> {
+pub(crate) async fn read_length_prefixed(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf);

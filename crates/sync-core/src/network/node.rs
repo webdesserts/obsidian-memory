@@ -14,6 +14,7 @@ use iroh_gossip::net::GOSSIP_ALPN;
 use tracing::info;
 
 use crate::peer_id::VaultId;
+use crate::network::pairing::{PairingEvent, PairingStreamHandler, PAIRING_ALPN};
 use crate::network::streams::{InboundSyncRx, SyncStreamHandler};
 
 /// ALPN identifier for our custom sync protocol.
@@ -44,6 +45,10 @@ pub struct SyncNode {
     /// Drive this in a task to process incoming sync requests. Each item
     /// carries a `SyncMessage` and a one-shot channel to send the response.
     pub inbound_sync_rx: InboundSyncRx,
+    /// Inbound pairing events from new devices.
+    ///
+    /// Drive this in the daemon event loop to process pairing requests.
+    pub inbound_pairing_rx: tokio::sync::mpsc::UnboundedReceiver<PairingEvent>,
     /// The protocol router (dispatches by ALPN).
     router: Router,
     /// mDNS address lookup for LAN mesh discovery (native only).
@@ -57,16 +62,22 @@ impl SyncNode {
     /// Intended for tests that need to control exactly how the endpoint,
     /// gossip, and router are configured (e.g., relay-disabled local testing).
     /// Normal callers should use [`SyncNode::new`] instead.
+    ///
+    /// Pairing is disabled in this constructor — `inbound_pairing_rx` will
+    /// never yield events. Use `new_from_parts_with_pairing` if you need it.
     pub fn new_from_parts(
         endpoint: Endpoint,
         gossip: Gossip,
         inbound_sync_rx: InboundSyncRx,
         router: Router,
     ) -> Self {
+        // Provide a dummy pairing channel that never yields.
+        let (_tx, inbound_pairing_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             endpoint,
             gossip,
             inbound_sync_rx,
+            inbound_pairing_rx,
             router,
             #[cfg(not(target_arch = "wasm32"))]
             mdns: None,
@@ -122,16 +133,19 @@ impl SyncNode {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+        let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
 
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(SYNC_ALPN.to_vec(), sync_handler)
+            .accept(PAIRING_ALPN.to_vec(), pairing_handler)
             .spawn();
 
         Ok(Self {
             endpoint,
             gossip,
             inbound_sync_rx,
+            inbound_pairing_rx,
             router,
             #[cfg(not(target_arch = "wasm32"))]
             mdns,
@@ -161,16 +175,19 @@ impl SyncNode {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+        let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
 
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(SYNC_ALPN.to_vec(), sync_handler)
+            .accept(PAIRING_ALPN.to_vec(), pairing_handler)
             .spawn();
 
         Ok(Self {
             endpoint,
             gossip,
             inbound_sync_rx,
+            inbound_pairing_rx,
             router,
             #[cfg(not(target_arch = "wasm32"))]
             mdns: None,

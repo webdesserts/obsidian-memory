@@ -769,6 +769,10 @@ mod wasm_impl {
                         path: notification.path,
                     }
                 }
+                // AllowlistUpdate is handled by the native daemon only.
+                // The WASM plugin receives allowlist changes through the daemon's
+                // storage layer rather than gossip.
+                GossipEvent::AllowlistUpdate { .. } => return Ok(JsValue::NULL),
             };
 
             serde_wasm_bindgen::to_value(&js_event).map_err(|e| JsError::new(&e.to_string()))
