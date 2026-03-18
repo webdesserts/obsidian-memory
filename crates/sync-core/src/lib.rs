@@ -29,7 +29,10 @@ pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use key_storage::{KeyStorage, KeyStorageError};
-pub use pairing::{PairingConfirmation, PairingRequest};
+pub use pairing::{
+    PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession,
+    compute_hmac, generate_pairing_code, hash_code, verify_hmac,
+};
 pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use peers::{PeerEntry, PeerRegistry, PeerState};
 pub use sync::SyncMessage;
