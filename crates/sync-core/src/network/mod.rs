@@ -27,11 +27,13 @@
 //! mDNS local discovery requires OS-level networking and is native-only.
 
 pub mod gossip;
-pub mod pairing;
 pub mod streams;
 pub use node::{SyncNode, SYNC_ALPN};
 mod node;
 
-// Discovery is native-only (mDNS requires OS-level networking)
+// Discovery and pairing are native-only — they depend on iroh::protocol::ProtocolHandler
+// and tokio::time::timeout which are unavailable in WASM.
 #[cfg(feature = "native")]
 pub mod discovery;
+#[cfg(feature = "native")]
+pub mod pairing;

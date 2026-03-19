@@ -32,18 +32,14 @@ pub struct PairingHello {
 
 /// Sent by the mesh member in response to a [`PairingHello`].
 ///
-/// The `code_hash` lets the new device confirm it's talking to the right mesh
-/// member before sending its HMAC. The actual code is logged on the mesh
-/// member's console for the user to read.
+/// The actual code is logged on the mesh member's console for the user to
+/// read and type into the new device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairingChallenge {
     /// The mesh member's ed25519 public key.
     pub node_id: PeerId,
     /// Human-readable name of the mesh member (e.g., "umbra").
     pub device_name: String,
-    /// SHA-256 of the 6-digit code. The new device can verify it matches
-    /// before computing the HMAC and sending `PairingResponse`.
-    pub code_hash: [u8; 32],
 }
 
 /// Sent by the new device to prove knowledge of the code.
@@ -82,13 +78,18 @@ const PAIRING_TIMEOUT_SECS: u64 = 5 * 60;
 ///
 /// Created when an inbound [`PairingHello`] arrives. The mesh member logs the
 /// code and waits for the new device to submit it. Expires after 5 minutes.
+///
+/// The `remote_id` is the transport-verified PeerId from the QUIC connection,
+/// not the self-reported `node_id` from `PairingHello`. HMAC verification
+/// must use this transport identity to prevent impersonation.
 pub struct PairingSession {
     /// The plaintext 6-digit code (e.g. `"042817"`).
     pub code: String,
-    /// SHA-256 of `code`, sent to the requester in [`PairingChallenge`].
-    pub code_hash: [u8; 32],
-    /// The requesting device's PeerId — used to bind the HMAC.
-    pub requester_node_id: PeerId,
+    /// The transport-verified PeerId of the requesting device.
+    ///
+    /// Derived from the QUIC connection's remote identity — not from
+    /// the self-reported `node_id` in `PairingHello`. Use this for HMAC verification.
+    pub remote_id: PeerId,
     /// Human-readable name of the requesting device.
     pub requester_device_name: String,
     /// When this session was created, for expiry checks.
@@ -98,14 +99,14 @@ pub struct PairingSession {
 impl PairingSession {
     /// Create a new session for the given requester.
     ///
+    /// `remote_id` must come from the QUIC transport layer, not from
+    /// `PairingHello::node_id` (which is self-reported and untrusted).
     /// Generates a fresh random 6-digit code.
-    pub fn new(requester_node_id: PeerId, requester_device_name: impl Into<String>) -> Self {
+    pub fn new(remote_id: PeerId, requester_device_name: impl Into<String>) -> Self {
         let code = generate_pairing_code();
-        let code_hash = hash_code(&code);
         Self {
             code,
-            code_hash,
-            requester_node_id,
+            remote_id,
             requester_device_name: requester_device_name.into(),
             created_at: Instant::now(),
         }
@@ -114,13 +115,6 @@ impl PairingSession {
     /// Whether this session has passed the 5-minute expiry window.
     pub fn is_expired(&self) -> bool {
         self.created_at.elapsed().as_secs() >= PAIRING_TIMEOUT_SECS
-    }
-
-    /// Verify an HMAC from the new device.
-    ///
-    /// Returns `true` if the HMAC matches `HMAC-SHA256(key=code, msg=requester_node_id)`.
-    pub fn verify(&self, hmac: &[u8; 32]) -> bool {
-        verify_hmac(&self.code, self.requester_node_id.as_bytes(), hmac)
     }
 }
 
@@ -135,14 +129,6 @@ pub fn generate_pairing_code() -> String {
     getrandom::getrandom(&mut buf).expect("getrandom failed");
     let n = u32::from_le_bytes(buf) % 1_000_000;
     format!("{:06}", n)
-}
-
-/// Compute SHA-256 of the code string (UTF-8 bytes).
-pub fn hash_code(code: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(code.as_bytes());
-    hasher.finalize().into()
 }
 
 /// Compute HMAC-SHA256(key=code_bytes, msg=node_id_bytes).
@@ -187,18 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn hash_code_is_deterministic() {
-        let a = hash_code("123456");
-        let b = hash_code("123456");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn hash_code_differs_for_different_inputs() {
-        assert_ne!(hash_code("000000"), hash_code("000001"));
-    }
-
-    #[test]
     fn hmac_round_trip_succeeds() {
         let code = "042817";
         let node_id_bytes = [0xABu8; 32];
@@ -220,14 +194,6 @@ mod tests {
         let wrong_id = [0x02u8; 32];
         let hmac = compute_hmac(code, &correct_id);
         assert!(!verify_hmac(code, &wrong_id, &hmac));
-    }
-
-    #[test]
-    fn pairing_session_verify_succeeds_with_correct_code() {
-        let peer_id = PeerId::generate();
-        let session = PairingSession::new(peer_id, "MacBook Pro");
-        let hmac = compute_hmac(&session.code, peer_id.as_bytes());
-        assert!(session.verify(&hmac));
     }
 
     #[test]
@@ -255,7 +221,6 @@ mod tests {
         let msg = PairingChallenge {
             node_id: PeerId::generate(),
             device_name: "umbra".to_string(),
-            code_hash: [0xBBu8; 32],
         };
         let bytes = bincode::serialize(&msg).unwrap();
         let decoded: PairingChallenge = bincode::deserialize(&bytes).unwrap();

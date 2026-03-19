@@ -34,7 +34,6 @@ pub struct AllowedPeer {
     /// When the peer was paired (Unix timestamp milliseconds).
     pub paired_at: u64,
     /// When we last saw this peer online (Unix timestamp milliseconds), if ever.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<u64>,
 }
 

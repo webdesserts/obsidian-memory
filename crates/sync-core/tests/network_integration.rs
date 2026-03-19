@@ -338,4 +338,95 @@ mod network_integration {
 
         Ok(())
     }
+
+    /// `broadcast_allowlist_update` sends an `AllowlistUpdate` gossip message that
+    /// a subscribed peer receives and deserializes correctly.
+    ///
+    /// This mirrors the post-pairing flow where the mesh member broadcasts the
+    /// new peer's identity to all other members so they can update their allowlists.
+    #[tokio::test]
+    async fn broadcast_allowlist_update_round_trips() -> anyhow::Result<()> {
+        use sync_core::allowlist::AllowedPeer;
+        use sync_core::peer_id::PeerId;
+        use sync_core::network::gossip::GossipEvent;
+
+        // Use unique seeds to avoid key collisions with other tests running concurrently.
+        let node_a = make_test_node(seed(50)).await?;
+        let node_b = make_test_node(seed(51)).await?;
+
+        let addr_a = node_a.endpoint.addr();
+        let addr_b = node_b.endpoint.addr();
+
+        let lookup_a = MemoryLookup::new();
+        lookup_a.add_endpoint_info(addr_b.clone());
+        node_a.endpoint.address_lookup()?.add(lookup_a);
+
+        let lookup_b = MemoryLookup::new();
+        lookup_b.add_endpoint_info(addr_a.clone());
+        node_b.endpoint.address_lookup()?.add(lookup_b);
+
+        let vault_id: VaultId = "cafebabecafebabe".parse().unwrap();
+        let node_b_id = node_b.node_id();
+
+        // A subscribes with no bootstrap peers — it waits for B to join.
+        let mut gossip_a = node_a.join_vault_gossip(&vault_id, vec![]).await?;
+
+        // B subscribes and bootstraps off A.
+        let mut gossip_b = node_b
+            .join_vault_gossip(&vault_id, vec![node_a.node_id()])
+            .await?;
+
+        // Wait for B to connect to A.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match gossip_b.event_rx.recv().await {
+                    Some(GossipEvent::NeighborUp(_)) => break,
+                    Some(_) => continue,
+                    None => panic!("gossip_b event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B's NeighborUp");
+
+        // Test connectivity with ChangeReceived first
+        gossip_b.broadcast_change("test.md").await?;
+
+        // A should receive the ChangeReceived event.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match gossip_a.event_rx.recv().await {
+                    Some(GossipEvent::ChangeReceived { .. }) => break,
+                    Some(_) => continue,
+                    None => panic!("gossip_a event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for A to receive ChangeReceived");
+
+        // B broadcasts an allowlist update for a newly-paired peer.
+        let new_peer_id = PeerId::from_bytes([0x42u8; 32]);
+        let new_peer = AllowedPeer::new(new_peer_id, "new-device");
+        gossip_b.broadcast_allowlist_update(&new_peer).await?;
+
+        // A should receive the AllowlistUpdate event.
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match gossip_a.event_rx.recv().await {
+                    Some(GossipEvent::AllowlistUpdate { from, peer }) => break (from, peer),
+                    Some(_) => continue,
+                    None => panic!("gossip_a event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for A to receive AllowlistUpdate");
+
+        assert_eq!(received.0, node_b_id, "AllowlistUpdate.from should be B's id");
+        assert_eq!(received.1.node_id, new_peer_id, "AllowlistUpdate.peer should match");
+        assert_eq!(received.1.device_name, "new-device");
+
+        Ok(())
+    }
 }

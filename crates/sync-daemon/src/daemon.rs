@@ -345,7 +345,6 @@ impl Daemon {
         let challenge = PairingChallenge {
             node_id: PeerId::from_bytes(*self.sync_node.node_id().as_bytes()),
             device_name: self.device_name.clone(),
-            code_hash: session.code_hash,
         };
 
         // Collect vault gossip topic bytes for the new device.

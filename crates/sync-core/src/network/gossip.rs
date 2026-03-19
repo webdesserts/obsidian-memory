@@ -41,8 +41,8 @@ pub struct ChangeNotification {
 /// Envelope for all gossip messages.
 ///
 /// Wrapping messages in an enum lets us add new gossip message types without
-/// breaking the framing layer — unknown variants are logged and skipped rather
-/// than causing a deserialization error.
+/// breaking the framing layer — deserialization errors from unknown or corrupt
+/// messages are logged and skipped rather than causing a protocol failure.
 ///
 /// NOTE: This is a breaking wire format change relative to pre-v0.5.x versions,
 /// which serialized `ChangeNotification` directly. All peers must be upgraded

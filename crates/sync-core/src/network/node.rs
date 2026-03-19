@@ -14,6 +14,7 @@ use iroh_gossip::net::GOSSIP_ALPN;
 use tracing::info;
 
 use crate::peer_id::VaultId;
+#[cfg(feature = "native")]
 use crate::network::pairing::{PairingEvent, PairingStreamHandler, PAIRING_ALPN};
 use crate::network::streams::{InboundSyncRx, SyncStreamHandler};
 
@@ -45,9 +46,10 @@ pub struct SyncNode {
     /// Drive this in a task to process incoming sync requests. Each item
     /// carries a `SyncMessage` and a one-shot channel to send the response.
     pub inbound_sync_rx: InboundSyncRx,
-    /// Inbound pairing events from new devices.
+    /// Inbound pairing events from new devices (native only).
     ///
     /// Drive this in the daemon event loop to process pairing requests.
+    #[cfg(feature = "native")]
     pub inbound_pairing_rx: tokio::sync::mpsc::UnboundedReceiver<PairingEvent>,
     /// The protocol router (dispatches by ALPN).
     router: Router,
@@ -71,12 +73,14 @@ impl SyncNode {
         inbound_sync_rx: InboundSyncRx,
         router: Router,
     ) -> Self {
-        // Provide a dummy pairing channel that never yields.
-        let (_tx, inbound_pairing_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Provide a dummy pairing channel that never yields (native only).
+        #[cfg(feature = "native")]
+        let (_tx, inbound_pairing_rx) = tokio::sync::mpsc::unbounded_channel::<PairingEvent>();
         Self {
             endpoint,
             gossip,
             inbound_sync_rx,
+            #[cfg(feature = "native")]
             inbound_pairing_rx,
             router,
             #[cfg(not(target_arch = "wasm32"))]
@@ -133,18 +137,24 @@ impl SyncNode {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+
+        #[cfg(feature = "native")]
         let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
 
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(SYNC_ALPN.to_vec(), sync_handler)
-            .accept(PAIRING_ALPN.to_vec(), pairing_handler)
-            .spawn();
+        let router = {
+            let builder = Router::builder(endpoint.clone())
+                .accept(GOSSIP_ALPN, gossip.clone())
+                .accept(SYNC_ALPN.to_vec(), sync_handler);
+            #[cfg(feature = "native")]
+            let builder = builder.accept(PAIRING_ALPN.to_vec(), pairing_handler);
+            builder.spawn()
+        };
 
         Ok(Self {
             endpoint,
             gossip,
             inbound_sync_rx,
+            #[cfg(feature = "native")]
             inbound_pairing_rx,
             router,
             #[cfg(not(target_arch = "wasm32"))]
@@ -175,18 +185,24 @@ impl SyncNode {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+
+        #[cfg(feature = "native")]
         let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
 
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(SYNC_ALPN.to_vec(), sync_handler)
-            .accept(PAIRING_ALPN.to_vec(), pairing_handler)
-            .spawn();
+        let router = {
+            let builder = Router::builder(endpoint.clone())
+                .accept(GOSSIP_ALPN, gossip.clone())
+                .accept(SYNC_ALPN.to_vec(), sync_handler);
+            #[cfg(feature = "native")]
+            let builder = builder.accept(PAIRING_ALPN.to_vec(), pairing_handler);
+            builder.spawn()
+        };
 
         Ok(Self {
             endpoint,
             gossip,
             inbound_sync_rx,
+            #[cfg(feature = "native")]
             inbound_pairing_rx,
             router,
             #[cfg(not(target_arch = "wasm32"))]
