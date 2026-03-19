@@ -118,9 +118,18 @@ impl<F: FileSystem> Vault<F> {
                 registry_updates,
                 document_updates,
             } => {
-                // Apply registry updates first (handles deletes/renames)
-                if let Some(reg_data) = registry_updates {
-                    self.apply_registry_updates(&reg_data).await?;
+                // Apply registry updates first (handles deletes/renames).
+                // The returned deleted_paths filters out document updates that would
+                // re-create files the registry just deleted.
+                let deleted_paths = if let Some(reg_data) = registry_updates {
+                    self.apply_registry_updates(&reg_data).await?
+                } else {
+                    vec![]
+                };
+                // Skip document updates for paths deleted in the registry
+                let mut document_updates = document_updates;
+                for path in &deleted_paths {
+                    document_updates.remove(path);
                 }
                 // Then apply document updates
                 let modified = self.apply_document_updates(document_updates).await?;
@@ -148,13 +157,22 @@ impl<F: FileSystem> Vault<F> {
                 let received_files: std::collections::HashSet<String> =
                     response.document_updates.keys().cloned().collect();
 
-                // Apply registry updates first (handles deletes/renames)
-                if let Some(reg_data) = response.registry_updates {
-                    self.apply_registry_updates(&reg_data).await?;
+                // Apply registry updates first (handles deletes/renames).
+                // The returned deleted_paths filters out document updates that would
+                // re-create files the registry just deleted.
+                let deleted_paths = if let Some(reg_data) = response.registry_updates {
+                    self.apply_registry_updates(&reg_data).await?
+                } else {
+                    vec![]
+                };
+                // Skip document updates for paths deleted in the registry
+                let mut document_updates = response.document_updates;
+                for path in &deleted_paths {
+                    document_updates.remove(path);
                 }
 
                 // Then apply document updates
-                let modified = self.apply_document_updates(response.document_updates).await?;
+                let modified = self.apply_document_updates(document_updates).await?;
                 debug!("SyncExchange: modified {} files: {:?}", modified.len(), modified);
 
                 // Emit DocumentUpdated for each modified path
@@ -423,9 +441,13 @@ impl<F: FileSystem> Vault<F> {
 
     /// Apply registry updates from a sync response.
     ///
-    /// Imports the registry CRDT updates and rebuilds the path cache.
-    /// Syncs filesystem with tree state (deletes files marked as deleted).
-    async fn apply_registry_updates(&self, data: &[u8]) -> Result<()> {
+    /// Imports the registry CRDT updates, identifies deleted paths, rebuilds the
+    /// path cache, and cleans up the filesystem for any deleted files.
+    ///
+    /// Returns the list of paths that were deleted by this registry update, so the
+    /// caller can filter them out of subsequent document updates (which would
+    /// otherwise re-create the deleted files on disk).
+    async fn apply_registry_updates(&self, data: &[u8]) -> Result<Vec<String>> {
         debug!("apply_registry_updates: data_len={}", data.len());
 
         // Import registry updates
@@ -433,11 +455,27 @@ impl<F: FileSystem> Vault<F> {
             .import(data)
             .map_err(|e| SyncEngineError::Deserialization(format!("Registry import failed: {}", e)))?;
 
-        // Rebuild path cache from updated tree
+        // Collect deleted paths from the cache BEFORE rebuilding it.
+        //
+        // After import, the Loro tree marks deleted nodes internally, but
+        // `get_node_path` returns None for deleted nodes because Loro doesn't
+        // expose parent links for them. The path_to_node cache still has the
+        // pre-deletion mapping, so we check each cached path against the tree
+        // before the cache is cleared by rebuild_path_cache().
+        let deleted_paths: Vec<String> = {
+            let tree = self.file_tree();
+            self.path_to_node()
+                .iter()
+                .filter(|(_, node_id)| tree.is_node_deleted(node_id).unwrap_or(false))
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+
+        // Rebuild path cache from updated tree (skips deleted nodes)
         self.rebuild_path_cache();
 
-        // Sync filesystem with tree state - delete files that are deleted in tree
-        self.apply_registry_changes().await?;
+        // Clean up filesystem for deleted files
+        self.apply_registry_changes(&deleted_paths).await?;
 
         // Save updated registry to disk
         let registry_bytes = self.registry().export(loro::ExportMode::snapshot()).unwrap();
@@ -449,43 +487,38 @@ impl<F: FileSystem> Vault<F> {
         // Mark registry as synced so it will be reconciled before next sync import
         self.mark_registry_synced();
 
-        debug!("apply_registry_updates: complete");
-        Ok(())
+        debug!("apply_registry_updates: complete, deleted={:?}", deleted_paths);
+        Ok(deleted_paths)
     }
 
-    /// Apply registry changes to filesystem.
+    /// Apply filesystem cleanup for a set of deleted paths.
     ///
-    /// Deletes files on disk that are marked as deleted in the tree.
-    async fn apply_registry_changes(&self) -> Result<()> {
-        let tree = self.file_tree();
-
-        // Find deleted files and clean them up
-        for node_id in tree.nodes() {
-            if tree.is_node_deleted(&node_id).unwrap_or(false) {
-                // Get the path before it was deleted (if we can reconstruct it)
-                if let Some(path) = self.get_node_path(&node_id) {
-                    // Remove from filesystem
-                    if self.fs.exists(&path).await.unwrap_or(false) {
-                        debug!("apply_registry_changes: deleting {}", path);
-                        // Mark as synced BEFORE deleting (for echo detection)
-                        self.mark_synced(&path);
-                        if let Err(e) = self.fs.delete(&path).await {
-                            warn!("Failed to delete {}: {}", path, e);
-                        }
-                    }
-
-                    // Remove .loro document
-                    let sync_path = self.document_sync_path(&path);
-                    if self.fs.exists(&sync_path).await.unwrap_or(false) {
-                        if let Err(e) = self.fs.delete(&sync_path).await {
-                            warn!("Failed to delete .loro file {}: {}", sync_path, e);
-                        }
-                    }
-
-                    // Remove from documents cache
-                    self.documents_mut().remove(&path);
+    /// Removes the .md file, .loro document, and document cache entry for each
+    /// path. Takes an explicit list rather than re-iterating the tree because
+    /// Loro doesn't expose parent links for deleted nodes, making path resolution
+    /// unreliable after deletion.
+    async fn apply_registry_changes(&self, deleted_paths: &[String]) -> Result<()> {
+        for path in deleted_paths {
+            // Remove from filesystem
+            if self.fs.exists(path).await.unwrap_or(false) {
+                debug!("apply_registry_changes: deleting {}", path);
+                // Mark as synced BEFORE deleting (for echo detection)
+                self.mark_synced(path);
+                if let Err(e) = self.fs.delete(path).await {
+                    warn!("Failed to delete {}: {}", path, e);
                 }
             }
+
+            // Remove .loro document
+            let sync_path = self.document_sync_path(path);
+            if self.fs.exists(&sync_path).await.unwrap_or(false) {
+                if let Err(e) = self.fs.delete(&sync_path).await {
+                    warn!("Failed to delete .loro file {}: {}", sync_path, e);
+                }
+            }
+
+            // Remove from documents cache
+            self.documents_mut().remove(path);
         }
 
         Ok(())
