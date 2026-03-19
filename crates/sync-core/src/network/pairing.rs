@@ -51,6 +51,12 @@ const MAX_FAILED_ATTEMPTS: u32 = 5;
 /// Window over which failed attempts are counted, in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 5 * 60;
 
+// NOTE: Rate limiting is keyed by PeerId (= QUIC transport identity), so an attacker
+// can bypass it by generating fresh key pairs. Per-IP limiting would be stronger but
+// iroh may not expose the remote IP when traffic is routed through a relay. In practice,
+// the physical proximity requirement (reading a code from a screen) and the 5-minute
+// code expiry make brute-force attacks impractical even without IP-level limiting.
+
 // ── Events produced by PairingStreamHandler ───────────────────────────────────
 
 /// Events emitted by the pairing handler to the daemon event loop.

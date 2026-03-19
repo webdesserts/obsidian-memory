@@ -53,6 +53,23 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
         .await
         .context("Failed to create iroh SyncNode")?;
 
+    // Run the pairing logic, then unconditionally shut down the SyncNode to
+    // release UDP sockets and tokio tasks regardless of the outcome.
+    let result = pair_inner(&sync_node, &vault_path, &device_name).await;
+
+    if let Err(e) = sync_node.shutdown().await {
+        tracing::warn!("Error during SyncNode shutdown: {}", e);
+    }
+
+    result
+}
+
+/// Inner pairing logic — separated so `run()` can shut down `sync_node` on all paths.
+async fn pair_inner(
+    sync_node: &SyncNode,
+    vault_path: &std::path::Path,
+    device_name: &str,
+) -> Result<()> {
     let self_peer_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
 
     // Subscribe to mDNS discovery.
@@ -107,8 +124,9 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
         return Ok(());
     }
 
-    // Display numbered list of discovered meshes.
-    let mesh_list: Vec<&DiscoveredMesh> = meshes.values().collect();
+    // Display numbered list of discovered meshes, sorted by name for deterministic output.
+    let mut mesh_list: Vec<&DiscoveredMesh> = meshes.values().collect();
+    mesh_list.sort_by(|a, b| a.mesh_name.cmp(&b.mesh_name));
     eprintln!();
     for (i, mesh) in mesh_list.iter().enumerate() {
         eprintln!("  {}. {} ({} online)", i + 1, mesh.mesh_name, mesh.online_count);
@@ -149,7 +167,7 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
 
     let hello = PairingHello {
         node_id: self_peer_id,
-        device_name: device_name.clone(),
+        device_name: device_name.to_string(),
     };
 
     eprintln!("Connecting to {}...", selected_mesh.mesh_name);
@@ -181,18 +199,19 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
     }
 
     // Write all mesh members to the local allowlist.
-    let allowlist = FileAllowlistStorage::new(&vault_path);
+    let allowlist = FileAllowlistStorage::new(vault_path);
 
     // Add self on first pair (bootstrap the allowlist).
     if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty()) {
-        if let Err(e) = allowlist.add_peer(self_peer_id, &device_name).await {
+        if let Err(e) = allowlist.add_peer(self_peer_id, device_name).await {
             eprintln!("Warning: failed to add self to allowlist: {}", e);
         }
     }
 
     // Add all mesh members returned by the pairing result.
+    // Device names self-heal once a gossip AllowlistUpdate arrives from the mesh.
     for member_id in &result.mesh_members {
-        let peer = AllowedPeer::new(*member_id, "");
+        let peer = AllowedPeer::new(*member_id, "unknown");
         if let Err(e) = allowlist.add_peer(peer.node_id, &peer.device_name).await {
             eprintln!("Warning: failed to add mesh member to allowlist: {}", e);
         }

@@ -378,6 +378,17 @@ impl Daemon {
 
     /// Handle successful pairing — add the new peer to the allowlist and propagate.
     async fn on_pairing_completed(&mut self, peer_id: PeerId, device_name: String) {
+        // Verify the completing peer matches the active session. A mismatch would indicate
+        // a race between two concurrent pairing attempts (which we reject at the request
+        // stage) or a stale event from a previous session — both should be dropped.
+        if self.active_pairing.as_ref().map(|s| &s.remote_id) != Some(&peer_id) {
+            warn!(
+                peer_id = %peer_id,
+                "Pairing completed event does not match active session, ignoring"
+            );
+            return;
+        }
+
         self.active_pairing = None;
 
         let allowed_peer = AllowedPeer::new(peer_id.clone(), device_name.clone());
@@ -407,6 +418,11 @@ impl Daemon {
 
     /// Handle a failed pairing attempt.
     fn on_pairing_failed(&mut self, peer_id: PeerId, reason: String) {
+        // Clear the active session so a new pairing attempt can start fresh. This means
+        // the user must re-initiate pairing (triggering a new code) rather than retrying
+        // with the same code. Keeping the session alive for retry would require matching
+        // new QUIC connections to existing sessions, which is more complex. For v1 this
+        // tradeoff is acceptable.
         self.active_pairing = None;
         warn!("Pairing failed for {}: {}", peer_id, reason);
     }
