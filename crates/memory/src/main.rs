@@ -605,6 +605,18 @@ enum SyncAction {
         #[arg(long)]
         verbose: bool,
     },
+
+    /// Pair this device with a sync mesh on the local network
+    #[cfg(feature = "sync")]
+    Pair {
+        /// Path to the vault directory
+        #[arg(long)]
+        vault: PathBuf,
+
+        /// Device name to advertise during pairing (default: system hostname)
+        #[arg(long)]
+        device_name: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -821,6 +833,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     relay_listen,
                 })
                 .await?;
+                Ok(())
+            }
+
+            SyncAction::Pair { vault, device_name } => {
+                sync_daemon::pair::run(vault, device_name).await?;
                 Ok(())
             }
         },

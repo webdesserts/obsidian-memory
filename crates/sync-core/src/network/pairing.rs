@@ -302,6 +302,81 @@ pub async fn pair_with_mesh(
     Ok(result)
 }
 
+/// Open a pairing connection and complete the exchange interactively.
+///
+/// Like [`pair_with_mesh`], but instead of taking the code upfront, it calls
+/// `get_code` after receiving the `PairingChallenge`. This lets the caller
+/// prompt the user for the code after the challenge is received — which is
+/// when the mesh member generates and displays it.
+///
+/// The `get_code` future receives the challenge for display (e.g., to show the
+/// mesh member's device name) and returns the code the user typed.
+///
+/// # Errors
+///
+/// Returns an error if the QUIC connection fails, a message cannot be
+/// serialized/deserialized, the stream ends unexpectedly, or `get_code` returns
+/// an error.
+pub async fn pair_with_mesh_interactive<F, Fut>(
+    endpoint: &iroh::Endpoint,
+    peer: impl Into<iroh::EndpointAddr>,
+    hello: &PairingHello,
+    get_code: F,
+) -> Result<PairingResult>
+where
+    F: FnOnce(PairingChallenge) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let connection = endpoint
+        .connect(peer, PAIRING_ALPN)
+        .await
+        .context("Failed to connect to mesh member for pairing")?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("Failed to open bi-stream for pairing")?;
+
+    // Step 1: Send PairingHello
+    let hello_bytes = bincode::serialize(hello).context("Failed to serialize PairingHello")?;
+    write_length_prefixed(&mut send, &hello_bytes)
+        .await
+        .context("Failed to send PairingHello")?;
+
+    // Step 2: Receive PairingChallenge — the mesh member generates the code here.
+    let challenge_bytes = read_length_prefixed(&mut recv)
+        .await
+        .context("Failed to read PairingChallenge")?;
+    let challenge: PairingChallenge = bincode::deserialize(&challenge_bytes)
+        .context("Failed to deserialize PairingChallenge")?;
+
+    debug!(
+        mesh_device = %challenge.device_name,
+        "Received pairing challenge, prompting user for code"
+    );
+
+    // Step 3: Ask the caller for the code (e.g., prompt the user).
+    let code = get_code(challenge).await?;
+
+    // Step 4: Compute HMAC and send PairingResponse
+    let hmac = crate::pairing::compute_hmac(&code, hello.node_id.as_bytes());
+    let response = PairingResponse { hmac };
+    let response_bytes = bincode::serialize(&response).context("Failed to serialize PairingResponse")?;
+    write_length_prefixed(&mut send, &response_bytes)
+        .await
+        .context("Failed to send PairingResponse")?;
+    send.finish().context("Failed to finish send stream")?;
+
+    // Step 5: Receive PairingResult
+    let result_bytes = read_length_prefixed(&mut recv)
+        .await
+        .context("Failed to read PairingResult")?;
+    let result: PairingResult = bincode::deserialize(&result_bytes)
+        .context("Failed to deserialize PairingResult")?;
+
+    Ok(result)
+}
+
 // ── Integration tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
