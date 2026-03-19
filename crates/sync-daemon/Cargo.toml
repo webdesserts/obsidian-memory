@@ -55,3 +55,6 @@ reqwest = "0.13.2"
 tempfile.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+iroh-gossip = { version = "0.97", default-features = false, features = ["net"] }
+bincode.workspace = true
+anyhow.workspace = true
