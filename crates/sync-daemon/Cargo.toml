@@ -36,6 +36,9 @@ axum.workspace = true
 # File locking (flock-based daemon lock)
 fs2 = "0.4"
 
+# Hostname for device name detection
+gethostname = "0.4"
+
 # Ed25519 keypairs for peer identity
 ed25519-dalek.workspace = true
 getrandom.workspace = true

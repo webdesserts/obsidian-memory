@@ -17,14 +17,16 @@ use crate::persistence::DaemonConfig;
 use crate::relay::EmbeddedRelay;
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 
-use sync_core::allowlist::AllowlistStorage;
+use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::fs::FileSystem;
 use sync_core::network::{
     discovery::MeshMetadata,
     gossip::{GossipEvent, VaultGossip},
+    pairing::{InboundPairingExchange, PairingApproval, PairingEvent},
     streams::InboundSyncRequest,
     SyncNode,
 };
+use sync_core::pairing::{PairingChallenge, PairingSession};
 use sync_core::{PeerId, PeerRegistry, Vault};
 
 fn now_ms() -> u64 {
@@ -60,6 +62,12 @@ struct Daemon {
     peer_registry: PeerRegistry,
     /// Controls which peers are allowed to sync. Empty = open to all (pre-pairing).
     allowlist: FileAllowlistStorage,
+    /// Active pairing session, if any. Only one pairing session at a time.
+    active_pairing: Option<PairingSession>,
+    /// Human-readable name for this device, advertised during pairing.
+    device_name: String,
+    /// Relay URL if the embedded relay is running, for distribution to new peers.
+    relay_url: Option<String>,
     #[allow(dead_code)]
     vault_path: PathBuf,
 }
@@ -292,7 +300,7 @@ impl Daemon {
     ///
     /// Only processes the update if the sender is already in our allowlist —
     /// we don't trust gossip from peers we haven't explicitly paired with.
-    async fn on_allowlist_update_received(&self, from: iroh::EndpointId, peer: sync_core::allowlist::AllowedPeer) {
+    async fn on_allowlist_update_received(&self, from: iroh::EndpointId, peer: AllowedPeer) {
         let sender_id = PeerId::from_bytes(*from.as_bytes());
         if !self.is_peer_allowed(&sender_id).await {
             warn!(peer = %from, "Allowlist update from non-allowlisted peer, ignoring");
@@ -307,6 +315,101 @@ impl Daemon {
                 error!("Failed to add peer {} from allowlist update: {}", peer.node_id, e);
             }
         }
+    }
+
+    /// Handle an inbound pairing request from a new device.
+    ///
+    /// Generates a 6-digit code and logs it so the user can relay it to the new
+    /// device. Only one pairing session at a time — concurrent requests are dropped.
+    async fn on_inbound_pairing_request(&mut self, exchange: InboundPairingExchange) {
+        // Reject concurrent pairing attempts — only one session at a time.
+        if let Some(ref existing) = self.active_pairing {
+            if !existing.is_expired() {
+                warn!(
+                    device = %exchange.hello.device_name,
+                    "Pairing request rejected: session already active"
+                );
+                // Dropping reply_tx signals rejection to the handler.
+                drop(exchange.reply_tx);
+                return;
+            }
+        }
+
+        let session = PairingSession::new(exchange.remote_id, &exchange.hello.device_name);
+
+        info!(
+            "Device '{}' wants to join. Pairing code: {} (expires in 5:00)",
+            exchange.hello.device_name, session.code
+        );
+
+        let challenge = PairingChallenge {
+            node_id: PeerId::from_bytes(*self.sync_node.node_id().as_bytes()),
+            device_name: self.device_name.clone(),
+            code_hash: session.code_hash,
+        };
+
+        // Collect vault gossip topic bytes for the new device.
+        let vault_topic = *self.vault_gossip.topic.as_bytes();
+
+        // Include our relay URL if the embedded relay is running.
+        let relay_urls: Vec<String> = self.relay_url.iter().cloned().collect();
+
+        // Include all alive peers plus self as mesh members.
+        let mut mesh_members: Vec<PeerId> = self
+            .peer_registry
+            .get_alive_peers()
+            .iter()
+            .map(|e| e.node_id)
+            .collect();
+        mesh_members.push(PeerId::from_bytes(*self.sync_node.node_id().as_bytes()));
+
+        let approval = PairingApproval {
+            code: session.code.clone(),
+            challenge,
+            vault_topic,
+            relay_urls,
+            mesh_members,
+        };
+
+        self.active_pairing = Some(session);
+
+        // Ignore send error — the handler may have timed out or been dropped.
+        let _ = exchange.reply_tx.send(approval);
+    }
+
+    /// Handle successful pairing — add the new peer to the allowlist and propagate.
+    async fn on_pairing_completed(&mut self, peer_id: PeerId, device_name: String) {
+        self.active_pairing = None;
+
+        let allowed_peer = AllowedPeer::new(peer_id.clone(), device_name.clone());
+
+        // Bootstrap: if this is the first pairing, also add ourselves to the allowlist.
+        let is_first_pair = matches!(self.allowlist.list_peers().await, Ok(peers) if peers.is_empty());
+
+        if let Err(e) = self.allowlist.add_peer(peer_id.clone(), &device_name).await {
+            error!("Failed to add paired peer to allowlist: {}", e);
+            return;
+        }
+
+        if is_first_pair {
+            let self_id = PeerId::from_bytes(*self.sync_node.node_id().as_bytes());
+            if let Err(e) = self.allowlist.add_peer(self_id, &self.device_name).await {
+                warn!("Failed to add self to allowlist on first pair: {}", e);
+            }
+        }
+
+        // Propagate the new peer to existing mesh members via gossip.
+        if let Err(e) = self.vault_gossip.broadcast_allowlist_update(&allowed_peer).await {
+            warn!("Failed to broadcast allowlist update for {}: {}", device_name, e);
+        }
+
+        info!("Device '{}' joined the mesh", device_name);
+    }
+
+    /// Handle a failed pairing attempt.
+    fn on_pairing_failed(&mut self, peer_id: PeerId, reason: String) {
+        self.active_pairing = None;
+        warn!("Pairing failed for {}: {}", peer_id, reason);
     }
 
     /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
@@ -518,6 +621,16 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
         }
     };
 
+    // Resolve device name for pairing: system hostname or a safe fallback.
+    let device_name = {
+        let hostname = gethostname::gethostname();
+        hostname
+            .to_str()
+            .unwrap_or("Sync Daemon")
+            .to_string()
+    };
+    info!(device_name = %device_name, "Device name resolved for pairing");
+
     let mut daemon = Daemon {
         vault: Arc::new(Mutex::new(vault)),
         sync_node,
@@ -525,6 +638,9 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
         watcher,
         peer_registry: PeerRegistry::new(),
         allowlist,
+        active_pairing: None,
+        device_name,
+        relay_url: relay_url.as_ref().map(|u| u.to_string()),
         vault_path: config.vault.clone(),
     };
 
@@ -555,6 +671,20 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
             Some(inbound) = daemon.sync_node.inbound_sync_rx.recv() => {
                 daemon.on_inbound_sync(inbound).await;
+            }
+
+            Some(pairing_event) = daemon.sync_node.inbound_pairing_rx.recv() => {
+                match pairing_event {
+                    PairingEvent::InboundRequest(exchange) => {
+                        daemon.on_inbound_pairing_request(exchange).await;
+                    }
+                    PairingEvent::PairingCompleted { peer_id, device_name } => {
+                        daemon.on_pairing_completed(peer_id, device_name).await;
+                    }
+                    PairingEvent::PairingFailed { peer_id, reason } => {
+                        daemon.on_pairing_failed(peer_id, reason);
+                    }
+                }
             }
 
             Some(mesh) = async {
