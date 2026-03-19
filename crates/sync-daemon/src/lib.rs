@@ -18,5 +18,4 @@ pub mod watcher;
 pub use allowlist::FileAllowlistStorage;
 pub use key_storage::FileKeyStorage;
 pub use native_fs::NativeFs;
-pub use persistence::{PeerStorage, PersistedPeer, PersistedPeers};
 pub use watcher::{FileEvent, FileEventKind, FileWatcher};
