@@ -1,182 +1,116 @@
-Feature: Peer Discovery
-  A "peer" is any participant in the sync mesh — either an Obsidian plugin
-  or a standalone daemon. The discovery protocol treats them identically:
-  any peer can run a WebSocket server, advertise an address, and relay
-  gossip. Peers without a server (e.g., mobile) are "client-only" and
-  can only receive connections, not accept them.
+Feature: Peer Discovery and Sync
+  Devices on the same vault discover each other via mDNS on the local network.
+  Pairing is required before two devices can sync — an unpaired device is
+  rejected even if it can reach the mesh. Once paired, sync happens
+  automatically via QUIC streams triggered by gossip notifications.
 
-  As a user with multiple devices
-  I want my peers to discover each other and connect directly when possible
-  So that my notes sync across all my devices
+  # --- Discovery ---
 
-  # --- Address Propagation ---
+  Scenario: Device advertises its mesh on the LAN via mDNS
+    Given a daemon is running with a vault
+    Then it should advertise the mesh name and vault ID over mDNS
+    And other devices on the same LAN can discover it
 
-  Scenario: Peer includes its address in the handshake
-    Given Peer A has a WebSocket server at "ws://192.168.1.10:9427"
-    When Peer A connects to Peer B
-    Then Peer A's handshake should include its advertised address
-    And Peer B should register Peer A with that address
+  Scenario: Nearby meshes are visible before pairing
+    Given two devices are on the same LAN
+    And they share the same vault ID
+    When a new device listens for nearby meshes
+    Then it should see the mesh listed with its name and how many devices are online
 
-  Scenario: Peer registers the address from a received handshake
-    Given Peer A has a WebSocket server at "ws://192.168.1.10:9427"
-    When Peer A connects to Peer B and sends its handshake
-    Then Peer B should add Peer A to its known peers with address "ws://192.168.1.10:9427"
+  Scenario: Devices with different vault IDs appear as separate meshes
+    Given two devices on the same LAN each have different vault IDs
+    When a third device discovers nearby meshes
+    Then it should see two separate mesh entries, one for each vault ID
 
-  Scenario: Peer broadcasts a new connection's address to existing connections
-    Given Peer A is connected to Peer B
-    And Peer C has a WebSocket server at "ws://192.168.1.20:9427"
-    When Peer C connects to Peer B
-    Then Peer B should broadcast Peer C's address to Peer A
-    And Peer A should see Peer C as a known peer with address "ws://192.168.1.20:9427"
+  # --- Pairing Flow ---
 
-  Scenario: Peer sends known addresses to newly connecting peers
-    Given Peer A is connected to Peer B
-    And Peer A advertises address "ws://192.168.1.10:9427"
-    When Peer C connects to Peer B
-    Then Peer B should tell Peer C about all known peers
-    And Peer C should see Peer A as a known peer with address "ws://192.168.1.10:9427"
+  Scenario: Pairing a new device to the mesh
+    Given a new device discovers a mesh on the LAN
+    When it initiates pairing with a mesh member
+    Then the mesh member should display a 6-digit confirmation code
+    And when the user enters the correct code on the new device
+    Then pairing should succeed
+    And both devices should be added to each other's allowlist
+    And the new device should receive the mesh member list to bootstrap sync
 
-  Scenario: Address from gossip is merged when handshake had no address
-    Given Peer B registered Peer A without an address
-    When Peer B receives gossip from Peer A containing its address
-    Then Peer B should update Peer A's entry in its known peers with the address
-    And subsequent gossip from Peer B should include Peer A's address
+  Scenario: Wrong confirmation code is rejected
+    Given a pairing session is in progress
+    When the new device submits an incorrect code
+    Then pairing should fail with a rejection message
+    And the new device should NOT be added to the allowlist
 
-  Scenario: Existing address is not overwritten by a missing address
-    Given Peer B knows Peer A's address is "ws://192.168.1.10:9427"
-    When Peer B receives gossip about Peer A without an address
-    Then Peer A's address should remain "ws://192.168.1.10:9427"
+  Scenario: Confirmation code expires after 5 minutes
+    Given a pairing session was started 5 minutes ago
+    When the new device tries to submit the code
+    Then the session should be expired
+    And pairing should fail
 
-  Scenario: Updated address replaces the old one
-    Given Peer B knows Peer A's address is "ws://192.168.1.10:9427"
-    When Peer A reconnects with a new address "ws://10.0.0.5:9427"
-    Then Peer B should update Peer A's known address to "ws://10.0.0.5:9427"
-    And Peer B should gossip the new address to other peers
+  Scenario: Only one pairing session at a time
+    Given a pairing session is already active on the mesh member
+    When a second device initiates a new pairing request
+    Then the second request should be rejected
+    And the first session should continue unaffected
 
-  Scenario: Connection order does not affect address propagation
-    Given Peer A has a WebSocket server at "ws://192.168.1.10:9427"
-    And Peer B has a WebSocket server at "ws://192.168.1.20:9427"
-    When Peer A connects to Peer C
-    And then Peer B connects to Peer C
-    Then Peer A should see Peer B as a known peer with address "ws://192.168.1.20:9427"
-    And Peer B should see Peer A as a known peer with address "ws://192.168.1.10:9427"
+  Scenario: Rate limiting prevents brute-force code guessing
+    Given a device attempts pairing and submits incorrect codes
+    When 5 failed attempts occur within 5 minutes
+    Then further attempts from that device should be rejected
+    And the rate limit should reset after 5 minutes
 
-  Scenario: Addresses propagate across multiple hops
-    Given Peer A has a WebSocket server at "ws://192.168.1.10:9427"
-    And Peer A is connected to Peer B
-    And Peer B is connected to Peer C
-    But Peer A is NOT connected to Peer C
-    When Peer B gossips about Peer A to Peer C
-    Then Peer C should see Peer A as a known peer with address "ws://192.168.1.10:9427"
+  Scenario: HMAC is bound to the requesting device's transport identity
+    Given a pairing session is active for device A
+    When a different device B tries to submit a code computed for device A
+    Then the HMAC verification should fail
+    And device B should not be paired
 
-  Scenario: Peers only relay gossip that changes their membership state
-    Given Peer A, Peer B, and Peer C are all connected to each other
-    And all peers already know about Peer D
-    When Peer A sends gossip about Peer D to Peer B
-    Then Peer B should NOT relay the gossip further
+  # --- Allowlist Enforcement ---
 
-  # --- Direct Connections ---
+  Scenario: Unpaired device cannot sync
+    Given the mesh has at least one paired device
+    When an unpaired device attempts to sync
+    Then the sync request should be rejected
+    And an error should be logged
 
-  Scenario: Auto-connect to newly discovered peer on same LAN
-    Given Peer A and Peer B are on the same LAN
-    And Peer B has a WebSocket server
-    When Peer A discovers Peer B's address through gossip
-    Then Peer A should automatically connect to Peer B
-    And Peer A should see Peer B in Connected Peers
+  Scenario: Open-until-first-pair: mesh accepts all before any pairing
+    Given no devices have been paired yet
+    When any device attempts to sync
+    Then the sync request should be accepted
+    And after the first pairing, all future sync requests require allowlist membership
 
-  Scenario: Auto-connect is skipped for client-only peers
-    Given Peer C has no WebSocket server
-    When Peer A discovers Peer C through gossip
-    Then Peer C should appear as a known peer marked "client-only"
-    And Peer A should NOT attempt to connect to Peer C
+  Scenario: Allowlist is propagated to all mesh members
+    Given two devices are already paired with each other
+    When a third device pairs with one of them
+    Then the new device should be added to both devices' allowlists
+    And all three devices can sync with each other
 
-  Scenario: Auto-connect is skipped for already-connected peers
-    Given Peer A is already directly connected to Peer B
-    When Peer A receives gossip about Peer B
-    Then Peer A should NOT open a duplicate connection to Peer B
-
-  Scenario: Gossip-triggered auto-connect is one-shot
-    Given Peer A discovers Peer B's address through gossip
-    And Peer B's address is unreachable
-    When the connection attempt fails
-    Then Peer A should NOT automatically retry the connection
-    And Peer B should remain in Peer A's known peers for future reconnection
-
-  # --- Failure Propagation ---
-
-  Scenario: Peer broadcasts dead status when a connection drops
-    Given Peer A, Peer B, and Peer C are all connected to each other
-    When Peer B disconnects from Peer A
-    Then Peer A should broadcast that Peer B is Dead to Peer C
-    And Peer C should mark Peer B as Dead
-
-  # --- Reconnection ---
-
-  Scenario: Periodic sweep retries known but disconnected peers
-    Given Peer A was previously connected to Peer B
-    And Peer B went offline and was marked Dead
-    When the periodic reconnection sweep runs
-    Then Peer A should attempt to reconnect to Peer B's last known address
-
-  Scenario: Reconnection uses bounded backoff
-    Given Peer A is attempting to reconnect to Peer B
-    And the reconnection keeps failing
-    Then Peer A should increase the delay between attempts
-    And Peer A should eventually stop trying after a timeout
-
-  Scenario: Reconnected peer resumes normal sync
-    Given Peer A had marked Peer B as Dead
-    When Peer B comes back online and the reconnection sweep succeeds
-    Then Peer B should transition back to Alive
-    And Peer A and Peer B should sync normally
-
-  # --- Backwards Compatibility ---
-
-  Scenario: Old peer without address in handshake
-    Given Peer A is running an older version without address in handshake
-    When Peer A connects to Peer B
-    Then Peer B should register Peer A without an address
-    And Peer A's address should be updated when gossip arrives with it
-
-  # --- Connection Handshake ---
-
-  Scenario: Peer is not connected until handshake completes
-    Given Peer A accepts a TCP connection from Peer B
-    When Peer B has not yet sent its handshake
-    Then Peer B should NOT appear in Peer A's connected peers
-    And messages from Peer B should be dropped
-
-  Scenario: Peer is identified by its real peer ID after handshake
-    Given Peer A accepts a connection from Peer B
-    When Peer B sends a handshake with peer ID "peer-b-uuid"
-    Then Peer A should know Peer B as "peer-b-uuid"
-    And messages from Peer B should be attributed to "peer-b-uuid"
-
-  Scenario: Connection dropped before handshake has no effect
-    Given Peer A accepts a connection
-    When the connection closes before handshake completes
-    Then no peer should appear or disappear from Peer A's connected peers
-
-  Scenario: Gossip before handshake is ignored
-    Given Peer A is connecting to Peer B
-    When gossip arrives before handshake completes
-    Then the gossip should be dropped
-    And no error should occur
-
-  # --- Edge Cases ---
-
-  Scenario: Cross-network peers cannot connect directly
-    Given Peer A is on network 192.168.1.x
-    And Peer B is on network 10.0.0.x
-    And both are connected to Peer C
-    When Peer A discovers Peer B's LAN address through gossip
-    Then Peer A should attempt to connect to Peer B
-    But the connection should fail
-    And sync should continue working through Peer C
+  Scenario: Trust within the mesh is transitive
+    Given device A and device B are paired
+    When device B pairs with device C and propagates the allowlist update
+    Then device A should accept device C for syncing
 
   # --- Sync ---
 
-  Scenario: File edits sync between connected peers
-    Given Peer A and Peer B are connected (directly or through other peers)
-    When I edit a file in Peer A's vault
-    Then the change should appear in Peer B's vault
+  Scenario: File edit syncs to paired devices
+    Given two devices are paired and connected
+    When a file is edited on one device
+    Then the change notification should be broadcast via gossip
+    And the other device should pull the update via a QUIC stream
+    And the file should appear updated on the other device
+
+  Scenario: Full sync on reconnect
+    Given two paired devices were disconnected
+    When one device rejoins the gossip swarm
+    Then a full sync should be triggered automatically
+    And both devices should converge to the same vault state
+
+  Scenario: Sync works over relay when direct connection is unavailable
+    Given two paired devices cannot connect directly (NAT or different networks)
+    And a relay server is configured
+    Then sync should succeed via the relay
+    And the protocol behaves identically to direct QUIC sync
+
+  Scenario: Unpaired device cannot trigger a sync via gossip
+    Given the mesh has paired devices
+    When an unpaired device broadcasts a change notification
+    Then the mesh members should reject the notification
+    And no sync should be performed for that message

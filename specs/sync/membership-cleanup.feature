@@ -1,33 +1,48 @@
-Feature: Membership Cleanup
-  Dead SWIM members should be evicted after a timeout to prevent
-  unbounded growth of the membership list and stale UI entries.
+Feature: Peer Membership
+  The sync mesh tracks which devices are currently online or were previously
+  seen. Membership is driven entirely by iroh-gossip events — no manual
+  heartbeats or TTL sweeps are required.
 
-  Scenario: Dead member is evicted after TTL expires
-    Given Peer A is in SWIM membership marked as Dead
-    And Peer A has been Dead for longer than the eviction TTL
-    When the eviction sweep runs
-    Then Peer A should be removed from the membership list
-    And Peer A should no longer appear in the debug panel
+  # --- State Transitions ---
 
-  Scenario: Dead member is kept before TTL expires
-    Given Peer A is in SWIM membership marked as Dead
-    And Peer A has been Dead for less than the eviction TTL
-    When the eviction sweep runs
-    Then Peer A should remain in the membership list
+  Scenario: Device appears when it joins the gossip swarm
+    Given no device is currently online
+    When a paired device joins the gossip swarm
+    Then it should appear in the peer list as online
 
-  Scenario: Alive members are not affected by eviction
-    Given Peer A is in SWIM membership marked as Alive
-    When the eviction sweep runs
-    Then Peer A should remain in the membership list
+  Scenario: Device is marked offline when it leaves the gossip swarm
+    Given a device is currently online
+    When it disconnects from the gossip swarm
+    Then it should be marked as offline in the peer list
+    And it should remain visible (as offline) rather than disappearing
 
-  Scenario: Eviction runs periodically
-    Given the daemon is running
-    Then the eviction sweep should run on a regular interval
-    And each sweep should remove all members past the TTL
+  Scenario: Device returns to online when it rejoins the gossip swarm
+    Given a device was previously online and is now marked offline
+    When the device reconnects to the gossip swarm
+    Then it should return to online in the peer list
 
-  Scenario: Stale gossip does not resurrect evicted members permanently
-    Given Peer A was evicted from membership
-    When stale gossip arrives claiming Peer A is Alive
-    Then Peer A may temporarily re-enter membership as Alive
-    But if no actual connection exists, Peer A will eventually be
-    marked Dead and evicted again after the TTL
+  # --- No Automatic Eviction ---
+
+  Scenario: Offline devices remain in the peer list indefinitely
+    Given a device has been offline for a long time
+    Then it should still appear in the peer list as offline
+    And it should NOT be automatically removed
+
+  Scenario: Removing a device requires explicit unpairing
+    Given a device is in the peer list
+    When the user removes it via the sync panel
+    Then it should be removed from the allowlist
+    And it should no longer be able to sync
+
+  # --- Multiple Devices ---
+
+  Scenario: Multiple devices can be online simultaneously
+    Given three devices are in the sync mesh
+    When all three join the gossip swarm
+    Then all three should appear as online
+
+  Scenario: One device going offline does not affect others
+    Given three devices are currently online
+    When one device disconnects
+    Then the disconnected device should be marked offline
+    And the other two should remain online and continue syncing
