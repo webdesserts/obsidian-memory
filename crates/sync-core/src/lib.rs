@@ -8,6 +8,16 @@
 //! - Parsing/serializing markdown with frontmatter
 //! - Sync protocol between peers
 //! - FileSystem trait abstraction
+//!
+//! ## Feature gates
+//!
+//! - `cfg(feature = "native")` — code requiring iroh mDNS/sockets, tokio runtime, or
+//!   OS-level APIs. These are unavailable in WASM or when building without the `native`
+//!   feature (e.g. the Obsidian plugin via sync-wasm).
+//! - `cfg(target_arch = "wasm32")` — WASM-specific runtime differences: `Rc`/`RefCell`
+//!   instead of `Arc`/`RwLock`, and `?Send` async trait bounds. These gates exist
+//!   because Cargo feature unification can't express "Send only when native feature is
+//!   enabled" — the arch check is the only reliable way to vary trait bounds.
 
 pub mod network;
 

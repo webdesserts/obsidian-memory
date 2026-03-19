@@ -28,7 +28,7 @@ pub const SYNC_ALPN: &[u8] = b"obsidian-memory/sync/1";
 ///
 /// Peers using the same service name can discover each other on the LAN.
 /// Peers on a different service name are invisible to each other.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "native")]
 const MDNS_SERVICE_NAME: &str = "obsidian-sync";
 
 /// The iroh-based sync node.
@@ -54,7 +54,7 @@ pub struct SyncNode {
     /// The protocol router (dispatches by ALPN).
     router: Router,
     /// mDNS address lookup for LAN mesh discovery (native only).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "native")]
     mdns: Option<iroh::address_lookup::MdnsAddressLookup>,
 }
 
@@ -83,7 +83,7 @@ impl SyncNode {
             #[cfg(feature = "native")]
             inbound_pairing_rx,
             router,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(feature = "native")]
             mdns: None,
         }
     }
@@ -114,7 +114,7 @@ impl SyncNode {
 
         info!(node_id = %endpoint.id(), "Iroh endpoint created");
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(feature = "native")]
         let mdns = {
             use iroh::address_lookup::MdnsAddressLookup;
             match MdnsAddressLookup::builder()
@@ -157,7 +157,7 @@ impl SyncNode {
             #[cfg(feature = "native")]
             inbound_pairing_rx,
             router,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(feature = "native")]
             mdns,
         })
     }
@@ -205,7 +205,7 @@ impl SyncNode {
             #[cfg(feature = "native")]
             inbound_pairing_rx,
             router,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(feature = "native")]
             mdns: None,
         })
     }
@@ -253,7 +253,7 @@ impl SyncNode {
     ///
     /// Relay URL is included when provided so discovered peers can connect
     /// even without direct address information.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "native")]
     pub fn publish_mesh_info(
         &self,
         metadata: &crate::network::discovery::MeshMetadata,
@@ -296,7 +296,7 @@ impl SyncNode {
     /// including their `UserData` which contains JSON-encoded `MeshMetadata`.
     /// Parse the `UserData` to extract the mesh name and VaultId, then group
     /// peers by VaultId to form `DiscoveredMesh` entries.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "native")]
     pub async fn subscribe_discovery(
         &self,
     ) -> Option<impl n0_future::Stream<Item = iroh::address_lookup::DiscoveryEvent> + Unpin + use<>> {

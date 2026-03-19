@@ -5,8 +5,8 @@
 //! - `ObsidianFs` (in sync-wasm) - Uses Obsidian's Vault API via JS bridge
 //! - `NativeFs` (in sync-daemon) - Uses tokio::fs
 //!
-//! Uses `target_arch = "wasm32"` for conditional compilation instead of feature flags
-//! to avoid Cargo's feature unification issues when building the workspace.
+//! Uses `cfg(target_arch = "wasm32")` (not `cfg(feature = "native")`) to vary the
+//! `Send + Sync` trait bounds. See the crate-level doc in `lib.rs` for why.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
