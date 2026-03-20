@@ -58,8 +58,12 @@ struct Daemon {
     watcher: FileWatcher,
     /// Tracks liveness state of all peers observed in the gossip swarm.
     peer_registry: PeerRegistry,
-    /// Controls which peers are allowed to sync. Empty = open to all (pre-pairing).
-    allowlist: FileAllowlistStorage,
+    /// Controls which peers are allowed to sync. Empty = deny all (pair first).
+    ///
+    /// Wrapped in Arc so it can be shared with the gossip connection handler,
+    /// which runs in separate tasks and must check the allowlist on each inbound
+    /// gossip connection before the gossip protocol runs.
+    allowlist: Arc<FileAllowlistStorage>,
     /// Active pairing session, if any. Only one pairing session at a time.
     active_pairing: Option<PairingSession>,
     /// Human-readable name for this device, advertised during pairing.
@@ -539,7 +543,12 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     }
 
     let secret_key_bytes = identity_key.secret_key_bytes();
-    let sync_node = SyncNode::new(secret_key_bytes, relay_url.as_ref())
+
+    // Create the allowlist early so it can be shared with SyncNode (for gossip enforcement)
+    // and with the Daemon event loop (for sync and pairing checks).
+    let allowlist = Arc::new(FileAllowlistStorage::new(&config.vault));
+
+    let sync_node = SyncNode::new(secret_key_bytes, relay_url.as_ref(), allowlist.clone())
         .await
         .context("Failed to create iroh SyncNode")?;
 
@@ -560,8 +569,6 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
         ver: 1,
     };
     sync_node.publish_mesh_info(&mesh_metadata, relay_url.as_ref());
-
-    let allowlist = FileAllowlistStorage::new(&config.vault);
 
     // Bootstrap gossip from allowlist peers so we reconnect to known devices on startup
     // without requiring manually configured peer addresses.

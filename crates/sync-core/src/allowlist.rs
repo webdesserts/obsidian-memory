@@ -163,34 +163,55 @@ pub trait AllowlistStorage {
     }
 }
 
+/// In-memory implementation of `AllowlistStorage` for testing.
+///
+/// Thread-safe, zero-I/O — suitable for integration tests that need
+/// a real `AllowlistStorage` without touching the filesystem.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct InMemoryAllowlist {
+    peers: std::sync::RwLock<Vec<AllowedPeer>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for InMemoryAllowlist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryAllowlist").finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InMemoryAllowlist {
+    /// Create a new empty in-memory allowlist.
+    pub fn new() -> Self {
+        Self {
+            peers: std::sync::RwLock::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for InMemoryAllowlist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
+impl AllowlistStorage for InMemoryAllowlist {
+    async fn list_peers(&self) -> Result<Vec<AllowedPeer>> {
+        Ok(self.peers.read().unwrap().clone())
+    }
+
+    async fn save_peers(&self, peers: &[AllowedPeer]) -> Result<()> {
+        *self.peers.write().unwrap() = peers.to_vec();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::RwLock;
-
-    struct InMemoryAllowlist {
-        peers: RwLock<Vec<AllowedPeer>>,
-    }
-
-    impl InMemoryAllowlist {
-        fn new() -> Self {
-            Self {
-                peers: RwLock::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl AllowlistStorage for InMemoryAllowlist {
-        async fn list_peers(&self) -> Result<Vec<AllowedPeer>> {
-            Ok(self.peers.read().unwrap().clone())
-        }
-
-        async fn save_peers(&self, peers: &[AllowedPeer]) -> Result<()> {
-            *self.peers.write().unwrap() = peers.to_vec();
-            Ok(())
-        }
-    }
 
     fn peer_a() -> PeerId {
         PeerId::generate()

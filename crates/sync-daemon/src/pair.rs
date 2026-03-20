@@ -12,9 +12,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iroh::address_lookup::DiscoveryEvent;
+use std::sync::Arc;
 use tracing::debug;
 
-use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
+use sync_core::allowlist::{AllowedPeer, AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::{
     discovery::{DiscoveredMesh, MeshMetadata},
     pairing::pair_with_mesh_interactive,
@@ -48,8 +49,13 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
     let (_, identity_key) = DaemonConfig::load_or_generate(&vault_path, None).await?;
     let secret_key_bytes = identity_key.secret_key_bytes();
 
+    // Pairing creates a new mesh connection using the PAIRING_ALPN (separate from gossip).
+    // We pass an empty allowlist here — the gossip handler won't reject the pairing peer
+    // because pairing uses its own ALPN, not the gossip ALPN.
+    let pairing_allowlist = Arc::new(InMemoryAllowlist::new());
+
     // Create a minimal SyncNode (no relay needed for LAN pairing).
-    let sync_node = SyncNode::new(secret_key_bytes, None)
+    let sync_node = SyncNode::new(secret_key_bytes, None, pairing_allowlist)
         .await
         .context("Failed to create iroh SyncNode")?;
 

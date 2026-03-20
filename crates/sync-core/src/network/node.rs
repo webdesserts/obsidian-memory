@@ -11,9 +11,12 @@ use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh_gossip::{Gossip, TopicId};
 use iroh_gossip::net::GOSSIP_ALPN;
-use tracing::info;
+use std::sync::Arc;
+use tracing::{info, warn};
 
 use crate::peer_id::VaultId;
+#[cfg(feature = "native")]
+use crate::allowlist::{AllowlistStorage};
 #[cfg(feature = "native")]
 use crate::network::pairing::{PairingEvent, PairingStreamHandler, PAIRING_ALPN};
 use crate::network::streams::{InboundSyncRx, SyncStreamHandler};
@@ -30,6 +33,58 @@ pub const SYNC_ALPN: &[u8] = b"obsidian-memory/sync/1";
 /// Peers on a different service name are invisible to each other.
 #[cfg(feature = "native")]
 const MDNS_SERVICE_NAME: &str = "obsidian-sync";
+
+/// Wraps iroh-gossip's connection handler with allowlist enforcement.
+///
+/// Non-allowlisted peers are rejected before the gossip protocol runs.
+/// This prevents unpaired devices from joining the gossip swarm and
+/// observing which files are changing, even if they can reach the network.
+///
+/// The pairing ALPN is a separate handler and is NOT affected — pairing
+/// must remain open to allow new devices to join.
+#[cfg(feature = "native")]
+#[derive(Debug)]
+struct AllowlistGossipHandler<A: AllowlistStorage + std::fmt::Debug> {
+    gossip: Gossip,
+    allowlist: Arc<A>,
+}
+
+#[cfg(feature = "native")]
+impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHandler
+    for AllowlistGossipHandler<A>
+{
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        use crate::peer_id::PeerId;
+
+        let remote_id = connection.remote_id();
+        let peer_id = PeerId::from_bytes(*remote_id.as_bytes());
+
+        let allowed = match self.allowlist.list_peers().await {
+            Ok(peers) => peers.iter().any(|p| p.node_id == peer_id),
+            Err(e) => {
+                warn!(peer = %remote_id, "Failed to read allowlist for gossip accept, denying: {}", e);
+                false
+            }
+        };
+
+        if !allowed {
+            warn!(peer = %remote_id, "Gossip connection rejected — peer not in allowlist");
+            connection.close(
+                iroh::endpoint::VarInt::from_u32(1),
+                b"not in allowlist",
+            );
+            return Ok(());
+        }
+
+        self.gossip
+            .handle_connection(connection)
+            .await
+            .map_err(iroh::protocol::AcceptError::from_err)
+    }
+}
 
 /// The iroh-based sync node.
 ///
@@ -96,6 +151,87 @@ impl SyncNode {
     /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
     /// only this relay URL instead of the default number 0 relay servers. Pass this
     /// when the daemon is running its own embedded relay so peers can route through it.
+    ///
+    /// `allowlist` — on native builds, gossip connections are pre-screened using this
+    /// allowlist before the gossip protocol runs. Non-allowlisted peers are rejected
+    /// immediately. Pass `Arc::new(FileAllowlistStorage::new(&vault))` from the daemon.
+    #[cfg(feature = "native")]
+    pub async fn new<A: AllowlistStorage + std::fmt::Debug + 'static>(
+        secret_key_bytes: [u8; 32],
+        extra_relay: Option<&RelayUrl>,
+        allowlist: Arc<A>,
+    ) -> Result<Self> {
+        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
+        let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
+
+        let relay_mode = match extra_relay {
+            Some(url) => RelayMode::Custom(RelayMap::from_iter([url.clone()])),
+            None => RelayMode::Default,
+        };
+
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .relay_mode(relay_mode)
+            .bind()
+            .await
+            .context("Failed to create iroh endpoint")?;
+
+        info!(node_id = %endpoint.id(), "Iroh endpoint created");
+
+        let mdns = {
+            use iroh::address_lookup::MdnsAddressLookup;
+            match MdnsAddressLookup::builder()
+                .service_name(MDNS_SERVICE_NAME)
+                .build(endpoint.id())
+            {
+                Ok(mdns) => {
+                    if let Ok(lookup) = endpoint.address_lookup() {
+                        lookup.add(mdns.clone());
+                        info!("mDNS mesh discovery enabled");
+                    }
+                    Some(mdns)
+                }
+                Err(e) => {
+                    warn!("Failed to create mDNS address lookup, mesh discovery disabled: {e}");
+                    None
+                }
+            }
+        };
+
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+
+        let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
+
+        let gossip_handler = AllowlistGossipHandler {
+            gossip: gossip.clone(),
+            allowlist,
+        };
+
+        let router = Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip_handler)
+            .accept(SYNC_ALPN.to_vec(), sync_handler)
+            .accept(PAIRING_ALPN.to_vec(), pairing_handler)
+            .spawn();
+
+        Ok(Self {
+            endpoint,
+            gossip,
+            inbound_sync_rx,
+            inbound_pairing_rx,
+            router,
+            mdns,
+        })
+    }
+
+    /// Create a new SyncNode from an ed25519 secret key (WASM build).
+    ///
+    /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
+    /// The endpoint binds to a random available port.
+    ///
+    /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
+    /// only this relay URL instead of the default number 0 relay servers.
+    #[cfg(not(feature = "native"))]
     pub async fn new(secret_key_bytes: [u8; 32], extra_relay: Option<&RelayUrl>) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
@@ -114,51 +250,19 @@ impl SyncNode {
 
         info!(node_id = %endpoint.id(), "Iroh endpoint created");
 
-        #[cfg(feature = "native")]
-        let mdns = {
-            use iroh::address_lookup::MdnsAddressLookup;
-            match MdnsAddressLookup::builder()
-                .service_name(MDNS_SERVICE_NAME)
-                .build(endpoint.id())
-            {
-                Ok(mdns) => {
-                    if let Ok(lookup) = endpoint.address_lookup() {
-                        lookup.add(mdns.clone());
-                        info!("mDNS mesh discovery enabled");
-                    }
-                    Some(mdns)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create mDNS address lookup, mesh discovery disabled: {e}");
-                    None
-                }
-            }
-        };
-
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
 
-        #[cfg(feature = "native")]
-        let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
-
-        let router = {
-            let builder = Router::builder(endpoint.clone())
-                .accept(GOSSIP_ALPN, gossip.clone())
-                .accept(SYNC_ALPN.to_vec(), sync_handler);
-            #[cfg(feature = "native")]
-            let builder = builder.accept(PAIRING_ALPN.to_vec(), pairing_handler);
-            builder.spawn()
-        };
+        let router = Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip.clone())
+            .accept(SYNC_ALPN.to_vec(), sync_handler)
+            .spawn();
 
         Ok(Self {
             endpoint,
             gossip,
             inbound_sync_rx,
-            #[cfg(feature = "native")]
-            inbound_pairing_rx,
             router,
-            #[cfg(feature = "native")]
-            mdns,
         })
     }
 

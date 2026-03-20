@@ -35,6 +35,8 @@ pub mod sync_engine;
 pub mod vault;
 
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
+#[cfg(not(target_arch = "wasm32"))]
+pub use allowlist::InMemoryAllowlist;
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};

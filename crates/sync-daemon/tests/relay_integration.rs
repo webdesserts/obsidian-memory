@@ -9,12 +9,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::gossip::GossipEvent;
 use sync_core::network::streams::connect_and_sync_raw;
 use sync_core::network::SyncNode;
-use sync_core::peer_id::VaultId;
+use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 use sync_daemon::relay::EmbeddedRelay;
 
@@ -39,10 +41,21 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
     let relay = EmbeddedRelay::start(bind_addr).await?;
     let relay_url = relay.relay_url().clone();
 
+    // Derive each node's PeerId from its seed so we can pre-populate both allowlists.
+    // Both nodes must allow each other for gossip connections to be accepted.
+    let allowlist_a = Arc::new(InMemoryAllowlist::new());
+    let allowlist_b = Arc::new(InMemoryAllowlist::new());
+
     // Create two nodes that only know about the relay — no direct address
     // exchange. They can only reach each other by routing through the relay.
-    let node_a = SyncNode::new(seed(101), Some(&relay_url)).await?;
-    let node_b = SyncNode::new(seed(102), Some(&relay_url)).await?;
+    let node_a = SyncNode::new(seed(101), Some(&relay_url), allowlist_a.clone()).await?;
+    let node_b = SyncNode::new(seed(102), Some(&relay_url), allowlist_b.clone()).await?;
+
+    // Pre-populate each allowlist with the other node's PeerId so gossip is accepted.
+    let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
+    let peer_b = PeerId::from_bytes(*node_b.node_id().as_bytes());
+    allowlist_a.add_peer(peer_b, "node-b").await?;
+    allowlist_b.add_peer(peer_a, "node-a").await?;
 
     let vault_id: VaultId = "cafebabe0beef001".parse().unwrap();
 

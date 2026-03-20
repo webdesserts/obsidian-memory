@@ -12,6 +12,7 @@ use sync_core::allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, Result
 /// Reads and writes `.sync/allowlist.json` within the vault directory.
 /// Each call reads/writes the full file — the list is short enough that
 /// in-memory caching is not needed.
+#[derive(Debug)]
 pub struct FileAllowlistStorage {
     path: PathBuf,
 }
