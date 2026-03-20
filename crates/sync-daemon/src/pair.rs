@@ -218,7 +218,8 @@ async fn pair_inner(
     }
 
     eprintln!();
-    eprintln!("Joined the mesh. Run 'memory sync up' to start syncing.");
+    eprintln!("Pairing complete. Start the sync daemon to begin syncing.");
+    eprintln!("Run: memory sync up --vault <path>");
 
     Ok(())
 }

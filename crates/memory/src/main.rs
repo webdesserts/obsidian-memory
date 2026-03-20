@@ -535,10 +535,6 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:3000")]
         listen: String,
 
-        /// Bootstrap peer(s) to connect to on startup (iroh EndpointId hex strings)
-        #[arg(long)]
-        bootstrap: Vec<String>,
-
         /// Address for the sync daemon health endpoint (optional)
         #[arg(long)]
         health_listen: Option<String>,
@@ -584,10 +580,6 @@ enum SyncAction {
         /// Path to the vault directory
         #[arg(long)]
         vault: PathBuf,
-
-        /// Bootstrap peer(s) to connect to on startup (iroh EndpointId hex strings)
-        #[arg(long)]
-        bootstrap: Vec<String>,
 
         /// Address for the health endpoint (optional, e.g. 127.0.0.1:8081)
         #[arg(long)]
@@ -818,7 +810,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Sync { action }) => match action {
             SyncAction::Up {
                 vault,
-                bootstrap,
                 health_listen,
                 identity_key,
                 relay_listen,
@@ -828,7 +819,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sync_daemon::daemon::run(sync_daemon::daemon::DaemonRunConfig {
                     vault,
                     identity_key,
-                    bootstrap_peers: bootstrap,
                     health_listen,
                     relay_listen,
                 })
@@ -853,7 +843,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Up {
             vault,
             listen,
-            bootstrap,
             health_listen,
             verbose,
         }) => {
@@ -865,7 +854,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sync_config = sync_daemon::daemon::DaemonRunConfig {
                 vault,
                 identity_key: None,
-                bootstrap_peers: bootstrap,
                 health_listen,
                 relay_listen: None,
             };

@@ -17,10 +17,6 @@ struct Args {
     #[arg(short, long)]
     vault: PathBuf,
 
-    /// Bootstrap peer(s) to connect to on startup (iroh EndpointId hex strings)
-    #[arg(long)]
-    bootstrap: Vec<String>,
-
     /// Address to serve the /health endpoint on (e.g. 127.0.0.1:8081)
     #[arg(long)]
     health_listen: Option<String>,
@@ -43,7 +39,6 @@ impl From<Args> for DaemonRunConfig {
         Self {
             vault: args.vault,
             identity_key: args.identity_key,
-            bootstrap_peers: args.bootstrap,
             health_listen: args.health_listen,
             relay_listen: args.relay_listen,
         }

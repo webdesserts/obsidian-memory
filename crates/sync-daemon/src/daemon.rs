@@ -41,8 +41,6 @@ pub struct DaemonRunConfig {
     pub vault: PathBuf,
     /// Optional path to an alternate identity key file (default: `.sync/daemon.key`).
     pub identity_key: Option<PathBuf>,
-    /// Bootstrap peer EndpointId hex strings to join the gossip swarm.
-    pub bootstrap_peers: Vec<String>,
     /// If set, serve a `/health` endpoint on this address (e.g. `"127.0.0.1:8081"`).
     pub health_listen: Option<String>,
     /// If set, start an embedded iroh relay server on this address (e.g. `"0.0.0.0:3340"`).
@@ -75,16 +73,19 @@ struct Daemon {
 impl Daemon {
     /// Check whether a peer is allowed to sync.
     ///
-    /// Returns `true` if:
-    /// - The allowlist is empty (no peers paired yet — open to all), OR
-    /// - The peer is in the allowlist.
+    /// Returns `true` only if the peer's `node_id` is in the allowlist.
     ///
     /// Returns `false` if:
-    /// - The allowlist is non-empty and the peer is not in it, OR
+    /// - The allowlist is empty (no peers paired yet — deny all until paired), OR
+    /// - The peer is not in the allowlist, OR
     /// - The allowlist cannot be read (fail-closed for safety).
+    ///
+    /// The "open until first pair" behavior was removed because it creates a
+    /// window where any device on the network can sync before pairing completes.
+    /// Pair first with `memory sync pair`, then start the daemon.
     async fn is_peer_allowed(&self, peer_id: &PeerId) -> bool {
         match self.allowlist.list_peers().await {
-            Ok(peers) => peers.is_empty() || peers.iter().any(|p| &p.node_id == peer_id),
+            Ok(peers) => peers.iter().any(|p| &p.node_id == peer_id),
             Err(e) => {
                 error!("Failed to read allowlist, denying sync: {}", e);
                 false
@@ -560,18 +561,25 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     };
     sync_node.publish_mesh_info(&mesh_metadata, relay_url.as_ref());
 
-    // Parse bootstrap peers as EndpointId (iroh node ID hex strings)
-    let bootstrap_ids: Vec<EndpointId> = config
-        .bootstrap_peers
-        .iter()
-        .filter_map(|hex| {
-            hex.parse::<EndpointId>()
-                .map_err(|e| {
-                    error!("Invalid bootstrap peer ID '{}': {}", hex, e);
-                })
-                .ok()
-        })
-        .collect();
+    let allowlist = FileAllowlistStorage::new(&config.vault);
+
+    // Bootstrap gossip from allowlist peers so we reconnect to known devices on startup
+    // without requiring manually configured peer addresses.
+    let bootstrap_ids: Vec<EndpointId> = match allowlist.list_peers().await {
+        Ok(peers) => peers
+            .iter()
+            .filter_map(|p| {
+                // PeerId and EndpointId are both 32-byte ed25519 public keys.
+                EndpointId::from_bytes(p.node_id.as_bytes())
+                    .map_err(|e| warn!("Skipping invalid allowlist peer for gossip bootstrap: {}", e))
+                    .ok()
+            })
+            .collect(),
+        Err(e) => {
+            warn!("Failed to read allowlist for gossip bootstrap: {}", e);
+            vec![]
+        }
+    };
 
     let vault_gossip = sync_node
         .join_vault_gossip(&vault_id, bootstrap_ids)
@@ -591,8 +599,6 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     let watcher = FileWatcher::new(config.vault.clone())?;
     info!("File watcher started");
-
-    let allowlist = FileAllowlistStorage::new(&config.vault);
 
     // Spawn mDNS discovery events into a channel so the main select loop stays uniform.
     // Discovery is native-only; the channel is None when mDNS is unavailable.
