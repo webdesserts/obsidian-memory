@@ -8,6 +8,8 @@ use iroh::EndpointId;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use crate::allowlist::FileAllowlistStorage;
 use crate::daemon_lock::DaemonLock;
@@ -51,11 +53,19 @@ pub struct DaemonRunConfig {
 }
 
 /// Daemon state holding all components.
-struct Daemon {
-    vault: Arc<Mutex<Vault<NativeFs>>>,
+///
+/// Generic over the filesystem (`FS`) and allowlist storage (`AL`) so that
+/// integration tests can inject in-memory implementations without touching the
+/// real filesystem or spawning a file watcher.
+pub(crate) struct Daemon<FS: FileSystem, AL> {
+    vault: Arc<Mutex<Vault<FS>>>,
     sync_node: SyncNode,
     vault_gossip: VaultGossip,
-    watcher: FileWatcher,
+    /// Injected file event channel — replaces the `FileWatcher` field so tests can
+    /// push synthetic events without a real OS filesystem watcher.
+    file_event_rx: mpsc::UnboundedReceiver<FileEvent>,
+    /// Optional mDNS discovery channel. `None` in tests (and on WASM builds).
+    discovery_rx: Option<mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>>,
     /// Tracks liveness state of all peers observed in the gossip swarm.
     peer_registry: PeerRegistry,
     /// Controls which peers are allowed to sync. Empty = deny all (pair first).
@@ -63,7 +73,7 @@ struct Daemon {
     /// Wrapped in Arc so it can be shared with the gossip connection handler,
     /// which runs in separate tasks and must check the allowlist on each inbound
     /// gossip connection before the gossip protocol runs.
-    allowlist: Arc<FileAllowlistStorage>,
+    allowlist: Arc<AL>,
     /// Active pairing session, if any. Only one pairing session at a time.
     active_pairing: Option<PairingSession>,
     /// Human-readable name for this device, advertised during pairing.
@@ -72,9 +82,112 @@ struct Daemon {
     relay_url: Option<String>,
     #[allow(dead_code)]
     vault_path: PathBuf,
+    /// Cancellation token wired to the process shutdown signal. Calling
+    /// `shutdown.cancel()` causes `run_loop` to exit cleanly.
+    shutdown: CancellationToken,
 }
 
-impl Daemon {
+impl<FS: FileSystem, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
+    /// Construct a daemon from pre-built components.
+    ///
+    /// The `run()` function creates these from real filesystem paths; tests
+    /// inject in-memory equivalents directly.
+    pub(crate) fn new(
+        vault: Arc<Mutex<Vault<FS>>>,
+        sync_node: SyncNode,
+        vault_gossip: VaultGossip,
+        file_event_rx: mpsc::UnboundedReceiver<FileEvent>,
+        discovery_rx: Option<mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>>,
+        allowlist: Arc<AL>,
+        device_name: String,
+        relay_url: Option<String>,
+        vault_path: PathBuf,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            vault,
+            sync_node,
+            vault_gossip,
+            file_event_rx,
+            discovery_rx,
+            peer_registry: PeerRegistry::new(),
+            allowlist,
+            active_pairing: None,
+            device_name,
+            relay_url,
+            vault_path,
+            shutdown,
+        }
+    }
+
+    /// Run the daemon event loop until the shutdown token is cancelled.
+    ///
+    /// This is the `loop { tokio::select! { ... } }` body, extracted so tests can
+    /// drive it in a background task and inject synthetic events via channels.
+    pub(crate) async fn run_loop(&mut self) {
+        loop {
+            tokio::select! {
+                Some(event) = self.file_event_rx.recv() => {
+                    self.on_file_changed(event).await;
+                }
+
+                Some(gossip_event) = self.vault_gossip.event_rx.recv() => {
+                    match gossip_event {
+                        GossipEvent::NeighborUp(node_id) => {
+                            self.on_neighbor_up(node_id).await;
+                        }
+                        GossipEvent::NeighborDown(node_id) => {
+                            self.on_neighbor_down(node_id);
+                        }
+                        GossipEvent::ChangeReceived { from, notification } => {
+                            self.on_change_received(from, notification.path).await;
+                        }
+                        GossipEvent::AllowlistUpdate { from, peer } => {
+                            self.on_allowlist_update_received(from, peer).await;
+                        }
+                    }
+                }
+
+                Some(inbound) = self.sync_node.inbound_sync_rx.recv() => {
+                    self.on_inbound_sync(inbound).await;
+                }
+
+                Some(pairing_event) = self.sync_node.inbound_pairing_rx.recv() => {
+                    match pairing_event {
+                        PairingEvent::InboundRequest(exchange) => {
+                            self.on_inbound_pairing_request(exchange).await;
+                        }
+                        PairingEvent::PairingCompleted { peer_id, device_name } => {
+                            self.on_pairing_completed(peer_id, device_name).await;
+                        }
+                        PairingEvent::PairingFailed { peer_id, reason } => {
+                            self.on_pairing_failed(peer_id, reason);
+                        }
+                    }
+                }
+
+                Some(mesh) = async {
+                    match self.discovery_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    info!(
+                        mesh = %mesh.mesh_name,
+                        vid = %mesh.vault_id,
+                        peers = mesh.online_count,
+                        "mDNS: discovered mesh on LAN"
+                    );
+                }
+
+                _ = self.shutdown.cancelled() => {
+                    info!("Shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
     /// Check whether a peer is allowed to sync.
     ///
     /// Returns `true` only if the peer's `node_id` is in the allowlist.
@@ -609,7 +722,7 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     // Spawn mDNS discovery events into a channel so the main select loop stays uniform.
     // Discovery is native-only; the channel is None when mDNS is unavailable.
-    let mut discovery_rx: Option<tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>> = {
+    let discovery_rx: Option<tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>> = {
         use futures::StreamExt;
         use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata};
         use iroh::address_lookup::DiscoveryEvent;
@@ -659,82 +772,33 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     };
     info!(device_name = %device_name, "Device name resolved for pairing");
 
-    let mut daemon = Daemon {
-        vault: Arc::new(Mutex::new(vault)),
+    // Extract the file event receiver from the watcher for injection into Daemon.
+    let (file_event_rx, _watcher) = watcher.into_event_rx();
+
+    // Wire the cancellation token to the OS shutdown signal.
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        memory_common::shutdown_signal().await;
+        shutdown_clone.cancel();
+    });
+
+    let mut daemon = Daemon::new(
+        Arc::new(Mutex::new(vault)),
         sync_node,
         vault_gossip,
-        watcher,
-        peer_registry: PeerRegistry::new(),
+        file_event_rx,
+        discovery_rx,
         allowlist,
-        active_pairing: None,
         device_name,
-        relay_url: relay_url.as_ref().map(|u| u.to_string()),
-        vault_path: config.vault.clone(),
-    };
+        relay_url.as_ref().map(|u| u.to_string()),
+        config.vault.clone(),
+        shutdown,
+    );
 
     info!("Daemon running. Press Ctrl+C to stop.");
 
-    loop {
-        tokio::select! {
-            Some(event) = daemon.watcher.event_rx().recv() => {
-                daemon.on_file_changed(event).await;
-            }
-
-            Some(gossip_event) = daemon.vault_gossip.event_rx.recv() => {
-                match gossip_event {
-                    GossipEvent::NeighborUp(node_id) => {
-                        daemon.on_neighbor_up(node_id).await;
-                    }
-                    GossipEvent::NeighborDown(node_id) => {
-                        daemon.on_neighbor_down(node_id);
-                    }
-                    GossipEvent::ChangeReceived { from, notification } => {
-                        daemon.on_change_received(from, notification.path).await;
-                    }
-                    GossipEvent::AllowlistUpdate { from, peer } => {
-                        daemon.on_allowlist_update_received(from, peer).await;
-                    }
-                }
-            }
-
-            Some(inbound) = daemon.sync_node.inbound_sync_rx.recv() => {
-                daemon.on_inbound_sync(inbound).await;
-            }
-
-            Some(pairing_event) = daemon.sync_node.inbound_pairing_rx.recv() => {
-                match pairing_event {
-                    PairingEvent::InboundRequest(exchange) => {
-                        daemon.on_inbound_pairing_request(exchange).await;
-                    }
-                    PairingEvent::PairingCompleted { peer_id, device_name } => {
-                        daemon.on_pairing_completed(peer_id, device_name).await;
-                    }
-                    PairingEvent::PairingFailed { peer_id, reason } => {
-                        daemon.on_pairing_failed(peer_id, reason);
-                    }
-                }
-            }
-
-            Some(mesh) = async {
-                match discovery_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => None,
-                }
-            } => {
-                info!(
-                    mesh = %mesh.mesh_name,
-                    vid = %mesh.vault_id,
-                    peers = mesh.online_count,
-                    "mDNS: discovered mesh on LAN"
-                );
-            }
-
-            _ = memory_common::shutdown_signal() => {
-                info!("Shutting down");
-                break;
-            }
-        }
-    }
+    daemon.run_loop().await;
 
     // Graceful shutdown
     if let Err(e) = daemon.sync_node.shutdown().await {

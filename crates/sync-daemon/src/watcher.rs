@@ -181,6 +181,27 @@ impl FileWatcher {
         &mut self.event_rx
     }
 
+    /// Consume the watcher, returning the event receiver and the watcher itself.
+    ///
+    /// The caller must keep the returned `FileWatcher` alive (via `_watcher`) for
+    /// as long as events need to be delivered — dropping it stops the OS watcher.
+    pub fn into_event_rx(self) -> (mpsc::UnboundedReceiver<FileEvent>, Self) {
+        // We can't partially move out of self because _debouncer must stay alive,
+        // so we reconstruct with the receiver replaced by a dead channel. The actual
+        // receiver is returned to the caller.
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel();
+        // Keep dead_tx alive silently; it won't be used.
+        let _dead_tx = dead_tx;
+
+        let rx = self.event_rx;
+        let watcher = Self {
+            vault_path: self.vault_path,
+            _debouncer: self._debouncer,
+            event_rx: dead_rx,
+        };
+        (rx, watcher)
+    }
+
     /// Get the vault path.
     pub fn vault_path(&self) -> &Path {
         &self.vault_path
