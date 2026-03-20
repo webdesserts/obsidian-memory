@@ -67,7 +67,10 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// Optional mDNS discovery channel. `None` in tests (and on WASM builds).
     discovery_rx: Option<mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>>,
     /// Tracks liveness state of all peers observed in the gossip swarm.
-    peer_registry: PeerRegistry,
+    ///
+    /// Wrapped in `Arc<Mutex<...>>` so spawned tasks (QUIC sync exchanges) can
+    /// call `update_last_seen` after a successful sync without borrowing `&mut self`.
+    peer_registry: Arc<Mutex<PeerRegistry>>,
     /// Controls which peers are allowed to sync. Empty = deny all (pair first).
     ///
     /// Wrapped in Arc so it can be shared with the gossip connection handler,
@@ -110,7 +113,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             vault_gossip,
             file_event_rx,
             discovery_rx,
-            peer_registry: PeerRegistry::new(),
+            peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
             allowlist,
             active_pairing: None,
             device_name,
@@ -137,7 +140,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                             self.on_neighbor_up(node_id).await;
                         }
                         GossipEvent::NeighborDown(node_id) => {
-                            self.on_neighbor_down(node_id);
+                            self.on_neighbor_down(node_id).await;
                         }
                         GossipEvent::ChangeReceived { from, notification } => {
                             self.on_change_received(from, notification.path).await;
@@ -240,14 +243,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         drop(vault);
 
-        if self.peer_registry.alive_count() > 0 {
+        if self.peer_registry.lock().await.alive_count() > 0 {
             if let Err(e) = self.vault_gossip.broadcast_change(path).await {
                 error!("Failed to broadcast deletion of {}: {}", path, e);
             } else {
                 info!(
                     "Broadcast deletion of {} to {} peer(s)",
                     path,
-                    self.peer_registry.alive_count()
+                    self.peer_registry.lock().await.alive_count()
                 );
             }
         } else {
@@ -274,7 +277,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         drop(vault);
 
-        if self.peer_registry.alive_count() == 0 {
+        if self.peer_registry.lock().await.alive_count() == 0 {
             return;
         }
 
@@ -285,7 +288,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             info!(
                 "Broadcast change for {} to {} peer(s)",
                 path,
-                self.peer_registry.alive_count()
+                self.peer_registry.lock().await.alive_count()
             );
         }
     }
@@ -301,7 +304,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_neighbor_up(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
-        self.peer_registry.on_neighbor_up(peer_id.clone());
+        self.peer_registry.lock().await.on_neighbor_up(peer_id.clone());
 
         if !self.is_peer_allowed(&peer_id).await {
             warn!(peer = %node_id, "Peer not in allowlist, skipping sync");
@@ -324,6 +327,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // inbound sync — which can only happen if the event loop isn't blocked.
         let vault = self.vault.clone();
         let allowlist = self.allowlist.clone();
+        let peer_registry = self.peer_registry.clone();
         let endpoint = self.sync_node.endpoint.clone();
 
         tokio::spawn(async move {
@@ -347,6 +351,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             let vault = vault.lock().await;
             match vault.process_sync_message(&response_bytes).await {
                 Ok((_, modified_paths)) => {
+                    peer_registry.lock().await.update_last_seen(&peer_id);
                     if let Err(e) = allowlist.update_last_seen(&peer_id, now_ms()).await {
                         warn!("Failed to update allowlist last_seen for {}: {}", node_id, e);
                     }
@@ -368,10 +373,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 
     /// A peer left the gossip swarm.
-    fn on_neighbor_down(&mut self, node_id: EndpointId) {
+    async fn on_neighbor_down(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborDown");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
-        self.peer_registry.on_neighbor_down(&peer_id);
+        self.peer_registry.lock().await.on_neighbor_down(&peer_id);
     }
 
     /// A change notification arrived via gossip — pull the changed file via QUIC.
@@ -400,6 +405,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         let vault = self.vault.clone();
         let allowlist = self.allowlist.clone();
+        let peer_registry = self.peer_registry.clone();
         let endpoint = self.sync_node.endpoint.clone();
 
         tokio::spawn(async move {
@@ -420,6 +426,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             let vault = vault.lock().await;
             match vault.process_sync_message(&response_bytes).await {
                 Ok((_, modified_paths)) => {
+                    peer_registry.lock().await.update_last_seen(&peer_id);
                     if let Err(e) = allowlist.update_last_seen(&peer_id, now_ms()).await {
                         warn!("Failed to update allowlist last_seen for {}: {}", from, e);
                     }
@@ -499,6 +506,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // Include all alive peers plus self as mesh members.
         let mut mesh_members: Vec<PeerId> = self
             .peer_registry
+            .lock()
+            .await
             .get_alive_peers()
             .iter()
             .map(|e| e.node_id)
@@ -586,7 +595,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     info!("Applied {} file(s) from inbound sync", modified_paths.len());
                 }
 
-                self.peer_registry.update_last_seen(&inbound.remote_id);
+                self.peer_registry.lock().await.update_last_seen(&inbound.remote_id);
                 if let Err(e) = self.allowlist.update_last_seen(&inbound.remote_id, now_ms()).await {
                     warn!("Failed to update allowlist last_seen for {}: {}", inbound.remote_id, e);
                 }

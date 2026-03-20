@@ -50,6 +50,7 @@ mod daemon_integration {
     struct TestDaemon {
         vault: Arc<Mutex<Vault<Arc<InMemoryFs>>>>,
         fs: Arc<InMemoryFs>,
+        #[allow(dead_code)]
         allowlist: Arc<InMemoryAllowlist>,
         /// Send file events into the daemon's event loop.
         file_event_tx: mpsc::UnboundedSender<FileEvent>,
