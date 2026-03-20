@@ -13,17 +13,15 @@ mod sync_workflow {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use iroh::{EndpointAddr, RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
-    use iroh_gossip::{Gossip, net::GOSSIP_ALPN};
-    use iroh::protocol::Router;
+    use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
     use tokio::sync::Mutex;
 
-    use sync_core::allowlist::AllowedPeer;
+    use sync_core::allowlist::{AllowedPeer, AllowlistStorage, InMemoryAllowlist};
     use sync_core::fs::{FileSystem, InMemoryFs};
     use sync_core::network::{
-        SyncNode, SYNC_ALPN,
+        SyncNode,
         gossip::{GossipEvent, VaultGossip},
-        streams::{InboundSyncRequest, SyncStreamHandler, connect_and_sync_raw},
+        streams::{InboundSyncRequest, connect_and_sync_raw},
     };
     use sync_core::peer_id::VaultId;
     use sync_core::{PeerRegistry, Vault};
@@ -56,6 +54,8 @@ mod sync_workflow {
         #[allow(dead_code)]
         peer_registry: PeerRegistry,
         fs: Arc<InMemoryFs>,
+        /// Allowlist controlling which peers this device accepts sync requests from.
+        allowlist: Arc<InMemoryAllowlist>,
         /// Inbound QUIC sync requests. Pass to `spawn_inbound_handler` to start
         /// processing incoming sync connections.
         inbound_sync_rx: tokio::sync::mpsc::UnboundedReceiver<InboundSyncRequest>,
@@ -63,41 +63,26 @@ mod sync_workflow {
 
     /// Build a `TestDevice` from a seed byte.
     ///
-    /// Creates a fresh `InMemoryFs`, initializes a Vault, and constructs a
-    /// relay-disabled iroh node suitable for local in-process testing.
+    /// Creates a fresh `InMemoryFs`, initializes a Vault, and constructs an iroh
+    /// node using the real `SyncNode::new()` constructor (same code path as
+    /// production). A `MemoryLookup` is added for direct in-process connectivity.
     ///
     /// No gossip subscription is created here — tests create subscriptions explicitly
     /// via `sync_node.join_vault_gossip(...)` so each device has exactly one.
     async fn make_device(seed_byte: u8) -> anyhow::Result<TestDevice> {
-        use ed25519_dalek::SigningKey;
-        use iroh::{SecretKey, Endpoint};
-
         let fs = Arc::new(InMemoryFs::new());
         let vault = Vault::init(fs.clone()).await?;
         let vault = Arc::new(Mutex::new(vault));
 
-        let secret_key_bytes = seed(seed_byte);
-        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
-        let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
+        let allowlist = Arc::new(InMemoryAllowlist::new());
+        let mut sync_node = SyncNode::new(seed(seed_byte), None, allowlist.clone()).await?;
 
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await?;
+        // Add MemoryLookup for direct in-process connectivity without a relay.
+        let memory_lookup = MemoryLookup::new();
+        sync_node.endpoint.address_lookup()?.add(memory_lookup);
 
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
-
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(SYNC_ALPN.to_vec(), sync_handler)
-            .spawn();
-
-        // `new_from_parts` moves `inbound_sync_rx` into `SyncNode`. Since
-        // `SyncNode.inbound_sync_rx` is `pub`, we swap it back out so the caller
-        // can drive it from outside (mirrors how the daemon owns the rx separately).
-        let mut sync_node = SyncNode::new_from_parts(endpoint, gossip, inbound_sync_rx, router);
+        // Extract `inbound_sync_rx` from the node so the caller can drive it
+        // from outside, mirroring how the daemon owns the receiver separately.
         let (_, dead_rx) = tokio::sync::mpsc::unbounded_channel::<InboundSyncRequest>();
         let inbound_sync_rx = std::mem::replace(&mut sync_node.inbound_sync_rx, dead_rx);
 
@@ -106,12 +91,20 @@ mod sync_workflow {
             sync_node,
             peer_registry: PeerRegistry::new(),
             fs,
+            allowlist,
             inbound_sync_rx,
         })
     }
 
-    /// Wire two devices so they can dial each other directly via `MemoryLookup`.
-    fn connect_devices(a: &TestDevice, b: &TestDevice) -> anyhow::Result<()> {
+    /// Wire two devices so they can dial each other directly via `MemoryLookup`,
+    /// and pre-populate each device's allowlist with the other's PeerId.
+    ///
+    /// Tests that need an *unauthorized* device should call this only for the
+    /// authorized pair, leaving the unauthorized device's allowlist empty or
+    /// adding a different (unrelated) peer.
+    async fn connect_devices(a: &TestDevice, b: &TestDevice) -> anyhow::Result<()> {
+        use sync_core::peer_id::PeerId;
+
         let addr_a = a.sync_node.endpoint.addr();
         let addr_b = b.sync_node.endpoint.addr();
 
@@ -122,6 +115,13 @@ mod sync_workflow {
         let lookup_b = MemoryLookup::new();
         lookup_b.add_endpoint_info(addr_a.clone());
         b.sync_node.endpoint.address_lookup()?.add(lookup_b);
+
+        // Pre-populate each allowlist with the other's PeerId so gossip and sync
+        // requests are accepted between paired devices.
+        let peer_a = PeerId::from_bytes(*a.sync_node.node_id().as_bytes());
+        let peer_b = PeerId::from_bytes(*b.sync_node.node_id().as_bytes());
+        a.allowlist.add_peer(peer_b, "device-b").await?;
+        b.allowlist.add_peer(peer_a, "device-a").await?;
 
         Ok(())
     }
@@ -155,16 +155,25 @@ mod sync_workflow {
 
     /// Spawn a background task that processes all inbound sync requests for a device.
     ///
-    /// Each request passes through the vault's `process_sync_message`. If the vault
-    /// produces a response (as it does for `SyncRequest` → `SyncExchange`), it is
-    /// sent back via `reply_tx`. This mirrors exactly what the daemon's
-    /// `on_inbound_sync` does.
+    /// Each request is first checked against the allowlist, mirroring the daemon's
+    /// `on_inbound_sync` behavior: if the remote peer is not in the allowlist,
+    /// `reply_tx` is dropped to close the stream without a response. Allowed
+    /// requests are forwarded to the vault's `process_sync_message`.
     fn spawn_inbound_handler(
         vault: Arc<Mutex<Vault<Arc<InMemoryFs>>>>,
+        allowlist: Arc<InMemoryAllowlist>,
         mut inbound_rx: tokio::sync::mpsc::UnboundedReceiver<InboundSyncRequest>,
     ) {
         tokio::spawn(async move {
             while let Some(req) = inbound_rx.recv().await {
+                // Deny peers not in the allowlist — same logic as the daemon's on_inbound_sync.
+                let allowed = allowlist.is_allowed(&req.remote_id).await.unwrap_or(false);
+                if !allowed {
+                    // Dropping reply_tx closes the QUIC stream without a response.
+                    drop(req.reply_tx);
+                    continue;
+                }
+
                 let vault = vault.lock().await;
                 match vault.process_sync_message(&req.message_bytes).await {
                     Ok((Some(response_bytes), _)) => {
@@ -213,7 +222,7 @@ mod sync_workflow {
         let device_a = make_device(1).await?;
         let device_b = make_device(2).await?;
 
-        connect_devices(&device_a, &device_b)?;
+        connect_devices(&device_a, &device_b).await?;
 
         // Each device subscribes to exactly one gossip topic. A subscribes first
         // (empty bootstrap), B subscribes second (bootstrapping off A).
@@ -233,7 +242,7 @@ mod sync_workflow {
         .await;
 
         // Drive A's inbound QUIC handler so B can pull from A.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.inbound_sync_rx);
+        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
 
         // A writes a file and indexes the change.
         device_a.fs.write("notes/hello.md", b"# Hello World").await?;
@@ -299,7 +308,7 @@ mod sync_workflow {
         let device_a = make_device(3).await?;
         let device_b = make_device(4).await?;
 
-        connect_devices(&device_a, &device_b)?;
+        connect_devices(&device_a, &device_b).await?;
 
         let mut gossip_a = subscribe_gossip(&device_a).await?;
         let mut gossip_b = subscribe_gossip_via(&device_b, &device_a).await?;
@@ -317,8 +326,8 @@ mod sync_workflow {
         .await;
 
         // Wire inbound handlers on both sides so either can act as QUIC responder.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.inbound_sync_rx);
-        spawn_inbound_handler(device_b.vault.clone(), device_b.inbound_sync_rx);
+        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
+        spawn_inbound_handler(device_b.vault.clone(), device_b.allowlist.clone(), device_b.inbound_sync_rx);
 
         let addr_a: EndpointAddr = device_a.sync_node.endpoint.addr();
 
@@ -414,21 +423,37 @@ mod sync_workflow {
 
     /// An unrecognized device is denied when the allowlist is non-empty.
     ///
-    /// This mirrors the daemon's `on_inbound_sync` allowlist check: if the peer's
-    /// `remote_id` is not in the allowlist, `reply_tx` is dropped, closing the
-    /// QUIC stream without a response. The QUIC connection is then closed by the
-    /// server after a 30-second idle timeout. This test verifies the vault state
-    /// is unchanged after the rejected request.
+    /// This exercises the real `spawn_inbound_handler` allowlist check, which
+    /// mirrors the daemon's `on_inbound_sync`: if the peer's `remote_id` is not
+    /// in the allowlist, `reply_tx` is dropped, closing the QUIC stream without
+    /// a response. This test verifies the vault state is unchanged after a rejected
+    /// request.
     #[tokio::test]
     async fn test_unauthorized_device_rejected() -> anyhow::Result<()> {
+        use sync_core::peer_id::PeerId;
+
         let device_a = make_device(5).await?;
         let device_unknown = make_device(6).await?;
 
-        connect_devices(&device_a, &device_unknown)?;
+        // Wire direct connectivity without adding device_unknown to A's allowlist.
+        // Only add a fake peer to A's allowlist so it is non-empty (deny-all when empty
+        // is a separate invariant; here we test that a non-empty allowlist excludes
+        // unknown peers).
+        let addr_a = device_a.sync_node.endpoint.addr();
+        let addr_unknown = device_unknown.sync_node.endpoint.addr();
 
-        // A has a non-empty allowlist containing only a fake peer (not Unknown).
-        let fake_peer_id = sync_core::peer_id::PeerId::from_bytes([0xAAu8; 32]);
-        let allowlist = vec![AllowedPeer::new(fake_peer_id, "other-device")];
+        let lookup_a = MemoryLookup::new();
+        lookup_a.add_endpoint_info(addr_unknown.clone());
+        device_a.sync_node.endpoint.address_lookup()?.add(lookup_a);
+
+        let lookup_unknown = MemoryLookup::new();
+        lookup_unknown.add_endpoint_info(addr_a.clone());
+        device_unknown.sync_node.endpoint.address_lookup()?.add(lookup_unknown);
+
+        // Populate A's allowlist with a fake peer (not device_unknown) so it is
+        // non-empty — a non-empty allowlist denies all unlisted peers.
+        let fake_peer_id = PeerId::from_bytes([0xAAu8; 32]);
+        device_a.allowlist.add_peer(fake_peer_id, "other-device").await?;
 
         // Write a file to A's vault so there's something to protect.
         device_a.fs.write("notes/private.md", b"secret").await?;
@@ -437,29 +462,10 @@ mod sync_workflow {
             vault.on_file_changed("notes/private.md").await?;
         }
 
-        // Drive A's inbound handler with allowlist enforcement.
-        let vault_a = device_a.vault.clone();
-        let allowlist_clone = allowlist.clone();
-        tokio::spawn(async move {
-            let mut rx = device_a.inbound_sync_rx;
-            while let Some(req) = rx.recv().await {
-                let allowed = allowlist_clone.is_empty()
-                    || allowlist_clone.iter().any(|p| p.node_id == req.remote_id);
-                if !allowed {
-                    // Dropping reply_tx closes the QUIC stream without a response.
-                    // The server-side accept() then idles until connection.closed().
-                    drop(req.reply_tx);
-                    continue;
-                }
-                let vault = vault_a.lock().await;
-                if let Ok((Some(resp), _)) = vault.process_sync_message(&req.message_bytes).await {
-                    let _ = req.reply_tx.send(resp);
-                }
-            }
-        });
+        // Drive A's inbound handler using the real allowlist enforcement.
+        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
 
         // Unknown device tries to sync with A.
-        let addr_a: EndpointAddr = device_a.sync_node.endpoint.addr();
         let request_bytes = {
             let vault = device_unknown.vault.lock().await;
             vault.prepare_sync_request().await?
@@ -514,7 +520,7 @@ mod sync_workflow {
         let device_a = make_device(7).await?;
         let device_b = make_device(8).await?;
 
-        connect_devices(&device_a, &device_b)?;
+        connect_devices(&device_a, &device_b).await?;
 
         let mut gossip_a = subscribe_gossip(&device_a).await?;
         let mut gossip_b = subscribe_gossip_via(&device_b, &device_a).await?;
@@ -581,14 +587,14 @@ mod sync_workflow {
             vault.on_file_changed("notes/offline-edit.md").await?;
         }
 
-        connect_devices(&device_a, &device_b)?;
+        connect_devices(&device_a, &device_b).await?;
 
         // A subscribes first (empty bootstrap), B subscribes second (bootstrapping off A).
         let _gossip_a = subscribe_gossip(&device_a).await?;
         let mut gossip_b = subscribe_gossip_via(&device_b, &device_a).await?;
 
         // Wire A's inbound handler so B can pull from A when NeighborUp fires.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.inbound_sync_rx);
+        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
 
         // B waits to see A as a neighbor, then initiates a full sync to pull A's files.
         wait_for_gossip(

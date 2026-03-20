@@ -114,35 +114,6 @@ pub struct SyncNode {
 }
 
 impl SyncNode {
-    /// Construct a `SyncNode` from pre-built components.
-    ///
-    /// Intended for tests that need to control exactly how the endpoint,
-    /// gossip, and router are configured (e.g., relay-disabled local testing).
-    /// Normal callers should use [`SyncNode::new`] instead.
-    ///
-    /// Pairing is disabled in this constructor — `inbound_pairing_rx` will
-    /// never yield events. Use `new_from_parts_with_pairing` if you need it.
-    pub fn new_from_parts(
-        endpoint: Endpoint,
-        gossip: Gossip,
-        inbound_sync_rx: InboundSyncRx,
-        router: Router,
-    ) -> Self {
-        // Provide a dummy pairing channel that never yields (native only).
-        #[cfg(feature = "native")]
-        let (_tx, inbound_pairing_rx) = tokio::sync::mpsc::unbounded_channel::<PairingEvent>();
-        Self {
-            endpoint,
-            gossip,
-            inbound_sync_rx,
-            #[cfg(feature = "native")]
-            inbound_pairing_rx,
-            router,
-            #[cfg(feature = "native")]
-            mdns: None,
-        }
-    }
-
     /// Create a new SyncNode from an ed25519 secret key.
     ///
     /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
@@ -263,58 +234,6 @@ impl SyncNode {
             gossip,
             inbound_sync_rx,
             router,
-        })
-    }
-
-    /// Create a SyncNode for testing with relay disabled.
-    ///
-    /// Both endpoints must be on the same machine. Provide each other's
-    /// `EndpointAddr` via a `MemoryLookup` so they can dial directly.
-    ///
-    /// NOTE: Test nodes register gossip directly without AllowlistGossipHandler.
-    /// This means gossip connections in tests are not allowlist-filtered. This is
-    /// intentional — test peers are co-created and don't need allowlist enforcement.
-    #[cfg(test)]
-    pub async fn new_for_test(secret_key_bytes: [u8; 32]) -> Result<Self> {
-        use iroh::address_lookup::memory::MemoryLookup;
-
-        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
-        let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
-
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await
-            .context("Failed to create iroh test endpoint")?;
-
-        let memory_lookup = MemoryLookup::new();
-        endpoint.address_lookup()?.add(memory_lookup);
-
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
-
-        #[cfg(feature = "native")]
-        let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
-
-        let router = {
-            let builder = Router::builder(endpoint.clone())
-                .accept(GOSSIP_ALPN, gossip.clone())
-                .accept(SYNC_ALPN.to_vec(), sync_handler);
-            #[cfg(feature = "native")]
-            let builder = builder.accept(PAIRING_ALPN.to_vec(), pairing_handler);
-            builder.spawn()
-        };
-
-        Ok(Self {
-            endpoint,
-            gossip,
-            inbound_sync_rx,
-            #[cfg(feature = "native")]
-            inbound_pairing_rx,
-            router,
-            #[cfg(feature = "native")]
-            mdns: None,
         })
     }
 

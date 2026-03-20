@@ -10,21 +10,20 @@ mod network_integration {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use std::sync::Arc;
+
     use iroh::{
-        EndpointAddr, RelayMode,
+        EndpointAddr,
         address_lookup::memory::MemoryLookup,
-        endpoint::presets,
     };
-    use iroh_gossip::{Gossip, net::GOSSIP_ALPN};
-    use iroh::protocol::Router;
+    use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
     use sync_core::network::{
         gossip::GossipEvent,
-        streams::{connect_and_sync_raw, SyncStreamHandler},
+        streams::connect_and_sync_raw,
         SyncNode,
     };
-    use sync_core::network::SYNC_ALPN;
+    use sync_core::peer_id::{PeerId, VaultId};
     use sync_core::sync::SyncMessage;
-    use sync_core::peer_id::VaultId;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -35,10 +34,20 @@ mod network_integration {
 
     /// Create a pair of `SyncNode`s that can reach each other directly (no relay).
     ///
-    /// Returns `(node_a, node_b, addr_a, addr_b)`.
+    /// Returns `(node_a, node_b, addr_a, addr_b)`. Both nodes are pre-populated
+    /// in each other's allowlists so gossip connections are accepted.
     async fn make_test_pair() -> anyhow::Result<(SyncNode, SyncNode, EndpointAddr, EndpointAddr)> {
-        let node_a = make_test_node(seed(1)).await?;
-        let node_b = make_test_node(seed(2)).await?;
+        let allowlist_a = Arc::new(InMemoryAllowlist::new());
+        let allowlist_b = Arc::new(InMemoryAllowlist::new());
+
+        let node_a = make_test_node(seed(1), allowlist_a.clone()).await?;
+        let node_b = make_test_node(seed(2), allowlist_b.clone()).await?;
+
+        // Pre-populate each allowlist with the other peer's id.
+        let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
+        let peer_b = PeerId::from_bytes(*node_b.node_id().as_bytes());
+        allowlist_a.add_peer(peer_b, "node-b").await?;
+        allowlist_b.add_peer(peer_a, "node-a").await?;
 
         let addr_a = node_a.endpoint.addr();
         let addr_b = node_b.endpoint.addr();
@@ -55,29 +64,19 @@ mod network_integration {
         Ok((node_a, node_b, addr_a, addr_b))
     }
 
-    /// Build a `SyncNode` with relay disabled for local testing.
-    async fn make_test_node(secret_key_bytes: [u8; 32]) -> anyhow::Result<SyncNode> {
-        use ed25519_dalek::SigningKey;
-        use iroh::{SecretKey, Endpoint};
-
-        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
-        let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
-
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .relay_mode(RelayMode::Disabled)
-            .bind()
-            .await?;
-
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
-
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(SYNC_ALPN.to_vec(), sync_handler)
-            .spawn();
-
-        Ok(SyncNode::new_from_parts(endpoint, gossip, inbound_sync_rx, router))
+    /// Build a `SyncNode` using the real `SyncNode::new()` constructor.
+    ///
+    /// Uses `RelayMode::Default` (same as production) but adds a `MemoryLookup`
+    /// so peers can dial each other directly without hitting a relay server.
+    async fn make_test_node<A: sync_core::allowlist::AllowlistStorage + std::fmt::Debug + 'static>(
+        secret_key_bytes: [u8; 32],
+        allowlist: std::sync::Arc<A>,
+    ) -> anyhow::Result<SyncNode> {
+        let node = SyncNode::new(secret_key_bytes, None, allowlist).await?;
+        // Add MemoryLookup for direct in-process connectivity without relay.
+        let memory_lookup = MemoryLookup::new();
+        node.endpoint.address_lookup()?.add(memory_lookup);
+        Ok(node)
     }
 
     // ── SyncNode construction ─────────────────────────────────────────────────
@@ -85,8 +84,8 @@ mod network_integration {
     /// Nodes created from different seeds must have distinct `EndpointId`s.
     #[tokio::test]
     async fn sync_node_has_unique_id_per_key() -> anyhow::Result<()> {
-        let node_a = make_test_node(seed(10)).await?;
-        let node_b = make_test_node(seed(20)).await?;
+        let node_a = make_test_node(seed(10), Arc::new(InMemoryAllowlist::new())).await?;
+        let node_b = make_test_node(seed(20), Arc::new(InMemoryAllowlist::new())).await?;
 
         assert_ne!(node_a.node_id(), node_b.node_id());
         Ok(())
@@ -95,8 +94,8 @@ mod network_integration {
     /// A node created from the same seed always produces the same `EndpointId`.
     #[tokio::test]
     async fn sync_node_deterministic_from_seed() -> anyhow::Result<()> {
-        let node_a = make_test_node(seed(42)).await?;
-        let node_b = make_test_node(seed(42)).await?;
+        let node_a = make_test_node(seed(42), Arc::new(InMemoryAllowlist::new())).await?;
+        let node_b = make_test_node(seed(42), Arc::new(InMemoryAllowlist::new())).await?;
 
         assert_eq!(node_a.node_id(), node_b.node_id());
         Ok(())
@@ -347,12 +346,19 @@ mod network_integration {
     #[tokio::test]
     async fn broadcast_allowlist_update_round_trips() -> anyhow::Result<()> {
         use sync_core::allowlist::AllowedPeer;
-        use sync_core::peer_id::PeerId;
-        use sync_core::network::gossip::GossipEvent;
 
         // Use unique seeds to avoid key collisions with other tests running concurrently.
-        let node_a = make_test_node(seed(50)).await?;
-        let node_b = make_test_node(seed(51)).await?;
+        let allowlist_a = Arc::new(InMemoryAllowlist::new());
+        let allowlist_b = Arc::new(InMemoryAllowlist::new());
+
+        let node_a = make_test_node(seed(50), allowlist_a.clone()).await?;
+        let node_b = make_test_node(seed(51), allowlist_b.clone()).await?;
+
+        // Pre-populate each allowlist with the other peer's id.
+        let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
+        let peer_b = PeerId::from_bytes(*node_b.node_id().as_bytes());
+        allowlist_a.add_peer(peer_b, "node-b").await?;
+        allowlist_b.add_peer(peer_a, "node-a").await?;
 
         let addr_a = node_a.endpoint.addr();
         let addr_b = node_b.endpoint.addr();
