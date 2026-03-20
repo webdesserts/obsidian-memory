@@ -114,3 +114,17 @@ Feature: Peer Discovery and Sync
     When an unpaired device broadcasts a change notification
     Then the mesh members should reject the notification
     And no sync should be performed for that message
+
+  # --- Security ---
+
+  Scenario: Unpaired device cannot sync even on the same network
+    Given a device has sync enabled but has never paired
+    When another device discovers it via mDNS
+    And attempts to sync without pairing
+    Then the sync request should be rejected
+
+  Scenario: Non-allowlisted device cannot join gossip
+    Given Device A has a non-empty allowlist
+    When an unknown device tries to connect via gossip
+    Then the gossip connection should be rejected
+    And the unknown device should not receive change notifications

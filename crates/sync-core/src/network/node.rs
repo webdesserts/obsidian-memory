@@ -270,6 +270,10 @@ impl SyncNode {
     ///
     /// Both endpoints must be on the same machine. Provide each other's
     /// `EndpointAddr` via a `MemoryLookup` so they can dial directly.
+    ///
+    /// NOTE: Test nodes register gossip directly without AllowlistGossipHandler.
+    /// This means gossip connections in tests are not allowlist-filtered. This is
+    /// intentional — test peers are co-created and don't need allowlist enforcement.
     #[cfg(test)]
     pub async fn new_for_test(secret_key_bytes: [u8; 32]) -> Result<Self> {
         use iroh::address_lookup::memory::MemoryLookup;

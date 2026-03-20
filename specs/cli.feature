@@ -71,11 +71,6 @@ Feature: CLI Commands
     When I run `memory mcp up --vault ~/notes --listen 0.0.0.0:8080`
     Then the MCP server should listen on 0.0.0.0:8080
 
-  Scenario: Sync daemon with bootstrap peers
-    Given a vault exists at "/home/user/notes"
-    When I run `memory sync up --vault /home/user/notes --bootstrap ws://peer:8080`
-    Then the sync daemon should connect to ws://peer:8080 on startup
-
   Scenario: Sync daemon with advertised address
     Given a vault exists at "/home/user/notes"
     When I run `memory sync up --vault /home/user/notes --advertise ws://my.server.com:8080`

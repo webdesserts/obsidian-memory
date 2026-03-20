@@ -194,13 +194,13 @@ async fn test_health_endpoint() {
 }
 
 // ============================================================================
-// Allowlist Enforcement Tests (Open-Until-First-Pair)
+// Allowlist Enforcement Tests (Deny-All-When-Empty)
 // ============================================================================
 
 /// A helper implementing the same allowlist gate logic as the daemon.
 ///
 /// Returns `true` if the peer should be allowed to sync, mirroring the
-/// "open until first pair" invariant enforced in `on_neighbor_up` and
+/// deny-all-when-empty invariant enforced in `on_neighbor_up` and
 /// `on_inbound_sync`.
 async fn is_sync_allowed(
     storage: &sync_daemon::FileAllowlistStorage,
@@ -208,26 +208,26 @@ async fn is_sync_allowed(
 ) -> bool {
     use sync_core::allowlist::AllowlistStorage;
     let peers = storage.list_peers().await.unwrap_or_default();
-    // Empty allowlist = open to all. Non-empty = only listed peers.
-    peers.is_empty() || peers.iter().any(|p| &p.node_id == peer_id)
+    // Empty allowlist = deny all. Non-empty = only listed peers.
+    peers.iter().any(|p| &p.node_id == peer_id)
 }
 
-/// With an empty allowlist (no peers paired yet), any peer should be allowed
-/// to sync — this is the initial "open" state before first pairing.
+/// With an empty allowlist (no peers paired yet), all peers should be denied —
+/// a device must be explicitly paired before it can sync.
 #[tokio::test]
-async fn allowlist_empty_allows_all_peers() {
+async fn empty_allowlist_denies_all_peers() {
     let dir = TempDir::new().unwrap();
     let storage = sync_daemon::FileAllowlistStorage::new(dir.path());
     let peer_a = sync_core::PeerId::generate();
     let peer_b = sync_core::PeerId::generate();
 
     assert!(
-        is_sync_allowed(&storage, &peer_a).await,
-        "empty allowlist should allow peer A"
+        !is_sync_allowed(&storage, &peer_a).await,
+        "empty allowlist should deny peer A"
     );
     assert!(
-        is_sync_allowed(&storage, &peer_b).await,
-        "empty allowlist should allow peer B"
+        !is_sync_allowed(&storage, &peer_b).await,
+        "empty allowlist should deny peer B"
     );
 }
 
@@ -254,10 +254,10 @@ async fn allowlist_nonempty_allows_only_listed_peers() {
     );
 }
 
-/// Removing the last peer from the allowlist returns to the open state,
-/// allowing any peer again.
+/// Removing the last peer from the allowlist returns to deny-all —
+/// no peer can sync until another pairing is completed.
 #[tokio::test]
-async fn allowlist_reverts_to_open_when_emptied() {
+async fn empty_allowlist_denies_after_removal() {
     use sync_core::allowlist::AllowlistStorage;
 
     let dir = TempDir::new().unwrap();
@@ -272,10 +272,10 @@ async fn allowlist_reverts_to_open_when_emptied() {
         "unlisted peer should be blocked while allowlist is non-empty"
     );
 
-    // Remove it — allowlist is empty again, open state restored.
+    // Remove it — allowlist is empty again, deny-all state.
     storage.remove_peer(&peer_a).await.unwrap();
     assert!(
-        is_sync_allowed(&storage, &other).await,
-        "any peer should be allowed after allowlist is emptied"
+        !is_sync_allowed(&storage, &other).await,
+        "any peer should be denied after allowlist is emptied"
     );
 }
