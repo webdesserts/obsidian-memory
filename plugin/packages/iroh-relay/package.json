@@ -1,0 +1,22 @@
+{
+  "name": "@webdesserts/iroh-relay",
+  "version": "0.1.0",
+  "description": "TypeScript iroh-compatible relay server",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "author": "webdesserts",
+  "license": "MIT",
+  "dependencies": {
+    "@noble/hashes": "^1.7.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}

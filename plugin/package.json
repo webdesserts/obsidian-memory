@@ -3,6 +3,9 @@
   "version": "0.3.4",
   "description": "P2P vault synchronization for Obsidian using Loro CRDTs",
   "main": "main.js",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "npm run build:wasm && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
@@ -31,7 +34,6 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "@types/ws": "^8.18.1",
-    "ws": "^8.18.3"
+    "@webdesserts/iroh-relay": "*"
   }
 }
