@@ -34,6 +34,7 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "@webdesserts/iroh-relay": "*"
+    "@webdesserts/iroh-relay": "*",
+    "smol-toml": "^1.6.0"
   }
 }
