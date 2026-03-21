@@ -71,11 +71,11 @@ Feature: Peer Discovery and Sync
     Then the sync request should be rejected
     And an error should be logged
 
-  Scenario: Open-until-first-pair: mesh accepts all before any pairing
+  Scenario: Empty allowlist denies all sync requests
     Given no devices have been paired yet
     When any device attempts to sync
-    Then the sync request should be accepted
-    And after the first pairing, all future sync requests require allowlist membership
+    Then the sync request should be rejected
+    And pairing is required before any sync can occur
 
   Scenario: Allowlist is propagated to all mesh members
     Given two devices are already paired with each other
@@ -103,11 +103,18 @@ Feature: Peer Discovery and Sync
     Then a full sync should be triggered automatically
     And both devices should converge to the same vault state
 
-  Scenario: Sync works over relay when direct connection is unavailable
+  Scenario: Sync works over self-hosted relay when direct connection is unavailable
     Given two paired devices cannot connect directly (NAT or different networks)
-    And a relay server is configured
+    And a self-hosted relay server is configured (daemon embedded relay or plugin relay)
     Then sync should succeed via the relay
     And the protocol behaves identically to direct QUIC sync
+    And no traffic routes through public relay infrastructure
+
+  Scenario: Daemon never uses public relay servers
+    Given a daemon is running
+    When the sync node is created
+    Then it should use RelayMode::Disabled or the daemon's own embedded relay
+    And no traffic should route through iroh's public relay infrastructure
 
   Scenario: Unpaired device cannot trigger a sync via gossip
     Given the mesh has paired devices

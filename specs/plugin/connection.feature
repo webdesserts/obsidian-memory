@@ -57,3 +57,44 @@ Feature: Plugin Connection
     When the user removes it
     Then the device should be removed from the local allowlist
     And it should no longer be able to sync with this vault
+
+  # --- Relay ---
+
+  Scenario: Plugin never connects to public relay servers
+    Given the plugin is configured with the no-public-relays policy
+    When the plugin creates an iroh sync node
+    Then the node should use RelayMode::Disabled or a self-hosted relay
+    And no traffic should route through iroh's public relay infrastructure
+
+  Scenario: Plugin starts its own relay when daemon relay is unavailable
+    Given no daemon is running (no relay_url in daemon.toml)
+    When the plugin starts networking
+    Then it should start a local iroh-compatible relay server on a dynamic port
+    And use that relay URL for its sync node
+
+  Scenario: Plugin uses daemon relay when available
+    Given a daemon is running with an embedded relay
+    And daemon.toml contains a relay_url
+    When the plugin starts networking
+    Then it should use the daemon's relay URL for its sync node
+    And not start its own relay server
+
+  Scenario: Plugin relay shuts down cleanly on plugin unload
+    Given the plugin is hosting its own relay server
+    When the plugin is unloaded or Obsidian closes
+    Then the relay should send a Restarting frame to connected clients
+    And shut down the HTTP server gracefully
+
+  Scenario: Plugin relay startup failure does not block sync
+    Given the relay server fails to start (e.g., port bind error)
+    When the plugin starts networking
+    Then a warning should be logged
+    And the sync node should start with RelayMode::Disabled
+    And sync should still work for peers reachable via direct QUIC on LAN
+
+  Scenario: Cross-network peers with no shared relay cannot sync
+    Given two paired devices are on different networks
+    And no shared relay server is reachable from both devices
+    When the devices attempt to sync
+    Then the sync connection should fail to establish
+    And the sync panel should indicate the peer is unreachable
