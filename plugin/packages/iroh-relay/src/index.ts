@@ -8,9 +8,36 @@
  * @see https://docs.rs/iroh-relay/latest/iroh_relay/
  */
 
-// Populated in subsequent commits:
-// - varint.ts: QUIC VarInt encoding/decoding (RFC 9000 Section 16)
-// - frames.ts: 13 relay frame types (encode/decode)
-// - handshake.ts: Challenge-response authentication
-// - client-registry.ts: Connected client management + packet forwarding
-// - relay-server.ts: HTTP + WebSocket server lifecycle
+export { IrohRelayServer } from "./relay-server.js";
+export type { ServerStartResult } from "./relay-server.js";
+
+export { FrameType, serializeFrame, parseFrame } from "./frames.js";
+export type {
+  RelayFrame,
+  ServerChallengeFrame,
+  ClientAuthFrame,
+  ServerConfirmsAuthFrame,
+  ServerDeniesAuthFrame,
+  ClientToRelayDatagramFrame,
+  ClientToRelayDatagramBatchFrame,
+  RelayToClientDatagramFrame,
+  RelayToClientDatagramBatchFrame,
+  EndpointGoneFrame,
+  PingFrame,
+  PongFrame,
+  HealthFrame,
+  RestartingFrame,
+  UnknownFrame,
+} from "./frames.js";
+
+export { encodeVarInt, decodeVarInt } from "./varint.js";
+export type { VarIntDecodeResult } from "./varint.js";
+
+export type { EndpointId } from "./handshake.js";
+export {
+  generateChallenge,
+  deriveSigningChallenge,
+  verifyClientAuth,
+  publicKeyToEndpointId,
+  endpointIdToBytes,
+} from "./handshake.js";
