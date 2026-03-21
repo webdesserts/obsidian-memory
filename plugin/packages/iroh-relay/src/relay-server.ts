@@ -67,6 +67,7 @@ export class IrohRelayServer {
 
       const wss = new WebSocketServer({
         noServer: true,
+        maxPayload: 1024 * 1024, // 1MB max frame size (matches iroh's MAX_FRAME_SIZE)
         handleProtocols: (protocols) => {
           // Negotiate the iroh relay subprotocol. If the client doesn't request it,
           // handleProtocols returning false causes ws to reject with 400.
@@ -188,7 +189,7 @@ export class IrohRelayServer {
           authenticated = true;
           endpointId = id;
           this._startPingLoop(id, ws);
-        });
+        }).catch(() => ws.close(1011, "Internal error"));
         return;
       }
 

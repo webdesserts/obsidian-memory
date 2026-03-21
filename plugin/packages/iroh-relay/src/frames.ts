@@ -7,9 +7,10 @@
  * Encoding notes
  * --------------
  * Handshake frames (types 0–3) use postcard serialization in the iroh Rust implementation.
- * However, because every field in these structs is a fixed-size byte array, postcard
- * encodes them as raw bytes with no length prefix — identical to raw binary. The
- * serialization here is therefore byte-compatible with postcard.
+ * For fixed-size byte arrays ([u8; N]), postcard encodes them as raw bytes with no
+ * length prefix — identical to raw binary. This applies to ServerChallenge, ClientAuth,
+ * and ServerConfirmsAuth. However, ServerDeniesAuth contains a String, which postcard
+ * encodes as varint(len) + utf8_bytes. We handle this explicitly.
  *
  * Relay frames (types 4–12) use raw binary encoding directly.
  */
@@ -181,8 +182,15 @@ function encodePayload(frame: RelayFrame): [number, Uint8Array] {
     case FrameType.ServerConfirmsAuth:
       return [FrameType.ServerConfirmsAuth, new Uint8Array(0)];
 
-    case FrameType.ServerDeniesAuth:
-      return [FrameType.ServerDeniesAuth, encoder.encode(frame.reason)];
+    case FrameType.ServerDeniesAuth: {
+      // postcard encodes String as varint(len) + utf8_bytes
+      const reasonBytes = encoder.encode(frame.reason);
+      const lenPrefix = encodeVarInt(reasonBytes.length);
+      const buf = new Uint8Array(lenPrefix.length + reasonBytes.length);
+      buf.set(lenPrefix, 0);
+      buf.set(reasonBytes, lenPrefix.length);
+      return [FrameType.ServerDeniesAuth, buf];
+    }
 
     case FrameType.ClientToRelayDatagram: {
       const buf = new Uint8Array(33 + frame.payload.length);
@@ -255,12 +263,20 @@ export function parseFrame(buf: Uint8Array): RelayFrame {
   return decodePayload(typeCode, payload);
 }
 
+function assertMinLength(payload: Uint8Array, min: number, frameName: string): void {
+  if (payload.length < min) {
+    throw new Error(`${frameName} frame too short: expected at least ${min} bytes, got ${payload.length}`);
+  }
+}
+
 function decodePayload(typeCode: number, payload: Uint8Array): RelayFrame {
   switch (typeCode) {
     case FrameType.ServerChallenge:
+      assertMinLength(payload, 16, "ServerChallenge");
       return { type: FrameType.ServerChallenge, nonce: payload.slice(0, 16) };
 
     case FrameType.ClientAuth:
+      assertMinLength(payload, 96, "ClientAuth");
       return {
         type: FrameType.ClientAuth,
         publicKey: payload.slice(0, 32),
@@ -270,21 +286,29 @@ function decodePayload(typeCode: number, payload: Uint8Array): RelayFrame {
     case FrameType.ServerConfirmsAuth:
       return { type: FrameType.ServerConfirmsAuth };
 
-    case FrameType.ServerDeniesAuth:
-      return { type: FrameType.ServerDeniesAuth, reason: decoder.decode(payload) };
+    case FrameType.ServerDeniesAuth: {
+      // postcard encodes String as varint(len) + utf8_bytes
+      if (payload.length === 0) {
+        return { type: FrameType.ServerDeniesAuth, reason: "" };
+      }
+      const { value: reasonLen, bytesRead: lenBytes } = decodeVarInt(payload, 0);
+      return {
+        type: FrameType.ServerDeniesAuth,
+        reason: decoder.decode(payload.subarray(lenBytes, lenBytes + reasonLen)),
+      };
+    }
 
-    case FrameType.ClientToRelayDatagram: {
-      const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-      void view;
+    case FrameType.ClientToRelayDatagram:
+      assertMinLength(payload, 33, "ClientToRelayDatagram");
       return {
         type: FrameType.ClientToRelayDatagram,
         destEndpointId: payload.slice(0, 32),
         ecn: payload[32],
         payload: payload.slice(33),
       };
-    }
 
     case FrameType.ClientToRelayDatagramBatch: {
+      assertMinLength(payload, 35, "ClientToRelayDatagramBatch");
       const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
       return {
         type: FrameType.ClientToRelayDatagramBatch,
@@ -296,6 +320,7 @@ function decodePayload(typeCode: number, payload: Uint8Array): RelayFrame {
     }
 
     case FrameType.RelayToClientDatagram:
+      assertMinLength(payload, 33, "RelayToClientDatagram");
       return {
         type: FrameType.RelayToClientDatagram,
         srcEndpointId: payload.slice(0, 32),
@@ -304,6 +329,7 @@ function decodePayload(typeCode: number, payload: Uint8Array): RelayFrame {
       };
 
     case FrameType.RelayToClientDatagramBatch: {
+      assertMinLength(payload, 35, "RelayToClientDatagramBatch");
       const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
       return {
         type: FrameType.RelayToClientDatagramBatch,
@@ -315,18 +341,22 @@ function decodePayload(typeCode: number, payload: Uint8Array): RelayFrame {
     }
 
     case FrameType.EndpointGone:
+      assertMinLength(payload, 32, "EndpointGone");
       return { type: FrameType.EndpointGone, endpointKey: payload.slice(0, 32) };
 
     case FrameType.Ping:
+      assertMinLength(payload, 8, "Ping");
       return { type: FrameType.Ping, data: payload.slice(0, 8) };
 
     case FrameType.Pong:
+      assertMinLength(payload, 8, "Pong");
       return { type: FrameType.Pong, data: payload.slice(0, 8) };
 
     case FrameType.Health:
       return { type: FrameType.Health, problem: decoder.decode(payload) };
 
     case FrameType.Restarting: {
+      assertMinLength(payload, 8, "Restarting");
       const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
       return {
         type: FrameType.Restarting,
