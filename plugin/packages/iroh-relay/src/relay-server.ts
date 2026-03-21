@@ -27,12 +27,10 @@ import {
 
 /** Milliseconds before we give up waiting for a `ClientAuth` frame. */
 const HANDSHAKE_TIMEOUT_MS = 5_000;
-/** How often we send a server-initiated Ping (base interval). */
+/** How often we send a server-initiated Ping (base interval). Matches iroh's PING_INTERVAL. */
 const PING_INTERVAL_MS = 15_000;
-/** Maximum random jitter added to the ping interval. */
-const PING_JITTER_MS = 5_000;
-/** How long we wait for a Pong response before closing the connection. */
-const PONG_TIMEOUT_MS = 30_000;
+/** How long we wait for a Pong response before closing the connection. Matches iroh's PING_TIMEOUT. */
+const PONG_TIMEOUT_MS = 5_000;
 
 /** Outcome returned by `start()`. */
 export interface ServerStartResult {
@@ -53,7 +51,7 @@ export class IrohRelayServer {
   private httpServer: http.Server | null = null;
   private wss: WebSocketServer | null = null;
   private registry = new ClientRegistry();
-  private pingIntervals: Map<EndpointId, ReturnType<typeof setInterval>> = new Map();
+  private pingTimeouts: Map<EndpointId, ReturnType<typeof setTimeout>> = new Map();
   private pongTimeouts: Map<EndpointId, ReturnType<typeof setTimeout>> = new Map();
 
   /**
@@ -131,9 +129,9 @@ export class IrohRelayServer {
     }
 
     // Cancel all ping/pong timers.
-    for (const timer of this.pingIntervals.values()) clearInterval(timer);
+    for (const timer of this.pingTimeouts.values()) clearTimeout(timer);
     for (const timer of this.pongTimeouts.values()) clearTimeout(timer);
-    this.pingIntervals.clear();
+    this.pingTimeouts.clear();
     this.pongTimeouts.clear();
 
     return new Promise((resolve, reject) => {
@@ -289,9 +287,10 @@ export class IrohRelayServer {
   // ---- Private: keepalive ping loop ----
 
   private _startPingLoop(endpointId: EndpointId, ws: WebSocket): void {
-    const schedule = (): void => {
-      const jitter = Math.floor(Math.random() * PING_JITTER_MS);
-      const interval = setInterval(() => {
+    const schedulePing = (): void => {
+      // Jitter: 1-5 whole seconds, matching iroh's rand::rng().random_range(1..=5)
+      const jitter = (Math.floor(Math.random() * 5) + 1) * 1000;
+      const timer = setTimeout(() => {
         if (ws.readyState !== WebSocket.OPEN) {
           this._stopPingLoop(endpointId);
           return;
@@ -305,21 +304,23 @@ export class IrohRelayServer {
           ws.close(1001, "Pong timeout");
         }, PONG_TIMEOUT_MS);
 
-        // Store so it can be cleared on Pong or disconnect.
         this.pongTimeouts.set(endpointId, pongTimeout);
+
+        // Schedule the next ping with fresh jitter.
+        schedulePing();
       }, PING_INTERVAL_MS + jitter);
 
-      this.pingIntervals.set(endpointId, interval);
+      this.pingTimeouts.set(endpointId, timer);
     };
 
-    schedule();
+    schedulePing();
   }
 
   private _stopPingLoop(endpointId: EndpointId): void {
-    const interval = this.pingIntervals.get(endpointId);
-    if (interval) {
-      clearInterval(interval);
-      this.pingIntervals.delete(endpointId);
+    const pingTimer = this.pingTimeouts.get(endpointId);
+    if (pingTimer) {
+      clearTimeout(pingTimer);
+      this.pingTimeouts.delete(endpointId);
     }
     const timeout = this.pongTimeouts.get(endpointId);
     if (timeout) {
