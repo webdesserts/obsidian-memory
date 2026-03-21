@@ -649,15 +649,22 @@ mod wasm_impl {
     impl WasmSyncNode {
         /// Create a new iroh sync node from a 32-byte ed25519 secret key.
         ///
-        /// The node connects to other peers via relay (WebSocket) since browsers
-        /// cannot bind UDP sockets directly.
+        /// `relay_url` — if provided, the node routes through that relay URL for peers
+        /// that cannot be reached directly. Pass the daemon's embedded relay URL
+        /// (from `DaemonStatus.relayUrl`) for reliable LAN and internet connectivity.
+        /// If omitted, the node uses direct QUIC only.
         #[wasm_bindgen]
-        pub async fn create(secret_key: &[u8]) -> Result<WasmSyncNode, JsError> {
+        pub async fn create(secret_key: &[u8], relay_url: Option<String>) -> Result<WasmSyncNode, JsError> {
             let key_bytes: [u8; 32] = secret_key
                 .try_into()
                 .map_err(|_| JsError::new("secret_key must be exactly 32 bytes"))?;
 
-            let node = sync_core::network::SyncNode::new(key_bytes, None)
+            let relay = relay_url
+                .map(|u| u.parse::<iroh::RelayUrl>())
+                .transpose()
+                .map_err(|e| JsError::new(&format!("Invalid relay URL: {e}")))?;
+
+            let node = sync_core::network::SyncNode::new(key_bytes, relay.as_ref())
                 .await
                 .map_err(|e| JsError::new(&format!("Failed to create sync node: {e}")))?;
 

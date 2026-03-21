@@ -42,6 +42,8 @@ export class NetworkManager extends Events {
   private vaultId: string | null = null;
   /** Bootstrap peers for initial gossip connection */
   private bootstrapPeers: string[] = [];
+  /** Relay URL from the daemon — routes QUIC through the embedded relay */
+  private relayUrl: string | null = null;
 
   /**
    * Set the vault for processing inbound sync messages.
@@ -60,19 +62,21 @@ export class NetworkManager extends Events {
    * @param secretKey - 32-byte ed25519 secret key for this node
    * @param vaultId - Vault ID (hex string) to join gossip for
    * @param bootstrapPeers - Known peer EndpointIds to bootstrap from
+   * @param relayUrl - Daemon's embedded relay URL for routing QUIC connections
    */
-  async start(secretKey: Uint8Array, vaultId: string, bootstrapPeers: string[]): Promise<void> {
+  async start(secretKey: Uint8Array, vaultId: string, bootstrapPeers: string[], relayUrl?: string): Promise<void> {
     if (this.running) return;
 
     this.secretKey = secretKey;
     this.vaultId = vaultId;
     this.bootstrapPeers = bootstrapPeers;
+    this.relayUrl = relayUrl ?? null;
 
     try {
       // Dynamic import to avoid loading WASM at module initialization
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { WasmSyncNode: WasmSyncNodeClass } = require("../wasm");
-      this.syncNode = await WasmSyncNodeClass.create(secretKey) as WasmSyncNode;
+      this.syncNode = await WasmSyncNodeClass.create(secretKey, relayUrl) as WasmSyncNode;
       log.info(`Network node created, id=${this.syncNode.nodeId()}`);
     } catch (err) {
       log.error("Failed to create sync node:", err);

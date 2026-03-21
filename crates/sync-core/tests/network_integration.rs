@@ -66,8 +66,8 @@ mod network_integration {
 
     /// Build a `SyncNode` using the real `SyncNode::new()` constructor.
     ///
-    /// Uses `RelayMode::Default` (same as production) but adds a `MemoryLookup`
-    /// so peers can dial each other directly without hitting a relay server.
+    /// Passes `None` for the relay URL (direct QUIC, no relay) and adds a `MemoryLookup`
+    /// so peers can dial each other directly in-process.
     async fn make_test_node<A: sync_core::allowlist::AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
         allowlist: std::sync::Arc<A>,

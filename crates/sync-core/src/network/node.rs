@@ -120,8 +120,8 @@ impl SyncNode {
     /// The endpoint binds to a random available port.
     ///
     /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
-    /// only this relay URL instead of the default number 0 relay servers. Pass this
-    /// when the daemon is running its own embedded relay so peers can route through it.
+    /// only this relay URL. If `None`, the endpoint uses direct QUIC only (no relay).
+    /// Pass the daemon's embedded relay URL so peers can route through it.
     ///
     /// `allowlist` — on native builds, gossip connections are pre-screened using this
     /// allowlist before the gossip protocol runs. Non-allowlisted peers are rejected
@@ -137,7 +137,7 @@ impl SyncNode {
 
         let relay_mode = match extra_relay {
             Some(url) => RelayMode::Custom(RelayMap::from_iter([url.clone()])),
-            None => RelayMode::Default,
+            None => RelayMode::Disabled,
         };
 
         let endpoint = Endpoint::builder(presets::N0)
@@ -201,7 +201,8 @@ impl SyncNode {
     /// The endpoint binds to a random available port.
     ///
     /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
-    /// only this relay URL instead of the default number 0 relay servers.
+    /// only this relay URL. If `None`, the endpoint uses direct QUIC only (no relay).
+    /// The plugin should always pass the daemon's relay URL for reliable connectivity.
     #[cfg(not(feature = "native"))]
     pub async fn new(secret_key_bytes: [u8; 32], extra_relay: Option<&RelayUrl>) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
@@ -209,7 +210,7 @@ impl SyncNode {
 
         let relay_mode = match extra_relay {
             Some(url) => RelayMode::Custom(RelayMap::from_iter([url.clone()])),
-            None => RelayMode::Default,
+            None => RelayMode::Disabled,
         };
 
         let endpoint = Endpoint::builder(presets::N0)
