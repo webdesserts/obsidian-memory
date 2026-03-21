@@ -2,4 +2,4 @@
  * Network module exports.
  */
 
-export { NetworkManager, type PeerInfo } from "./NetworkManager";
+export { NetworkManager, type PeerInfo, type RelayInfo } from "./NetworkManager";

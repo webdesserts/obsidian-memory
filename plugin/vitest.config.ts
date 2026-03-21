@@ -9,7 +9,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      // Mock the obsidian module - tests use MockObsidianVault instead
+      // Mock the obsidian module — tests use MockObsidianVault instead
       obsidian: path.resolve(__dirname, "tests/mocks/obsidian.ts"),
     },
   },

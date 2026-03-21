@@ -293,7 +293,7 @@ export default class P2PSyncPlugin extends Plugin {
     });
 
     try {
-      await this.networkManager.start(secretKey, vaultId, this.settings.bootstrapPeers);
+      await this.networkManager.start(secretKey, vaultId, this.settings.bootstrapPeers, this.app.vault.adapter);
       log.info("Network manager started");
       this.events.trigger("state-changed");
     } catch (err) {
