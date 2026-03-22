@@ -105,7 +105,7 @@ Feature: Peer Discovery and Sync
 
   Scenario: Sync works over self-hosted relay when direct connection is unavailable
     Given two paired devices cannot connect directly (NAT or different networks)
-    And a self-hosted relay server is configured (daemon embedded relay or plugin relay)
+    And a self-hosted relay server is configured (daemon embedded relay)
     Then sync should succeed via the relay
     And the protocol behaves identically to direct QUIC sync
     And no traffic routes through public relay infrastructure

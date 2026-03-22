@@ -66,31 +66,22 @@ Feature: Plugin Connection
     Then the node should use RelayMode::Disabled or a self-hosted relay
     And no traffic should route through iroh's public relay infrastructure
 
-  Scenario: Plugin starts its own relay when daemon relay is unavailable
+  Scenario: Plugin defers to daemon when detected
+    Given daemon.toml contains a relay_url
+    When the plugin starts networking
+    Then it should skip creating its own iroh node
+    And display "Syncing via daemon" in the sync panel
+
+  Scenario: Plugin syncs independently when no daemon is running
     Given no daemon is running (no relay_url in daemon.toml)
     When the plugin starts networking
-    Then it should start a local iroh-compatible relay server on a dynamic port
-    And use that relay URL for its sync node
+    Then it should create a WASM iroh node with RelayMode::Disabled
+    And sync with peers reachable via direct QUIC
 
-  Scenario: Plugin uses daemon relay when available
-    Given a daemon is running with an embedded relay
-    And daemon.toml contains a relay_url
-    When the plugin starts networking
-    Then it should use the daemon's relay URL for its sync node
-    And not start its own relay server
-
-  Scenario: Plugin relay shuts down cleanly on plugin unload
-    Given the plugin is hosting its own relay server
-    When the plugin is unloaded or Obsidian closes
-    Then the relay should send a Restarting frame to connected clients
-    And shut down the HTTP server gracefully
-
-  Scenario: Plugin relay startup failure does not block sync
-    Given the relay server fails to start (e.g., port bind error)
-    When the plugin starts networking
-    Then a warning should be logged
-    And the sync node should start with RelayMode::Disabled
-    And sync should still work for peers reachable via direct QUIC on LAN
+  Scenario: Plugin detects daemon appearing after startup
+    Given the plugin is running without a daemon
+    When a daemon starts and writes relay_url to daemon.toml
+    Then the plugin should log the daemon relay URL
 
   Scenario: Cross-network peers with no shared relay cannot sync
     Given two paired devices are on different networks

@@ -7,13 +7,15 @@
  * - Polls gossip events and inbound sync requests in a loop
  * - Routes inbound sync messages to WasmVault for processing
  * - Broadcasts file change notifications to connected peers
- * - Manages relay selection: daemon relay if available, plugin relay otherwise
+ *
+ * When a daemon is detected via daemon.toml, the plugin defers to the daemon
+ * for relay and skips creating its own iroh node. Without a daemon, the plugin
+ * creates a WASM iroh node with RelayMode::Disabled (LAN-only direct QUIC).
  */
 
 import { Events } from "obsidian";
 import { log } from "../logger";
 import type { WasmSyncNode, WasmVault } from "../wasm";
-import type { IrohRelayServer, ServerStartResult } from "@webdesserts/iroh-relay";
 import { DaemonDiscovery } from "./daemon-discovery";
 
 /** Information about a peer currently visible in the gossip swarm */
@@ -29,11 +31,9 @@ export interface PeerInfo {
 /** Information about the relay currently in use. */
 export interface RelayInfo {
   /** Where the relay URL came from. "none" means no relay is available. */
-  mode: "daemon" | "plugin" | "none";
+  mode: "daemon" | "none";
   /** The relay WebSocket URL, or null if mode is "none". */
   url: string | null;
-  /** Number of authenticated clients connected to the plugin relay (0 if daemon or none). */
-  clientCount: number;
 }
 
 /** Minimal DataAdapter interface needed for daemon.toml discovery. */
@@ -56,10 +56,7 @@ export class NetworkManager extends Events {
   private vault: WasmVault | null = null;
   private connectedPeers: Map<string, PeerInfo> = new Map();
 
-  private relayServer: IrohRelayServer | null = null;
   private daemonDiscovery: DaemonDiscovery | null = null;
-  /** The relay URL passed to the sync node at startup. */
-  private activeRelayUrl: string | null = null;
 
   /**
    * Set the vault for processing inbound sync messages.
@@ -72,12 +69,13 @@ export class NetworkManager extends Events {
   /**
    * Start the network manager.
    *
-   * Relay selection order:
-   * 1. If vaultAdapter is provided, check daemon.toml for a daemon relay URL.
-   * 2. If no daemon relay, start the plugin's embedded relay server.
-   * 3. If the plugin relay also fails, continue without relay (LAN-only QUIC).
+   * If a daemon is detected via daemon.toml, the plugin defers to it: no WASM
+   * node is created and no gossip polling runs. The daemon handles all sync.
    *
-   * After startup, DaemonDiscovery continues polling so the plugin can log
+   * If no daemon is detected, a WASM iroh node is created with
+   * RelayMode::Disabled. Peers reachable via direct QUIC on LAN will still sync.
+   *
+   * DaemonDiscovery continues polling after startup so the plugin can log
    * when the daemon relay appears or disappears.
    *
    * @param secretKey - 32-byte ed25519 secret key for this node
@@ -93,7 +91,7 @@ export class NetworkManager extends Events {
   ): Promise<void> {
     if (this.running) return;
 
-    // 1. Try daemon relay discovery
+    // Check for a running daemon with an embedded relay
     let relayUrl: string | undefined;
     if (vaultAdapter) {
       this.daemonDiscovery = new DaemonDiscovery();
@@ -101,32 +99,31 @@ export class NetworkManager extends Events {
       const daemonUrl = this.daemonDiscovery.currentRelayUrl;
       if (daemonUrl) {
         relayUrl = daemonUrl;
-        log.info(`Using daemon relay at ${relayUrl}`);
       }
     }
 
-    // 2. If no daemon relay, start the plugin's embedded relay server
-    if (!relayUrl) {
-      try {
-        const { IrohRelayServer: IrohRelayServerClass } = await import("@webdesserts/iroh-relay");
-        const server = new IrohRelayServerClass();
-        const result: ServerStartResult = await server.start();
-        this.relayServer = server;
-        relayUrl = result.url;
-        log.info(`Plugin relay started at ${relayUrl}`);
-      } catch (err) {
-        log.warn("Failed to start plugin relay, continuing without relay:", err);
-        // Fail-open: sync works via direct QUIC on LAN
-      }
+    // If daemon is available, defer to it — no WASM node needed
+    if (relayUrl) {
+      log.info(`Syncing via daemon at ${relayUrl}`);
+      this.running = true;
+
+      this.daemonDiscovery?.on("relay-changed", (url: string | null) => {
+        if (url) {
+          log.info(`Daemon relay detected at ${url}`);
+        } else {
+          log.info("Daemon relay no longer available");
+        }
+        this.trigger("relay-changed", url);
+      });
+
+      return;
     }
 
-    this.activeRelayUrl = relayUrl ?? null;
-
-    // 3. Create the sync node with the chosen relay URL (undefined = RelayMode::Disabled)
+    // No daemon — create WASM node with RelayMode::Disabled
     try {
       // Dynamic import to avoid loading WASM at module initialization
       const { WasmSyncNode: WasmSyncNodeClass } = await import("../wasm");
-      this.syncNode = await WasmSyncNodeClass.create(secretKey, relayUrl) as WasmSyncNode;
+      this.syncNode = await WasmSyncNodeClass.create(secretKey, undefined) as WasmSyncNode;
       log.info(`Network node created, id=${this.syncNode.nodeId()}`);
     } catch (err) {
       log.error("Failed to create sync node:", err);
@@ -141,20 +138,12 @@ export class NetworkManager extends Events {
       // Non-fatal — can still accept inbound connections
     }
 
-    // Subscribe to daemon relay changes that occur after startup.
-    // We can't hot-swap the relay URL on a running sync node, but we can
-    // stop the plugin relay if the daemon takes over, and log changes.
     if (this.daemonDiscovery) {
       this.daemonDiscovery.on("relay-changed", (url: string | null) => {
-        if (url && this.relayServer) {
-          // Daemon relay appeared — stop the plugin relay to free the port
-          this.relayServer.stop().catch((err) => log.warn("Error stopping plugin relay:", err));
-          this.relayServer = null;
-          log.info(`Switched to daemon relay at ${url}`);
-        } else if (!url && !this.relayServer) {
-          // Daemon relay disappeared — plugin relay is gone too. Sync will
-          // continue without relay until restart.
-          log.info("Daemon relay gone, will start plugin relay on next restart");
+        if (url) {
+          log.info(`Daemon relay detected at ${url}`);
+        } else {
+          log.info("Daemon relay no longer available");
         }
         this.trigger("relay-changed", url);
       });
@@ -166,7 +155,7 @@ export class NetworkManager extends Events {
   }
 
   /**
-   * Stop the network manager, shutting down the sync node and relay server.
+   * Stop the network manager, shutting down the sync node.
    */
   async stop(): Promise<void> {
     this.running = false;
@@ -175,15 +164,6 @@ export class NetworkManager extends Events {
     if (this.daemonDiscovery) {
       this.daemonDiscovery.stop();
       this.daemonDiscovery = null;
-    }
-
-    if (this.relayServer) {
-      try {
-        await this.relayServer.stop();
-      } catch (err) {
-        log.warn("Error stopping relay server:", err);
-      }
-      this.relayServer = null;
     }
 
     if (this.syncNode) {
@@ -197,7 +177,7 @@ export class NetworkManager extends Events {
   }
 
   /**
-   * This node's iroh EndpointId (hex string), or null if not started.
+   * This node's iroh EndpointId (hex string), or null if not started or deferred to daemon.
    */
   get nodeId(): string | null {
     try {
@@ -212,18 +192,14 @@ export class NetworkManager extends Events {
    *
    * `mode` reflects where the relay URL came from:
    * - "daemon": using the relay URL from daemon.toml
-   * - "plugin": using the plugin's own embedded relay server
-   * - "none": no relay is available (LAN-only QUIC)
+   * - "none": no relay is available (standalone LAN-only QUIC)
    */
   get relayInfo(): RelayInfo {
     const daemonUrl = this.daemonDiscovery?.currentRelayUrl ?? null;
     if (daemonUrl) {
-      return { mode: "daemon", url: daemonUrl, clientCount: 0 };
+      return { mode: "daemon", url: daemonUrl };
     }
-    if (this.relayServer) {
-      return { mode: "plugin", url: this.activeRelayUrl, clientCount: this.relayServer.clientCount };
-    }
-    return { mode: "none", url: null, clientCount: 0 };
+    return { mode: "none", url: null };
   }
 
   /**
