@@ -165,6 +165,114 @@ async fn test_native_fs_nested_directories() {
 }
 
 // ============================================================================
+// run_with_shutdown Tests
+// ============================================================================
+
+/// External cancellation during startup completes cleanly.
+///
+/// Cancels the token immediately after calling `run_with_shutdown`, before the
+/// daemon has finished its full startup sequence (gossip join, file watcher,
+/// mDNS). Verifies the function returns without hanging and without panicking.
+#[tokio::test]
+async fn test_run_with_shutdown_cancels_during_startup() {
+    use tokio_util::sync::CancellationToken;
+    use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown};
+    use tokio::time::timeout;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let vault_path = temp_dir.path().to_path_buf();
+
+    let config = DaemonRunConfig {
+        vault: vault_path,
+        identity_key: None,
+        health_listen: None,
+        relay_listen: None,
+    };
+
+    let shutdown = CancellationToken::new();
+    // Cancel immediately so the daemon sees cancellation as early as possible.
+    shutdown.cancel();
+
+    let result = timeout(
+        Duration::from_secs(15),
+        run_with_shutdown(config, shutdown),
+    )
+    .await
+    .expect("run_with_shutdown did not complete within 15s after immediate cancel");
+
+    // Ok(()) or an Err are both acceptable — the important property is that it
+    // returned at all rather than hanging indefinitely.
+    match result {
+        Ok(()) => {}
+        Err(e) => {
+            // Any error is fine here; the contract is just "returns cleanly".
+            // We log it so test output is informative on CI.
+            eprintln!("run_with_shutdown returned error on early cancel (acceptable): {e}");
+        }
+    }
+}
+
+/// A clean startup followed by external cancellation shuts down without hanging.
+///
+/// Lets the daemon fully start (health endpoint responding), then cancels and
+/// verifies the function returns within a reasonable deadline.
+#[tokio::test]
+async fn test_run_with_shutdown_cancels_after_startup() {
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+    use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown};
+    use tokio::time::timeout;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let vault_path = temp_dir.path().to_path_buf();
+
+    // Bind a random port for the health endpoint so we can poll readiness.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind health port");
+    let health_addr = listener.local_addr().expect("Failed to get local addr");
+    // Release the listener — the daemon will re-bind the same port.
+    drop(listener);
+
+    let config = DaemonRunConfig {
+        vault: vault_path,
+        identity_key: None,
+        health_listen: Some(health_addr.to_string()),
+        relay_listen: None,
+    };
+
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    let handle = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
+
+    // Poll the health endpoint until the daemon is fully started.
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{}/health", health_addr);
+    let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if tokio::time::Instant::now() >= startup_deadline {
+            panic!("daemon did not start within 20s");
+        }
+        if client.get(&health_url).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Now trigger external cancellation and wait for the daemon to exit.
+    shutdown_clone.cancel();
+
+    let result = timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("run_with_shutdown did not return within 15s after cancel")
+        .expect("tokio task panicked");
+
+    // The daemon should complete cleanly (Ok) after cancellation.
+    result.expect("run_with_shutdown returned an error after clean shutdown");
+}
+
+// ============================================================================
 // Health Endpoint Test
 // ============================================================================
 

@@ -612,11 +612,47 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 }
 
+/// Run the sync daemon with the given configuration, honoring an externally-supplied
+/// cancellation token.
+///
+/// This is the embedding entry point used by the desktop app, which needs to drive
+/// shutdown from a tray-quit click rather than an OS signal. Cancelling `shutdown`
+/// at any point — including during startup — causes the function to return cleanly.
+///
+/// The entire startup sequence is wrapped in a single `tokio::select!` so that a
+/// quit-during-startup (e.g. slow gossip join) doesn't hang the caller.
+pub async fn run_with_shutdown(config: DaemonRunConfig, shutdown: CancellationToken) -> Result<()> {
+    // Run the full daemon body (startup + event loop). If `shutdown` fires before
+    // the inner future resolves, we fall into the cancel branch and clean up.
+    tokio::select! {
+        result = run_inner(config, shutdown.clone()) => result,
+        _ = shutdown.cancelled() => {
+            // Shutdown fired before the inner future resolved — startup was interrupted.
+            // Lock and file cleanup are handled via RAII in run_inner's local scope; no
+            // explicit work needed here beyond returning cleanly.
+            info!("Daemon shutdown requested during startup — exiting cleanly");
+            Ok(())
+        }
+    }
+}
+
 /// Run the sync daemon with the given configuration.
 ///
 /// This is the main entry point for embedding the daemon in the `memory` binary.
 /// Assumes logging is already configured by the caller.
 pub async fn run(config: DaemonRunConfig) -> Result<()> {
+    let token = CancellationToken::new();
+    let signal_token = token.clone();
+    tokio::spawn(async move {
+        memory_common::shutdown_signal().await;
+        signal_token.cancel();
+    });
+    run_with_shutdown(config, token).await
+}
+
+/// Inner daemon body: lock acquisition, vault init, node startup, event loop,
+/// and graceful shutdown. Called by both `run()` and `run_with_shutdown()`.
+async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Result<()> {
     // Acquire exclusive daemon lock
     let _daemon_lock = DaemonLock::acquire(&config.vault)
         .context("Failed to acquire daemon lock — is another daemon already running on this vault?")?;
@@ -808,14 +844,6 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
 
     // Extract the file event receiver from the watcher for injection into Daemon.
     let (file_event_rx, _watcher) = watcher.into_event_rx();
-
-    // Wire the cancellation token to the OS shutdown signal.
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        memory_common::shutdown_signal().await;
-        shutdown_clone.cancel();
-    });
 
     let mut daemon = Daemon::new(
         Arc::new(Mutex::new(vault)),
