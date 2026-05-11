@@ -1,0 +1,20 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Exclude from cargo-dist builds — this crate uses Tauri's own bundling pipeline.
+[package.metadata.dist]
+dist = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+sync-daemon = { path = "../sync-daemon" }
+memory-common = { path = "../memory-common" }
+tauri = { version = "2", features = ["tray-icon"] }
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow.workspace = true
+tracing.workspace = true

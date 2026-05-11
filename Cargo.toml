@@ -10,6 +10,7 @@ members = [
     "crates/sync-core",
     "crates/sync-daemon",
     "crates/sync-wasm",
+    "crates/desktop",
 ]
 
 [workspace.package]
