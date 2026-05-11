@@ -77,7 +77,7 @@ fn main() -> Result<()> {
                 .on_menu_event(move |app, event| {
                     if event.id().as_ref() == "quit" {
                         let app = app.clone();
-                        tokio::spawn(async move {
+                        tauri::async_runtime::spawn(async move {
                             let daemon = app.state::<DaemonHandle>();
                             daemon.shutdown(Duration::from_secs(5)).await;
                             app.exit(0);

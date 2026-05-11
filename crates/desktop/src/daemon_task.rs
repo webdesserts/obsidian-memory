@@ -10,8 +10,8 @@ use anyhow::Result;
 use std::sync::Arc;
 use sync_daemon::daemon::DaemonRunConfig;
 use tauri::AppHandle;
+use tauri::async_runtime::JoinHandle;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -29,7 +29,9 @@ impl DaemonHandle {
     /// broken daemon.
     pub fn spawn(config: DaemonRunConfig, app: AppHandle) -> Self {
         let token = CancellationToken::new();
-        let join_handle = tokio::spawn(sync_daemon::daemon::run_with_shutdown(
+        // Use Tauri's async runtime so the spawn works from the setup() callback,
+        // which runs before the Tokio reactor is entered on the main thread.
+        let join_handle = tauri::async_runtime::spawn(sync_daemon::daemon::run_with_shutdown(
             config,
             token.clone(),
         ));
@@ -38,7 +40,7 @@ impl DaemonHandle {
         let watchdog_join = join.clone();
         let watchdog_app = app.clone();
 
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             let handle = {
                 let mut guard = watchdog_join.lock().await;
                 guard.take()
