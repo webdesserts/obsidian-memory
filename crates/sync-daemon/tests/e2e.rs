@@ -168,16 +168,20 @@ async fn test_native_fs_nested_directories() {
 // run_with_shutdown Tests
 // ============================================================================
 
-/// External cancellation during startup completes cleanly.
+/// Mid-startup cancellation completes cleanly and is not treated as an error.
 ///
-/// Cancels the token immediately after calling `run_with_shutdown`, before the
-/// daemon has finished its full startup sequence (gossip join, file watcher,
-/// mDNS). Verifies the function returns without hanging and without panicking.
+/// A background task fires `token.cancel()` after 50ms — while the daemon is
+/// still in its startup sequence (vault init, iroh node creation, gossip join).
+/// This validates the actual hazard the plan described: quitting while a slow
+/// gossip join or iroh node setup is in progress shouldn't hang the caller.
+///
+/// Distinct from the "cancel after fully started" test: here the cancellation
+/// races the startup path, not the running event loop.
 #[tokio::test]
 async fn test_run_with_shutdown_cancels_during_startup() {
-    use tokio_util::sync::CancellationToken;
     use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown};
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let vault_path = temp_dir.path().to_path_buf();
@@ -190,26 +194,25 @@ async fn test_run_with_shutdown_cancels_during_startup() {
     };
 
     let shutdown = CancellationToken::new();
-    // Cancel immediately so the daemon sees cancellation as early as possible.
-    shutdown.cancel();
+    let cancel_trigger = shutdown.clone();
+
+    // Fire cancellation after a short delay so the daemon is mid-startup when
+    // it arrives — past lock acquisition and vault load, but likely still in
+    // the iroh node / gossip join sequence.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_trigger.cancel();
+    });
 
     let result = timeout(
         Duration::from_secs(15),
         run_with_shutdown(config, shutdown),
     )
     .await
-    .expect("run_with_shutdown did not complete within 15s after immediate cancel");
+    .expect("run_with_shutdown did not complete within 15s after mid-startup cancel");
 
-    // Ok(()) or an Err are both acceptable — the important property is that it
-    // returned at all rather than hanging indefinitely.
-    match result {
-        Ok(()) => {}
-        Err(e) => {
-            // Any error is fine here; the contract is just "returns cleanly".
-            // We log it so test output is informative on CI.
-            eprintln!("run_with_shutdown returned error on early cancel (acceptable): {e}");
-        }
-    }
+    // Cancel-during-startup must return Ok(()) — it is a clean exit, not an error.
+    result.expect("run_with_shutdown returned Err on mid-startup cancel; expected Ok(())");
 }
 
 /// A clean startup followed by external cancellation shuts down without hanging.

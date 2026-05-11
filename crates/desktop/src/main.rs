@@ -3,6 +3,7 @@
 
 mod daemon_task;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -12,7 +13,14 @@ use tauri::{
     Manager,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tokio::sync::Mutex;
 use tracing::info;
+
+/// Managed state wrapper so the Quit handler can take ownership of DaemonHandle.
+///
+/// DaemonHandle::shutdown() consumes self to enforce single-call semantics, so
+/// the handle is wrapped in Option and taken on the first Quit event.
+type DaemonState = Arc<Mutex<Option<DaemonHandle>>>;
 
 fn main() -> Result<()> {
     // Read the vault path from the environment — the only supported configuration
@@ -48,6 +56,8 @@ fn main() -> Result<()> {
             // Tray-only mode: suppress the dock icon so the app lives entirely
             // in the menu bar. `"windows": []` in tauri.conf.json removes the
             // main window; this call removes the Dock icon.
+            // App::set_activation_policy (on &mut App in setup()) returns (). The
+            // AppHandle variant returns Result, but the App variant used here does not.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
@@ -56,9 +66,10 @@ fn main() -> Result<()> {
             // Spawn the sync daemon and wire up the failure watchdog.
             let daemon = DaemonHandle::spawn(daemon_config, handle.clone());
 
-            // Store the daemon handle in Tauri's managed state so the Quit
-            // handler can reach it.
-            app.manage(daemon);
+            // Wrap in Arc<Mutex<Option<...>>> so the Quit handler can take
+            // ownership of DaemonHandle when calling shutdown() (which consumes self).
+            let daemon_state: DaemonState = Arc::new(Mutex::new(Some(daemon)));
+            app.manage(daemon_state);
 
             // Build the tray icon and menu.
             let menu = tauri::menu::MenuBuilder::new(app)
@@ -78,8 +89,11 @@ fn main() -> Result<()> {
                     if event.id().as_ref() == "quit" {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            let daemon = app.state::<DaemonHandle>();
-                            daemon.shutdown(Duration::from_secs(5)).await;
+                            let state = app.state::<DaemonState>();
+                            let daemon = state.lock().await.take();
+                            if let Some(d) = daemon {
+                                d.shutdown(Duration::from_secs(5)).await;
+                            }
                             app.exit(0);
                         });
                     }

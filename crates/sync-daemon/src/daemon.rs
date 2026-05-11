@@ -628,8 +628,12 @@ pub async fn run_with_shutdown(config: DaemonRunConfig, shutdown: CancellationTo
         result = run_inner(config, shutdown.clone()) => result,
         _ = shutdown.cancelled() => {
             // Shutdown fired before the inner future resolved — startup was interrupted.
-            // Lock and file cleanup are handled via RAII in run_inner's local scope; no
-            // explicit work needed here beyond returning cleanly.
+            // Lock cleanup is handled via RAII (DaemonLock drops when run_inner is
+            // cancelled). relay_url cleanup (clearing daemon.toml) is deferred: Phase 1
+            // always sets relay_listen: None so relay_url is never written here, making
+            // cleanup a no-op. TODO(phase-2): when relay_listen is wired, load
+            // daemon_config before the select! and call set_relay_url(None) here so a
+            // cancel-during-startup doesn't leave a stale relay URL in daemon.toml.
             info!("Daemon shutdown requested during startup — exiting cleanly");
             Ok(())
         }

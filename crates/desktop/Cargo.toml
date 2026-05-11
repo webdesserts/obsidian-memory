@@ -15,6 +15,6 @@ sync-daemon = { path = "../sync-daemon" }
 memory-common = { path = "../memory-common" }
 tauri = { version = "2", features = ["tray-icon"] }
 tokio.workspace = true
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
