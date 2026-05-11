@@ -16,3 +16,9 @@ crates/semantic-embeddings/models/
 # Claude Code local settings
 .claude/settings.local.json
 CLAUDE.local.md
+
+# Desktop app (Tauri)
+crates/desktop/node_modules/
+crates/desktop/frontend/node_modules/
+crates/desktop/frontend/dist/assets/
+crates/desktop/gen/
