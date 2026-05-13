@@ -719,6 +719,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
     /// Handle a failed pairing attempt.
     fn on_pairing_failed(&mut self, peer_id: PeerId, reason: String) {
+        // Notify the tray before clearing the session so the responder window can
+        // auto-close. This covers timeout, bad-code, and gossip-layer errors — the
+        // only path not covered here is an explicit user reject (handled in
+        // on_daemon_command via DaemonCommand::RejectInbound, which also calls
+        // emit_pairing_event before taking active_pairing).
+        self.emit_pairing_event(PairingUiEvent::InboundFailed {
+            reason: reason.clone(),
+        });
         // Clear the active session so a new pairing attempt can start fresh. This means
         // the user must re-initiate pairing (triggering a new code) rather than retrying
         // with the same code. Keeping the session alive for retry would require matching
@@ -799,7 +807,15 @@ pub async fn run_with_shutdown_controlled(
         }
     };
 
-    let (mut daemon, embedded_relay, mut daemon_config, vault_path, mesh_name) = startup_result?;
+    let StartupBundle {
+        mut daemon,
+        embedded_relay,
+        mut daemon_config,
+        vault_path,
+        mesh_name,
+        _daemon_lock,
+        _watcher,
+    } = startup_result?;
 
     // Wire control channels into the daemon before the loop starts.
     let (status_tx, status_rx) = watch::channel(DaemonStatus::initial());
@@ -819,6 +835,12 @@ pub async fn run_with_shutdown_controlled(
     };
 
     let handle = tokio::spawn(async move {
+        // DaemonLock and FileWatcher are moved here so they live for the duration
+        // of run_loop. The underscore prefix silences the "unused" warning while
+        // making the RAII intent explicit — both must not drop before run_loop exits.
+        let _daemon_lock = _daemon_lock;
+        let _watcher = _watcher;
+
         daemon.run_loop().await;
         // Graceful shutdown
         if let Err(e) = daemon.sync_node.shutdown().await {
@@ -876,20 +898,38 @@ pub async fn run(config: DaemonRunConfig) -> Result<()> {
     run_with_shutdown(config, token).await
 }
 
+/// Everything `startup_inner` returns to the caller after a successful startup.
+///
+/// Keeps `DaemonLock` and `FileWatcher` alive until they are explicitly moved into
+/// the `run_loop` task — if either were dropped at the call site, the OS-level lock
+/// and file watcher would stop before the daemon processes any events.
+struct StartupBundle {
+    daemon: Daemon<NativeFs, FileAllowlistStorage>,
+    embedded_relay: Option<EmbeddedRelay>,
+    daemon_config: DaemonConfig,
+    vault_path: PathBuf,
+    mesh_name: String,
+    /// Holds the exclusive flock on `.sync/daemon.lock` for the daemon's lifetime.
+    _daemon_lock: DaemonLock,
+    /// Keeps the OS-level file watcher alive; dropping it stops event delivery.
+    _watcher: FileWatcher,
+}
+
 /// Startup phase: lock acquisition, vault init, node startup.
 ///
-/// Returns the fully-initialized `Daemon` plus the components needed for
-/// graceful shutdown (`EmbeddedRelay`, `DaemonConfig`, vault path, mesh name).
-/// All startup failures surface as `Err` before the daemon is returned, so
-/// callers are guaranteed to receive a fully-operational `Daemon`.
+/// Returns a [`StartupBundle`] that includes `DaemonLock` and `FileWatcher` so
+/// the caller can move them into the spawned `run_loop` task, keeping both alive
+/// for the daemon's full lifetime. All startup failures surface as `Err` before
+/// any `StartupBundle` is materialized.
 ///
 /// Used by `run_with_shutdown_controlled`; the event loop is run by the caller.
 async fn startup_inner(
     config: &DaemonRunConfig,
     shutdown: CancellationToken,
-) -> Result<(Daemon<NativeFs, FileAllowlistStorage>, Option<EmbeddedRelay>, DaemonConfig, PathBuf, String)> {
-    // Acquire exclusive daemon lock
-    let _daemon_lock = DaemonLock::acquire(&config.vault)
+) -> Result<StartupBundle> {
+    // Acquire exclusive daemon lock — must outlive this function. It is moved into
+    // the StartupBundle and from there into the spawned run_loop task.
+    let daemon_lock = DaemonLock::acquire(&config.vault)
         .context("Failed to acquire daemon lock — is another daemon already running on this vault?")?;
 
     info!("Starting sync daemon");
@@ -1067,7 +1107,9 @@ async fn startup_inner(
     };
     info!(device_name = %device_name, "Device name resolved for pairing");
 
-    let (file_event_rx, _watcher) = watcher.into_event_rx();
+    // The watcher must outlive this function — it is moved into StartupBundle and
+    // from there into the spawned run_loop task. Dropping it would stop OS events.
+    let (file_event_rx, watcher) = watcher.into_event_rx();
 
     let daemon = Daemon::new(
         Arc::new(Mutex::new(vault)),
@@ -1082,7 +1124,15 @@ async fn startup_inner(
         shutdown,
     );
 
-    Ok((daemon, embedded_relay, daemon_config, config.vault.clone(), mesh_name))
+    Ok(StartupBundle {
+        daemon,
+        embedded_relay,
+        daemon_config,
+        vault_path: config.vault.clone(),
+        mesh_name,
+        _daemon_lock: daemon_lock,
+        _watcher: watcher,
+    })
 }
 
 /// Inner daemon body: lock acquisition, vault init, node startup, event loop,
