@@ -923,10 +923,19 @@ async fn startup_inner(
         }
     }
 
+    // Start the embedded relay before the SyncNode so we can pass its URL in.
+    // When advertised_relay_url is set, bind on relay_listen but tell peers to dial
+    // the advertised address (e.g. LAN IP instead of 0.0.0.0).
+    // Failure is non-fatal: the daemon continues without relay support.
     let embedded_relay: Option<EmbeddedRelay> = if let Some(ref addr_str) = config.relay_listen {
         match addr_str.parse() {
             Ok(bind_addr) => {
-                match EmbeddedRelay::start(bind_addr).await {
+                let relay_result = if let Some(ref adv_url) = config.advertised_relay_url {
+                    EmbeddedRelay::start_with_advertised_url(bind_addr, adv_url).await
+                } else {
+                    EmbeddedRelay::start(bind_addr).await
+                };
+                match relay_result {
                     Ok(relay) => {
                         info!(url = %relay.relay_url(), "Embedded relay started");
                         Some(relay)

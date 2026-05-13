@@ -14,13 +14,29 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Managed state wrapper so the Quit handler can take ownership of DaemonHandle.
 ///
 /// DaemonHandle::shutdown() consumes self to enforce single-call semantics, so
 /// the handle is wrapped in Option and taken on the first Quit event.
 type DaemonState = Arc<Mutex<Option<DaemonHandle>>>;
+
+/// The port the embedded iroh relay listens on.
+const RELAY_PORT: u16 = 3340;
+
+/// Detect the machine's primary LAN IP address for advertising to peers.
+///
+/// Returns `None` if detection fails (e.g. no network interface, VPN-only config).
+/// The relay still starts and binds to 0.0.0.0; it just won't advertise a reachable
+/// URL. A warning is logged once at startup.
+///
+/// On machines with multiple LAN interfaces (Wi-Fi + ethernet, VPN active), this
+/// picks the default route's interface — usually the right one. A manual override
+/// will be available in Phase 6 via a network-interface picker in the settings UI.
+fn detect_lan_ip() -> Option<std::net::IpAddr> {
+    local_ip_address::local_ip().ok()
+}
 
 fn main() -> Result<()> {
     // Read the vault path from the environment — the only supported configuration
@@ -44,12 +60,31 @@ fn main() -> Result<()> {
     info!("Starting Obsidian Memory desktop app");
     info!("Vault: {:?}", vault_path);
 
+    // Detect the LAN IP for the relay's advertised URL. The relay binds to
+    // 0.0.0.0:RELAY_PORT (all interfaces) but peers need a dialable address.
+    let advertised_relay_url = match detect_lan_ip() {
+        Some(ip) => {
+            let url = format!("http://{}:{}/", ip, RELAY_PORT);
+            info!("Relay will advertise LAN URL: {}", url);
+            Some(url)
+        }
+        None => {
+            warn!(
+                "LAN IP detection failed — relay will start but advertise 0.0.0.0:{}. \
+                 Peers on the LAN won't be able to reach the relay. \
+                 Check your network connection.",
+                RELAY_PORT
+            );
+            None
+        }
+    };
+
     let daemon_config = DaemonRunConfig {
         vault: vault_path,
         identity_key: None,
         health_listen: Some("127.0.0.1:8081".to_string()),
-        relay_listen: None,
-        advertised_relay_url: None,
+        relay_listen: Some(format!("0.0.0.0:{}", RELAY_PORT)),
+        advertised_relay_url,
     };
 
     tauri::Builder::default()
