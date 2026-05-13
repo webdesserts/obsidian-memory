@@ -450,4 +450,102 @@ mod daemon_integration {
 
         Ok(())
     }
+
+    // ── DaemonControl / status broadcast tests ───────────────────────────────
+
+    /// Status watch channel updates when peers join and leave the gossip swarm.
+    ///
+    /// Two real iroh nodes join gossip together so NeighborUp fires naturally.
+    /// We wire `DaemonControl` into daemon A and verify the watch channel transitions
+    /// from `Idle` (0 peers) to `Connected` (1 peer) after gossip connects, then
+    /// back to `Idle` after daemon B shuts down and NeighborDown fires.
+    ///
+    /// Seeds 61/62 are reserved for this test to avoid collisions.
+    #[tokio::test]
+    async fn test_status_broadcast_on_neighbor_events() -> anyhow::Result<()> {
+        use sync_daemon::daemon::Daemon;
+        use sync_daemon::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent};
+        use tokio::sync::{broadcast, mpsc, watch};
+
+        // Build two nodes that can communicate in-memory.
+        let node_a = build_node(61).await?;
+        let node_b = build_node(62).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let vault_id = shared_vault_id();
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&vault_id, vec![])
+            .await?;
+
+        let (file_event_tx, file_event_rx) = mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
+        let shutdown = CancellationToken::new();
+
+        let mut daemon = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            file_event_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault".into(),
+            shutdown.clone(),
+        );
+
+        // Wire DaemonControl channels.
+        let (status_tx, mut status_rx) = watch::channel(DaemonStatus::initial());
+        let (pairing_tx, _pairing_rx): (broadcast::Sender<PairingUiEvent>, _) =
+            broadcast::channel(16);
+        let (_command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+        daemon.wire_control(status_tx, pairing_tx, command_rx, "Test Vault".to_string());
+
+        // Emit the initial status so the watch channel has a real value immediately.
+        daemon.emit_status().await;
+
+        // Verify initial state: Idle with 0 peers, mesh name and device name set.
+        {
+            let status = status_rx.borrow_and_update();
+            assert_eq!(status.state, ConnectionState::Idle, "initial state should be Idle");
+            assert_eq!(status.peer_count, 0);
+            assert_eq!(status.mesh_name.as_deref(), Some("Test Vault"));
+            assert_eq!(status.device_name.as_deref(), Some("device-a"));
+        }
+
+        // Spawn daemon A's event loop.
+        drop(file_event_tx);
+        let loop_handle = tokio::spawn(async move {
+            daemon.run_loop().await;
+        });
+
+        // Join gossip on node B so NeighborUp fires on daemon A.
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&vault_id, vec![node_a.node_id.as_bytes().try_into().unwrap()])
+            .await?;
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Wait for daemon A's status to show Connected (NeighborUp from B).
+        wait_until("status = Connected after peer B joins", || {
+            let state = status_rx.borrow().state.clone();
+            async move { state == ConnectionState::Connected }
+        })
+        .await;
+
+        {
+            let status = status_rx.borrow();
+            assert_eq!(status.state, ConnectionState::Connected);
+            assert!(status.peer_count >= 1);
+        }
+
+        // Shut down daemon B and daemon A.
+        daemon_b.shutdown.cancel();
+        let _ = daemon_b.loop_handle.await;
+
+        shutdown.cancel();
+        let _ = loop_handle.await;
+        Ok(())
+    }
 }

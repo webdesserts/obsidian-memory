@@ -191,6 +191,7 @@ async fn test_run_with_shutdown_cancels_during_startup() {
         identity_key: None,
         health_listen: None,
         relay_listen: None,
+        advertised_relay_url: None,
     };
 
     let shutdown = CancellationToken::new();
@@ -242,6 +243,7 @@ async fn test_run_with_shutdown_cancels_after_startup() {
         identity_key: None,
         health_listen: Some(health_addr.to_string()),
         relay_listen: None,
+        advertised_relay_url: None,
     };
 
     let shutdown = CancellationToken::new();

@@ -821,6 +821,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     identity_key,
                     health_listen,
                     relay_listen,
+                    advertised_relay_url: None,
                 })
                 .await?;
                 Ok(())
@@ -856,6 +857,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 identity_key: None,
                 health_listen,
                 relay_listen: None,
+                advertised_relay_url: None,
             };
             let sync_handle = tokio::spawn(async move {
                 if let Err(e) = sync_daemon::daemon::run(sync_config).await {

@@ -41,6 +41,8 @@ impl From<Args> for DaemonRunConfig {
             identity_key: args.identity_key,
             health_listen: args.health_listen,
             relay_listen: args.relay_listen,
+            // CLI callers don't set the advertised URL — they bind and advertise the same address.
+            advertised_relay_url: None,
         }
     }
 }

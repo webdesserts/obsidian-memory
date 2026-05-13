@@ -49,6 +49,7 @@ fn main() -> Result<()> {
         identity_key: None,
         health_listen: Some("127.0.0.1:8081".to_string()),
         relay_listen: None,
+        advertised_relay_url: None,
     };
 
     tauri::Builder::default()

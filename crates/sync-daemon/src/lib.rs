@@ -10,6 +10,7 @@ pub mod http;
 pub mod key_storage;
 pub mod native_fs;
 pub mod pair;
+pub mod pair_api;
 pub mod persistence;
 pub mod relay;
 pub mod watcher;
