@@ -7,6 +7,7 @@
     "core:default",
     "core:webview:allow-create-webview-window",
     "core:event:default",
-    "core:window:allow-close"
+    "core:window:allow-close",
+    "notification:default"
   ]
 }

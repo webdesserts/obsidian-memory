@@ -3,6 +3,8 @@
 
 mod commands;
 mod daemon_task;
+mod notification;
+mod pair_events;
 mod pair_window;
 mod shutdown;
 mod tray_status;
@@ -119,8 +121,14 @@ fn main() -> Result<()> {
             // - `token` + `done_rx` → ShutdownController (for Quit handler)
             let (token, control, done_rx) = daemon.into_parts();
 
-            // Status receiver cloned before control moves into Arc.
+            // Receivers cloned/extracted before control moves into Arc.
+            //
+            // `status_rx` is a watch::Receiver (Clone), but `pairing_rx` is a
+            // broadcast::Receiver (not Clone). We resubscribe from the
+            // broadcast sender via `Receiver::resubscribe` to obtain an
+            // independent stream of pairing events for the consumer task.
             let status_rx = control.status_rx.clone();
+            let pairing_rx = control.pairing_rx.resubscribe();
 
             // Store the DaemonControl in managed state so Tauri command handlers
             // can access it via `State<ControlState>`.
@@ -202,12 +210,18 @@ fn main() -> Result<()> {
             };
             tray_status::start(handle.clone(), handles, status_rx);
 
+            // Start the pairing-events consumer. Translates daemon-side
+            // PairingUiEvents into the responder window + macOS notification.
+            pair_events::start(handle.clone(), pairing_rx);
+
             Ok(())
         })
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             commands::start_pair_discovery,
             commands::submit_pair_code,
             commands::cancel_pair_discovery,
+            commands::reject_inbound_pair,
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri application error: {e}"))?;

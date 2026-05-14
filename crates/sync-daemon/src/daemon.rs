@@ -408,9 +408,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                                 // Dedupe by vault_id: only emit on first sighting.
                                 // mDNS re-advertises every ~5s, so without this guard
                                 // the UI would receive a flood of identical events.
-                                // Matches `pair.rs`'s HashMap-based behavior — one
-                                // entry per mesh, additional peers update the entry
-                                // but do not produce new UI events.
+                                // This is stricter than `pair.rs` — the CLI tracks
+                                // additional peers in the same mesh and updates
+                                // `online_count`. Phase 1.5's UI displays only the
+                                // mesh name + a "1 online" hint, so the first sighting
+                                // is enough; a richer peer count is Phase 6 work.
                                 let mut map = discovered.lock().await;
                                 let is_new = !map.contains_key(&meta.vid);
                                 map.entry(meta.vid.clone()).or_insert(endpoint_id);

@@ -130,3 +130,26 @@ pub async fn cancel_pair_discovery(
 
     Ok(())
 }
+
+/// Reject the currently-active inbound pairing request. Idempotent.
+///
+/// Sends `DaemonCommand::RejectInbound`. The daemon drops `active_pairing`,
+/// which closes the pairing handler's reply channel and surfaces to the
+/// requesting peer as a failed pairing. Returns `Ok(())` whether or not an
+/// inbound session is currently active — the responder window can call this
+/// safely after the daemon has already failed or completed the exchange.
+#[tauri::command]
+pub async fn reject_inbound_pair(control: State<'_, ControlState>) -> Result<(), String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    control
+        .command_tx
+        .send(DaemonCommand::RejectInbound { reply: reply_tx })
+        .map_err(|_| "Daemon is not running".to_string())?;
+
+    reply_rx
+        .await
+        .map_err(|_| "Daemon disconnected before replying".to_string())?;
+
+    Ok(())
+}

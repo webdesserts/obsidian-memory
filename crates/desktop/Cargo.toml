@@ -14,9 +14,11 @@ tauri-build = { version = "2", features = [] }
 sync-daemon = { path = "../sync-daemon" }
 memory-common = { path = "../memory-common" }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 local-ip-address.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
