@@ -93,7 +93,13 @@ pub enum DaemonCommand {
         reply: mpsc::UnboundedSender<sync_core::network::discovery::DiscoveredMesh>,
     },
     /// Submit the 6-digit pairing code for the currently-selected mesh.
+    ///
+    /// `vault_id` identifies which discovered mesh to connect to. `code` is the
+    /// 6-digit numeric code shown on the responder device. The daemon resolves
+    /// the peer endpoint from the most recent discovery scan and drives the
+    /// pairing exchange. On success, the reply carries the peer's device name.
     SubmitCode {
+        vault_id: String,
         code: String,
         reply: oneshot::Sender<Result<String, String>>,
     },

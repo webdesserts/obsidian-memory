@@ -1628,6 +1628,7 @@ dependencies = [
  "anyhow",
  "local-ip-address",
  "memory-common",
+ "serde",
  "sync-daemon",
  "tauri",
  "tauri-build",

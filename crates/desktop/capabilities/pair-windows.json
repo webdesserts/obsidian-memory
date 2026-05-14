@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pair-windows",
+  "description": "Permissions granted to the pairing initiator (and later, responder) windows",
+  "windows": ["pair-initiator"],
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:event:default",
+    "core:window:allow-close"
+  ]
+}

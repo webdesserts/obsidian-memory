@@ -8,7 +8,7 @@ use iroh::EndpointId;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -20,6 +20,7 @@ use crate::pair_api::{
     ConnectionState, DaemonCommand, DaemonControl, DaemonStatus, PairingUiEvent, PeerSummary,
     PAIRING_BROADCAST_CAPACITY,
 };
+use std::collections::HashMap;
 use crate::persistence::DaemonConfig;
 use crate::relay::EmbeddedRelay;
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
@@ -33,8 +34,12 @@ use sync_core::network::{
     streams::InboundSyncRequest,
     SyncNode,
 };
-use sync_core::pairing::{PairingChallenge, PairingSession};
+use sync_core::network::pairing::pair_with_mesh_interactive;
+use sync_core::pairing::{PairingChallenge, PairingHello, PairingSession};
 use sync_core::{PeerId, PeerRegistry, Vault};
+
+/// How long the initiator window scans for nearby meshes before stopping.
+const INITIATOR_DISCOVERY_TIMEOUT_SECS: u64 = 10;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -108,6 +113,23 @@ pub struct Daemon<FS: FileSystem, AL> {
     command_rx: Option<mpsc::UnboundedReceiver<DaemonCommand>>,
     /// Name of the vault mesh, carried through for status broadcasts.
     mesh_name: Option<String>,
+    /// In-flight initiator pairing session. Holds the discovered meshes map so
+    /// `SubmitCode` can resolve `vault_id` → `EndpointId` without re-scanning,
+    /// and a cancellation token so `CancelInitiate` aborts both the discovery
+    /// task and any pairing attempt in progress. `None` between sessions.
+    active_initiator: Option<InitiatorSession>,
+}
+
+/// State tracked between `StartDiscovery` and `SubmitCode` for an in-flight
+/// initiator pairing session. The discovery task writes to `discovered` as
+/// mDNS produces results; `SubmitCode` reads it to look up the peer endpoint
+/// for the user-selected mesh.
+struct InitiatorSession {
+    /// Maps `vault_id` to the first observed peer's endpoint, used by
+    /// `SubmitCode` to dial the mesh.
+    discovered: Arc<Mutex<HashMap<String, EndpointId>>>,
+    /// Cancels the discovery scan and any in-progress pairing attempt.
+    cancel: CancellationToken,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -144,6 +166,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             pairing_tx: None,
             command_rx: None,
             mesh_name: None,
+            active_initiator: None,
         }
     }
 
@@ -293,20 +316,21 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// Dispatch a `DaemonCommand` from the desktop tray.
     async fn on_daemon_command(&mut self, cmd: DaemonCommand) {
         match cmd {
-            DaemonCommand::StartDiscovery { reply: _ } => {
-                // Placeholder: full mDNS-scan-to-channel wiring is implemented in
-                // commit 4 (initiator window). For now, accept the command silently
-                // so the type system is satisfied and Wave B can build on top.
-                debug!("DaemonCommand::StartDiscovery received (not yet implemented)");
+            DaemonCommand::StartDiscovery { reply } => {
+                self.start_initiator_discovery(reply).await;
             }
-            DaemonCommand::SubmitCode { code: _, reply } => {
-                // Placeholder: wired in commit 4 (initiator window).
-                debug!("DaemonCommand::SubmitCode received (not yet implemented)");
-                let _ = reply.send(Err("not yet implemented".to_string()));
+            DaemonCommand::SubmitCode {
+                vault_id,
+                code,
+                reply,
+            } => {
+                self.submit_initiator_code(vault_id, code, reply).await;
             }
             DaemonCommand::CancelInitiate { reply } => {
-                // Placeholder: wired in commit 4 (initiator window).
-                debug!("DaemonCommand::CancelInitiate received (not yet implemented)");
+                if let Some(session) = self.active_initiator.take() {
+                    session.cancel.cancel();
+                    info!("Initiator pairing session cancelled by user");
+                }
                 let _ = reply.send(());
             }
             DaemonCommand::RejectInbound { reply } => {
@@ -321,6 +345,158 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 let _ = reply.send(());
             }
         }
+    }
+
+    /// Begin mDNS discovery for the initiator window.
+    ///
+    /// Cancels any prior initiator session, then spawns a task that subscribes
+    /// to mDNS for `INITIATOR_DISCOVERY_TIMEOUT_SECS` and forwards each
+    /// `DiscoveredMesh` to `reply`. The same task records `vault_id` →
+    /// `EndpointId` in `active_initiator.discovered` so a subsequent
+    /// `SubmitCode` can resolve the peer without re-scanning.
+    ///
+    /// Closing `reply` (by dropping the sender at the end of the task) signals
+    /// "discovery finished" to the desktop side, which then surfaces the
+    /// `pair://discovery-finished` event to the window.
+    async fn start_initiator_discovery(
+        &mut self,
+        reply: mpsc::UnboundedSender<sync_core::network::discovery::DiscoveredMesh>,
+    ) {
+        // Replace any prior session, cancelling its in-flight tasks.
+        if let Some(prev) = self.active_initiator.take() {
+            prev.cancel.cancel();
+        }
+
+        let cancel = CancellationToken::new();
+        let discovered = Arc::new(Mutex::new(HashMap::<String, EndpointId>::new()));
+
+        self.active_initiator = Some(InitiatorSession {
+            discovered: discovered.clone(),
+            cancel: cancel.clone(),
+        });
+
+        let Some(stream) = self.sync_node.subscribe_discovery().await else {
+            debug!("mDNS discovery not available on this platform; closing reply");
+            drop(reply);
+            return;
+        };
+
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            use iroh::address_lookup::DiscoveryEvent;
+            use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata};
+
+            let deadline =
+                tokio::time::sleep(std::time::Duration::from_secs(INITIATOR_DISCOVERY_TIMEOUT_SECS));
+            futures::pin_mut!(stream);
+            futures::pin_mut!(deadline);
+
+            // Track which vault_ids we've already emitted so we don't repeat
+            // events when mDNS re-advertises a known peer.
+            let mut seen: HashMap<String, usize> = HashMap::new();
+
+            loop {
+                tokio::select! {
+                    Some(event) = stream.next() => {
+                        if let DiscoveryEvent::Discovered { endpoint_info, .. } = event {
+                            let metadata = endpoint_info
+                                .data
+                                .user_data()
+                                .and_then(|ud| {
+                                    serde_json::from_str::<MeshMetadata>(ud.as_ref()).ok()
+                                });
+
+                            if let Some(meta) = metadata {
+                                let endpoint_id = endpoint_info.endpoint_id;
+                                let mut map = discovered.lock().await;
+                                map.entry(meta.vid.clone()).or_insert(endpoint_id);
+                                drop(map);
+
+                                let count = seen.entry(meta.vid.clone()).or_insert(0);
+                                *count += 1;
+
+                                let mesh = DiscoveredMesh {
+                                    mesh_name: meta.mesh.clone(),
+                                    vault_id: meta.vid.clone(),
+                                    peers: vec![endpoint_id],
+                                    online_count: *count,
+                                };
+
+                                // Send failures mean the desktop dropped the
+                                // receiver (window closed) — stop the scan early.
+                                if reply.send(mesh).is_err() {
+                                    debug!("Initiator discovery reply channel closed; ending scan");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    _ = &mut deadline => {
+                        debug!("Initiator discovery scan window elapsed");
+                        return;
+                    }
+                    _ = cancel.cancelled() => {
+                        debug!("Initiator discovery cancelled");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Run the pairing exchange for the user-selected mesh.
+    ///
+    /// Looks up the peer endpoint from the active discovery session, then
+    /// spawns a task that drives `pair_with_mesh_interactive` and writes the
+    /// resulting mesh members to the local allowlist on success. The peer's
+    /// device name is returned via `reply` so the UI can confirm.
+    async fn submit_initiator_code(
+        &mut self,
+        vault_id: String,
+        code: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    ) {
+        let Some(session) = self.active_initiator.as_ref() else {
+            let _ = reply.send(Err(
+                "No active pairing session. Click 'Pair with nearby device…' first.".to_string(),
+            ));
+            return;
+        };
+
+        let peer_endpoint_id = {
+            let map = session.discovered.lock().await;
+            map.get(&vault_id).copied()
+        };
+
+        let Some(peer_endpoint_id) = peer_endpoint_id else {
+            let _ = reply.send(Err(
+                "Selected mesh has no discovered peers yet. Wait for discovery to find a peer."
+                    .to_string(),
+            ));
+            return;
+        };
+
+        let endpoint = self.sync_node.endpoint.clone();
+        let self_node_id = *self.sync_node.node_id().as_bytes();
+        let device_name = self.device_name.clone();
+        let allowlist = self.allowlist.clone();
+        let cancel = session.cancel.clone();
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                r = run_initiator_pairing(
+                    &endpoint,
+                    peer_endpoint_id,
+                    self_node_id,
+                    &device_name,
+                    code,
+                    allowlist,
+                ) => r,
+                _ = cancel.cancelled() => Err("Pairing cancelled".to_string()),
+            };
+
+            let _ = reply.send(result);
+        });
     }
 
     /// Check whether a peer is allowed to sync.
@@ -767,6 +943,70 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
         }
     }
+}
+
+/// Drive the initiator pairing protocol against a discovered peer, then write
+/// the mesh roster to the local allowlist on success.
+///
+/// Mirrors the post-pair allowlist logic in `pair.rs::pair_inner` (CLI path)
+/// but uses the running daemon's allowlist handle so the in-memory cache stays
+/// consistent. Failures and warning paths return a string for the desktop UI
+/// to display verbatim — the message is shown directly in the pair window.
+async fn run_initiator_pairing<AL: AllowlistStorage + 'static>(
+    endpoint: &iroh::Endpoint,
+    peer_endpoint_id: EndpointId,
+    self_node_id_bytes: [u8; 32],
+    device_name: &str,
+    code: String,
+    allowlist: Arc<AL>,
+) -> Result<String, String> {
+    let self_peer_id = PeerId::from_bytes(self_node_id_bytes);
+    let hello = PairingHello {
+        node_id: self_peer_id,
+        device_name: device_name.to_string(),
+    };
+
+    // The PairingChallenge carries the responder's device_name; capture it
+    // here so we can return it to the UI's success message.
+    let captured_device_name = Arc::new(Mutex::new(String::new()));
+    let captured_device_name_setter = captured_device_name.clone();
+
+    let result = pair_with_mesh_interactive(endpoint, peer_endpoint_id, &hello, move |challenge| {
+        let code = code.clone();
+        let setter = captured_device_name_setter.clone();
+        async move {
+            *setter.lock().await = challenge.device_name;
+            Ok(code)
+        }
+    })
+    .await
+    .map_err(|e| format!("Pairing connection failed: {e:#}"))?;
+
+    if !result.success {
+        return Err("Pairing failed. The code may be wrong or expired. Try again.".to_string());
+    }
+
+    let responder_device_name = captured_device_name.lock().await.clone();
+
+    // Bootstrap the allowlist on first pair: add self so the responder side's
+    // sync requests are accepted once gossip joins.
+    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty()) {
+        if let Err(e) = allowlist.add_peer(self_peer_id, device_name).await {
+            warn!("Failed to add self to allowlist on first pair: {}", e);
+        }
+    }
+
+    // Add all mesh members returned by the pairing result. Device names
+    // self-heal once a gossip AllowlistUpdate arrives from the mesh.
+    for member_id in &result.mesh_members {
+        let peer = AllowedPeer::new(*member_id, "unknown");
+        if let Err(e) = allowlist.add_peer(peer.node_id, &peer.device_name).await {
+            warn!("Failed to add mesh member {} to allowlist: {}", member_id, e);
+        }
+    }
+
+    // Return the responder device name for the UI's success message.
+    Ok(responder_device_name)
 }
 
 /// Start the daemon and return a control handle before the event loop begins.

@@ -1,7 +1,9 @@
 // Prevents a console window from popping up on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod commands;
 mod daemon_task;
+mod pair_window;
 mod shutdown;
 mod tray_status;
 
@@ -171,8 +173,9 @@ fn main() -> Result<()> {
                             });
                         }
                         "pair" => {
-                            // Wired in commit 4 — opens the initiator window.
-                            warn!("Pair menu clicked; initiator window not yet wired");
+                            if let Err(e) = pair_window::open_initiator(&app_for_events) {
+                                warn!("Failed to open pair initiator window: {}", e);
+                            }
                         }
                         _ => {}
                     }
@@ -201,6 +204,11 @@ fn main() -> Result<()> {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            commands::start_pair_discovery,
+            commands::submit_pair_code,
+            commands::cancel_pair_discovery,
+        ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri application error: {e}"))?;
 

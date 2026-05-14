@@ -548,4 +548,73 @@ mod daemon_integration {
         let _ = loop_handle.await;
         Ok(())
     }
+
+    /// `DaemonCommand::SubmitCode` returns an error reply (not a hang) when no
+    /// initiator session is active. This protects against the deadlock-prone
+    /// pattern where the desktop awaits the oneshot reply while the daemon
+    /// silently drops the command — the channel close would surface only as a
+    /// generic "daemon disconnected" error in the UI, which is much worse than
+    /// the explicit "no active session" message we send back.
+    ///
+    /// Seed 63 reserved.
+    #[tokio::test]
+    async fn test_submit_code_without_active_initiator_returns_error() -> anyhow::Result<()> {
+        use sync_daemon::daemon::Daemon;
+        use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
+        use tokio::sync::{broadcast, mpsc, oneshot, watch};
+
+        let node = build_node(63).await?;
+        let vault_id = shared_vault_id();
+        let gossip = node.sync_node.join_vault_gossip(&vault_id, vec![]).await?;
+
+        let (_file_event_tx, file_event_rx) = mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
+        let shutdown = CancellationToken::new();
+
+        let mut daemon = Daemon::new(
+            node.vault.clone(),
+            node.sync_node,
+            gossip,
+            file_event_rx,
+            None,
+            node.allowlist.clone(),
+            "device-test".to_string(),
+            None,
+            "/test-vault".into(),
+            shutdown.clone(),
+        );
+
+        let (status_tx, _status_rx) = watch::channel(DaemonStatus::initial());
+        let (pairing_tx, _pairing_rx): (broadcast::Sender<PairingUiEvent>, _) =
+            broadcast::channel(16);
+        let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+        daemon.wire_control(status_tx, pairing_tx, command_rx, "Test Vault".to_string());
+
+        let loop_handle = tokio::spawn(async move {
+            daemon.run_loop().await;
+        });
+
+        // Send SubmitCode without ever sending StartDiscovery — the daemon
+        // should respond with an Err describing the missing session.
+        let (reply_tx, reply_rx) = oneshot::channel::<Result<String, String>>();
+        command_tx.send(DaemonCommand::SubmitCode {
+            vault_id: "any-vault".to_string(),
+            code: "123456".to_string(),
+            reply: reply_tx,
+        })?;
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("daemon did not reply to SubmitCode within 2s")
+            .expect("daemon dropped the reply channel");
+
+        let err = reply.expect_err("expected Err when no active session");
+        assert!(
+            err.to_lowercase().contains("no active") || err.to_lowercase().contains("session"),
+            "error message should mention missing session, got: {err}"
+        );
+
+        shutdown.cancel();
+        let _ = loop_handle.await;
+        Ok(())
+    }
 }

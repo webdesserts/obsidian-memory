@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pair with nearby device</title>
+    <style>
+      body { font: 13px -apple-system, system-ui, sans-serif; padding: 16px; color: #1d1d1f; }
+      h2 { margin: 0 0 12px; font-size: 16px; }
+      select, input, button { font: inherit; }
+      .row { margin: 10px 0; }
+      .row label { display: inline-flex; align-items: center; gap: 8px; }
+      #code { width: 8em; letter-spacing: 4px; font-family: ui-monospace, monospace; text-align: center; }
+      #status { min-height: 1.4em; }
+      .error { color: #c33; }
+      .ok { color: #2a2; }
+      button { padding: 4px 12px; }
+      button:disabled { opacity: 0.5; }
+    </style>
+  </head>
+  <body>
+    <h2>Pair with nearby device</h2>
+    <div class="row" id="scan-status">Scanning for meshes on this network…</div>
+    <div class="row">
+      <label>Mesh:
+        <select id="mesh"><option disabled selected value="">—</option></select>
+      </label>
+    </div>
+    <div class="row">
+      <label>Code:
+        <input id="code" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="off" />
+      </label>
+    </div>
+    <div class="row">
+      <button id="pair" disabled>Pair</button>
+      <button id="cancel">Cancel</button>
+    </div>
+    <div id="status" class="row"></div>
+
+    <script>
+      // The pair-initiator window uses vanilla DOM + Tauri's JS API. No bundler,
+      // no framework — files in this directory are served verbatim by Vite's
+      // public/ convention and copied into dist/ at build.
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+      const currentWindow = window.__TAURI__.window.getCurrentWindow();
+
+      const meshSel = document.getElementById('mesh');
+      const codeInp = document.getElementById('code');
+      const pairBtn = document.getElementById('pair');
+      const cancelBtn = document.getElementById('cancel');
+      const status = document.getElementById('status');
+      const scanStatus = document.getElementById('scan-status');
+
+      const meshes = new Map();
+
+      function maybeEnablePair() {
+        pairBtn.disabled = !(meshSel.value && /^\d{6}$/.test(codeInp.value));
+      }
+
+      meshSel.addEventListener('change', maybeEnablePair);
+      codeInp.addEventListener('input', maybeEnablePair);
+
+      (async () => {
+        await listen('pair://mesh-discovered', (event) => {
+          const mesh = event.payload;
+          if (meshes.has(mesh.vault_id)) return;
+          meshes.set(mesh.vault_id, mesh);
+          const opt = document.createElement('option');
+          opt.value = mesh.vault_id;
+          opt.textContent = `${mesh.mesh_name} (${mesh.online_count} online)`;
+          meshSel.appendChild(opt);
+        });
+
+        await listen('pair://discovery-finished', () => {
+          if (meshes.size === 0) {
+            scanStatus.textContent = 'No meshes found.';
+          } else {
+            scanStatus.textContent = `Found ${meshes.size} mesh(es).`;
+          }
+        });
+
+        try {
+          await invoke('start_pair_discovery');
+        } catch (e) {
+          scanStatus.className = 'row error';
+          scanStatus.textContent = 'Discovery failed: ' + e;
+        }
+      })();
+
+      pairBtn.addEventListener('click', async () => {
+        pairBtn.disabled = true;
+        status.className = 'row';
+        status.textContent = 'Pairing…';
+        try {
+          const result = await invoke('submit_pair_code', {
+            vaultId: meshSel.value,
+            code: codeInp.value,
+          });
+          status.className = 'row ok';
+          status.textContent = `Paired with ${result.device_name}. Closing…`;
+          setTimeout(() => currentWindow.close(), 1500);
+        } catch (e) {
+          status.className = 'row error';
+          status.textContent = 'Pairing failed: ' + e;
+          pairBtn.disabled = false;
+        }
+      });
+
+      cancelBtn.addEventListener('click', async () => {
+        try {
+          await invoke('cancel_pair_discovery');
+        } catch (_) {
+          // ignore — cancellation is idempotent
+        }
+        currentWindow.close();
+      });
+    </script>
+  </body>
+</html>
