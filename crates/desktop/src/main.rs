@@ -2,25 +2,36 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon_task;
+mod shutdown;
+mod tray_status;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use daemon_task::DaemonHandle;
+use shutdown::ShutdownController;
 use sync_daemon::daemon::DaemonRunConfig;
+use sync_daemon::pair_api::DaemonControl;
 use tauri::{
     Manager,
+    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-/// Managed state wrapper so the Quit handler can take ownership of DaemonHandle.
+/// Managed state wrapper so the Quit handler can take ownership of ShutdownController.
+type ShutdownState = Arc<Mutex<Option<ShutdownController>>>;
+
+/// Managed state for the daemon control handle, used by Tauri commands to send
+/// commands to the running daemon (pairing, discovery, etc.).
 ///
-/// DaemonHandle::shutdown() consumes self to enforce single-call semantics, so
-/// the handle is wrapped in Option and taken on the first Quit event.
-type DaemonState = Arc<Mutex<Option<DaemonHandle>>>;
+/// `Arc` because Tauri managed state requires `Send + Sync + 'static`, and
+/// `DaemonControl` holds non-`Clone` channels that can't be wrapped in plain `Mutex`
+/// without losing the ability to clone receivers. The inner fields use tokio's own
+/// thread-safe channel primitives.
+pub type ControlState = Arc<DaemonControl>;
 
 /// The port the embedded iroh relay listens on.
 const RELAY_PORT: u16 = 3340;
@@ -92,46 +103,78 @@ fn main() -> Result<()> {
             // Tray-only mode: suppress the dock icon so the app lives entirely
             // in the menu bar. `"windows": []` in tauri.conf.json removes the
             // main window; this call removes the Dock icon.
-            // App::set_activation_policy (on &mut App in setup()) returns (). The
-            // AppHandle variant returns Result, but the App variant used here does not.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let handle = app.handle().clone();
 
-            // Spawn the sync daemon and wire up the failure watchdog.
+            // Spawn the sync daemon and block until startup completes. Returns
+            // a DaemonHandle carrying the control, cancellation token, and done_rx.
             let daemon = DaemonHandle::spawn(daemon_config, handle.clone());
 
-            // Wrap in Arc<Mutex<Option<...>>> so the Quit handler can take
-            // ownership of DaemonHandle when calling shutdown() (which consumes self).
-            let daemon_state: DaemonState = Arc::new(Mutex::new(Some(daemon)));
-            app.manage(daemon_state);
+            // Decompose the handle so we can move each piece to its owner:
+            // - `control` → Tauri managed state (for command handlers)
+            // - `token` + `done_rx` → ShutdownController (for Quit handler)
+            let (token, control, done_rx) = daemon.into_parts();
 
-            // Build the tray icon and menu.
-            let menu = tauri::menu::MenuBuilder::new(app)
-                .text("status", "Status: Running")
-                .separator()
-                .text("quit", "Quit")
+            // Status receiver cloned before control moves into Arc.
+            let status_rx = control.status_rx.clone();
+
+            // Store the DaemonControl in managed state so Tauri command handlers
+            // can access it via `State<ControlState>`.
+            let control: ControlState = Arc::new(control);
+            app.manage(control);
+
+            // Shutdown controller — taken once by the Quit handler.
+            let shutdown = ShutdownController { token, done_rx };
+            let shutdown_state: ShutdownState = Arc::new(Mutex::new(Some(shutdown)));
+            app.manage(shutdown_state);
+
+            // Build the tray menu with cached item handles so the status driver
+            // can update text in-place via MenuItem::set_text.
+            let status_item = MenuItemBuilder::new("Status: Connecting…")
+                .id("status")
+                .enabled(false) // display-only label, not interactive
+                .build(app)?;
+
+            let pair_item = MenuItemBuilder::new("Pair with nearby device…")
+                .id("pair")
+                .build(app)?;
+
+            let menu = MenuBuilder::new(app)
+                .items(&[
+                    &status_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &pair_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItemBuilder::new("Quit").id("quit").build(app)?,
+                ])
                 .build()?;
 
-            // Load the tray icon embedded at compile time via Tauri's include_image!
-            // macro. The 32x32.png is the standard macOS menu bar icon size.
             let icon = tauri::include_image!("icons/32x32.png");
 
+            let app_for_events = handle.clone();
             TrayIconBuilder::new()
                 .icon(icon)
                 .menu(&menu)
-                .on_menu_event(move |app, event| {
-                    if event.id().as_ref() == "quit" {
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let state = app.state::<DaemonState>();
-                            let daemon = state.lock().await.take();
-                            if let Some(d) = daemon {
-                                d.shutdown(Duration::from_secs(5)).await;
-                            }
-                            app.exit(0);
-                        });
+                .on_menu_event(move |_tray, event| {
+                    match event.id().as_ref() {
+                        "quit" => {
+                            let app = app_for_events.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = app.state::<ShutdownState>();
+                                let shutdown = state.lock().await.take();
+                                if let Some(s) = shutdown {
+                                    s.shutdown(Duration::from_secs(5)).await;
+                                }
+                                app.exit(0);
+                            });
+                        }
+                        "pair" => {
+                            // Wired in commit 4 — opens the initiator window.
+                            warn!("Pair menu clicked; initiator window not yet wired");
+                        }
+                        _ => {}
                     }
                 })
                 .on_tray_icon_event(|_tray, event| {
@@ -141,11 +184,20 @@ fn main() -> Result<()> {
                         ..
                     } = event
                     {
-                        // Left-click on the tray icon — no action in Phase 1.
+                        // Left-click on the tray icon — no action in Phase 1.5.
                         // Phase 6 will open the status popup here.
                     }
                 })
                 .build(app)?;
+
+            // Start the tray status driver. It subscribes to status_rx and calls
+            // MenuItem::set_text on the status_item handle whenever the daemon
+            // status changes, without rebuilding the entire menu.
+            let handles = tray_status::TrayMenuHandles {
+                status_item,
+                pair_item,
+            };
+            tray_status::start(handle.clone(), handles, status_rx);
 
             Ok(())
         })
