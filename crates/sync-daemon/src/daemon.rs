@@ -391,10 +391,6 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             futures::pin_mut!(stream);
             futures::pin_mut!(deadline);
 
-            // Track which vault_ids we've already emitted so we don't repeat
-            // events when mDNS re-advertises a known peer.
-            let mut seen: HashMap<String, usize> = HashMap::new();
-
             loop {
                 tokio::select! {
                     Some(event) = stream.next() => {
@@ -408,18 +404,27 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
                             if let Some(meta) = metadata {
                                 let endpoint_id = endpoint_info.endpoint_id;
+
+                                // Dedupe by vault_id: only emit on first sighting.
+                                // mDNS re-advertises every ~5s, so without this guard
+                                // the UI would receive a flood of identical events.
+                                // Matches `pair.rs`'s HashMap-based behavior — one
+                                // entry per mesh, additional peers update the entry
+                                // but do not produce new UI events.
                                 let mut map = discovered.lock().await;
+                                let is_new = !map.contains_key(&meta.vid);
                                 map.entry(meta.vid.clone()).or_insert(endpoint_id);
                                 drop(map);
 
-                                let count = seen.entry(meta.vid.clone()).or_insert(0);
-                                *count += 1;
+                                if !is_new {
+                                    continue;
+                                }
 
                                 let mesh = DiscoveredMesh {
                                     mesh_name: meta.mesh.clone(),
                                     vault_id: meta.vid.clone(),
                                     peers: vec![endpoint_id],
-                                    online_count: *count,
+                                    online_count: 1,
                                 };
 
                                 // Send failures mean the desktop dropped the

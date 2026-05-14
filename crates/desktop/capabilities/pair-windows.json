@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "pair-windows",
   "description": "Permissions granted to the pairing initiator (and later, responder) windows",
-  "windows": ["pair-initiator"],
+  "windows": ["pair-initiator", "pair-responder"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",

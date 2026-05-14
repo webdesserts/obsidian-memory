@@ -9,6 +9,7 @@
     "beforeBuildCommand": "cd frontend && npm run build"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [],
     "trayIcon": {
       "iconPath": "icons/32x32.png",
