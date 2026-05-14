@@ -32,10 +32,7 @@
     <button id="reject">Reject</button>
 
     <script>
-      // Vanilla DOM + Tauri JS API — served verbatim by Vite's public/ convention.
-      // The window's identity, code, and expiry are delivered after the page loads
-      // via the `pair://responder-init` event so the Rust side can listen-first /
-      // emit-after-build without racing the page's listener registration.
+      // Vanilla DOM + Tauri JS API — served verbatim from public/windows/.
       const { invoke } = window.__TAURI__.core;
       const { listen } = window.__TAURI__.event;
       const currentWindow = window.__TAURI__.window.getCurrentWindow();
