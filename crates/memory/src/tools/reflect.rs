@@ -44,9 +44,10 @@ You are performing a focused consolidation session to optimize token usage while
 2. **Compact** - Rewrite concisely while preserving essential information
    - Example: Detailed debugging steps → "Fixed X by doing Y"
 
-3. **Migrate** - Move information to appropriate permanent notes
+3. **Migrate** - **Move** information to appropriate permanent notes. This is a MOVE — the source content is removed after the destination is verified. Leaving duplicate content at both the source and destination defeats consolidation.
    - Working Memory sections → knowledge notes or project notes
-   - Log entries → weekly journal summaries
+   - Log entries → weekly journal narratives (remove the migrated entries from Log.md after the narrative is written)
+   - Optional: leave a one-line wiki-link breadcrumb at the source pointing to the new home
 
 4. **Fragment** - Split large notes into smaller focused notes
    - Use wiki-links to connect fragments
@@ -67,6 +68,10 @@ When consolidating logs to weekly journal, create episodic narratives:
 - Include the thought process and discoveries
 - Use bold summaries for browsability
 - Group related work into coherent stories
+
+**Scope and removal:**
+- Migrate every Log entry from an ISO week earlier than the current week. Current-week entries stay in Log.md.
+- After the narrative is written and verified in the weekly journal, remove the source entries from Log.md via the `WriteLogs` tool. Leaving the entries in place is a bug — Log will grow without bound.
 
 ## Your Task
 
