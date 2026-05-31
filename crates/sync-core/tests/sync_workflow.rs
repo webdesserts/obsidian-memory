@@ -70,8 +70,13 @@ mod sync_workflow {
     /// No gossip subscription is created here — tests create subscriptions explicitly
     /// via `sync_node.join_vault_gossip(...)` so each device has exactly one.
     async fn make_device(seed_byte: u8) -> anyhow::Result<TestDevice> {
+        use sync_core::peer_id::PeerId;
         let fs = Arc::new(InMemoryFs::new());
-        let vault = Vault::init(fs.clone()).await?;
+        // Author Loro ops under a per-device PeerId derived from this device's
+        // secret seed (the same seed driving its iroh node), so each device is a
+        // distinct Loro replica.
+        let author = PeerId::from_secret_bytes(seed(seed_byte));
+        let vault = Vault::init(fs.clone(), author).await?;
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());

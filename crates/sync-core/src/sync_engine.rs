@@ -571,9 +571,9 @@ impl<F: FileSystem> Vault<F> {
             .map_err(crate::vault::VaultError::from)?;
 
         if exists_in_cache || exists_on_disk {
-            // Get local mtime and vault_id before borrowing doc (needed for "latest wins" comparison)
+            // Get local mtime and device author before borrowing doc (needed for "latest wins" comparison)
             let local_mtime = self.fs.stat(path).await.ok().map(|s| s.mtime_millis);
-            let vault_id = self.vault_id();
+            let author = self.loro_author;
 
             // Note: Staleness reconciliation is handled by ensure_consistency() at the
             // start of process_sync_message(). Documents are guaranteed to be consistent
@@ -585,7 +585,7 @@ impl<F: FileSystem> Vault<F> {
 
             // Create temp doc FROM LOCAL STATE, then import remote to get merged version
             // This correctly handles incremental updates (not just full snapshots)
-            let mut temp_doc = NoteDocument::from_bytes(path, &doc.export_snapshot(), vault_id)?;
+            let mut temp_doc = NoteDocument::from_bytes(path, &doc.export_snapshot(), author)?;
             temp_doc.import(data)?;
             let merged_vv = temp_doc.version();
 
@@ -595,7 +595,7 @@ impl<F: FileSystem> Vault<F> {
             // Check if histories are truly divergent by comparing doc_ids.
             // Documents from the same source (synced) share the same doc_id.
             // Documents created independently have different doc_ids.
-            let remote_only_doc = NoteDocument::from_bytes(path, data, vault_id)?;
+            let remote_only_doc = NoteDocument::from_bytes(path, data, author)?;
 
             let local_doc_id = doc.doc_id();
             let remote_doc_id = remote_only_doc.doc_id();
@@ -671,8 +671,8 @@ impl<F: FileSystem> Vault<F> {
 
             Ok(modified)
         } else {
-            // Document is new - create directly from sync data (preserves peer ID)
-            let doc = NoteDocument::from_bytes(path, data, self.vault_id())?;
+            // Document is new - create directly from sync data; new ops author under this device
+            let doc = NoteDocument::from_bytes(path, data, self.loro_author)?;
 
             // Mark as synced BEFORE writing to disk (for echo detection)
             self.mark_synced(path);
@@ -698,14 +698,14 @@ impl<F: FileSystem> Vault<F> {
 mod tests {
     use super::*;
     use crate::fs::InMemoryFs;
-    use crate::VaultId;
+    use crate::PeerId;
 
-    fn test_vault_id() -> VaultId {
-        VaultId::from(12345u64)
+    fn test_author() -> PeerId {
+        PeerId::from_bytes([1u8; 32])
     }
 
-    fn test_vault_id_2() -> VaultId {
-        VaultId::from(67890u64)
+    fn test_author_2() -> PeerId {
+        PeerId::from_bytes([2u8; 32])
     }
 
     #[tokio::test]
@@ -721,8 +721,8 @@ mod tests {
         fs2.write("file2.md", b"# From Vault 2").await.unwrap();
 
         // Initialize both vaults (this indexes existing files)
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Vault 1 sends sync request to Vault 2
         let request = vault1.prepare_sync_request().await.unwrap();
@@ -760,8 +760,8 @@ mod tests {
         fs1.write("note1.md", b"# Note 1").await.unwrap();
         fs1.write("note2.md", b"# Note 2").await.unwrap();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Empty vault sends sync request
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -789,8 +789,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Create and sync initial content
         vault1.fs.write("note.md", b"Initial content").await.unwrap();
@@ -827,11 +827,11 @@ mod tests {
         use crate::document::NoteDocument;
 
         // Create a document and get its initial version
-        let doc1 = NoteDocument::from_markdown("test.md", "# Hello", test_vault_id()).unwrap();
+        let doc1 = NoteDocument::from_markdown("test.md", "# Hello", test_author()).unwrap();
         let v1 = doc1.version().encode();
 
         // Create another document and import doc1's state
-        let mut doc2 = NoteDocument::new("test.md", test_vault_id_2());
+        let mut doc2 = NoteDocument::new("test.md", test_author_2());
         doc2.import(&doc1.export_snapshot()).unwrap();
         let v2 = doc2.version().encode();
 
@@ -852,8 +852,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Vault1 creates a file
         vault1.fs.write("note.md", b"# Original").await.unwrap();
@@ -887,8 +887,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Vault1 creates a file
         vault1.fs.write("note.md", b"# Content").await.unwrap();
@@ -919,8 +919,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Vault1 creates a file with specific content
         let content = "Hello";
@@ -959,8 +959,8 @@ mod tests {
         let fs1 = InMemoryFs::new();
         let fs2 = InMemoryFs::new();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Vault1 creates initial content
         vault1.fs.write("note.md", b"Hello").await.unwrap();
@@ -995,7 +995,7 @@ mod tests {
     async fn test_diff_merge_preserves_peer_id() {
         // Test that diff-and-merge updates don't create new peer IDs
         let fs = InMemoryFs::new();
-        let vault = Vault::init(fs).await.unwrap();
+        let vault = Vault::init(fs, test_author()).await.unwrap();
 
         // Create initial file
         vault.fs.write("note.md", b"Hello").await.unwrap();
@@ -1036,12 +1036,12 @@ mod tests {
 
         // Initialize vault1 with a file
         fs1.write("note.md", b"Original").await.unwrap();
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
 
         // Sync to vault2
         fs2.mkdir(".sync").await.unwrap();
         fs2.mkdir(".sync/documents").await.unwrap();
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
         fs2.write("note.md", b"Modified externally").await.unwrap();
 
         // Reload vault2 - this triggers reconcile() -> reindex_file()
-        let vault2_reloaded = Vault::load(Arc::clone(&fs2)).await.unwrap();
+        let vault2_reloaded = Vault::load(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         // Sync back to vault1
         let request2 = vault1.prepare_sync_request().await.unwrap();
@@ -1081,10 +1081,10 @@ mod tests {
 
         // Initialize vault1 with a file
         fs1.write("note.md", b"Hello").await.unwrap();
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
 
         // Sync to vault2
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
         let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
@@ -1123,14 +1123,14 @@ mod tests {
 
         // Initialize vault1 with a file
         fs1.write("old_name.md", b"Content ABC").await.unwrap();
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
 
         // Get the peer ID count from the original document
         let doc1 = vault1.get_document("old_name.md").await.unwrap();
         let original_peer_count = doc1.version().len();
 
         // Sync to vault2
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
         let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
@@ -1144,7 +1144,7 @@ mod tests {
         fs2.delete("old_name.md").await.unwrap();
 
         // Reload vault2 - this triggers reconcile() -> migrate_document()
-        let vault2_reloaded = Vault::load(Arc::clone(&fs2)).await.unwrap();
+        let vault2_reloaded = Vault::load(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         // The migrated document should exist
         let doc2 = vault2_reloaded.get_document("new_name.md").await.unwrap();
@@ -1180,8 +1180,8 @@ mod tests {
         fs2.write("note.md", b"# Hello from B").await.unwrap();
 
         // Initialize vaults - each creates its own LoroDoc with independent peer IDs
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         // Sync vault1 → vault2
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1235,8 +1235,8 @@ mod tests {
         fs2.write("note.md", b"Newer content").await.unwrap();
         fs2.set_mtime("note.md", 2000); // Newer timestamp
 
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         // Vault2 sends DocumentUpdate to Vault1 (real-time sync with mtime)
         let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
@@ -1264,8 +1264,8 @@ mod tests {
         fs2.write("note.md", b"Older content").await.unwrap();
         fs2.set_mtime("note.md", 1000); // Older timestamp
 
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         // Vault2 sends DocumentUpdate to Vault1 (real-time sync with mtime)
         let update = vault2.prepare_document_update("note.md").await.unwrap().unwrap();
@@ -1286,8 +1286,8 @@ mod tests {
         // Vault1 creates an empty file
         fs1.write("empty.md", b"").await.unwrap();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Sync to vault2
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1312,8 +1312,8 @@ mod tests {
         // Vault1 creates a file with only frontmatter
         fs1.write("meta.md", b"---\ntitle: Test\ntags:\n  - a\n  - b\n---\n").await.unwrap();
 
-        let vault1 = Vault::init(fs1).await.unwrap();
-        let vault2 = Vault::init(fs2).await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
         // Sync to vault2
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1339,8 +1339,8 @@ mod tests {
         use crate::document::NoteDocument;
 
         // Two documents created independently have different doc_ids
-        let doc1 = NoteDocument::from_markdown("test.md", "Content A", test_vault_id()).unwrap();
-        let doc2 = NoteDocument::from_markdown("test.md", "Content B", test_vault_id_2()).unwrap();
+        let doc1 = NoteDocument::from_markdown("test.md", "Content A", test_author()).unwrap();
+        let doc2 = NoteDocument::from_markdown("test.md", "Content B", test_author_2()).unwrap();
 
         let doc1_id = doc1.doc_id();
         let doc2_id = doc2.doc_id();
@@ -1354,7 +1354,7 @@ mod tests {
 
         // A document imported from another preserves the doc_id
         // Use different peer_id to avoid Loro merge conflicts with same-peer operations
-        let mut doc3 = NoteDocument::new("test.md", test_vault_id_2());
+        let mut doc3 = NoteDocument::new("test.md", test_author_2());
         doc3.import(&doc1.export_snapshot()).unwrap();
 
         assert_eq!(
@@ -1375,8 +1375,8 @@ mod tests {
 
         // Vault1 creates file
         fs1.write("note.md", b"Line 1").await.unwrap();
-        let vault1 = Vault::init(Arc::clone(&fs1)).await.unwrap();
-        let vault2 = Vault::init(Arc::clone(&fs2)).await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2()).await.unwrap();
 
         // Initial sync - vault2 gets the file with vault1's doc_id
         let request = vault2.prepare_sync_request().await.unwrap();
@@ -1436,11 +1436,11 @@ mod tests {
         let legacy_bytes = legacy_doc.export(loro::ExportMode::Snapshot).unwrap();
 
         // Load via from_bytes - should NOT add a doc_id (preserves legacy state)
-        let doc = NoteDocument::from_bytes("test.md", &legacy_bytes, test_vault_id()).unwrap();
+        let doc = NoteDocument::from_bytes("test.md", &legacy_bytes, test_author()).unwrap();
         assert!(doc.doc_id().is_none(), "Legacy document should have no doc_id");
 
         // New document has doc_id
-        let new_doc = NoteDocument::from_markdown("test.md", "New content", test_vault_id()).unwrap();
+        let new_doc = NoteDocument::from_markdown("test.md", "New content", test_author()).unwrap();
         assert!(new_doc.doc_id().is_some(), "New document should have doc_id");
 
         // When syncing legacy (no doc_id) with new (has doc_id), should assume compatible

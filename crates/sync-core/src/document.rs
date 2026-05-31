@@ -9,7 +9,7 @@
 //! The `_meta.path` field allows detecting file moves/renames during reconciliation.
 
 use crate::markdown;
-use crate::VaultId;
+use crate::PeerId;
 use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, UpdateOptions, VersionVector};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -56,10 +56,12 @@ impl NoteDocument {
     /// Does NOT set doc_id - this is intended for receiving imported data
     /// or as a container that will receive content via update methods.
     /// Use `from_markdown()` to create a new document with original content and doc_id.
-    /// The vault_id is set as the Loro peer ID for consistent version vectors.
-    pub fn new(path: &str, vault_id: VaultId) -> Self {
+    /// The device's `PeerId` is set as the Loro peer id so operations are attributed
+    /// to this independent replica (required for correct CRDT merge — see
+    /// [[Loro Peer ID Semantics]]).
+    pub fn new(path: &str, author: PeerId) -> Self {
         let doc = LoroDoc::new();
-        doc.set_peer_id(vault_id.as_u64()).ok();
+        doc.set_peer_id(author.as_u64()).ok();
 
         // Set path metadata only - doc_id comes from imported content or from_markdown()
         let meta = doc.get_map(META_CONTAINER);
@@ -74,10 +76,10 @@ impl NoteDocument {
 
     /// Create a NoteDocument by importing from existing Loro bytes.
     ///
-    /// The vault_id is set as the Loro peer ID before import so any new operations
-    /// (like path metadata updates) are attributed to this vault. Imported operations
-    /// preserve their original author IDs.
-    pub fn from_bytes(path: &str, bytes: &[u8], vault_id: VaultId) -> Result<Self> {
+    /// The device's `PeerId` is set as the Loro peer id before import so any new
+    /// operations (like path metadata updates) are attributed to this independent
+    /// replica. Imported operations preserve their original author IDs.
+    pub fn from_bytes(path: &str, bytes: &[u8], author: PeerId) -> Result<Self> {
         debug!(
             path = %path,
             bytes_len = bytes.len(),
@@ -85,7 +87,7 @@ impl NoteDocument {
         );
 
         let doc = LoroDoc::new();
-        doc.set_peer_id(vault_id.as_u64()).ok();
+        doc.set_peer_id(author.as_u64()).ok();
         doc.import(bytes).map_err(|e| {
             error!(
                 path = %path,
@@ -185,10 +187,12 @@ impl NoteDocument {
     /// Load from markdown content.
     ///
     /// Generates a unique `doc_id` to track document lineage across syncs.
-    /// The vault_id is set as the Loro peer ID for consistent version vectors.
-    pub fn from_markdown(path: &str, content: &str, vault_id: VaultId) -> Result<Self> {
+    /// The device's `PeerId` is set as the Loro peer id so operations are attributed
+    /// to this independent replica (required for correct CRDT merge — see
+    /// [[Loro Peer ID Semantics]]).
+    pub fn from_markdown(path: &str, content: &str, author: PeerId) -> Result<Self> {
         let doc = LoroDoc::new();
-        doc.set_peer_id(vault_id.as_u64()).ok();
+        doc.set_peer_id(author.as_u64()).ok();
         let parsed = markdown::parse(content);
 
         // Set internal metadata with unique doc_id
@@ -486,13 +490,17 @@ fn loro_value_to_yaml(value: &loro::LoroValue) -> std::result::Result<serde_yaml
 mod tests {
     use super::*;
 
-    fn test_vault_id() -> VaultId {
-        VaultId::from(12345u64)
+    fn test_author() -> PeerId {
+        PeerId::from_bytes([1u8; 32])
+    }
+
+    fn test_author_2() -> PeerId {
+        PeerId::from_bytes([2u8; 32])
     }
 
     #[test]
     fn test_new_document() {
-        let doc = NoteDocument::new("test.md", test_vault_id());
+        let doc = NoteDocument::new("test.md", test_author());
         assert_eq!(doc.path(), "test.md");
         assert!(doc.body().to_string().is_empty());
     }
@@ -507,7 +515,7 @@ title: Test
 
 World"#;
 
-        let doc = NoteDocument::from_markdown("test.md", content, test_vault_id()).unwrap();
+        let doc = NoteDocument::from_markdown("test.md", content, test_author()).unwrap();
         assert!(doc.to_markdown().contains("title:"));
         assert!(doc.to_markdown().contains("# Hello"));
     }
@@ -515,8 +523,8 @@ World"#;
     #[test]
     fn test_sync_between_documents() {
         // Create two documents
-        let doc1 = NoteDocument::from_markdown("test.md", "Hello", test_vault_id()).unwrap();
-        let mut doc2 = NoteDocument::new("test.md", test_vault_id());
+        let doc1 = NoteDocument::from_markdown("test.md", "Hello", test_author()).unwrap();
+        let mut doc2 = NoteDocument::new("test.md", test_author());
 
         // Sync from doc1 to doc2
         let snapshot = doc1.export_snapshot();
@@ -528,7 +536,7 @@ World"#;
     #[test]
     fn test_update_body_with_update_by_line() {
         // Test that update_body (using update_by_line) works correctly
-        let doc = NoteDocument::from_markdown("test.md", "Hello World", test_vault_id()).unwrap();
+        let doc = NoteDocument::from_markdown("test.md", "Hello World", test_author()).unwrap();
         assert_eq!(doc.body().to_string(), "Hello World");
 
         // Update the body
@@ -542,11 +550,61 @@ World"#;
     #[test]
     fn test_update_body_no_change() {
         // Test that update_body returns false when content is the same
-        let doc = NoteDocument::from_markdown("test.md", "Hello", test_vault_id()).unwrap();
+        let doc = NoteDocument::from_markdown("test.md", "Hello", test_author()).unwrap();
 
         let changed = doc.update_body("Hello").unwrap();
 
         assert!(!changed, "Should not detect change for same content");
         assert_eq!(doc.body().to_string(), "Hello");
+    }
+
+    /// Two devices that share a vault but author under distinct `PeerId`s must
+    /// edit the same note offline and still converge without OpId collisions.
+    ///
+    /// This is the regression tripwire for the shared-peer-id corruption bug
+    /// (see [[Loro Peer ID Semantics]]): under the old behavior both replicas
+    /// authored under the same VaultId, so concurrent offline edits produced
+    /// colliding `(peer, counter)` OpIds and the merged version vector collapsed
+    /// to a single entry. With per-device authoring the merged version vector
+    /// has exactly two entries — one per device — proving the replicas were
+    /// genuinely independent. Anchored to the distinct-author invariant: if a
+    /// future change reverts to a shared author, `vv.iter().count()` drops to 1
+    /// and this fails.
+    #[test]
+    fn test_independent_replicas_have_distinct_authors_and_converge() {
+        let author_a = test_author();
+        let author_b = test_author_2();
+
+        // Device A creates the note, then device B starts from A's history but
+        // authors new ops under its own PeerId (two devices sharing a vault).
+        let doc_a = NoteDocument::from_markdown("note.md", "base", author_a).unwrap();
+        let base_snapshot = doc_a.export_snapshot();
+        let mut doc_b = NoteDocument::from_bytes("note.md", &base_snapshot, author_b).unwrap();
+
+        let base_vv = doc_a.version();
+
+        // Both edit independently while offline (no syncing between the edits).
+        doc_a.update_body("base edited by A").unwrap();
+        doc_a.commit();
+        doc_b.update_body("base edited by B").unwrap();
+        doc_b.commit();
+
+        // Cross-import each other's updates since the shared base.
+        let updates_from_b = doc_b.export_updates(&base_vv);
+        let mut doc_a = doc_a;
+        doc_a.import(&updates_from_b).unwrap();
+        let updates_from_a = doc_a.export_updates(&base_vv);
+        doc_b.import(&updates_from_a).unwrap();
+
+        // Both replicas converge to identical content.
+        assert_eq!(doc_a.to_markdown(), doc_b.to_markdown());
+
+        // The merged version vector has one entry per device — proof the two
+        // replicas authored under distinct Loro peer ids.
+        assert_eq!(
+            doc_a.version().iter().count(),
+            2,
+            "merged version vector should have one entry per device author"
+        );
     }
 }

@@ -62,6 +62,19 @@ impl PeerId {
         Self(bytes)
     }
 
+    /// Derive the device PeerId from a 32-byte ed25519 secret (signing) key.
+    ///
+    /// This is the canonical "device secret → Loro author" derivation: both the
+    /// daemon (via its persisted `IdentityKey`) and the WASM plugin (via its
+    /// per-device secret key in `localStorage`) use it so a device authors Loro
+    /// operations under a single stable, device-unique PeerId. See
+    /// [[Loro Peer ID Semantics]].
+    pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::from_bytes(&bytes);
+        Self(signing_key.verifying_key().to_bytes())
+    }
+
     /// Get the raw ed25519 public key bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
