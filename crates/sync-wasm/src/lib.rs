@@ -260,9 +260,21 @@ mod wasm_impl {
         ///
         /// Call this when the user clicks "Initialize Sync" for the first time.
         /// The VaultId is generated automatically and persisted in `.sync/metadata.toml`.
+        ///
+        /// `secret_key` is this device's 32-byte ed25519 secret key; the device's
+        /// Loro author PeerId is derived from it so this replica authors operations
+        /// under a device-unique id (see Loro Peer ID Semantics).
         #[wasm_bindgen]
-        pub async fn init(fs: fs_bridge::JsFileSystemBridge) -> Result<WasmVault, JsError> {
-            let inner = sync_core::Vault::init(fs)
+        pub async fn init(
+            fs: fs_bridge::JsFileSystemBridge,
+            secret_key: &[u8],
+        ) -> Result<WasmVault, JsError> {
+            let key_bytes: [u8; 32] = secret_key
+                .try_into()
+                .map_err(|_| JsError::new("secret_key must be exactly 32 bytes"))?;
+            let author = sync_core::PeerId::from_secret_bytes(key_bytes);
+
+            let inner = sync_core::Vault::init(fs, author)
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
 
@@ -274,9 +286,20 @@ mod wasm_impl {
         /// Call this on plugin startup if vault is already initialized.
         /// Reconciliation detects files added/modified/deleted while plugin was off.
         /// The VaultId is read from `.sync/metadata.toml` (migrated from v0 if needed).
+        ///
+        /// `secret_key` is this device's 32-byte ed25519 secret key; the device's
+        /// Loro author PeerId is derived from it (see `init`).
         #[wasm_bindgen]
-        pub async fn load(fs: fs_bridge::JsFileSystemBridge) -> Result<WasmVault, JsError> {
-            let inner = sync_core::Vault::load(fs)
+        pub async fn load(
+            fs: fs_bridge::JsFileSystemBridge,
+            secret_key: &[u8],
+        ) -> Result<WasmVault, JsError> {
+            let key_bytes: [u8; 32] = secret_key
+                .try_into()
+                .map_err(|_| JsError::new("secret_key must be exactly 32 bytes"))?;
+            let author = sync_core::PeerId::from_secret_bytes(key_bytes);
+
+            let inner = sync_core::Vault::load(fs, author)
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
 
@@ -303,10 +326,19 @@ mod wasm_impl {
             serde_wasm_bindgen::to_value(&js_report).map_err(|e| JsError::new(&e.to_string()))
         }
 
-        /// Get our peer ID.
+        /// Get this device's Loro author PeerId (the id this replica authors under).
         #[wasm_bindgen(js_name = peerId)]
         pub fn peer_id(&self) -> String {
-            self.inner.peer_id().to_string()
+            self.inner.loro_author().to_string()
+        }
+
+        /// Get the VaultId (gossip topic seed + mDNS mesh grouping key).
+        ///
+        /// Shared across every replica of this vault — use this, not `peerId()`,
+        /// to seed the gossip topic so all devices join the same mesh.
+        #[wasm_bindgen(js_name = vaultId)]
+        pub fn vault_id(&self) -> String {
+            self.inner.vault_id().to_string()
         }
 
         /// Check if vault is initialized (has .sync directory).

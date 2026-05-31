@@ -18,7 +18,10 @@
   let error: string | null = null;
 
   // Self info
-  let peerId: string | null = null;
+  let vaultId: string | null = null;
+  // This device's Loro author — the id this replica's ops are keyed under in the
+  // version vector below.
+  let loroAuthor: string | null = null;
   let nodeId: string | null = null;
   let fileCount: number = 0;
 
@@ -116,7 +119,8 @@
 
     try {
       // WASM calls (synchronous debug APIs)
-      peerId = vault.peerId();
+      vaultId = vault.vaultId();
+      loroAuthor = vault.peerId();
       registryStats = vault.getRegistryStats() as RegistryStats;
       versionVector = vault.getRegistryVersion() as VersionVector;
 
@@ -192,7 +196,11 @@
       <div class="debug-table">
         <div class="debug-row">
           <span class="debug-label">Vault ID</span>
-          <code class="debug-value" title={peerId ?? ""}>{peerId ?? "N/A"}</code>
+          <code class="debug-value" title={vaultId ?? ""}>{vaultId ?? "N/A"}</code>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Loro Author</span>
+          <code class="debug-value" title={loroAuthor ?? ""}>{loroAuthor ? truncatePeerId(loroAuthor) : "N/A"}</code>
         </div>
         <div class="debug-row">
           <span class="debug-label">Node ID</span>

@@ -59,6 +59,15 @@ export default class P2PSyncPlugin extends Plugin {
   /** The vault manager from WASM */
   vault: WasmVault | null = null;
 
+  /**
+   * This device's 32-byte ed25519 secret key, lazily loaded/generated once.
+   *
+   * Used both to derive the vault's per-device Loro author (passed to
+   * `WasmVault.init`/`load`) and to seed the iroh node. Cached so the vault and
+   * the network manager share one stable key instead of regenerating.
+   */
+  private deviceSecretKey: Uint8Array | null = null;
+
   /** Network manager (iroh-based P2P) */
   networkManager: NetworkManager | null = null;
 
@@ -248,14 +257,16 @@ export default class P2PSyncPlugin extends Plugin {
    * Start the network manager (iroh sync node + gossip).
    */
   private async startNetworkManager(): Promise<void> {
-    const vaultId = this.vault?.peerId() ?? null;
+    // The gossip topic is seeded by the VaultId (shared across devices), NOT the
+    // per-device Loro author — all replicas of a vault must join the same mesh.
+    const vaultId = this.vault?.vaultId() ?? null;
 
     if (!vaultId) {
       log.info("Vault not initialized — skipping network manager startup");
       return;
     }
 
-    const secretKey = this.loadOrGenerateSecretKey();
+    const secretKey = this.getDeviceSecretKey();
 
     this.networkManager = new NetworkManager();
 
@@ -299,6 +310,16 @@ export default class P2PSyncPlugin extends Plugin {
     } catch (err) {
       log.error("Failed to start network manager:", err);
     }
+  }
+
+  /**
+   * Get this device's secret key, loading or generating it on first access.
+   *
+   * Memoized in `deviceSecretKey` so the vault author and the iroh node use the
+   * same stable key for the lifetime of the plugin.
+   */
+  private getDeviceSecretKey(): Uint8Array {
+    return (this.deviceSecretKey ??= this.loadOrGenerateSecretKey());
   }
 
   /**
@@ -398,7 +419,7 @@ export default class P2PSyncPlugin extends Plugin {
       const syncDirExists = await this.app.vault.adapter.exists(".sync");
 
       if (syncDirExists) {
-        this.vault = await WasmVault.load(fsBridge);
+        this.vault = await WasmVault.load(fsBridge, this.getDeviceSecretKey());
         log.info("Vault loaded");
         this.updateStatusBar("loaded");
         this.subscribeToDebugEvents();
@@ -421,7 +442,7 @@ export default class P2PSyncPlugin extends Plugin {
     }
 
     const fsBridge = createFsBridge(this.app.vault);
-    this.vault = await WasmVault.init(fsBridge);
+    this.vault = await WasmVault.init(fsBridge, this.getDeviceSecretKey());
     log.info("Vault initialized");
     this.updateStatusBar("initialized");
     this.subscribeToDebugEvents();

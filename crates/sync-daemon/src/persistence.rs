@@ -62,8 +62,11 @@ impl IdentityKey {
     }
 
     /// Derive the `PeerId` from this identity key's public key.
+    ///
+    /// Delegates to `PeerId::from_secret_bytes` so the secret-key → device
+    /// PeerId derivation lives in one place, shared with the WASM plugin.
     pub fn peer_id(&self) -> PeerId {
-        PeerId::from_bytes(self.signing_key.verifying_key().to_bytes())
+        PeerId::from_secret_bytes(self.signing_key.to_bytes())
     }
 
     /// Return the raw 32-byte ed25519 secret key.

@@ -1184,17 +1184,8 @@ async fn startup_inner(
 
     let fs = NativeFs::new(config.vault.clone());
 
-    let vault = if fs.exists(".sync").await? {
-        info!("Loading existing vault");
-        Vault::load(fs).await?
-    } else {
-        info!("Initializing new vault");
-        Vault::init(fs).await?
-    };
-
-    let vault_id = vault.vault_id();
-    info!("Vault loaded, vault ID: {}", vault_id);
-
+    // Load identity before the vault so we can author Loro ops under this
+    // device's PeerId (config-load has no dependency on the vault).
     let (mut daemon_config, identity_key) = DaemonConfig::load_or_generate(
         &config.vault,
         config.identity_key.as_deref(),
@@ -1202,6 +1193,18 @@ async fn startup_inner(
     .await?;
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
+
+    let author = identity_key.peer_id();
+    let vault = if fs.exists(".sync").await? {
+        info!("Loading existing vault");
+        Vault::load(fs, author).await?
+    } else {
+        info!("Initializing new vault");
+        Vault::init(fs, author).await?
+    };
+
+    let vault_id = vault.vault_id();
+    info!("Vault loaded, vault ID: {}", vault_id);
 
     if daemon_config.relay_url.is_some() {
         info!("Clearing stale relay URL from previous run");
@@ -1394,17 +1397,8 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
 
     let fs = NativeFs::new(config.vault.clone());
 
-    let vault = if fs.exists(".sync").await? {
-        info!("Loading existing vault");
-        Vault::load(fs).await?
-    } else {
-        info!("Initializing new vault");
-        Vault::init(fs).await?
-    };
-
-    let vault_id = vault.vault_id();
-    info!("Vault loaded, vault ID: {}", vault_id);
-
+    // Load identity before the vault so we can author Loro ops under this
+    // device's PeerId (config-load has no dependency on the vault).
     let (mut daemon_config, identity_key) = DaemonConfig::load_or_generate(
         &config.vault,
         config.identity_key.as_deref(),
@@ -1412,6 +1406,18 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
     .await?;
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
+
+    let author = identity_key.peer_id();
+    let vault = if fs.exists(".sync").await? {
+        info!("Loading existing vault");
+        Vault::load(fs, author).await?
+    } else {
+        info!("Initializing new vault");
+        Vault::init(fs, author).await?
+    };
+
+    let vault_id = vault.vault_id();
+    info!("Vault loaded, vault ID: {}", vault_id);
 
     // Clear any stale relay_url left by a previous crash — relay_url is runtime state
     // that must be re-established each run. A stale URL would advertise a dead relay.

@@ -75,7 +75,10 @@ mod daemon_integration {
     /// has exactly one subscription per topic, matching the daemon's production behavior.
     async fn build_node(seed_byte: u8) -> anyhow::Result<NodeBundle> {
         let fs = Arc::new(InMemoryFs::new());
-        let vault = Vault::init(fs.clone()).await?;
+        // Author Loro ops under a per-device PeerId derived from this node's
+        // secret seed, so each node is a distinct Loro replica.
+        let author = PeerId::from_secret_bytes(seed(seed_byte));
+        let vault = Vault::init(fs.clone(), author).await?;
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());
