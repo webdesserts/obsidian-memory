@@ -10,7 +10,7 @@ use std::path::Path;
 use rmcp::model::{CallToolResult, Content, ErrorData, ResourceContents};
 
 use crate::graph::GraphIndex;
-use crate::projects::{discover_projects, generate_discovery_status_message, DiscoveryResult};
+use crate::projects::{DiscoveryResult, discover_projects, generate_discovery_status_message};
 use crate::tools::get_weekly_note_info;
 
 /// Execute the Remember tool

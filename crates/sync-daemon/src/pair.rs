@@ -17,9 +17,9 @@ use tracing::debug;
 
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::{
+    SyncNode,
     discovery::{DiscoveredMesh, MeshMetadata},
     pairing::pair_with_mesh_interactive,
-    SyncNode,
 };
 use sync_core::pairing::PairingHello;
 use sync_core::peer_id::PeerId;
@@ -39,10 +39,7 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
     // Resolve device name: use provided name, or system hostname, or fallback.
     let device_name = device_name.unwrap_or_else(|| {
         let hostname = gethostname::gethostname();
-        hostname
-            .to_str()
-            .unwrap_or("Sync Daemon")
-            .to_string()
+        hostname.to_str().unwrap_or("Sync Daemon").to_string()
     });
 
     // Load or generate the identity key for this vault.
@@ -135,7 +132,12 @@ async fn pair_inner(
     mesh_list.sort_by(|a, b| a.mesh_name.cmp(&b.mesh_name));
     eprintln!();
     for (i, mesh) in mesh_list.iter().enumerate() {
-        eprintln!("  {}. {} ({} online)", i + 1, mesh.mesh_name, mesh.online_count);
+        eprintln!(
+            "  {}. {} ({} online)",
+            i + 1,
+            mesh.mesh_name,
+            mesh.online_count
+        );
     }
     eprintln!();
 

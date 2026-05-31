@@ -205,10 +205,7 @@ mod sync_workflow {
     }
 
     /// Subscribe device B to gossip, bootstrapping off device A.
-    async fn subscribe_gossip_via(
-        b: &TestDevice,
-        a: &TestDevice,
-    ) -> anyhow::Result<VaultGossip> {
+    async fn subscribe_gossip_via(b: &TestDevice, a: &TestDevice) -> anyhow::Result<VaultGossip> {
         b.sync_node
             .join_vault_gossip(&shared_vault_id(), vec![a.sync_node.node_id()])
             .await
@@ -247,10 +244,17 @@ mod sync_workflow {
         .await;
 
         // Drive A's inbound QUIC handler so B can pull from A.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
+        spawn_inbound_handler(
+            device_a.vault.clone(),
+            device_a.allowlist.clone(),
+            device_a.inbound_sync_rx,
+        );
 
         // A writes a file and indexes the change.
-        device_a.fs.write("notes/hello.md", b"# Hello World").await?;
+        device_a
+            .fs
+            .write("notes/hello.md", b"# Hello World")
+            .await?;
         {
             let vault = device_a.vault.lock().await;
             vault.on_file_changed("notes/hello.md").await?;
@@ -272,12 +276,8 @@ mod sync_workflow {
             let vault = device_b.vault.lock().await;
             vault.prepare_sync_request().await?
         };
-        let response_bytes = connect_and_sync_raw(
-            &device_b.sync_node.endpoint,
-            addr_a,
-            &request_bytes,
-        )
-        .await?;
+        let response_bytes =
+            connect_and_sync_raw(&device_b.sync_node.endpoint, addr_a, &request_bytes).await?;
 
         {
             let vault = device_b.vault.lock().await;
@@ -331,14 +331,25 @@ mod sync_workflow {
         .await;
 
         // Wire inbound handlers on both sides so either can act as QUIC responder.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
-        spawn_inbound_handler(device_b.vault.clone(), device_b.allowlist.clone(), device_b.inbound_sync_rx);
+        spawn_inbound_handler(
+            device_a.vault.clone(),
+            device_a.allowlist.clone(),
+            device_a.inbound_sync_rx,
+        );
+        spawn_inbound_handler(
+            device_b.vault.clone(),
+            device_b.allowlist.clone(),
+            device_b.inbound_sync_rx,
+        );
 
         let addr_a: EndpointAddr = device_a.sync_node.endpoint.addr();
 
         // Step 1: A creates the file and B pulls it via QUIC.
         // We use gossip to signal B that there's something to pull.
-        device_a.fs.write("notes/delete-me.md", b"to be deleted").await?;
+        device_a
+            .fs
+            .write("notes/delete-me.md", b"to be deleted")
+            .await?;
         {
             let vault = device_a.vault.lock().await;
             vault.on_file_changed("notes/delete-me.md").await?;
@@ -355,12 +366,9 @@ mod sync_workflow {
             let vault = device_b.vault.lock().await;
             vault.prepare_sync_request().await?
         };
-        let response_bytes = connect_and_sync_raw(
-            &device_b.sync_node.endpoint,
-            addr_a.clone(),
-            &request_bytes,
-        )
-        .await?;
+        let response_bytes =
+            connect_and_sync_raw(&device_b.sync_node.endpoint, addr_a.clone(), &request_bytes)
+                .await?;
         {
             let vault = device_b.vault.lock().await;
             vault.process_sync_message(&response_bytes).await?;
@@ -399,12 +407,8 @@ mod sync_workflow {
             let vault = device_b.vault.lock().await;
             vault.prepare_sync_request().await?
         };
-        let response_bytes2 = connect_and_sync_raw(
-            &device_b.sync_node.endpoint,
-            addr_a,
-            &request_bytes2,
-        )
-        .await?;
+        let response_bytes2 =
+            connect_and_sync_raw(&device_b.sync_node.endpoint, addr_a, &request_bytes2).await?;
         {
             let vault = device_b.vault.lock().await;
             vault.process_sync_message(&response_bytes2).await?;
@@ -453,12 +457,19 @@ mod sync_workflow {
 
         let lookup_unknown = MemoryLookup::new();
         lookup_unknown.add_endpoint_info(addr_a.clone());
-        device_unknown.sync_node.endpoint.address_lookup()?.add(lookup_unknown);
+        device_unknown
+            .sync_node
+            .endpoint
+            .address_lookup()?
+            .add(lookup_unknown);
 
         // Populate A's allowlist with a fake peer (not device_unknown) so it is
         // non-empty — a non-empty allowlist denies all unlisted peers.
         let fake_peer_id = PeerId::from_bytes([0xAAu8; 32]);
-        device_a.allowlist.add_peer(fake_peer_id, "other-device").await?;
+        device_a
+            .allowlist
+            .add_peer(fake_peer_id, "other-device")
+            .await?;
 
         // Write a file to A's vault so there's something to protect.
         device_a.fs.write("notes/private.md", b"secret").await?;
@@ -468,7 +479,11 @@ mod sync_workflow {
         }
 
         // Drive A's inbound handler using the real allowlist enforcement.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
+        spawn_inbound_handler(
+            device_a.vault.clone(),
+            device_a.allowlist.clone(),
+            device_a.inbound_sync_rx,
+        );
 
         // Unknown device tries to sync with A.
         let request_bytes = {
@@ -586,7 +601,10 @@ mod sync_workflow {
         let device_b = make_device(10).await?;
 
         // A has a file before B joins.
-        device_a.fs.write("notes/offline-edit.md", b"# Written offline").await?;
+        device_a
+            .fs
+            .write("notes/offline-edit.md", b"# Written offline")
+            .await?;
         {
             let vault = device_a.vault.lock().await;
             vault.on_file_changed("notes/offline-edit.md").await?;
@@ -599,16 +617,17 @@ mod sync_workflow {
         let mut gossip_b = subscribe_gossip_via(&device_b, &device_a).await?;
 
         // Wire A's inbound handler so B can pull from A when NeighborUp fires.
-        spawn_inbound_handler(device_a.vault.clone(), device_a.allowlist.clone(), device_a.inbound_sync_rx);
+        spawn_inbound_handler(
+            device_a.vault.clone(),
+            device_a.allowlist.clone(),
+            device_a.inbound_sync_rx,
+        );
 
         // B waits to see A as a neighbor, then initiates a full sync to pull A's files.
-        wait_for_gossip(
-            &mut gossip_b.event_rx,
-            |e| match e {
-                GossipEvent::NeighborUp(_) => Some(()),
-                _ => None,
-            },
-        )
+        wait_for_gossip(&mut gossip_b.event_rx, |e| match e {
+            GossipEvent::NeighborUp(_) => Some(()),
+            _ => None,
+        })
         .await;
 
         // B sends its SyncRequest to A (A's inbound handler responds with SyncExchange
@@ -618,12 +637,8 @@ mod sync_workflow {
             let vault = device_b.vault.lock().await;
             vault.prepare_sync_request().await?
         };
-        let response_bytes = connect_and_sync_raw(
-            &device_b.sync_node.endpoint,
-            addr_a,
-            &request_bytes,
-        )
-        .await?;
+        let response_bytes =
+            connect_and_sync_raw(&device_b.sync_node.endpoint, addr_a, &request_bytes).await?;
         {
             let vault = device_b.vault.lock().await;
             vault.process_sync_message(&response_bytes).await?;

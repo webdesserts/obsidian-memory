@@ -1,20 +1,20 @@
 use clap::Parser;
 use rmcp::{
+    ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
     tool, tool_handler, tool_router,
     transport::stdio,
-    ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpService,
+    StreamableHttpService, session::local::LocalSessionManager,
 };
 
 mod config;
@@ -223,9 +223,15 @@ impl SharedState {
                 }
 
                 if !notes.is_empty() {
-                    tracing::info!("Preloading embeddings for {} notes in background...", notes.len());
+                    tracing::info!(
+                        "Preloading embeddings for {} notes in background...",
+                        notes.len()
+                    );
                     if let Err(e) = embeddings_clone.get_embeddings_batch(&notes).await {
-                        tracing::warn!("Failed to preload embeddings: {}. First search will be slower.", e);
+                        tracing::warn!(
+                            "Failed to preload embeddings: {}. First search will be slower.",
+                            e
+                        );
                     } else {
                         tracing::info!("Embeddings preloaded successfully");
                     }
@@ -237,20 +243,21 @@ impl SharedState {
         let storage = Arc::new(FileStorage::new(config.vault_path.clone()));
 
         // Start file watcher to keep graph index and embeddings up to date
-        let watcher = match VaultWatcher::start(
-            config.vault_path.clone(),
-            graph.clone(),
-            embeddings.clone(),
-        ) {
-            Ok(w) => {
-                tracing::info!("File watcher started successfully");
-                Some(Arc::new(w))
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start file watcher: {}. Graph index will not auto-update.", e);
-                None
-            }
-        };
+        let watcher =
+            match VaultWatcher::start(config.vault_path.clone(), graph.clone(), embeddings.clone())
+            {
+                Ok(w) => {
+                    tracing::info!("File watcher started successfully");
+                    Some(Arc::new(w))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to start file watcher: {}. Graph index will not auto-update.",
+                        e
+                    );
+                    None
+                }
+            };
 
         Ok(Self {
             config: Arc::new(config),
@@ -303,17 +310,23 @@ impl MemoryServer {
         &self.shared.storage
     }
 
-    #[tool(description = "Get the current date and time in ISO format for use in Working Memory timeline entries. Returns ISO 8601 formatted datetime (YYYY-MM-DDTHH:MM) and additional context.")]
+    #[tool(
+        description = "Get the current date and time in ISO format for use in Working Memory timeline entries. Returns ISO 8601 formatted datetime (YYYY-MM-DDTHH:MM) and additional context."
+    )]
     async fn get_current_datetime(&self) -> Result<CallToolResult, ErrorData> {
         tools::get_current_datetime::execute()
     }
 
-    #[tool(description = "Append a timestamped entry to Log.md for active work state and debugging context tracking. Records chronological session activity - what happened when. The tool automatically adds timestamps and organizes entries by day. Use this for tracking work in progress, debugging steps, state changes, and decisions made during active work.")]
+    #[tool(
+        description = "Append a timestamped entry to Log.md for active work state and debugging context tracking. Records chronological session activity - what happened when. The tool automatically adds timestamps and organizes entries by day. Use this for tracking work in progress, debugging steps, state changes, and decisions made during active work."
+    )]
     async fn log(&self, params: Parameters<LogParams>) -> Result<CallToolResult, ErrorData> {
         tools::log::execute(&self.config().vault_path, &params.0.content).await
     }
 
-    #[tool(description = "Get metadata and graph connections for the current week's journal note. Returns path, URIs, frontmatter, and links/backlinks. Works whether or not the note exists yet. Use ReadNote tool to get content.")]
+    #[tool(
+        description = "Get metadata and graph connections for the current week's journal note. Returns path, URIs, frontmatter, and links/backlinks. Works whether or not the note exists yet. Use ReadNote tool to get content."
+    )]
     async fn get_weekly_note_info(&self) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::get_weekly_note_info::execute(
@@ -324,8 +337,13 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Get metadata and graph connections for a note. Returns frontmatter, file paths, and links/backlinks. Use ReadNote tool to get content.")]
-    async fn get_note_info(&self, params: Parameters<GetNoteInfoParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Get metadata and graph connections for a note. Returns frontmatter, file paths, and links/backlinks. Use ReadNote tool to get content."
+    )]
+    async fn get_note_info(
+        &self,
+        params: Parameters<GetNoteInfoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::get_note_info::execute(
             &self.config().vault_path,
@@ -336,8 +354,13 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Update frontmatter metadata in a note. Requires content_hash from ReadNote. Returns JSON with new content_hash.")]
-    async fn update_frontmatter(&self, params: Parameters<UpdateFrontmatterParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Update frontmatter metadata in a note. Requires content_hash from ReadNote. Returns JSON with new content_hash."
+    )]
+    async fn update_frontmatter(
+        &self,
+        params: Parameters<UpdateFrontmatterParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::update_frontmatter::execute(
             &*self.storage(),
@@ -349,14 +372,21 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Load all session context files in a single call. Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. Automatically discovers projects based on git remotes and directory names. Use this at the start of every session to get complete context about recent work, current focus, this week's activity, and project context.")]
-    async fn remember(&self, params: Parameters<RememberParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Load all session context files in a single call. Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. Automatically discovers projects based on git remotes and directory names. Use this at the start of every session to get complete context about recent work, current focus, this week's activity, and project context."
+    )]
+    async fn remember(
+        &self,
+        params: Parameters<RememberParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         let cwd = params.0.cwd.map(std::path::PathBuf::from);
         tools::remember::execute(&self.config().vault_path, &graph, cwd.as_deref()).await
     }
 
-    #[tool(description = "Search for relevant notes using semantic similarity. Encodes the query and compares it against all note embeddings. Returns similarity-ordered list of potentially relevant notes. Supports note references via wiki-links: [[Note Name]]")]
+    #[tool(
+        description = "Search for relevant notes using semantic similarity. Encodes the query and compares it against all note embeddings. Returns similarity-ordered list of potentially relevant notes. Supports note references via wiki-links: [[Note Name]]"
+    )]
     async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::search::execute(
@@ -369,8 +399,13 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Replace an entire day's log entries with consolidated/compacted entries. Use this ONLY during memory consolidation to rewrite or summarize a day's logs. For adding new entries during active work, use the Log tool instead (it's simpler and doesn't require reading the log first). This tool automatically formats entries with correct timestamps, en-dashes, and chronological sorting. Pass an empty object to delete the entire day section (header and all entries).")]
-    async fn write_logs(&self, params: Parameters<WriteLogsParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Replace an entire day's log entries with consolidated/compacted entries. Use this ONLY during memory consolidation to rewrite or summarize a day's logs. For adding new entries during active work, use the Log tool instead (it's simpler and doesn't require reading the log first). This tool automatically formats entries with correct timestamps, en-dashes, and chronological sorting. Pass an empty object to delete the entire day section (header and all entries)."
+    )]
+    async fn write_logs(
+        &self,
+        params: Parameters<WriteLogsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         tools::write_logs::execute(
             &self.config().vault_path,
             &params.0.iso_week_date,
@@ -379,24 +414,31 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Review active context (Log.md, Working Memory.md, current weekly journal, project notes) and consolidate content into permanent storage. Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. Returns detailed consolidation instructions.")]
+    #[tool(
+        description = "Review active context (Log.md, Working Memory.md, current weekly journal, project notes) and consolidate content into permanent storage. Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. Returns detailed consolidation instructions."
+    )]
     async fn reflect(&self) -> Result<CallToolResult, ErrorData> {
         tools::reflect::execute()
     }
 
-#[tool(description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote, EditNote, or ReplaceInNote unchanged.")]
-    async fn read_note(&self, params: Parameters<ReadNoteParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote, EditNote, or ReplaceInNote unchanged."
+    )]
+    async fn read_note(
+        &self,
+        params: Parameters<ReadNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
-        tools::read_note::execute(
-            self.storage(),
-            &graph,
-            &params.0.note,
-        )
-        .await
+        tools::read_note::execute(self.storage(), &graph, &params.0.note).await
     }
 
-    #[tool(description = "Create a new note or overwrite an existing note. For existing notes, include content_hash from ReadNote. Returns JSON with new content_hash for chained writes.")]
-    async fn write_note(&self, params: Parameters<WriteNoteParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Create a new note or overwrite an existing note. For existing notes, include content_hash from ReadNote. Returns JSON with new content_hash for chained writes."
+    )]
+    async fn write_note(
+        &self,
+        params: Parameters<WriteNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::write_note::execute(
             &self.config().vault_path,
@@ -409,9 +451,16 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits.")]
-    async fn replace_in_note(&self, params: Parameters<ReplaceInNoteParams>) -> Result<CallToolResult, ErrorData> {
-        let edits: Vec<tools::replace_in_note::Edit> = params.0.edits
+    #[tool(
+        description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits."
+    )]
+    async fn replace_in_note(
+        &self,
+        params: Parameters<ReplaceInNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let edits: Vec<tools::replace_in_note::Edit> = params
+            .0
+            .edits
             .into_iter()
             .map(|e| tools::replace_in_note::Edit {
                 old_text: e.old_text,
@@ -432,9 +481,16 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Replace lines in a note by line number. Each edit specifies a startLine and endLine (1-indexed, inclusive, matching ReadNote output) and newText to replace that range. Use empty newText to delete lines. Ranges must not overlap. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits.")]
-    async fn edit_note(&self, params: Parameters<EditNoteParams>) -> Result<CallToolResult, ErrorData> {
-        let edits: Vec<tools::edit_note::LineEdit> = params.0.edits
+    #[tool(
+        description = "Replace lines in a note by line number. Each edit specifies a startLine and endLine (1-indexed, inclusive, matching ReadNote output) and newText to replace that range. Use empty newText to delete lines. Ranges must not overlap. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits."
+    )]
+    async fn edit_note(
+        &self,
+        params: Parameters<EditNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let edits: Vec<tools::edit_note::LineEdit> = params
+            .0
+            .edits
             .into_iter()
             .map(|e| tools::edit_note::LineEdit {
                 start_line: e.start_line,
@@ -456,8 +512,13 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Permanently delete a note from the vault. Returns an error if the note doesn't exist.")]
-    async fn delete_note(&self, params: Parameters<DeleteNoteParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Permanently delete a note from the vault. Returns an error if the note doesn't exist."
+    )]
+    async fn delete_note(
+        &self,
+        params: Parameters<DeleteNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         tools::delete_note::execute(
             &self.config().vault_path,
             self.storage(),
@@ -467,8 +528,13 @@ impl MemoryServer {
         .await
     }
 
-    #[tool(description = "Move or rename a note. Automatically updates wiki-links in all notes that reference the moved note. Fails if destination already exists.")]
-    async fn move_note(&self, params: Parameters<MoveNoteParams>) -> Result<CallToolResult, ErrorData> {
+    #[tool(
+        description = "Move or rename a note. Automatically updates wiki-links in all notes that reference the moved note. Fails if destination already exists."
+    )]
+    async fn move_note(
+        &self,
+        params: Parameters<MoveNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
         tools::move_note::execute(
             &self.config().vault_path,
             self.storage(),
@@ -665,9 +731,7 @@ fn run_obsidian_install(
     if main_js_path.exists() && !force {
         let existing = std::fs::read_to_string(&main_js_path).unwrap_or_default();
         if !existing.starts_with(HARNESS_MARKER) {
-            return Err(
-                "Plugin already installed. Use --force to overwrite.".into()
-            );
+            return Err("Plugin already installed. Use --force to overwrite.".into());
         }
     }
 
@@ -763,7 +827,10 @@ fn discover_vault() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
                 // Install to all vaults — just use the first one here,
                 // the caller would need to loop. For now, return first.
                 // TODO: support installing to all vaults
-                Err("Installing to all vaults is not yet supported. Use --vault to specify one.".into())
+                Err(
+                    "Installing to all vaults is not yet supported. Use --vault to specify one."
+                        .into(),
+                )
             } else {
                 let idx: usize = input.parse::<usize>().map_err(|_| "Invalid selection")?;
                 if idx < 1 || idx > valid_vaults.len() {
@@ -912,10 +979,7 @@ fn health_router() -> axum::Router {
 }
 
 /// Run the server with HTTP transport.
-async fn run_http_server(
-    config: Config,
-    listen: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_http_server(config: Config, listen: &str) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Vault path: {}", config.vault_path.display());
 
     let shared = Arc::new(SharedState::new(config).await?);
@@ -983,4 +1047,3 @@ mod tests {
         assert_eq!(&body[..], b"OK");
     }
 }
-

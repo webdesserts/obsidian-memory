@@ -109,7 +109,11 @@ impl ProtocolHandler for SyncStreamHandler {
         debug!(peer = %remote_endpoint_id, "Inbound sync message: {} bytes", message_bytes.len());
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        let request = InboundSyncRequest { message_bytes, reply_tx, remote_id };
+        let request = InboundSyncRequest {
+            message_bytes,
+            reply_tx,
+            remote_id,
+        };
 
         if self.inbound_tx.send(request).is_err() {
             // No one is listening for inbound requests — close the stream.

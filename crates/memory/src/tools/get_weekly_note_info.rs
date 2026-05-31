@@ -123,7 +123,9 @@ mod tests {
         let vault_path = temp_dir.path();
 
         // Create journal directory
-        fs::create_dir_all(vault_path.join("journal")).await.unwrap();
+        fs::create_dir_all(vault_path.join("journal"))
+            .await
+            .unwrap();
 
         // Build empty graph
         let graph = GraphIndex::new();
@@ -136,7 +138,9 @@ mod tests {
         let vault_path = temp_dir.path();
 
         // Create journal directory
-        fs::create_dir_all(vault_path.join("journal")).await.unwrap();
+        fs::create_dir_all(vault_path.join("journal"))
+            .await
+            .unwrap();
 
         // Get current week info to create the right file
         let (iso_week_date, _) = get_current_week_info();
@@ -230,7 +234,15 @@ mod tests {
             .clone();
 
         // Should show current day name
-        let days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+        let days = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ];
         assert!(days.iter().any(|day| text.contains(day)));
     }
 
@@ -243,7 +255,15 @@ mod tests {
         assert!(iso_week_date.contains("-w"));
 
         // Day name should be valid
-        let valid_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+        let valid_days = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ];
         assert!(valid_days.contains(&day_name));
     }
 }

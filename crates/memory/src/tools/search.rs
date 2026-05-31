@@ -9,17 +9,15 @@ use tokio::fs;
 
 use crate::embeddings::EmbeddingManager;
 use crate::graph::GraphIndex;
-use semantic_embeddings::{Embedding, EMBEDDING_DIM};
+use semantic_embeddings::{EMBEDDING_DIM, Embedding};
 
 /// Regex for extracting [[wiki-links]] from query text
-static WIKI_LINK_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\[\[([^\]]+)\]\]").expect("Invalid wiki-link regex")
-});
+static WIKI_LINK_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\[\[([^\]]+)\]\]").expect("Invalid wiki-link regex"));
 
 /// Regex for normalizing whitespace
-static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\s+").expect("Invalid whitespace regex")
-});
+static WHITESPACE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\s+").expect("Invalid whitespace regex"));
 
 /// Hardcoded search parameters
 const TOP_K: usize = 10;
@@ -43,18 +41,18 @@ pub async fn execute(
     query: &str,
     debug: bool,
 ) -> Result<CallToolResult, ErrorData> {
-    tracing::info!(
-        query_len = query.len(),
-        "Starting search"
-    );
+    tracing::info!(query_len = query.len(), "Starting search");
 
     // Parse wiki-links from query
     let (note_refs, remaining_text) = parse_query(query);
 
     // Build the query embedding
-    let query_embedding = build_query_embedding(vault_path, embeddings, &note_refs, &remaining_text)
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("Failed to build query embedding: {}", e), None))?;
+    let query_embedding =
+        build_query_embedding(vault_path, embeddings, &note_refs, &remaining_text)
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to build query embedding: {}", e), None)
+            })?;
 
     // Get all note embeddings
     let notes = get_all_notes(vault_path, graph).await;
@@ -71,16 +69,15 @@ pub async fn execute(
     );
 
     // Compute embeddings for all notes
-    let note_embeddings = embeddings
-        .get_embeddings_batch(&notes)
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("Failed to compute embeddings: {}", e), None))?;
+    let note_embeddings = embeddings.get_embeddings_batch(&notes).await.map_err(|e| {
+        ErrorData::internal_error(format!("Failed to compute embeddings: {}", e), None)
+    })?;
 
     // Compute semantic similarity scores
     let mut results: Vec<SearchResult> = Vec::new();
     for (path, embedding) in &note_embeddings {
-        let semantic_score = EmbeddingManager::cosine_similarity(&query_embedding, embedding)
-            .unwrap_or(0.0);
+        let semantic_score =
+            EmbeddingManager::cosine_similarity(&query_embedding, embedding).unwrap_or(0.0);
 
         if semantic_score < MIN_SIMILARITY {
             continue;
@@ -235,21 +232,21 @@ async fn get_all_notes(vault_path: &Path, graph: &GraphIndex) -> Vec<(String, St
 /// (intersection - note must be close to ALL seeds).
 fn compute_graph_proximity(graph: &GraphIndex, seeds: &[String], target: &str) -> f32 {
     use crate::graph::pagerank::personalized_pagerank;
-    
+
     if seeds.is_empty() {
         return 0.0;
     }
 
     let mut combined_score = 1.0;
-    
+
     for seed in seeds {
         let scores = personalized_pagerank(graph, seed);
         let score = scores.get(target).copied().unwrap_or(0.0) as f32;
-        
+
         // Multiply scores for intersection (must be close to ALL seeds)
         combined_score *= score;
     }
-    
+
     // Cap at 1.0 (100% boost)
     combined_score.min(1.0)
 }
@@ -269,13 +266,11 @@ fn format_results(
         let parts: Vec<String> = note_refs
             .iter()
             .map(|n| format!("[[{}]]", n))
-            .chain(
-                if remaining_text.is_empty() {
-                    None
-                } else {
-                    Some(format!("\"{}\"", remaining_text))
-                }
-            )
+            .chain(if remaining_text.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"", remaining_text))
+            })
             .collect();
         output.push_str(&parts.join(", "));
         output.push_str("\n\n");

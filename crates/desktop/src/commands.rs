@@ -114,9 +114,7 @@ pub async fn submit_pair_code(
 /// session is currently active — handles the race where the user clicks Cancel
 /// after pairing has already completed but the window is still closing.
 #[tauri::command]
-pub async fn cancel_pair_discovery(
-    control: State<'_, ControlState>,
-) -> Result<(), String> {
+pub async fn cancel_pair_discovery(control: State<'_, ControlState>) -> Result<(), String> {
     let (reply_tx, reply_rx) = oneshot::channel();
 
     control

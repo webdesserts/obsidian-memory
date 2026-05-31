@@ -21,13 +21,15 @@ fn test_attention_mask_with_padding() {
 #[test]
 fn test_regression_padding_bug() {
     // This test ensures the bug we fixed (using all-1s attention mask) doesn't regress
-    let emb1 = TEST_MODEL.encode_single("cat").expect("Failed to encode cat");
-    let emb2 = TEST_MODEL.encode_single("dog").expect("Failed to encode dog");
+    let emb1 = TEST_MODEL
+        .encode_single("cat")
+        .expect("Failed to encode cat");
+    let emb2 = TEST_MODEL
+        .encode_single("dog")
+        .expect("Failed to encode dog");
 
     // Compute cosine similarity
-    let similarity = emb1.iter().zip(&emb2)
-        .map(|(a, b)| a * b)
-        .sum::<f32>();
+    let similarity = emb1.iter().zip(&emb2).map(|(a, b)| a * b).sum::<f32>();
 
     // With the bug, this was ~0.97. Fixed, it should be ~0.76
     assert!(
@@ -51,7 +53,9 @@ fn test_batch_encoding() {
         "The weather is lovely".to_string(),
     ];
 
-    let embeddings = TEST_MODEL.encode_batch(&texts).expect("Failed to encode batch");
+    let embeddings = TEST_MODEL
+        .encode_batch(&texts)
+        .expect("Failed to encode batch");
 
     assert_eq!(embeddings.len(), 3, "Should have 3 embeddings");
 

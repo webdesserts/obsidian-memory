@@ -35,9 +35,9 @@ pub async fn execute<S: Storage>(
     content_hash: Option<&str>,
 ) -> Result<CallToolResult, ErrorData> {
     // Resolve the note reference using the graph index
-    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
-    })?;
+    let (uri, exists) = resolve_note_uri(storage, graph, note)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to resolve note: {}", e), None))?;
 
     // Validate content_hash for existing files
     if exists {
@@ -45,7 +45,10 @@ pub async fn execute<S: Storage>(
             Some(hash) => {
                 // Validate the provided hash matches current content
                 let (current_content, _) = storage.read(&uri).await.map_err(|e| {
-                    ErrorData::internal_error(format!("Failed to read note for hash check: {}", e), None)
+                    ErrorData::internal_error(
+                        format!("Failed to read note for hash check: {}", e),
+                        None,
+                    )
                 })?;
                 let current_hash = ContentHash::from_content(&current_content);
                 if current_hash.as_str() != hash {
@@ -77,26 +80,31 @@ pub async fn execute<S: Storage>(
     }
 
     // Attempt to write (pass hash for optimistic locking on existing files)
-    storage.write(&uri, content, content_hash).await.map_err(|e| match e {
-        StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
-            format!(
-                "Parent directory doesn't exist for '{}': {}. \
+    storage
+        .write(&uri, content, content_hash)
+        .await
+        .map_err(|e| match e {
+            StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
+                format!(
+                    "Parent directory doesn't exist for '{}': {}. \
                  Create the directory first or use a different path.",
-                uri,
-                parent.display()
+                    uri,
+                    parent.display()
+                ),
+                None,
             ),
-            None,
-        ),
-        StorageError::HashMismatch { expected, actual, .. } => ErrorData::invalid_params(
-            format!(
-                "Note modified since last read (expected hash: {}, actual: {}). \
+            StorageError::HashMismatch {
+                expected, actual, ..
+            } => ErrorData::invalid_params(
+                format!(
+                    "Note modified since last read (expected hash: {}, actual: {}). \
                  Read note again to get current content and hash.",
-                expected, actual
+                    expected, actual
+                ),
+                None,
             ),
-            None,
-        ),
-        _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
-    })?;
+            _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
+        })?;
 
     // Compute new content hash for response
     let new_hash = ContentHash::from_content(content);
@@ -110,8 +118,9 @@ pub async fn execute<S: Storage>(
         bytes_written: content.len(),
     };
 
-    let json = serde_json::to_string(&response)
-        .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+    let json = serde_json::to_string(&response).map_err(|e| {
+        ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+    })?;
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -273,16 +282,9 @@ mod tests {
         let (temp_dir, storage, graph) = create_test_env().await;
 
         // First write - creates new file
-        let result1 = execute(
-            temp_dir.path(),
-            &storage,
-            &graph,
-            "test",
-            "Version 1",
-            None,
-        )
-        .await
-        .expect("should succeed");
+        let result1 = execute(temp_dir.path(), &storage, &graph, "test", "Version 1", None)
+            .await
+            .expect("should succeed");
 
         let response1 = parse_response(&result1);
 
@@ -399,13 +401,12 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         // Create note in subdirectory
-        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
-        fs::write(
-            temp_dir.path().join("knowledge/My Note.md"),
-            "Version 1",
-        )
-        .await
-        .unwrap();
+        fs::create_dir(temp_dir.path().join("knowledge"))
+            .await
+            .unwrap();
+        fs::write(temp_dir.path().join("knowledge/My Note.md"), "Version 1")
+            .await
+            .unwrap();
         graph.update_note(
             "My Note",
             PathBuf::from("knowledge/My Note.md"),
@@ -413,17 +414,12 @@ mod tests {
         );
 
         // Step 1: ReadNote
-        let read_result = super::super::read_note::execute(
-            &storage,
-            &graph,
-            "My Note",
-        )
-        .await
-        .expect("ReadNote should succeed");
+        let read_result = super::super::read_note::execute(&storage, &graph, "My Note")
+            .await
+            .expect("ReadNote should succeed");
 
-        let read_json: serde_json::Value = serde_json::from_str(
-            &read_result.content[0].raw.as_text().unwrap().text
-        ).unwrap();
+        let read_json: serde_json::Value =
+            serde_json::from_str(&read_result.content[0].raw.as_text().unwrap().text).unwrap();
 
         let content_hash = read_json["content_hash"].as_str().unwrap();
         assert_eq!(read_json["content"].as_str().unwrap(), "1\tVersion 1");

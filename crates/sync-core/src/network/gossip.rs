@@ -15,7 +15,10 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::EndpointId;
-use iroh_gossip::{TopicId, api::{Event, GossipSender}};
+use iroh_gossip::{
+    TopicId,
+    api::{Event, GossipSender},
+};
 use n0_future::task;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -63,7 +66,10 @@ pub enum GossipEvent {
     /// A peer left the gossip swarm for this vault.
     NeighborDown(EndpointId),
     /// A change notification broadcast received from a peer.
-    ChangeReceived { from: EndpointId, notification: ChangeNotification },
+    ChangeReceived {
+        from: EndpointId,
+        notification: ChangeNotification,
+    },
     /// A peer was added to the allowlist by a trusted mesh member.
     AllowlistUpdate { from: EndpointId, peer: AllowedPeer },
 }
@@ -124,7 +130,10 @@ impl VaultGossip {
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to deserialize gossip message from {}: {}", msg.delivered_from, e);
+                                warn!(
+                                    "Failed to deserialize gossip message from {}: {}",
+                                    msg.delivered_from, e
+                                );
                                 continue;
                             }
                         }

@@ -165,9 +165,9 @@ pub async fn execute<S: Storage>(
     content_hash: &str,
     dry_run: bool,
 ) -> Result<CallToolResult, ErrorData> {
-    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
-    })?;
+    let (uri, exists) = resolve_note_uri(storage, graph, note)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to resolve note: {}", e), None))?;
 
     if !exists {
         return Err(ErrorData::invalid_params(
@@ -176,9 +176,10 @@ pub async fn execute<S: Storage>(
         ));
     }
 
-    let (content, _metadata) = storage.read(&uri).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to read note: {}", e), None)
-    })?;
+    let (content, _metadata) = storage
+        .read(&uri)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to read note: {}", e), None))?;
 
     // Validate content_hash matches current content
     let current_hash = ContentHash::from_content(&content);
@@ -194,9 +195,8 @@ pub async fn execute<S: Storage>(
         ));
     }
 
-    let (modified, diff) = apply_line_edits(&content, &edits).map_err(|e| {
-        ErrorData::invalid_params(format!("Edit failed: {}", e), None)
-    })?;
+    let (modified, diff) = apply_line_edits(&content, &edits)
+        .map_err(|e| ErrorData::invalid_params(format!("Edit failed: {}", e), None))?;
 
     let file_path = ensure_markdown_extension(&uri);
     let new_hash = ContentHash::from_content(&modified);
@@ -209,22 +209,28 @@ pub async fn execute<S: Storage>(
             edits_count: edits.len(),
             changes: diff,
         };
-        let json = serde_json::to_string(&response)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+        let json = serde_json::to_string(&response).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+        })?;
         return Ok(CallToolResult::success(vec![Content::text(json)]));
     }
 
-    storage.write(&uri, &modified, Some(content_hash)).await.map_err(|e| match e {
-        StorageError::HashMismatch { expected, actual, .. } => ErrorData::invalid_params(
-            format!(
-                "Note modified since last read (expected hash: {}, actual: {}). \
+    storage
+        .write(&uri, &modified, Some(content_hash))
+        .await
+        .map_err(|e| match e {
+            StorageError::HashMismatch {
+                expected, actual, ..
+            } => ErrorData::invalid_params(
+                format!(
+                    "Note modified since last read (expected hash: {}, actual: {}). \
                  Read note again to get current content and hash.",
-                expected, actual
+                    expected, actual
+                ),
+                None,
             ),
-            None,
-        ),
-        _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
-    })?;
+            _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
+        })?;
 
     let response = EditNoteResponse {
         uri: format!("memory:{}", uri),
@@ -233,8 +239,9 @@ pub async fn execute<S: Storage>(
         edits_applied: edits.len(),
     };
 
-    let json = serde_json::to_string(&response)
-        .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+    let json = serde_json::to_string(&response).map_err(|e| {
+        ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+    })?;
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -299,7 +306,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "line one\nline two\nline three";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -309,14 +318,24 @@ mod tests {
             new_text: "replaced".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
 
         let response = parse_response(&result);
         assert_eq!(response.edits_applied, 1);
 
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "line one\nreplaced\nline three");
     }
 
@@ -325,7 +344,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "keep\ndelete me\nalso delete\nkeep too";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -335,12 +356,22 @@ mod tests {
             new_text: String::new(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
 
         let _ = parse_response(&result);
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "keep\nkeep too");
     }
 
@@ -349,7 +380,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "before\nold line\nafter";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -359,12 +392,22 @@ mod tests {
             new_text: "new line A\nnew line B\nnew line C".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
 
         let _ = parse_response(&result);
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "before\nnew line A\nnew line B\nnew line C\nafter");
     }
 
@@ -373,7 +416,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "only one line";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -383,7 +428,16 @@ mod tests {
             new_text: "replacement".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false).await;
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("exceeds total lines"));
@@ -394,7 +448,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "line one";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -404,7 +460,16 @@ mod tests {
             new_text: "replacement".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false).await;
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("1-indexed"));
@@ -415,7 +480,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "line one\nline two";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -425,7 +492,16 @@ mod tests {
             new_text: "replacement".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false).await;
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("must be <= end_line"));
@@ -436,16 +512,35 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "a\nb\nc\nd";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
         let edits = vec![
-            LineEdit { start_line: 1, end_line: 2, new_text: "x".to_string() },
-            LineEdit { start_line: 2, end_line: 3, new_text: "y".to_string() },
+            LineEdit {
+                start_line: 1,
+                end_line: 2,
+                new_text: "x".to_string(),
+            },
+            LineEdit {
+                start_line: 2,
+                end_line: 3,
+                new_text: "y".to_string(),
+            },
         ];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false).await;
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("Overlapping ranges"));
@@ -456,24 +551,44 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "a\nb\nc\nd\ne";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
         // Provide edits out of order to test sorting
         let edits = vec![
-            LineEdit { start_line: 4, end_line: 4, new_text: "D".to_string() },
-            LineEdit { start_line: 2, end_line: 2, new_text: "B".to_string() },
+            LineEdit {
+                start_line: 4,
+                end_line: 4,
+                new_text: "D".to_string(),
+            },
+            LineEdit {
+                start_line: 2,
+                end_line: 2,
+                new_text: "B".to_string(),
+            },
         ];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
 
         let response = parse_response(&result);
         assert_eq!(response.edits_applied, 2);
 
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "a\nB\nc\nD\ne");
     }
 
@@ -482,7 +597,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "line one\nline two\nline three";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -492,9 +609,17 @@ mod tests {
             new_text: "replaced".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), true)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            true,
+        )
+        .await
+        .expect("should succeed");
 
         let response = parse_dry_run_response(&result);
         assert_eq!(response.uri, "memory:test");
@@ -502,7 +627,9 @@ mod tests {
         assert_eq!(response.edits_count, 1);
 
         // Content should NOT have changed
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, content);
     }
 
@@ -511,7 +638,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "a\nb\nc";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -522,9 +651,17 @@ mod tests {
             end_line: 1,
             new_text: "A".to_string(),
         }];
-        let result1 = execute(temp_dir.path(), &storage, &graph, "test", edits1, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result1 = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits1,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
         let response1 = parse_response(&result1);
 
         // Second edit using hash from first
@@ -533,14 +670,24 @@ mod tests {
             end_line: 3,
             new_text: "C".to_string(),
         }];
-        let result2 = execute(temp_dir.path(), &storage, &graph, "test", edits2, &response1.content_hash, false)
-            .await
-            .expect("should succeed");
+        let result2 = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits2,
+            &response1.content_hash,
+            false,
+        )
+        .await
+        .expect("should succeed");
         let response2 = parse_response(&result2);
 
         assert_ne!(response1.content_hash, response2.content_hash);
 
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "A\nb\nC");
     }
 
@@ -550,7 +697,9 @@ mod tests {
 
         // Most real files have a trailing newline, which split('\n') turns into an extra empty element
         let content = "line one\nline two\n";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -563,12 +712,22 @@ mod tests {
             new_text: "replaced".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
 
         let _ = parse_response(&result);
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "line one\nreplaced\n");
     }
 
@@ -577,7 +736,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         // Create note in subdirectory (mirrors replace_in_note's integration test)
-        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
+        fs::create_dir(temp_dir.path().join("knowledge"))
+            .await
+            .unwrap();
         fs::write(
             temp_dir.path().join("knowledge/My Note.md"),
             "first\nsecond\nthird",
@@ -591,17 +752,12 @@ mod tests {
         );
 
         // Step 1: ReadNote to get content_hash
-        let read_result = super::super::read_note::execute(
-            &storage,
-            &graph,
-            "My Note",
-        )
-        .await
-        .expect("ReadNote should succeed");
+        let read_result = super::super::read_note::execute(&storage, &graph, "My Note")
+            .await
+            .expect("ReadNote should succeed");
 
-        let read_json: serde_json::Value = serde_json::from_str(
-            &read_result.content[0].raw.as_text().unwrap().text
-        ).unwrap();
+        let read_json: serde_json::Value =
+            serde_json::from_str(&read_result.content[0].raw.as_text().unwrap().text).unwrap();
 
         let content_hash = read_json["content_hash"].as_str().unwrap();
         // Verify line numbers appear in the content
@@ -641,7 +797,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         let content = "Hello 🌍\n日本語テスト\naccénted";
-        fs::write(temp_dir.path().join("test.md"), content).await.unwrap();
+        fs::write(temp_dir.path().join("test.md"), content)
+            .await
+            .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let hash = ContentHash::from_content(content);
@@ -651,12 +809,22 @@ mod tests {
             new_text: "replaced".to_string(),
         }];
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", edits, hash.as_str(), false)
-            .await
-            .expect("should succeed");
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            edits,
+            hash.as_str(),
+            false,
+        )
+        .await
+        .expect("should succeed");
 
         let _ = parse_response(&result);
-        let written = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let written = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert_eq!(written, "Hello 🌍\nreplaced\naccénted");
     }
 }

@@ -6,20 +6,20 @@
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
-use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh_gossip::{Gossip, TopicId};
+use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::net::GOSSIP_ALPN;
+use iroh_gossip::{Gossip, TopicId};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::peer_id::VaultId;
 #[cfg(feature = "native")]
-use crate::allowlist::{AllowlistStorage};
+use crate::allowlist::AllowlistStorage;
 #[cfg(feature = "native")]
-use crate::network::pairing::{PairingEvent, PairingStreamHandler, PAIRING_ALPN};
+use crate::network::pairing::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
 use crate::network::streams::{InboundSyncRx, SyncStreamHandler};
+use crate::peer_id::VaultId;
 
 /// ALPN identifier for our custom sync protocol.
 ///
@@ -72,10 +72,7 @@ impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHa
 
         if !allowed {
             warn!(peer = %remote_id, "Gossip connection rejected — peer not in allowlist");
-            connection.close(
-                iroh::endpoint::VarInt::from_u32(1),
-                b"not in allowlist",
-            );
+            connection.close(iroh::endpoint::VarInt::from_u32(1), b"not in allowlist");
             return Ok(());
         }
 
@@ -305,7 +302,10 @@ impl SyncNode {
         let user_data = match json.parse::<iroh::address_lookup::UserData>() {
             Ok(ud) => ud,
             Err(e) => {
-                tracing::warn!("MeshMetadata JSON too long for mDNS UserData ({} bytes): {e}", json.len());
+                tracing::warn!(
+                    "MeshMetadata JSON too long for mDNS UserData ({} bytes): {e}",
+                    json.len()
+                );
                 return;
             }
         };
@@ -327,7 +327,8 @@ impl SyncNode {
     #[cfg(feature = "native")]
     pub async fn subscribe_discovery(
         &self,
-    ) -> Option<impl n0_future::Stream<Item = iroh::address_lookup::DiscoveryEvent> + Unpin + use<>> {
+    ) -> Option<impl n0_future::Stream<Item = iroh::address_lookup::DiscoveryEvent> + Unpin + use<>>
+    {
         let mdns = self.mdns.as_ref()?;
         Some(mdns.subscribe().await)
     }

@@ -1,7 +1,7 @@
 //! Vault: Manages a collection of NoteDocuments and syncs with peers.
 
 use crate::document::NoteDocument;
-use crate::events::{EventBus, SyncEvent, Subscription};
+use crate::events::{EventBus, Subscription, SyncEvent};
 use crate::fs::{FileSystem, FsError};
 use crate::{PeerId, VaultId};
 
@@ -135,7 +135,10 @@ impl SyncMetadata {
                 .map_err(|e| VaultError::CorruptMetadata(format!("invalid TOML: {}", e)))?;
 
             if meta.version > CURRENT_SYNC_VERSION {
-                return Err(VaultError::VersionTooNew(meta.version, CURRENT_SYNC_VERSION));
+                return Err(VaultError::VersionTooNew(
+                    meta.version,
+                    CURRENT_SYNC_VERSION,
+                ));
             }
 
             tracing::info!(vault_id = %meta.vault_id, version = meta.version, "Loaded vault metadata");
@@ -154,8 +157,9 @@ impl SyncMetadata {
             let bytes = fs.read(METADATA_FILE).await?;
             let content = String::from_utf8(bytes.to_vec())
                 .map_err(|e| VaultError::CorruptMetadata(format!("invalid UTF-8: {}", e)))?;
-            let written: SyncMetadata = toml::from_str(&content)
-                .map_err(|e| VaultError::CorruptMetadata(format!("invalid TOML after write: {}", e)))?;
+            let written: SyncMetadata = toml::from_str(&content).map_err(|e| {
+                VaultError::CorruptMetadata(format!("invalid TOML after write: {}", e))
+            })?;
 
             tracing::info!(vault_id = %written.vault_id, "Migration v0 → v1 complete");
             Ok(written)
@@ -381,7 +385,6 @@ pub struct Vault<F: FileSystem> {
     /// Event bus for sync events (WASM: Rc for single-threaded browser)
     #[cfg(target_arch = "wasm32")]
     events: Rc<EventBus>,
-
 }
 
 impl<F: FileSystem> Vault<F> {
@@ -597,38 +600,41 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Reconcile filesystem state with Loro documents.
-    /// 
+    ///
     /// This is called on load to handle changes made while the plugin was off:
     /// - External file additions → create new Loro docs
     /// - External file modifications → re-create Loro docs from markdown
     /// - External file moves → migrate Loro doc to new path hash
     /// - External file deletions → orphaned .loro files (logged, not deleted)
-    /// 
+    ///
     /// The filesystem (markdown) is always the source of truth.
     pub async fn reconcile(&self) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
-        
+
         // Get all markdown files in the vault
-        let md_files: std::collections::HashSet<String> = 
+        let md_files: std::collections::HashSet<String> =
             self.list_files().await?.into_iter().collect();
-        
+
         // Get all .loro files in .sync/documents/
         let loro_hashes = self.list_loro_documents().await?;
-        
+
         // Build mapping: path hash → path
-        let path_to_hash: HashMap<String, String> = md_files.iter()
+        let path_to_hash: HashMap<String, String> = md_files
+            .iter()
             .map(|path| (path.clone(), simple_hash(path)))
             .collect();
-        let hash_to_path: HashMap<String, String> = path_to_hash.iter()
+        let hash_to_path: HashMap<String, String> = path_to_hash
+            .iter()
             .map(|(path, hash)| (hash.clone(), path.clone()))
             .collect();
-        
+
         // Track which new files we've already matched to moved files
-        let mut matched_new_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-        
+        let mut matched_new_files: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // First pass: identify orphaned .loro files and try to match them to new files
         let mut orphaned_docs: Vec<(String, NoteDocument)> = Vec::new();
-        
+
         for hash in &loro_hashes {
             if !hash_to_path.contains_key(hash) {
                 // This .loro has no matching markdown file - could be deleted or moved
@@ -641,7 +647,7 @@ impl<F: FileSystem> Vault<F> {
                 }
             }
         }
-        
+
         // Collect new files (markdown exists but no .loro)
         let mut new_files: Vec<String> = Vec::new();
         for path in &md_files {
@@ -650,28 +656,30 @@ impl<F: FileSystem> Vault<F> {
                 new_files.push(path.clone());
             }
         }
-        
+
         // Try to match orphaned .loro files to new markdown files by content
         for (old_hash, orphaned_doc) in &orphaned_docs {
             let orphaned_content_hash = orphaned_doc.content_hash();
             let old_path = orphaned_doc.stored_path().unwrap_or_default();
-            
+
             for new_path in &new_files {
                 if matched_new_files.contains(new_path) {
                     continue;
                 }
-                
+
                 // Read new file content and compute hash
                 if let Ok(bytes) = self.fs.read(new_path).await {
                     let content = String::from_utf8_lossy(&bytes);
-                    if let Ok(new_doc) = NoteDocument::from_markdown(new_path, &content, self.loro_author) {
+                    if let Ok(new_doc) =
+                        NoteDocument::from_markdown(new_path, &content, self.loro_author)
+                    {
                         if new_doc.content_hash() == orphaned_content_hash {
                             // Content matches - this is a move!
                             tracing::info!("File move detected: {} -> {}", old_path, new_path);
-                            
+
                             // Migrate the Loro doc to the new path
                             self.migrate_document(old_hash, new_path).await?;
-                            
+
                             report.moved.push(FileMove {
                                 from: old_path.clone(),
                                 to: new_path.clone(),
@@ -683,17 +691,17 @@ impl<F: FileSystem> Vault<F> {
                 }
             }
         }
-        
+
         // Process remaining markdown files
         for path in &md_files {
             if matched_new_files.contains(path) {
                 // Already handled as a move target
                 continue;
             }
-            
+
             let hash = simple_hash(path);
             let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
-            
+
             if loro_hashes.contains(&hash) {
                 // Both exist - check if markdown was modified externally
                 if self.needs_reindex(path, &sync_path).await? {
@@ -710,7 +718,7 @@ impl<F: FileSystem> Vault<F> {
                 report.indexed.push(path.clone());
             }
         }
-        
+
         // Report orphaned .loro files that weren't matched to moves
         for (hash, doc) in &orphaned_docs {
             let old_path = doc.stored_path().unwrap_or_else(|| hash.clone());
@@ -720,10 +728,10 @@ impl<F: FileSystem> Vault<F> {
                 report.orphaned.push(old_path);
             }
         }
-        
+
         Ok(report)
     }
-    
+
     /// Migrate a Loro document from old path hash to new path.
     ///
     /// This preserves the CRDT history when a file is moved/renamed.
@@ -752,16 +760,16 @@ impl<F: FileSystem> Vault<F> {
 
         Ok(())
     }
-    
+
     /// List all .loro document hashes in .sync/documents/
     async fn list_loro_documents(&self) -> Result<std::collections::HashSet<String>> {
         let mut hashes = std::collections::HashSet::new();
         let docs_dir = format!("{}/documents", SYNC_DIR);
-        
+
         if !self.fs.exists(&docs_dir).await? {
             return Ok(hashes);
         }
-        
+
         let entries = self.fs.list(&docs_dir).await?;
         for entry in entries {
             if !entry.is_dir && entry.name.ends_with(".loro") {
@@ -770,10 +778,10 @@ impl<F: FileSystem> Vault<F> {
                 hashes.insert(hash);
             }
         }
-        
+
         Ok(hashes)
     }
-    
+
     /// Check if a file needs re-indexing (markdown content differs from Loro state)
     async fn needs_reindex(&self, md_path: &str, loro_path: &str) -> Result<bool> {
         // Read markdown content
@@ -794,7 +802,7 @@ impl<F: FileSystem> Vault<F> {
 
         Ok(md_normalized != loro_normalized)
     }
-    
+
     /// Re-index a file by diff-merging changes into the existing Loro doc.
     ///
     /// This is used when external modifications are detected during reconciliation.
@@ -847,7 +855,8 @@ impl<F: FileSystem> Vault<F> {
                 Ok(false) => {} // Already consistent
                 Err(e) => {
                     // Check if file was deleted - skip gracefully
-                    if matches!(e, VaultError::Fs(ref fs_err) if matches!(fs_err, crate::fs::FsError::NotFound(_))) {
+                    if matches!(e, VaultError::Fs(ref fs_err) if matches!(fs_err, crate::fs::FsError::NotFound(_)))
+                    {
                         tracing::debug!("Skipping deleted file during reconcile: {}", path);
                     } else {
                         return Err(e);
@@ -1071,7 +1080,11 @@ impl<F: FileSystem> Vault<F> {
         if self.fs.exists(path).await? {
             let bytes = self.fs.read(path).await?;
             let content = String::from_utf8_lossy(&bytes);
-            return Ok(NoteDocument::from_markdown(path, &content, self.loro_author)?);
+            return Ok(NoteDocument::from_markdown(
+                path,
+                &content,
+                self.loro_author,
+            )?);
         }
 
         // New document - use from_markdown with empty content to get a doc_id
@@ -1260,7 +1273,10 @@ impl<F: FileSystem> Vault<F> {
             }
         }
 
-        tracing::debug!("Rebuilt path cache with {} entries", self.path_to_node().len());
+        tracing::debug!(
+            "Rebuilt path cache with {} entries",
+            self.path_to_node().len()
+        );
     }
 
     /// Get the path for a node by walking up the tree
@@ -1320,7 +1336,9 @@ impl<F: FileSystem> Vault<F> {
         }
         // Absolute paths (Windows - drive letter)
         if path.len() >= 2 && path.chars().nth(1) == Some(':') {
-            return Err(VaultError::Other("Windows absolute path not allowed".into()));
+            return Err(VaultError::Other(
+                "Windows absolute path not allowed".into(),
+            ));
         }
         // Backslash
         if path.contains('\\') {
@@ -1336,7 +1354,9 @@ impl<F: FileSystem> Vault<F> {
         }
         // Control characters
         if path.chars().any(|c| c.is_control()) {
-            return Err(VaultError::Other("Control character in path not allowed".into()));
+            return Err(VaultError::Other(
+                "Control character in path not allowed".into(),
+            ));
         }
         // Path length limit (filesystem safety)
         if path.len() > 1024 {
@@ -1462,7 +1482,8 @@ impl<F: FileSystem> Vault<F> {
                 // Target already exists (rename already happened) - just register it
                 tracing::debug!(
                     "rename_file: source {} not in tree, but {} exists - registering target",
-                    old_path, new_path
+                    old_path,
+                    new_path
                 );
                 self.register_file(new_path)?;
 
@@ -1474,12 +1495,18 @@ impl<F: FileSystem> Vault<F> {
 
                 return Ok(());
             }
-            return Err(VaultError::Other(format!("Source file not found: {}", old_path)));
+            return Err(VaultError::Other(format!(
+                "Source file not found: {}",
+                old_path
+            )));
         };
 
         // Check target doesn't exist
         if self.find_node_by_path(new_path).is_some() {
-            return Err(VaultError::Other(format!("Target already exists: {}", new_path)));
+            return Err(VaultError::Other(format!(
+                "Target already exists: {}",
+                new_path
+            )));
         }
 
         let new_parts: Vec<&str> = new_path.split('/').collect();
@@ -1508,7 +1535,8 @@ impl<F: FileSystem> Vault<F> {
 
         // Update caches
         self.path_to_node_mut().remove(old_path);
-        self.path_to_node_mut().insert(new_path.to_string(), node_id);
+        self.path_to_node_mut()
+            .insert(new_path.to_string(), node_id);
 
         // Move .loro document file
         let old_sync_path = self.document_sync_path(old_path);
@@ -1669,7 +1697,6 @@ impl<F: FileSystem> Vault<F> {
             has_frontmatter,
         }))
     }
-
 }
 
 /// FNV-1a hash for deterministic file naming.
@@ -1689,8 +1716,8 @@ fn simple_hash(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::InMemoryFs;
     use crate::VaultId;
+    use crate::fs::InMemoryFs;
 
     fn test_peer_id() -> PeerId {
         // Deterministic test PeerId using from_bytes
@@ -1817,15 +1844,16 @@ mod tests {
         fs.mkdir(&format!("{}/documents", SYNC_DIR)).await.unwrap();
 
         // Write metadata with a future version
-        let meta = format!(
-            "version = 99\nvault_id = \"{}\"\n",
-            VaultId::generate()
-        );
+        let meta = format!("version = 99\nvault_id = \"{}\"\n", VaultId::generate());
         fs.write(METADATA_FILE, meta.as_bytes()).await.unwrap();
 
         let result = Vault::load(fs, test_peer_id()).await;
         let err = result.err().expect("should fail with version too new");
-        assert!(err.to_string().contains("newer than supported"), "Got: {}", err);
+        assert!(
+            err.to_string().contains("newer than supported"),
+            "Got: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -1835,7 +1863,9 @@ mod tests {
         fs.mkdir(&format!("{}/documents", SYNC_DIR)).await.unwrap();
 
         // Write garbage to metadata.toml
-        fs.write(METADATA_FILE, b"not valid toml {{{{").await.unwrap();
+        fs.write(METADATA_FILE, b"not valid toml {{{{")
+            .await
+            .unwrap();
 
         let result = Vault::load(fs, test_peer_id()).await;
         let err = result.err().expect("should fail with corrupt metadata");
@@ -1869,129 +1899,139 @@ mod tests {
         let doc = vault.get_document("test.md").await.unwrap();
         assert!(doc.to_markdown().contains("Hello"));
     }
-    
+
     #[tokio::test]
     async fn test_reconcile_detects_new_files() {
         use std::sync::Arc;
-        
+
         let fs = Arc::new(InMemoryFs::new());
-        
+
         // Initialize vault with one file
         fs.write("existing.md", b"# Existing").await.unwrap();
         let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // Simulate adding a new file while plugin was off
         fs.write("new_file.md", b"# New File").await.unwrap();
-        
+
         // Load vault - should detect and index the new file
         let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // The new file should be accessible
         let doc = vault.get_document("new_file.md").await.unwrap();
         assert!(doc.to_markdown().contains("New File"));
     }
-    
+
     #[tokio::test]
     async fn test_reconcile_detects_modified_files() {
         use std::sync::Arc;
-        
+
         let fs = Arc::new(InMemoryFs::new());
-        
+
         // Initialize vault with one file
         fs.write("note.md", b"# Original Content").await.unwrap();
         let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // Simulate modifying the file while plugin was off
         fs.write("note.md", b"# Modified Content").await.unwrap();
-        
+
         // Load vault - should detect modification and re-index
         let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // The document should have the new content
         let doc = vault.get_document("note.md").await.unwrap();
         assert!(doc.to_markdown().contains("Modified Content"));
     }
-    
+
     #[tokio::test]
     async fn test_reconcile_detects_deleted_files() {
         use std::sync::Arc;
-        
+
         let fs = Arc::new(InMemoryFs::new());
-        
+
         // Initialize vault with two files
         fs.write("keep.md", b"# Keep this").await.unwrap();
         fs.write("delete.md", b"# Delete this").await.unwrap();
         let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // Simulate deleting a file while plugin was off
         fs.delete("delete.md").await.unwrap();
-        
+
         // Load vault - should detect orphaned .loro file
         let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // list_files should not include the deleted file
         let files = vault.list_files().await.unwrap();
         assert!(!files.contains(&"delete.md".to_string()));
         assert!(files.contains(&"keep.md".to_string()));
     }
-    
+
     #[tokio::test]
     async fn test_reconcile_detects_file_move() {
         use std::sync::Arc;
-        
+
         let fs = Arc::new(InMemoryFs::new());
-        
+
         // Initialize vault with a file
-        fs.write("old_name.md", b"# Unique Content ABC123").await.unwrap();
+        fs.write("old_name.md", b"# Unique Content ABC123")
+            .await
+            .unwrap();
         let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // Simulate renaming the file while plugin was off
         let content = fs.read("old_name.md").await.unwrap();
         fs.write("new_name.md", &content).await.unwrap();
         fs.delete("old_name.md").await.unwrap();
-        
+
         // Load vault - should detect move and migrate .loro file
         let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // The new file should be accessible with the same content
         let doc = vault.get_document("new_name.md").await.unwrap();
         assert!(doc.to_markdown().contains("Unique Content ABC123"));
-        
+
         // The old file should not be in the list
         let files = vault.list_files().await.unwrap();
         assert!(!files.contains(&"old_name.md".to_string()));
         assert!(files.contains(&"new_name.md".to_string()));
-        
+
         // Check that the .loro file was migrated (old one deleted, new one exists)
         let old_hash = simple_hash("old_name.md");
         let new_hash = simple_hash("new_name.md");
-        assert!(!fs.exists(&format!("{}/documents/{}.loro", SYNC_DIR, old_hash)).await.unwrap());
-        assert!(fs.exists(&format!("{}/documents/{}.loro", SYNC_DIR, new_hash)).await.unwrap());
+        assert!(
+            !fs.exists(&format!("{}/documents/{}.loro", SYNC_DIR, old_hash))
+                .await
+                .unwrap()
+        );
+        assert!(
+            fs.exists(&format!("{}/documents/{}.loro", SYNC_DIR, new_hash))
+                .await
+                .unwrap()
+        );
     }
-    
+
     #[tokio::test]
     async fn test_reconcile_detects_file_move_to_subfolder() {
         use std::sync::Arc;
-        
+
         let fs = Arc::new(InMemoryFs::new());
-        
+
         // Initialize vault with a file at root
         fs.write("note.md", b"# My Note XYZ789").await.unwrap();
         let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // Simulate moving file to subfolder while plugin was off
         let content = fs.read("note.md").await.unwrap();
         fs.mkdir("knowledge").await.unwrap();
         fs.write("knowledge/note.md", &content).await.unwrap();
         fs.delete("note.md").await.unwrap();
-        
+
         // Load vault - should detect move
         let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        
+
         // The moved file should be accessible
         let doc = vault.get_document("knowledge/note.md").await.unwrap();
         assert!(doc.to_markdown().contains("My Note XYZ789"));
-        
+
         // Only the new path should exist
         let files = vault.list_files().await.unwrap();
         assert!(!files.contains(&"note.md".to_string()));
@@ -2132,10 +2172,15 @@ mod tests {
         let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
 
         // Sync to vault2
-        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2()).await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
+            .await
+            .unwrap();
         let request = vault2.prepare_sync_request().await.unwrap();
         let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2.process_sync_message(&exchange.unwrap()).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
         if let Some(resp) = final_resp {
             vault1.process_sync_message(&resp).await.unwrap();
         }
@@ -2151,7 +2196,10 @@ mod tests {
         // Sync again - vault2 should see deletion via registry
         let request2 = vault2.prepare_sync_request().await.unwrap();
         let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
-        let (_, _) = vault2.process_sync_message(&exchange2.unwrap()).await.unwrap();
+        let (_, _) = vault2
+            .process_sync_message(&exchange2.unwrap())
+            .await
+            .unwrap();
 
         // Vault2 should now see the file as deleted
         assert!(vault2.is_file_deleted("note.md"));
@@ -2224,9 +2272,7 @@ mod tests {
 
         // Create file in vault1
         fs1.write("note.md", b"# Hello").await.unwrap();
-        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
-            .await
-            .unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
 
         // Create empty vault2
@@ -2247,10 +2293,7 @@ mod tests {
 
         // Sync response back to vault2
         let update = vault1.prepare_document_update("note.md").await.unwrap();
-        let (_, modified2) = vault2
-            .process_sync_message(&update.unwrap())
-            .await
-            .unwrap();
+        let (_, modified2) = vault2.process_sync_message(&update.unwrap()).await.unwrap();
 
         // vault2 should have the synced flag set for modified files
         for path in &modified2 {
@@ -2289,9 +2332,7 @@ mod tests {
         // Create file in both vaults
         fs1.write("note.md", b"# Hello").await.unwrap();
         fs2.write("note.md", b"# Hello").await.unwrap();
-        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id())
-            .await
-            .unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
         let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
             .await
             .unwrap();
@@ -2416,7 +2457,10 @@ mod tests {
     async fn test_get_document_blob_meta_not_found() {
         let fs = InMemoryFs::new();
         let vault = Vault::init(fs, test_peer_id()).await.unwrap();
-        let meta = vault.get_document_blob_meta("nonexistent.md").await.unwrap();
+        let meta = vault
+            .get_document_blob_meta("nonexistent.md")
+            .await
+            .unwrap();
         assert!(meta.is_none());
     }
 
@@ -2427,7 +2471,11 @@ mod tests {
         let vault = Vault::init(fs, test_peer_id()).await.unwrap();
         vault.on_file_changed("test.md").await.unwrap();
 
-        let meta = vault.get_document_blob_meta("test.md").await.unwrap().unwrap();
+        let meta = vault
+            .get_document_blob_meta("test.md")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(meta.change_count > 0);
         // Version vectors should contain our peer
         assert!(!meta.end_version.is_empty());
@@ -2479,7 +2527,10 @@ mod tests {
         // between registry tree nodes and .loro document files.
         assert_eq!(simple_hash("test.md"), "9006b3b63c0e9510");
         assert_eq!(simple_hash("folder/note.md"), "a1b149525257902d");
-        assert_eq!(simple_hash("deeply/nested/path/file.md"), "daec06fdbc6a5936");
+        assert_eq!(
+            simple_hash("deeply/nested/path/file.md"),
+            "daec06fdbc6a5936"
+        );
         assert_eq!(simple_hash(""), "cbf29ce484222325"); // FNV-1a offset basis
     }
 

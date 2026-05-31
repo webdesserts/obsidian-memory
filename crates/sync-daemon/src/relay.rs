@@ -62,7 +62,10 @@ impl EmbeddedRelay {
     ///
     /// The caller is responsible for providing a reachable `advertised_url` — this
     /// function does not verify connectivity.
-    pub async fn start_with_advertised_url(bind_addr: SocketAddr, advertised_url: &str) -> Result<Self> {
+    pub async fn start_with_advertised_url(
+        bind_addr: SocketAddr,
+        advertised_url: &str,
+    ) -> Result<Self> {
         let server = Self::spawn_server(bind_addr).await?;
 
         let url: RelayUrl = advertised_url
@@ -135,8 +138,14 @@ mod tests {
         let relay = EmbeddedRelay::start(addr).await.unwrap();
 
         let url_str = relay.relay_url().to_string();
-        assert!(url_str.starts_with("http://"), "expected http://, got {url_str}");
-        assert!(url_str.ends_with('/'), "expected trailing slash, got {url_str}");
+        assert!(
+            url_str.starts_with("http://"),
+            "expected http://, got {url_str}"
+        );
+        assert!(
+            url_str.ends_with('/'),
+            "expected trailing slash, got {url_str}"
+        );
 
         relay.shutdown().await;
     }

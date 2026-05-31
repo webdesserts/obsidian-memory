@@ -178,7 +178,10 @@ impl EmbeddingManager {
 
             let mut computed = 0;
             for chunk in to_compute.chunks(CHUNK_SIZE) {
-                let texts: Vec<String> = chunk.iter().map(|(_, content, _)| content.clone()).collect();
+                let texts: Vec<String> = chunk
+                    .iter()
+                    .map(|(_, content, _)| content.clone())
+                    .collect();
                 let embeddings = self.embeddings.encode_batch(&texts)?;
 
                 let mut cache = self.cache.write().await;
@@ -212,7 +215,7 @@ impl EmbeddingManager {
         }
 
         let json = fs::read_to_string(&self.cache_path).await?;
-        
+
         // Try to load cache, but if format is incompatible (old cache from TypeScript),
         // just start fresh rather than failing
         match serde_json::from_str::<HashMap<String, CacheEntry>>(&json) {

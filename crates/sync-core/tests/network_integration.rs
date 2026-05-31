@@ -12,16 +12,9 @@ mod network_integration {
 
     use std::sync::Arc;
 
-    use iroh::{
-        EndpointAddr,
-        address_lookup::memory::MemoryLookup,
-    };
+    use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
-    use sync_core::network::{
-        gossip::GossipEvent,
-        streams::connect_and_sync_raw,
-        SyncNode,
-    };
+    use sync_core::network::{SyncNode, gossip::GossipEvent, streams::connect_and_sync_raw};
     use sync_core::peer_id::{PeerId, VaultId};
     use sync_core::sync::SyncMessage;
 
@@ -68,7 +61,9 @@ mod network_integration {
     ///
     /// Passes `None` for the relay URL (direct QUIC, no relay) and adds a `MemoryLookup`
     /// so peers can dial each other directly in-process.
-    async fn make_test_node<A: sync_core::allowlist::AllowlistStorage + std::fmt::Debug + 'static>(
+    async fn make_test_node<
+        A: sync_core::allowlist::AllowlistStorage + std::fmt::Debug + 'static,
+    >(
         secret_key_bytes: [u8; 32],
         allowlist: std::sync::Arc<A>,
     ) -> anyhow::Result<SyncNode> {
@@ -134,9 +129,7 @@ mod network_integration {
         let node_b_id = node_b.node_id();
 
         // A subscribes with no bootstrap peers — it waits for B to join.
-        let mut gossip_a = node_a
-            .join_vault_gossip(&vault_id, vec![])
-            .await?;
+        let mut gossip_a = node_a.join_vault_gossip(&vault_id, vec![]).await?;
 
         // B subscribes and bootstraps off A.
         let mut gossip_b = node_b
@@ -156,7 +149,11 @@ mod network_integration {
         .await
         .expect("timed out waiting for B's NeighborUp");
 
-        assert_eq!(neighbor, node_a.node_id(), "B's NeighborUp should identify A");
+        assert_eq!(
+            neighbor,
+            node_a.node_id(),
+            "B's NeighborUp should identify A"
+        );
 
         // B broadcasts a change notification.
         gossip_b.broadcast_change("notes/hello.md").await?;
@@ -285,7 +282,9 @@ mod network_integration {
 
         let response: SyncMessage = bincode::deserialize(&received_bytes)?;
         match response {
-            SyncMessage::SyncResponse { document_updates, .. } => {
+            SyncMessage::SyncResponse {
+                document_updates, ..
+            } => {
                 let data = document_updates.get("big.md").expect("missing big.md");
                 assert_eq!(data.len(), 1024 * 1024);
                 assert!(data.iter().all(|&b| b == 0xAB));
@@ -429,8 +428,14 @@ mod network_integration {
         .await
         .expect("timed out waiting for A to receive AllowlistUpdate");
 
-        assert_eq!(received.0, node_b_id, "AllowlistUpdate.from should be B's id");
-        assert_eq!(received.1.node_id, new_peer_id, "AllowlistUpdate.peer should match");
+        assert_eq!(
+            received.0, node_b_id,
+            "AllowlistUpdate.from should be B's id"
+        );
+        assert_eq!(
+            received.1.node_id, new_peer_id,
+            "AllowlistUpdate.peer should match"
+        );
         assert_eq!(received.1.device_name, "new-device");
 
         Ok(())

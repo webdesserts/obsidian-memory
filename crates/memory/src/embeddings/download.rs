@@ -60,7 +60,8 @@ pub async fn download_model(model_dir: &Path) -> Result<PathBuf> {
             "Downloading model file"
         );
 
-        download_file(&url, &dest_path).await
+        download_file(&url, &dest_path)
+            .await
             .with_context(|| format!("Failed to download {}", file))?;
     }
 

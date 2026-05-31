@@ -10,7 +10,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PeerIdError {
-    #[error("Invalid ID format: expected 64 hex chars (ed25519 pubkey), 16 hex chars (legacy), or UUID (legacy)")]
+    #[error(
+        "Invalid ID format: expected 64 hex chars (ed25519 pubkey), 16 hex chars (legacy), or UUID (legacy)"
+    )]
     InvalidFormat,
     #[error("Invalid hex: {0}")]
     InvalidHex(String),
@@ -186,7 +188,10 @@ fn hex_nibble(b: u8) -> Result<u32, PeerIdError> {
         b'0'..=b'9' => Ok((b - b'0') as u32),
         b'a'..=b'f' => Ok((b - b'a' + 10) as u32),
         b'A'..=b'F' => Ok((b - b'A' + 10) as u32),
-        _ => Err(PeerIdError::InvalidHex(format!("invalid hex char: {}", b as char))),
+        _ => Err(PeerIdError::InvalidHex(format!(
+            "invalid hex char: {}",
+            b as char
+        ))),
     }
 }
 
@@ -383,13 +388,17 @@ mod tests {
     #[test]
     fn test_reject_invalid_uuid() {
         // Wrong number of dashes
-        assert!("550e8400e29b-41d4-a716-446655440000"
-            .parse::<PeerId>()
-            .is_err());
+        assert!(
+            "550e8400e29b-41d4-a716-446655440000"
+                .parse::<PeerId>()
+                .is_err()
+        );
         // Wrong positions
-        assert!("550e8400-e29b41d4-a716-4466-55440000"
-            .parse::<PeerId>()
-            .is_err());
+        assert!(
+            "550e8400-e29b41d4-a716-4466-55440000"
+                .parse::<PeerId>()
+                .is_err()
+        );
     }
 
     #[test]
@@ -449,9 +458,11 @@ mod tests {
     #[test]
     fn test_vault_id_rejects_uuid() {
         // VaultId has no legacy UUID support
-        assert!("550e8400-e29b-41d4-a716-446655440000"
-            .parse::<VaultId>()
-            .is_err());
+        assert!(
+            "550e8400-e29b-41d4-a716-446655440000"
+                .parse::<VaultId>()
+                .is_err()
+        );
     }
 
     #[test]

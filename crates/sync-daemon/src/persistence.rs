@@ -48,9 +48,9 @@ impl IdentityKey {
     pub fn load_from(key_path: &Path) -> Result<Self> {
         let bytes = fs::read(key_path)
             .with_context(|| format!("Failed to read key file: {}", key_path.display()))?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Key file must be exactly 32 bytes: {}", key_path.display()))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("Key file must be exactly 32 bytes: {}", key_path.display())
+        })?;
         Ok(Self::from_bytes(bytes))
     }
 
@@ -116,13 +116,17 @@ impl DaemonConfig {
     ///
     /// `identity_key_path` — if provided, loads a custom key file instead of the
     /// default `.sync/daemon.key`. This replaces the old `--peer-id` flag.
-    pub async fn load_or_generate(vault_path: &Path, identity_key_path: Option<&Path>) -> Result<(Self, IdentityKey)> {
+    pub async fn load_or_generate(
+        vault_path: &Path,
+        identity_key_path: Option<&Path>,
+    ) -> Result<(Self, IdentityKey)> {
         let config_path = vault_path.join(DAEMON_CONFIG_FILE);
         let key_path = vault_path.join(DAEMON_KEY_FILE);
 
         // Detect legacy upgrade: daemon.toml exists but daemon.key doesn't.
         // This means the daemon was previously running with the old u64 PeerId format.
-        let is_legacy_upgrade = config_path.exists() && !key_path.exists() && identity_key_path.is_none();
+        let is_legacy_upgrade =
+            config_path.exists() && !key_path.exists() && identity_key_path.is_none();
 
         // Load the identity key (custom path, or generate/load default)
         let identity_key = match identity_key_path {
@@ -248,7 +252,6 @@ fn clear_known_peers(vault_path: &Path) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +333,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let (config, _key) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _key) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
 
         // Should have a valid PeerId (64-char hex, non-zero as_u64)
         assert_eq!(config.peer_id.to_string().len(), 64);
@@ -347,10 +352,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let (config1, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config1, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
 
         // Simulate restart — should load same PeerId from key file
-        let (config2, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config2, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
 
         assert_eq!(config1.peer_id, config2.peer_id);
     }
@@ -361,7 +370,9 @@ mod tests {
         let vault_path = temp_dir.path();
 
         // First start with default key
-        let (config1, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config1, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
 
         // Generate an alternate key in a separate location
         let alt_dir = TempDir::new().unwrap();
@@ -371,12 +382,16 @@ mod tests {
 
         // Start with alternate key — should update PeerId in config
         let alt_key_path = alt_dir.path().join(".sync/daemon.key");
-        let (config2, _) = DaemonConfig::load_or_generate(vault_path, Some(&alt_key_path)).await.unwrap();
+        let (config2, _) = DaemonConfig::load_or_generate(vault_path, Some(&alt_key_path))
+            .await
+            .unwrap();
         assert_eq!(config2.peer_id, alt_peer_id);
 
         // After using the alternate key, the config reflects the alternate PeerId.
         // Default restart now uses the default key again (config tracks last used PeerId).
-        let (config3, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config3, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
         assert_eq!(config3.peer_id, config1.peer_id);
     }
 
@@ -397,7 +412,9 @@ incarnation = 3
         fs::write(sync_dir.join("known_peers.json"), r#"{"peers":[]}"#).unwrap();
 
         // Load with new code — should generate a new ed25519 key and migrate
-        let (config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
 
         // New PeerId should be 64-char hex (ed25519)
         assert_eq!(config.peer_id.to_string().len(), 64);
@@ -417,21 +434,31 @@ incarnation = 3
         let temp_dir = TempDir::new().unwrap();
         let vault_path = temp_dir.path();
 
-        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
 
         // Write relay URL
-        config.set_relay_url(Some("http://127.0.0.1:3340/".into()), vault_path).unwrap();
+        config
+            .set_relay_url(Some("http://127.0.0.1:3340/".into()), vault_path)
+            .unwrap();
 
         // Reload and verify the URL is stored in the file
         let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
-        assert!(contents.contains("relay_url"), "relay_url should be in daemon.toml");
+        assert!(
+            contents.contains("relay_url"),
+            "relay_url should be in daemon.toml"
+        );
         assert!(contents.contains("3340"), "relay URL should contain port");
 
         // Clear the URL
         config.set_relay_url(None, vault_path).unwrap();
 
         let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
-        assert!(!contents.contains("relay_url"), "relay_url should be absent after clearing");
+        assert!(
+            !contents.contains("relay_url"),
+            "relay_url should be absent after clearing"
+        );
     }
 
     #[tokio::test]
@@ -448,10 +475,13 @@ incarnation = 3
         fs::write(
             sync_dir.join("daemon.toml"),
             format!("peer_id = \"{peer_id}\"\n"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should load without error — relay_url field is optional
-        let (config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
         assert!(config.relay_url.is_none());
     }
 
@@ -476,7 +506,9 @@ incarnation = 3
         .unwrap();
 
         // Should load without error, ignoring incarnation
-        let (config, _) = DaemonConfig::load_or_generate(vault_path, None).await.unwrap();
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
         assert_eq!(config.peer_id, peer_id);
 
         // Saved file should no longer have incarnation field

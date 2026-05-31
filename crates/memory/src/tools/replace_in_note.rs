@@ -116,9 +116,9 @@ pub async fn execute<S: Storage>(
     dry_run: bool,
 ) -> Result<CallToolResult, ErrorData> {
     // Resolve the note reference using the same logic as read_note
-    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
-    })?;
+    let (uri, exists) = resolve_note_uri(storage, graph, note)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to resolve note: {}", e), None))?;
 
     if !exists {
         return Err(ErrorData::invalid_params(
@@ -128,9 +128,10 @@ pub async fn execute<S: Storage>(
     }
 
     // Read current content (note existence already verified by resolve_note_uri)
-    let (content, _metadata) = storage.read(&uri).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to read note: {}", e), None)
-    })?;
+    let (content, _metadata) = storage
+        .read(&uri)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to read note: {}", e), None))?;
 
     // Validate content_hash matches current content
     let current_hash = ContentHash::from_content(&content);
@@ -147,9 +148,8 @@ pub async fn execute<S: Storage>(
     }
 
     // Apply edits
-    let (modified, diff) = apply_edits(&content, &edits).map_err(|e| {
-        ErrorData::invalid_params(format!("Edit failed: {}", e), None)
-    })?;
+    let (modified, diff) = apply_edits(&content, &edits)
+        .map_err(|e| ErrorData::invalid_params(format!("Edit failed: {}", e), None))?;
 
     let file_path = ensure_markdown_extension(&uri);
     let new_hash = ContentHash::from_content(&modified);
@@ -162,23 +162,29 @@ pub async fn execute<S: Storage>(
             edits_count: edits.len(),
             changes: diff,
         };
-        let json = serde_json::to_string(&response)
-            .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+        let json = serde_json::to_string(&response).map_err(|e| {
+            ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+        })?;
         return Ok(CallToolResult::success(vec![Content::text(json)]));
     }
 
     // Write the modified content with optimistic locking (TOCTOU protection)
-    storage.write(&uri, &modified, Some(content_hash)).await.map_err(|e| match e {
-        StorageError::HashMismatch { expected, actual, .. } => ErrorData::invalid_params(
-            format!(
-                "Note modified since last read (expected hash: {}, actual: {}). \
+    storage
+        .write(&uri, &modified, Some(content_hash))
+        .await
+        .map_err(|e| match e {
+            StorageError::HashMismatch {
+                expected, actual, ..
+            } => ErrorData::invalid_params(
+                format!(
+                    "Note modified since last read (expected hash: {}, actual: {}). \
                  Read note again to get current content and hash.",
-                expected, actual
+                    expected, actual
+                ),
+                None,
             ),
-            None,
-        ),
-        _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
-    })?;
+            _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
+        })?;
 
     let response = EditNoteResponse {
         uri: format!("memory:{}", uri),
@@ -187,8 +193,9 @@ pub async fn execute<S: Storage>(
         edits_applied: edits.len(),
     };
 
-    let json = serde_json::to_string(&response)
-        .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+    let json = serde_json::to_string(&response).map_err(|e| {
+        ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+    })?;
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -563,7 +570,9 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         // Create note in subdirectory
-        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
+        fs::create_dir(temp_dir.path().join("knowledge"))
+            .await
+            .unwrap();
         fs::write(
             temp_dir.path().join("knowledge/My Note.md"),
             "Hello, world!",
@@ -577,17 +586,12 @@ mod tests {
         );
 
         // Step 1: ReadNote
-        let read_result = super::super::read_note::execute(
-            &storage,
-            &graph,
-            "My Note",
-        )
-        .await
-        .expect("ReadNote should succeed");
+        let read_result = super::super::read_note::execute(&storage, &graph, "My Note")
+            .await
+            .expect("ReadNote should succeed");
 
-        let read_json: serde_json::Value = serde_json::from_str(
-            &read_result.content[0].raw.as_text().unwrap().text
-        ).unwrap();
+        let read_json: serde_json::Value =
+            serde_json::from_str(&read_result.content[0].raw.as_text().unwrap().text).unwrap();
 
         let content_hash = read_json["content_hash"].as_str().unwrap();
         assert_eq!(read_json["content"].as_str().unwrap(), "1\tHello, world!");

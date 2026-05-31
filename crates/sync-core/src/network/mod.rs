@@ -28,7 +28,7 @@
 
 pub mod gossip;
 pub mod streams;
-pub use node::{SyncNode, SYNC_ALPN};
+pub use node::{SYNC_ALPN, SyncNode};
 mod node;
 
 // Discovery and pairing are native-only — they depend on iroh::protocol::ProtocolHandler

@@ -12,12 +12,12 @@
 //! - External edits (hash mismatch triggers re-read requirement)
 
 use notify::RecommendedWatcher;
-use notify_debouncer_mini::{new_debouncer, DebouncedEventKind, Debouncer};
+use notify_debouncer_mini::{DebouncedEventKind, Debouncer, new_debouncer};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use wiki_links::extract_linked_notes;
 
 use crate::embeddings::EmbeddingManager;
@@ -49,12 +49,7 @@ impl VaultWatcher {
                     // Filter for markdown files only
                     let md_events: Vec<_> = events
                         .into_iter()
-                        .filter(|e| {
-                            e.path
-                                .extension()
-                                .map(|ext| ext == "md")
-                                .unwrap_or(false)
-                        })
+                        .filter(|e| e.path.extension().map(|ext| ext == "md").unwrap_or(false))
                         .collect();
 
                     if !md_events.is_empty() {
@@ -109,9 +104,7 @@ async fn process_events(
                 DebouncedEventKind::Any => {
                     if path.exists() {
                         // Check mtime BEFORE processing to avoid infinite loops
-                        let current_mtime = std::fs::metadata(path)
-                            .and_then(|m| m.modified())
-                            .ok();
+                        let current_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
 
                         let cached_mtime = mtime_cache.get(path).copied();
 
@@ -203,10 +196,8 @@ async fn remove_file(vault_path: &Path, file_path: &Path, graph: &Arc<RwLock<Gra
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string();
-        
-    let relative_path = file_path
-        .strip_prefix(vault_path)
-        .unwrap_or(file_path);
+
+    let relative_path = file_path.strip_prefix(vault_path).unwrap_or(file_path);
 
     if !note_name.is_empty() {
         let mut graph = graph.write().await;
@@ -227,11 +218,7 @@ mod tests {
         let graph = Arc::new(RwLock::new(GraphIndex::new()));
         let embeddings = Arc::new(EmbeddingManager::new(temp_dir.path()));
 
-        let watcher = VaultWatcher::start(
-            temp_dir.path().to_path_buf(),
-            graph,
-            embeddings,
-        );
+        let watcher = VaultWatcher::start(temp_dir.path().to_path_buf(), graph, embeddings);
         assert!(watcher.is_ok());
     }
 

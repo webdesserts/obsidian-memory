@@ -7,8 +7,8 @@
 //! mDNS is native-only (requires OS-level networking) and is gated by the
 //! `address-lookup-mdns` feature via the `native` feature set.
 
-use serde::{Deserialize, Serialize};
 use iroh::EndpointId;
+use serde::{Deserialize, Serialize};
 
 /// Metadata broadcast via mDNS to identify a mesh (vault).
 ///

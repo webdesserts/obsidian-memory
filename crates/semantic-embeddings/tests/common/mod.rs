@@ -32,17 +32,17 @@ pub static TEST_MODEL: Lazy<ModelManager> = Lazy::new(|| {
     let manager = ModelManager::new();
 
     // Load model files from the models directory
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models/all-MiniLM-L6-v2");
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/all-MiniLM-L6-v2");
 
-    let config = fs::read_to_string(model_dir.join("config.json"))
-        .expect("Failed to read config.json");
+    let config =
+        fs::read_to_string(model_dir.join("config.json")).expect("Failed to read config.json");
     let tokenizer = fs::read_to_string(model_dir.join("tokenizer.json"))
         .expect("Failed to read tokenizer.json");
-    let weights = fs::read(model_dir.join("model.safetensors"))
-        .expect("Failed to read model.safetensors");
+    let weights =
+        fs::read(model_dir.join("model.safetensors")).expect("Failed to read model.safetensors");
 
-    manager.load_model(&config, &tokenizer, &weights)
+    manager
+        .load_model(&config, &tokenizer, &weights)
         .expect("Failed to load model");
 
     manager
@@ -50,14 +50,13 @@ pub static TEST_MODEL: Lazy<ModelManager> = Lazy::new(|| {
 
 // Load reference similarity values from fixtures
 pub static SIMILARITY_FIXTURES: Lazy<SimilarityReference> = Lazy::new(|| {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/similarity-reference.toml");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/similarity-reference.toml");
 
-    let fixture_toml = fs::read_to_string(&fixture_path)
-        .expect("Failed to read similarity-reference.toml");
+    let fixture_toml =
+        fs::read_to_string(&fixture_path).expect("Failed to read similarity-reference.toml");
 
-    toml::from_str(&fixture_toml)
-        .expect("Failed to parse similarity-reference.toml")
+    toml::from_str(&fixture_toml).expect("Failed to parse similarity-reference.toml")
 });
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

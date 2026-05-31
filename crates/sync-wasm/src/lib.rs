@@ -111,10 +111,12 @@ mod wasm_impl {
                 if !self.message.is_empty() {
                     self.message.push_str(", ");
                 }
-                self.message.push_str(&format!("{}={:?}", field.name(), value));
+                self.message
+                    .push_str(&format!("{}={:?}", field.name(), value));
             } else {
                 // Append additional fields
-                self.message.push_str(&format!(" {}={:?}", field.name(), value));
+                self.message
+                    .push_str(&format!(" {}={:?}", field.name(), value));
             }
         }
 
@@ -124,7 +126,8 @@ mod wasm_impl {
             } else if self.message.is_empty() {
                 self.message = format!("{}={}", field.name(), value);
             } else {
-                self.message.push_str(&format!(" {}={}", field.name(), value));
+                self.message
+                    .push_str(&format!(" {}={}", field.name(), value));
             }
         }
     }
@@ -305,24 +308,25 @@ mod wasm_impl {
 
             Ok(WasmVault { inner })
         }
-        
+
         /// Manually trigger reconciliation.
-        /// 
+        ///
         /// This is automatically called during `load()`, but can be called again
         /// if needed (e.g., after detecting external filesystem changes).
         #[wasm_bindgen]
         pub async fn reconcile(&self) -> Result<JsValue, JsError> {
-            let report = self.inner
+            let report = self
+                .inner
                 .reconcile()
                 .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
-            
+
             let js_report = ReconcileReportJs {
                 indexed: report.indexed,
                 reindexed: report.reindexed,
                 orphaned: report.orphaned,
             };
-            
+
             serde_wasm_bindgen::to_value(&js_report).map_err(|e| JsError::new(&e.to_string()))
         }
 
@@ -391,7 +395,10 @@ mod wasm_impl {
         /// (should be skipped to prevent re-broadcast) or includes local edits.
         #[wasm_bindgen(js_name = versionIncludes)]
         pub fn version_includes(current_version: &[u8], synced_version: &[u8]) -> bool {
-            sync_core::Vault::<sync_core::fs::InMemoryFs>::version_includes(current_version, synced_version)
+            sync_core::Vault::<sync_core::fs::InMemoryFs>::version_includes(
+                current_version,
+                synced_version,
+            )
         }
 
         /// List all markdown files in the vault.
@@ -429,20 +436,22 @@ mod wasm_impl {
         /// Call this when you receive a message from a peer.
         #[wasm_bindgen(js_name = processSyncMessage)]
         pub async fn process_sync_message(&self, data: &[u8]) -> Result<JsValue, JsError> {
-            log(&format!("processSyncMessage: received {} bytes", data.len()));
+            log(&format!(
+                "processSyncMessage: received {} bytes",
+                data.len()
+            ));
 
-            let (response, modified_paths) = self
-                .inner
-                .process_sync_message(data)
-                .await
-                .map_err(|e| {
+            let (response, modified_paths) =
+                self.inner.process_sync_message(data).await.map_err(|e| {
                     error(&format!("processSyncMessage error: {}", e));
                     JsError::new(&e.to_string())
                 })?;
 
-            log(&format!("processSyncMessage: response={}, modified={:?}",
+            log(&format!(
+                "processSyncMessage: response={}, modified={:?}",
                 response.as_ref().map(|r| r.len()).unwrap_or(0),
-                modified_paths));
+                modified_paths
+            ));
 
             // Return as a JS object: { response: Uint8Array | null, modifiedPaths: string[] }
             let result = SyncMessageResult {
@@ -450,8 +459,7 @@ mod wasm_impl {
                 modified_paths,
             };
 
-            serde_wasm_bindgen::to_value(&result)
-                .map_err(|e| JsError::new(&e.to_string()))
+            serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&e.to_string()))
         }
 
         /// Prepare a document update to broadcast after a local file change.
@@ -538,7 +546,11 @@ mod wasm_impl {
         ///
         /// Call this after `renameFile` to get the message to broadcast.
         #[wasm_bindgen(js_name = prepareFileRenamed)]
-        pub fn prepare_file_renamed(&self, old_path: &str, new_path: &str) -> Result<JsValue, JsError> {
+        pub fn prepare_file_renamed(
+            &self,
+            old_path: &str,
+            new_path: &str,
+        ) -> Result<JsValue, JsError> {
             let bytes = self
                 .inner
                 .prepare_file_renamed(old_path, new_path)
@@ -558,7 +570,8 @@ mod wasm_impl {
             let version = self.inner.get_registry_version();
             // Use serialize_maps_as_objects to return a plain JS object instead of Map
             let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
-            version.serialize(&serializer)
+            version
+                .serialize(&serializer)
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
@@ -568,8 +581,7 @@ mod wasm_impl {
         #[wasm_bindgen(js_name = getRegistryStats)]
         pub fn get_registry_stats(&self) -> Result<JsValue, JsError> {
             let stats = self.inner.get_registry_stats();
-            serde_wasm_bindgen::to_value(&stats)
-                .map_err(|e| JsError::new(&e.to_string()))
+            serde_wasm_bindgen::to_value(&stats).map_err(|e| JsError::new(&e.to_string()))
         }
 
         /// Get cheap metadata from the .loro blob header.
@@ -578,11 +590,15 @@ mod wasm_impl {
         /// loading the full document. Returns `null` if the document doesn't exist.
         #[wasm_bindgen(js_name = getDocumentBlobMeta)]
         pub async fn get_document_blob_meta(&self, path: &str) -> Result<JsValue, JsError> {
-            let meta = self.inner.get_document_blob_meta(path).await
+            let meta = self
+                .inner
+                .get_document_blob_meta(path)
+                .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
             match meta {
-                Some(m) => serde_wasm_bindgen::to_value(&m)
-                    .map_err(|e| JsError::new(&e.to_string())),
+                Some(m) => {
+                    serde_wasm_bindgen::to_value(&m).map_err(|e| JsError::new(&e.to_string()))
+                }
                 None => Ok(JsValue::NULL),
             }
         }
@@ -593,11 +609,15 @@ mod wasm_impl {
         /// Returns `null` if the document doesn't exist.
         #[wasm_bindgen(js_name = getDocumentInfo)]
         pub async fn get_document_info(&self, path: &str) -> Result<JsValue, JsError> {
-            let info = self.inner.get_document_info(path).await
+            let info = self
+                .inner
+                .get_document_info(path)
+                .await
                 .map_err(|e| JsError::new(&e.to_string()))?;
             match info {
-                Some(i) => serde_wasm_bindgen::to_value(&i)
-                    .map_err(|e| JsError::new(&e.to_string())),
+                Some(i) => {
+                    serde_wasm_bindgen::to_value(&i).map_err(|e| JsError::new(&e.to_string()))
+                }
                 None => Ok(JsValue::NULL),
             }
         }
@@ -686,7 +706,10 @@ mod wasm_impl {
         /// (from `DaemonStatus.relayUrl`) for reliable LAN and internet connectivity.
         /// If omitted, the node uses direct QUIC only.
         #[wasm_bindgen]
-        pub async fn create(secret_key: &[u8], relay_url: Option<String>) -> Result<WasmSyncNode, JsError> {
+        pub async fn create(
+            secret_key: &[u8],
+            relay_url: Option<String>,
+        ) -> Result<WasmSyncNode, JsError> {
             let key_bytes: [u8; 32] = secret_key
                 .try_into()
                 .map_err(|_| JsError::new("secret_key must be exactly 32 bytes"))?;
@@ -716,7 +739,9 @@ mod wasm_impl {
         #[wasm_bindgen(js_name = nodeId)]
         pub fn node_id(&self) -> Result<String, JsError> {
             let state = self.inner.borrow();
-            let state = state.as_ref().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let state = state
+                .as_ref()
+                .ok_or_else(|| JsError::new("Node is shut down"))?;
             Ok(state.node.node_id().to_string())
         }
 
@@ -783,7 +808,9 @@ mod wasm_impl {
             use tokio::sync::mpsc::error::TryRecvError;
 
             let mut state = self.inner.borrow_mut();
-            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let state = state
+                .as_mut()
+                .ok_or_else(|| JsError::new("Node is shut down"))?;
             let gossip = match state.gossip.as_mut() {
                 Some(g) => g,
                 None => return Ok(JsValue::NULL),
@@ -824,7 +851,9 @@ mod wasm_impl {
         #[wasm_bindgen(js_name = broadcastChange)]
         pub async fn broadcast_change(&self, path: &str) -> Result<(), JsError> {
             let mut state = self.inner.borrow_mut();
-            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let state = state
+                .as_mut()
+                .ok_or_else(|| JsError::new("Node is shut down"))?;
             let gossip = state
                 .gossip
                 .as_mut()
@@ -848,7 +877,9 @@ mod wasm_impl {
             use tokio::sync::mpsc::error::TryRecvError;
 
             let mut state = self.inner.borrow_mut();
-            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let state = state
+                .as_mut()
+                .ok_or_else(|| JsError::new("Node is shut down"))?;
 
             match state.node.inbound_sync_rx.try_recv() {
                 Ok(request) => {
@@ -859,9 +890,11 @@ mod wasm_impl {
                     // Store the reply channel for `replyInboundSync`
                     state.pending_reply = Some(request.reply_tx);
 
-                    let js_req = InboundSyncRequestJs { message_bytes, remote_id };
-                    serde_wasm_bindgen::to_value(&js_req)
-                        .map_err(|e| JsError::new(&e.to_string()))
+                    let js_req = InboundSyncRequestJs {
+                        message_bytes,
+                        remote_id,
+                    };
+                    serde_wasm_bindgen::to_value(&js_req).map_err(|e| JsError::new(&e.to_string()))
                 }
                 Err(TryRecvError::Empty) => Ok(JsValue::NULL),
                 Err(TryRecvError::Disconnected) => Ok(JsValue::NULL),
@@ -875,7 +908,9 @@ mod wasm_impl {
         #[wasm_bindgen(js_name = replyInboundSync)]
         pub fn reply_inbound_sync(&self, response_bytes: &[u8]) -> Result<(), JsError> {
             let mut state = self.inner.borrow_mut();
-            let state = state.as_mut().ok_or_else(|| JsError::new("Node is shut down"))?;
+            let state = state
+                .as_mut()
+                .ok_or_else(|| JsError::new("Node is shut down"))?;
 
             let reply_tx = state
                 .pending_reply
@@ -910,7 +945,9 @@ mod wasm_impl {
             // Borrow the endpoint for the sync call
             let endpoint = {
                 let state = self.inner.borrow();
-                let state = state.as_ref().ok_or_else(|| JsError::new("Node is shut down"))?;
+                let state = state
+                    .as_ref()
+                    .ok_or_else(|| JsError::new("Node is shut down"))?;
                 state.node.endpoint.clone()
             };
 
@@ -972,7 +1009,6 @@ mod wasm_impl {
             }
         }
     }
-
 }
 
 // Re-export wasm_impl contents at crate root for wasm32 targets

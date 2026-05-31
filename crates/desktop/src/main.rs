@@ -167,26 +167,24 @@ fn main() -> Result<()> {
             TrayIconBuilder::new()
                 .icon(icon)
                 .menu(&menu)
-                .on_menu_event(move |_tray, event| {
-                    match event.id().as_ref() {
-                        "quit" => {
-                            let app = app_for_events.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let state = app.state::<ShutdownState>();
-                                let shutdown = state.lock().await.take();
-                                if let Some(s) = shutdown {
-                                    s.shutdown(Duration::from_secs(5)).await;
-                                }
-                                app.exit(0);
-                            });
-                        }
-                        "pair" => {
-                            if let Err(e) = pair_window::open_initiator(&app_for_events) {
-                                warn!("Failed to open pair initiator window: {}", e);
+                .on_menu_event(move |_tray, event| match event.id().as_ref() {
+                    "quit" => {
+                        let app = app_for_events.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<ShutdownState>();
+                            let shutdown = state.lock().await.take();
+                            if let Some(s) = shutdown {
+                                s.shutdown(Duration::from_secs(5)).await;
                             }
-                        }
-                        _ => {}
+                            app.exit(0);
+                        });
                     }
+                    "pair" => {
+                        if let Err(e) = pair_window::open_initiator(&app_for_events) {
+                            warn!("Failed to open pair initiator window: {}", e);
+                        }
+                    }
+                    _ => {}
                 })
                 .on_tray_icon_event(|_tray, event| {
                     if let TrayIconEvent::Click {

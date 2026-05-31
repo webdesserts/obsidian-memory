@@ -3,8 +3,20 @@
 //! This allows the `memory` binary to embed the sync daemon behind a feature
 //! flag, while still keeping the standalone `sync-daemon` binary as a thin wrapper.
 
+use crate::allowlist::FileAllowlistStorage;
+use crate::daemon_lock::DaemonLock;
+use crate::http;
+use crate::native_fs::NativeFs;
+use crate::pair_api::{
+    ConnectionState, DaemonCommand, DaemonControl, DaemonStatus, PAIRING_BROADCAST_CAPACITY,
+    PairingUiEvent, PeerSummary,
+};
+use crate::persistence::DaemonConfig;
+use crate::relay::EmbeddedRelay;
+use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 use anyhow::{Context, Result};
 use iroh::EndpointId;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -12,29 +24,17 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use crate::allowlist::FileAllowlistStorage;
-use crate::daemon_lock::DaemonLock;
-use crate::http;
-use crate::native_fs::NativeFs;
-use crate::pair_api::{
-    ConnectionState, DaemonCommand, DaemonControl, DaemonStatus, PairingUiEvent, PeerSummary,
-    PAIRING_BROADCAST_CAPACITY,
-};
-use std::collections::HashMap;
-use crate::persistence::DaemonConfig;
-use crate::relay::EmbeddedRelay;
-use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::fs::FileSystem;
+use sync_core::network::pairing::pair_with_mesh_interactive;
 use sync_core::network::{
+    SyncNode,
     discovery::MeshMetadata,
     gossip::{GossipEvent, VaultGossip},
     pairing::{InboundPairingExchange, PairingApproval, PairingEvent},
     streams::InboundSyncRequest,
-    SyncNode,
 };
-use sync_core::network::pairing::pair_with_mesh_interactive;
 use sync_core::pairing::{PairingChallenge, PairingHello, PairingSession};
 use sync_core::{PeerId, PeerRegistry, Vault};
 
@@ -386,8 +386,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             use iroh::address_lookup::DiscoveryEvent;
             use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata};
 
-            let deadline =
-                tokio::time::sleep(std::time::Duration::from_secs(INITIATOR_DISCOVERY_TIMEOUT_SECS));
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(
+                INITIATOR_DISCOVERY_TIMEOUT_SECS,
+            ));
             futures::pin_mut!(stream);
             futures::pin_mut!(deadline);
 
@@ -569,7 +570,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 );
             }
         } else {
-            info!("Deleted {} from registry tree (no peers to broadcast)", path);
+            info!(
+                "Deleted {} from registry tree (no peers to broadcast)",
+                path
+            );
         }
     }
 
@@ -619,7 +623,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_neighbor_up(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
-        self.peer_registry.lock().await.on_neighbor_up(peer_id.clone());
+        self.peer_registry
+            .lock()
+            .await
+            .on_neighbor_up(peer_id.clone());
         self.emit_status().await;
 
         if !self.is_peer_allowed(&peer_id).await {
@@ -669,7 +676,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 Ok((_, modified_paths)) => {
                     peer_registry.lock().await.update_last_seen(&peer_id);
                     if let Err(e) = allowlist.update_last_seen(&peer_id, now_ms()).await {
-                        warn!("Failed to update allowlist last_seen for {}: {}", node_id, e);
+                        warn!(
+                            "Failed to update allowlist last_seen for {}: {}",
+                            node_id, e
+                        );
                     }
                     if !modified_paths.is_empty() {
                         info!(
@@ -774,12 +784,19 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         }
 
-        match self.allowlist.add_peer(peer.node_id, &peer.device_name).await {
+        match self
+            .allowlist
+            .add_peer(peer.node_id, &peer.device_name)
+            .await
+        {
             Ok(()) => {
                 info!(peer_id = %peer.node_id, device = %peer.device_name, "Added peer via gossip allowlist update");
             }
             Err(e) => {
-                error!("Failed to add peer {} from allowlist update: {}", peer.node_id, e);
+                error!(
+                    "Failed to add peer {} from allowlist update: {}",
+                    peer.node_id, e
+                );
             }
         }
     }
@@ -850,7 +867,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // Notify the desktop tray so it can open the responder window.
         self.emit_pairing_event(PairingUiEvent::InboundRequest {
             device_name: exchange.hello.device_name.clone(),
-            code: self.active_pairing.as_ref().map(|s| s.code.clone()).unwrap_or_default(),
+            code: self
+                .active_pairing
+                .as_ref()
+                .map(|s| s.code.clone())
+                .unwrap_or_default(),
             expires_at_ms,
         });
     }
@@ -873,7 +894,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let allowed_peer = AllowedPeer::new(peer_id.clone(), device_name.clone());
 
         // Bootstrap: if this is the first pairing, also add ourselves to the allowlist.
-        let is_first_pair = matches!(self.allowlist.list_peers().await, Ok(peers) if peers.is_empty());
+        let is_first_pair =
+            matches!(self.allowlist.list_peers().await, Ok(peers) if peers.is_empty());
 
         if let Err(e) = self.allowlist.add_peer(peer_id.clone(), &device_name).await {
             error!("Failed to add paired peer to allowlist: {}", e);
@@ -888,8 +910,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         // Propagate the new peer to existing mesh members via gossip.
-        if let Err(e) = self.vault_gossip.broadcast_allowlist_update(&allowed_peer).await {
-            warn!("Failed to broadcast allowlist update for {}: {}", device_name, e);
+        if let Err(e) = self
+            .vault_gossip
+            .broadcast_allowlist_update(&allowed_peer)
+            .await
+        {
+            warn!(
+                "Failed to broadcast allowlist update for {}: {}",
+                device_name, e
+            );
         }
 
         info!("Device '{}' joined the mesh", device_name);
@@ -935,9 +964,19 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     info!("Applied {} file(s) from inbound sync", modified_paths.len());
                 }
 
-                self.peer_registry.lock().await.update_last_seen(&inbound.remote_id);
-                if let Err(e) = self.allowlist.update_last_seen(&inbound.remote_id, now_ms()).await {
-                    warn!("Failed to update allowlist last_seen for {}: {}", inbound.remote_id, e);
+                self.peer_registry
+                    .lock()
+                    .await
+                    .update_last_seen(&inbound.remote_id);
+                if let Err(e) = self
+                    .allowlist
+                    .update_last_seen(&inbound.remote_id, now_ms())
+                    .await
+                {
+                    warn!(
+                        "Failed to update allowlist last_seen for {}: {}",
+                        inbound.remote_id, e
+                    );
                 }
 
                 if let Some(resp_bytes) = response_bytes_opt {
@@ -1008,7 +1047,10 @@ async fn run_initiator_pairing<AL: AllowlistStorage + 'static>(
     for member_id in &result.mesh_members {
         let peer = AllowedPeer::new(*member_id, "unknown");
         if let Err(e) = allowlist.add_peer(peer.node_id, &peer.device_name).await {
-            warn!("Failed to add mesh member {} to allowlist: {}", member_id, e);
+            warn!(
+                "Failed to add mesh member {} to allowlist: {}",
+                member_id, e
+            );
         }
     }
 
@@ -1176,8 +1218,9 @@ async fn startup_inner(
 ) -> Result<StartupBundle> {
     // Acquire exclusive daemon lock — must outlive this function. It is moved into
     // the StartupBundle and from there into the spawned run_loop task.
-    let daemon_lock = DaemonLock::acquire(&config.vault)
-        .context("Failed to acquire daemon lock — is another daemon already running on this vault?")?;
+    let daemon_lock = DaemonLock::acquire(&config.vault).context(
+        "Failed to acquire daemon lock — is another daemon already running on this vault?",
+    )?;
 
     info!("Starting sync daemon");
     info!("Vault path: {:?}", config.vault);
@@ -1186,11 +1229,8 @@ async fn startup_inner(
 
     // Load identity before the vault so we can author Loro ops under this
     // device's PeerId (config-load has no dependency on the vault).
-    let (mut daemon_config, identity_key) = DaemonConfig::load_or_generate(
-        &config.vault,
-        config.identity_key.as_deref(),
-    )
-    .await?;
+    let (mut daemon_config, identity_key) =
+        DaemonConfig::load_or_generate(&config.vault, config.identity_key.as_deref()).await?;
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
 
@@ -1237,7 +1277,10 @@ async fn startup_inner(
                 }
             }
             Err(e) => {
-                warn!("Invalid relay-listen address '{}': {}, continuing without relay", addr_str, e);
+                warn!(
+                    "Invalid relay-listen address '{}': {}, continuing without relay",
+                    addr_str, e
+                );
                 None
             }
         }
@@ -1263,7 +1306,8 @@ async fn startup_inner(
     info!(node_id = %sync_node.node_id(), "Iroh node started");
 
     let mesh_name = daemon_config.mesh_name.clone().unwrap_or_else(|| {
-        config.vault
+        config
+            .vault
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Obsidian Vault")
@@ -1281,7 +1325,12 @@ async fn startup_inner(
             .iter()
             .filter_map(|p| {
                 EndpointId::from_bytes(p.node_id.as_bytes())
-                    .map_err(|e| warn!("Skipping invalid allowlist peer for gossip bootstrap: {}", e))
+                    .map_err(|e| {
+                        warn!(
+                            "Skipping invalid allowlist peer for gossip bootstrap: {}",
+                            e
+                        )
+                    })
                     .ok()
             })
             .collect(),
@@ -1303,16 +1352,23 @@ async fn startup_inner(
         tokio::spawn(async move {
             http::serve_health(&health_addr).await;
         });
-        info!("Health endpoint started on {}", config.health_listen.as_ref().unwrap());
+        info!(
+            "Health endpoint started on {}",
+            config.health_listen.as_ref().unwrap()
+        );
     }
 
     let watcher = FileWatcher::new(config.vault.clone())?;
     info!("File watcher started");
 
-    let discovery_rx: Option<tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>> = {
+    let discovery_rx: Option<
+        tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
+    > = {
         use futures::StreamExt;
-        use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata};
         use iroh::address_lookup::DiscoveryEvent;
+        use sync_core::network::discovery::{
+            DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata,
+        };
 
         if let Some(stream) = sync_node.subscribe_discovery().await {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1321,10 +1377,9 @@ async fn startup_inner(
                 while let Some(event) = stream.next().await {
                     match event {
                         DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let metadata = endpoint_info
-                                .data
-                                .user_data()
-                                .and_then(|ud| serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok());
+                            let metadata = endpoint_info.data.user_data().and_then(|ud| {
+                                serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok()
+                            });
 
                             if let Some(meta) = metadata {
                                 let mesh = DiscoveredMesh {
@@ -1350,10 +1405,7 @@ async fn startup_inner(
 
     let device_name = {
         let hostname = gethostname::gethostname();
-        hostname
-            .to_str()
-            .unwrap_or("Sync Daemon")
-            .to_string()
+        hostname.to_str().unwrap_or("Sync Daemon").to_string()
     };
     info!(device_name = %device_name, "Device name resolved for pairing");
 
@@ -1389,8 +1441,9 @@ async fn startup_inner(
 /// and graceful shutdown. Called by `run_with_shutdown`.
 async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Result<()> {
     // Acquire exclusive daemon lock
-    let _daemon_lock = DaemonLock::acquire(&config.vault)
-        .context("Failed to acquire daemon lock — is another daemon already running on this vault?")?;
+    let _daemon_lock = DaemonLock::acquire(&config.vault).context(
+        "Failed to acquire daemon lock — is another daemon already running on this vault?",
+    )?;
 
     info!("Starting sync daemon");
     info!("Vault path: {:?}", config.vault);
@@ -1399,11 +1452,8 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
 
     // Load identity before the vault so we can author Loro ops under this
     // device's PeerId (config-load has no dependency on the vault).
-    let (mut daemon_config, identity_key) = DaemonConfig::load_or_generate(
-        &config.vault,
-        config.identity_key.as_deref(),
-    )
-    .await?;
+    let (mut daemon_config, identity_key) =
+        DaemonConfig::load_or_generate(&config.vault, config.identity_key.as_deref()).await?;
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
 
@@ -1432,20 +1482,21 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
     // Failure is non-fatal: the daemon continues without relay support.
     let embedded_relay: Option<EmbeddedRelay> = if let Some(ref addr_str) = config.relay_listen {
         match addr_str.parse() {
-            Ok(bind_addr) => {
-                match EmbeddedRelay::start(bind_addr).await {
-                    Ok(relay) => {
-                        info!(url = %relay.relay_url(), "Embedded relay started");
-                        Some(relay)
-                    }
-                    Err(e) => {
-                        warn!("Failed to start embedded relay, continuing without: {}", e);
-                        None
-                    }
+            Ok(bind_addr) => match EmbeddedRelay::start(bind_addr).await {
+                Ok(relay) => {
+                    info!(url = %relay.relay_url(), "Embedded relay started");
+                    Some(relay)
                 }
-            }
+                Err(e) => {
+                    warn!("Failed to start embedded relay, continuing without: {}", e);
+                    None
+                }
+            },
             Err(e) => {
-                warn!("Invalid relay-listen address '{}': {}, continuing without relay", addr_str, e);
+                warn!(
+                    "Invalid relay-listen address '{}': {}, continuing without relay",
+                    addr_str, e
+                );
                 None
             }
         }
@@ -1478,7 +1529,8 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
     // Publish mesh info via mDNS so LAN peers can discover this mesh.
     // mesh_name defaults to the vault directory name if not set in config.
     let mesh_name = daemon_config.mesh_name.clone().unwrap_or_else(|| {
-        config.vault
+        config
+            .vault
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("Obsidian Vault")
@@ -1499,7 +1551,12 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
             .filter_map(|p| {
                 // PeerId and EndpointId are both 32-byte ed25519 public keys.
                 EndpointId::from_bytes(p.node_id.as_bytes())
-                    .map_err(|e| warn!("Skipping invalid allowlist peer for gossip bootstrap: {}", e))
+                    .map_err(|e| {
+                        warn!(
+                            "Skipping invalid allowlist peer for gossip bootstrap: {}",
+                            e
+                        )
+                    })
                     .ok()
             })
             .collect(),
@@ -1522,7 +1579,10 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
         tokio::spawn(async move {
             http::serve_health(&health_addr).await;
         });
-        info!("Health endpoint started on {}", config.health_listen.as_ref().unwrap());
+        info!(
+            "Health endpoint started on {}",
+            config.health_listen.as_ref().unwrap()
+        );
     }
 
     let watcher = FileWatcher::new(config.vault.clone())?;
@@ -1530,10 +1590,14 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
 
     // Spawn mDNS discovery events into a channel so the main select loop stays uniform.
     // Discovery is native-only; the channel is None when mDNS is unavailable.
-    let discovery_rx: Option<tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>> = {
+    let discovery_rx: Option<
+        tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
+    > = {
         use futures::StreamExt;
-        use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata};
         use iroh::address_lookup::DiscoveryEvent;
+        use sync_core::network::discovery::{
+            DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata,
+        };
 
         if let Some(stream) = sync_node.subscribe_discovery().await {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1542,10 +1606,9 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
                 while let Some(event) = stream.next().await {
                     match event {
                         DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let metadata = endpoint_info
-                                .data
-                                .user_data()
-                                .and_then(|ud| serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok());
+                            let metadata = endpoint_info.data.user_data().and_then(|ud| {
+                                serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok()
+                            });
 
                             if let Some(meta) = metadata {
                                 let mesh = DiscoveredMesh {
@@ -1573,10 +1636,7 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
     // Resolve device name for pairing: system hostname or a safe fallback.
     let device_name = {
         let hostname = gethostname::gethostname();
-        hostname
-            .to_str()
-            .unwrap_or("Sync Daemon")
-            .to_string()
+        hostname.to_str().unwrap_or("Sync Daemon").to_string()
     };
     info!(device_name = %device_name, "Device name resolved for pairing");
 

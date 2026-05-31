@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use sync_daemon::{native_fs::NativeFs, watcher::FileWatcher, FileEventKind};
+use sync_daemon::{FileEventKind, native_fs::NativeFs, watcher::FileWatcher};
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -79,7 +79,10 @@ async fn test_file_watcher_ignores_sync_directory() {
         .expect("Timeout waiting for file event")
         .expect("No event received");
 
-    assert_eq!(event.path, "test.md", "Should detect test.md, not .sync file");
+    assert_eq!(
+        event.path, "test.md",
+        "Should detect test.md, not .sync file"
+    );
 }
 
 /// Test that file watcher only processes .md files.
@@ -131,7 +134,11 @@ async fn test_native_fs_basic_operations() {
 
     // Exists
     assert!(fs.exists("test.md").await.expect("Exists check failed"));
-    assert!(!fs.exists("nonexistent.md").await.expect("Exists check failed"));
+    assert!(
+        !fs.exists("nonexistent.md")
+            .await
+            .expect("Exists check failed")
+    );
 
     // Read
     let content = fs.read("test.md").await.expect("Read failed");
@@ -158,7 +165,11 @@ async fn test_native_fs_nested_directories() {
         .await
         .expect("Write to nested path failed");
 
-    assert!(fs.exists("knowledge/topic.md").await.expect("Exists check failed"));
+    assert!(
+        fs.exists("knowledge/topic.md")
+            .await
+            .expect("Exists check failed")
+    );
 
     let content = fs.read("knowledge/topic.md").await.expect("Read failed");
     assert_eq!(content, b"# Topic");
@@ -205,12 +216,9 @@ async fn test_run_with_shutdown_cancels_during_startup() {
         cancel_trigger.cancel();
     });
 
-    let result = timeout(
-        Duration::from_secs(15),
-        run_with_shutdown(config, shutdown),
-    )
-    .await
-    .expect("run_with_shutdown did not complete within 15s after mid-startup cancel");
+    let result = timeout(Duration::from_secs(15), run_with_shutdown(config, shutdown))
+        .await
+        .expect("run_with_shutdown did not complete within 15s after mid-startup cancel");
 
     // Cancel-during-startup must return Ok(()) — it is a clean exit, not an error.
     result.expect("run_with_shutdown returned Err on mid-startup cancel; expected Ok(())");
@@ -222,10 +230,10 @@ async fn test_run_with_shutdown_cancels_during_startup() {
 /// verifies the function returns within a reasonable deadline.
 #[tokio::test]
 async fn test_run_with_shutdown_cancels_after_startup() {
-    use tokio::net::TcpListener;
-    use tokio_util::sync::CancellationToken;
     use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown};
+    use tokio::net::TcpListener;
     use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let vault_path = temp_dir.path().to_path_buf();
@@ -259,7 +267,13 @@ async fn test_run_with_shutdown_cancels_after_startup() {
         if tokio::time::Instant::now() >= startup_deadline {
             panic!("daemon did not start within 20s");
         }
-        if client.get(&health_url).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+        if client
+            .get(&health_url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -293,11 +307,11 @@ async fn test_run_with_shutdown_cancels_after_startup() {
 /// still be alive inside the spawned task (C2 fix).
 #[tokio::test]
 async fn test_controlled_daemon_holds_lock_and_watcher_across_run_loop() {
+    use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown_controlled};
+    use sync_daemon::daemon_lock::DaemonLock;
     use tokio::net::TcpListener;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
-    use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown_controlled};
-    use sync_daemon::daemon_lock::DaemonLock;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let vault_path = temp_dir.path().to_path_buf();
@@ -343,7 +357,13 @@ async fn test_controlled_daemon_holds_lock_and_watcher_across_run_loop() {
         if tokio::time::Instant::now() >= startup_deadline {
             panic!("daemon health endpoint did not respond within 20s");
         }
-        if client.get(&health_url).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+        if client
+            .get(&health_url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -414,4 +434,3 @@ async fn test_health_endpoint() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "OK");
 }
-

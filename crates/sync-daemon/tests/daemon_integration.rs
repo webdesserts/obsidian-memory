@@ -24,11 +24,11 @@ mod daemon_integration {
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 
+    use sync_core::Vault;
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
     use sync_core::fs::{FileSystem, InMemoryFs};
-    use sync_core::network::{gossip::VaultGossip, SyncNode};
+    use sync_core::network::{SyncNode, gossip::VaultGossip};
     use sync_core::peer_id::{PeerId, VaultId};
-    use sync_core::Vault;
 
     use sync_daemon::daemon::Daemon;
     use sync_daemon::watcher::{FileEvent, FileEventKind};
@@ -235,7 +235,10 @@ mod daemon_integration {
         let daemon_b = spawn_daemon(node_b, gossip_b);
 
         // Write file to A's filesystem, then inject the modification event.
-        daemon_a.fs.write("notes/hello.md", b"# Hello World").await?;
+        daemon_a
+            .fs
+            .write("notes/hello.md", b"# Hello World")
+            .await?;
         inject_modified(&daemon_a, "notes/hello.md");
 
         // Wait for B to receive the file via gossip broadcast + QUIC pull.
@@ -276,7 +279,10 @@ mod daemon_integration {
         connect_nodes(&node_a, &node_b).await?;
 
         // Write A's file directly into the vault before spawning the event loops.
-        node_a.fs.write("notes/offline-edit.md", b"# Written offline").await?;
+        node_a
+            .fs
+            .write("notes/offline-edit.md", b"# Written offline")
+            .await?;
         {
             let vault = node_a.vault.lock().await;
             vault.on_file_changed("notes/offline-edit.md").await?;
@@ -343,7 +349,10 @@ mod daemon_integration {
         let daemon_b = spawn_daemon(node_b, gossip_b);
 
         // Step 1: Sync the file from A to B via the daemon's normal file-change path.
-        daemon_a.fs.write("notes/delete-me.md", b"to be deleted").await?;
+        daemon_a
+            .fs
+            .write("notes/delete-me.md", b"to be deleted")
+            .await?;
         inject_modified(&daemon_a, "notes/delete-me.md");
 
         wait_until("B has notes/delete-me.md before deletion", || {
@@ -414,7 +423,10 @@ mod daemon_integration {
         let daemon_b = spawn_daemon(node_b, gossip_b);
 
         // Sync a file from A to B.
-        daemon_a.fs.write("notes/synced.md", b"synced content").await?;
+        daemon_a
+            .fs
+            .write("notes/synced.md", b"synced content")
+            .await?;
         inject_modified(&daemon_a, "notes/synced.md");
 
         wait_until("B has notes/synced.md", || {
@@ -441,8 +453,7 @@ mod daemon_integration {
         // B's file content should be unchanged.
         let content = daemon_b.fs.read("notes/synced.md").await?;
         assert_eq!(
-            content,
-            b"synced content",
+            content, b"synced content",
             "B's file content should be unchanged after spurious Modified event"
         );
 
@@ -482,7 +493,8 @@ mod daemon_integration {
             .join_vault_gossip(&vault_id, vec![])
             .await?;
 
-        let (file_event_tx, file_event_rx) = mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
+        let (file_event_tx, file_event_rx) =
+            mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
         let shutdown = CancellationToken::new();
 
         let mut daemon = Daemon::new(
@@ -511,7 +523,11 @@ mod daemon_integration {
         // Verify initial state: Idle with 0 peers, mesh name and device name set.
         {
             let status = status_rx.borrow_and_update();
-            assert_eq!(status.state, ConnectionState::Idle, "initial state should be Idle");
+            assert_eq!(
+                status.state,
+                ConnectionState::Idle,
+                "initial state should be Idle"
+            );
             assert_eq!(status.peer_count, 0);
             assert_eq!(status.mesh_name.as_deref(), Some("Test Vault"));
             assert_eq!(status.device_name.as_deref(), Some("device-a"));
@@ -526,7 +542,10 @@ mod daemon_integration {
         // Join gossip on node B so NeighborUp fires on daemon A.
         let gossip_b = node_b
             .sync_node
-            .join_vault_gossip(&vault_id, vec![node_a.node_id.as_bytes().try_into().unwrap()])
+            .join_vault_gossip(
+                &vault_id,
+                vec![node_a.node_id.as_bytes().try_into().unwrap()],
+            )
             .await?;
         let daemon_b = spawn_daemon(node_b, gossip_b);
 
@@ -570,7 +589,8 @@ mod daemon_integration {
         let vault_id = shared_vault_id();
         let gossip = node.sync_node.join_vault_gossip(&vault_id, vec![]).await?;
 
-        let (_file_event_tx, file_event_rx) = mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
+        let (_file_event_tx, file_event_rx) =
+            mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
         let shutdown = CancellationToken::new();
 
         let mut daemon = Daemon::new(

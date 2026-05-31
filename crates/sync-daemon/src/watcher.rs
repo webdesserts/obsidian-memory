@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, DebouncedEvent, DebouncedEventKind};
+use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind, new_debouncer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -148,9 +148,7 @@ impl FileWatcher {
         if kind == FileEventKind::Modified {
             if let Ok(metadata) = std::fs::metadata(path) {
                 if let Ok(mtime) = metadata.modified() {
-                    let mut cache = mtime_cache
-                        .lock()
-                        .expect("mtime cache mutex poisoned");
+                    let mut cache = mtime_cache.lock().expect("mtime cache mutex poisoned");
                     if let Some(last_mtime) = cache.get(&relative_path) {
                         if *last_mtime == mtime {
                             // Mtime unchanged - spurious event, skip it
@@ -162,9 +160,7 @@ impl FileWatcher {
             }
         } else if kind == FileEventKind::Deleted {
             // Remove from cache when file is deleted
-            let mut cache = mtime_cache
-                .lock()
-                .expect("mtime cache mutex poisoned");
+            let mut cache = mtime_cache.lock().expect("mtime cache mutex poisoned");
             cache.remove(&relative_path);
         }
 

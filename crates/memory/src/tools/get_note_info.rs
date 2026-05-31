@@ -1,4 +1,6 @@
-use obsidian_fs::{ensure_markdown_extension, generate_search_paths, normalize_note_reference, NoteRef};
+use obsidian_fs::{
+    NoteRef, ensure_markdown_extension, generate_search_paths, normalize_note_reference,
+};
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 
@@ -128,7 +130,9 @@ mod tests {
         let vault_path = temp_dir.path();
 
         // Create some test notes
-        fs::create_dir_all(vault_path.join("knowledge")).await.unwrap();
+        fs::create_dir_all(vault_path.join("knowledge"))
+            .await
+            .unwrap();
 
         // Note A links to Note B
         fs::write(
@@ -153,11 +157,7 @@ mod tests {
             "knowledge/Note A.md".into(),
             ["Note B".to_string()].into_iter().collect(),
         );
-        graph.update_note(
-            "Note B",
-            "knowledge/Note B.md".into(),
-            HashSet::new(),
-        );
+        graph.update_note("Note B", "knowledge/Note B.md".into(), HashSet::new());
 
         (temp_dir, graph)
     }
@@ -166,14 +166,9 @@ mod tests {
     async fn test_get_existing_note() {
         let (temp_dir, graph) = create_test_vault().await;
 
-        let result = execute(
-            temp_dir.path(),
-            "test-vault",
-            &graph,
-            "Note A",
-        )
-        .await
-        .expect("should succeed");
+        let result = execute(temp_dir.path(), "test-vault", &graph, "Note A")
+            .await
+            .expect("should succeed");
 
         let text = result.content[0]
             .raw
@@ -191,14 +186,9 @@ mod tests {
     async fn test_get_nonexistent_note() {
         let (temp_dir, graph) = create_test_vault().await;
 
-        let result = execute(
-            temp_dir.path(),
-            "test-vault",
-            &graph,
-            "Nonexistent Note",
-        )
-        .await
-        .expect("should succeed");
+        let result = execute(temp_dir.path(), "test-vault", &graph, "Nonexistent Note")
+            .await
+            .expect("should succeed");
 
         let text = result.content[0]
             .raw
@@ -215,14 +205,9 @@ mod tests {
     async fn test_get_note_with_links() {
         let (temp_dir, graph) = create_test_vault().await;
 
-        let result = execute(
-            temp_dir.path(),
-            "test-vault",
-            &graph,
-            "Note A",
-        )
-        .await
-        .expect("should succeed");
+        let result = execute(temp_dir.path(), "test-vault", &graph, "Note A")
+            .await
+            .expect("should succeed");
 
         let text = result.content[0]
             .raw
@@ -240,14 +225,9 @@ mod tests {
     async fn test_get_note_with_backlinks() {
         let (temp_dir, graph) = create_test_vault().await;
 
-        let result = execute(
-            temp_dir.path(),
-            "test-vault",
-            &graph,
-            "Note B",
-        )
-        .await
-        .expect("should succeed");
+        let result = execute(temp_dir.path(), "test-vault", &graph, "Note B")
+            .await
+            .expect("should succeed");
 
         let text = result.content[0]
             .raw

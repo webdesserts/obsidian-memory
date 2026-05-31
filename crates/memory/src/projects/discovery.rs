@@ -192,8 +192,10 @@ fn is_strict_match(project: &ProjectMetadata, directory: &DirectoryInfo) -> Matc
     // Check current remotes
     if let Some(ref project_remotes) = project.remotes {
         if !directory.git_remotes.is_empty() {
-            let normalized_project_remotes: Vec<String> =
-                project_remotes.iter().map(|r| normalize_remote(r)).collect();
+            let normalized_project_remotes: Vec<String> = project_remotes
+                .iter()
+                .map(|r| normalize_remote(r))
+                .collect();
             let normalized_dir_remotes: Vec<String> = directory
                 .git_remotes
                 .iter()

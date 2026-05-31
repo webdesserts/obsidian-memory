@@ -1,6 +1,6 @@
 mod common;
 
-use common::{cosine_similarity, SIMILARITY_FIXTURES, TEST_MODEL};
+use common::{SIMILARITY_FIXTURES, TEST_MODEL, cosine_similarity};
 
 #[test]
 fn test_similarity_against_fixtures() {
@@ -12,9 +12,11 @@ fn test_similarity_against_fixtures() {
     let mut failure_details = Vec::new();
 
     for test_case in &fixtures.test_cases {
-        let emb1 = TEST_MODEL.encode_single(&test_case.text1)
+        let emb1 = TEST_MODEL
+            .encode_single(&test_case.text1)
             .unwrap_or_else(|_| panic!("Failed to encode text1 for {}", test_case.name));
-        let emb2 = TEST_MODEL.encode_single(&test_case.text2)
+        let emb2 = TEST_MODEL
+            .encode_single(&test_case.text2)
             .unwrap_or_else(|_| panic!("Failed to encode text2 for {}", test_case.name));
 
         let actual_similarity = cosine_similarity(&emb1, &emb2);

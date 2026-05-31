@@ -166,9 +166,7 @@ mod tests {
             .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
-        let (uri, exists) = resolve_note_uri(&storage, &graph, "test")
-            .await
-            .unwrap();
+        let (uri, exists) = resolve_note_uri(&storage, &graph, "test").await.unwrap();
 
         assert_eq!(uri, "test");
         assert!(exists);
@@ -178,7 +176,9 @@ mod tests {
     async fn test_resolve_plain_name_in_subdirectory() {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
-        fs::create_dir(temp_dir.path().join("knowledge")).await.unwrap();
+        fs::create_dir(temp_dir.path().join("knowledge"))
+            .await
+            .unwrap();
         fs::write(temp_dir.path().join("knowledge/My Note.md"), "content")
             .await
             .unwrap();
@@ -189,9 +189,7 @@ mod tests {
         );
 
         // Just the name should resolve to the full path
-        let (uri, exists) = resolve_note_uri(&storage, &graph, "My Note")
-            .await
-            .unwrap();
+        let (uri, exists) = resolve_note_uri(&storage, &graph, "My Note").await.unwrap();
 
         assert_eq!(uri, "knowledge/My Note");
         assert!(exists);
@@ -218,7 +216,9 @@ mod tests {
     async fn test_resolve_memory_uri_with_path() {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
-        fs::create_dir(temp_dir.path().join("projects")).await.unwrap();
+        fs::create_dir(temp_dir.path().join("projects"))
+            .await
+            .unwrap();
         fs::write(temp_dir.path().join("projects/foo.md"), "content")
             .await
             .unwrap();
@@ -262,9 +262,7 @@ mod tests {
         graph.update_note("note", PathBuf::from("a/note.md"), HashSet::new());
 
         // Explicit path should take precedence over graph lookup
-        let (uri, exists) = resolve_note_uri(&storage, &graph, "b/note")
-            .await
-            .unwrap();
+        let (uri, exists) = resolve_note_uri(&storage, &graph, "b/note").await.unwrap();
 
         assert_eq!(uri, "b/note");
         assert!(exists);

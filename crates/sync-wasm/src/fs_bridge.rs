@@ -65,18 +65,21 @@ impl JsFileSystemBridge {
 }
 
 /// Helper to call a JS function and await its Promise result.
-async fn call_js_async(func: &js_sys::Function, args: &[JsValue]) -> std::result::Result<JsValue, JsValue> {
+async fn call_js_async(
+    func: &js_sys::Function,
+    args: &[JsValue],
+) -> std::result::Result<JsValue, JsValue> {
     let this = JsValue::NULL;
-    
+
     // Build arguments array
     let js_args = js_sys::Array::new();
     for arg in args {
         js_args.push(arg);
     }
-    
+
     // Call the function - it returns a Promise
     let promise = func.apply(&this, &js_args)?;
-    
+
     // Convert Promise to Future and await
     JsFuture::from(js_sys::Promise::from(promise)).await
 }
@@ -91,7 +94,7 @@ fn js_err_to_fs_err(err: JsValue) -> FsError {
                 .and_then(|v| v.as_string())
         })
         .unwrap_or_else(|| format!("{:?}", err));
-    
+
     // Try to detect specific error types from the message
     if msg.contains("not found") || msg.contains("ENOENT") {
         FsError::NotFound(msg)
@@ -127,7 +130,7 @@ impl FileSystem for JsFileSystemBridge {
         let result = call_js_async(&self.read_fn, &[path.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
         // Result should be a Uint8Array
         let array = js_sys::Uint8Array::from(result);
         Ok(array.to_vec())
@@ -136,11 +139,11 @@ impl FileSystem for JsFileSystemBridge {
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         // Convert content to Uint8Array for JS
         let js_array = js_sys::Uint8Array::from(content);
-        
+
         call_js_async(&self.write_fn, &[path.into(), js_array.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
         Ok(())
     }
 
@@ -148,11 +151,11 @@ impl FileSystem for JsFileSystemBridge {
         let result = call_js_async(&self.list_fn, &[path.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
         // Result should be an array of { name, isDir } objects
         let entries: Vec<JsFileEntry> = serde_wasm_bindgen::from_value(result)
             .map_err(|e| FsError::Io(format!("Failed to parse list result: {}", e)))?;
-        
+
         Ok(entries
             .into_iter()
             .map(|e| FileEntry {
@@ -166,7 +169,7 @@ impl FileSystem for JsFileSystemBridge {
         call_js_async(&self.delete_fn, &[path.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
         Ok(())
     }
 
@@ -174,7 +177,7 @@ impl FileSystem for JsFileSystemBridge {
         let result = call_js_async(&self.exists_fn, &[path.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
         Ok(result.as_bool().unwrap_or(false))
     }
 
@@ -182,10 +185,10 @@ impl FileSystem for JsFileSystemBridge {
         let result = call_js_async(&self.stat_fn, &[path.into()])
             .await
             .map_err(js_err_to_fs_err)?;
-        
+
         let js_stat: JsFileStat = serde_wasm_bindgen::from_value(result)
             .map_err(|e| FsError::Io(format!("Failed to parse stat result: {}", e)))?;
-        
+
         Ok(FileStat {
             mtime_millis: js_stat.mtime as u64,
             size: js_stat.size as u64,

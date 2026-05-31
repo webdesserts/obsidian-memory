@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
+use sync_core::network::SyncNode;
 use sync_core::network::gossip::GossipEvent;
 use sync_core::network::streams::connect_and_sync_raw;
-use sync_core::network::SyncNode;
 use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 use sync_daemon::relay::EmbeddedRelay;
@@ -108,10 +108,7 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
     let addr_a = node_a.endpoint.addr();
     let request = SyncMessage::SyncRequest {
         registry_version: vec![1, 2, 3],
-        document_versions: HashMap::from([(
-            "notes/relay-test.md".to_string(),
-            vec![0u8; 4],
-        )]),
+        document_versions: HashMap::from([("notes/relay-test.md".to_string(), vec![0u8; 4])]),
     };
     let request_bytes = bincode::serialize(&request)?;
 

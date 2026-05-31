@@ -42,9 +42,9 @@ pub async fn execute<S: Storage>(
     note: &str,
 ) -> Result<CallToolResult, ErrorData> {
     // Resolve the note reference
-    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
-    })?;
+    let (uri, exists) = resolve_note_uri(storage, graph, note)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to resolve note: {}", e), None))?;
 
     if !exists {
         return Err(ErrorData::invalid_params(
@@ -70,8 +70,9 @@ pub async fn execute<S: Storage>(
         content: number_lines(&content),
         content_hash: content_hash.as_str().to_string(),
     };
-    let json = serde_json::to_string(&response)
-        .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+    let json = serde_json::to_string(&response).map_err(|e| {
+        ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+    })?;
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -161,12 +162,9 @@ mod tests {
         fs::create_dir(temp_dir.path().join("knowledge"))
             .await
             .unwrap();
-        fs::write(
-            temp_dir.path().join("knowledge/My Note.md"),
-            "Note content",
-        )
-        .await
-        .unwrap();
+        fs::write(temp_dir.path().join("knowledge/My Note.md"), "Note content")
+            .await
+            .unwrap();
         graph.update_note(
             "My Note",
             PathBuf::from("knowledge/My Note.md"),
@@ -234,9 +232,12 @@ mod tests {
     async fn test_read_multiline_content_has_line_numbers() {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
-        fs::write(temp_dir.path().join("test.md"), "line one\nline two\nline three")
-            .await
-            .unwrap();
+        fs::write(
+            temp_dir.path().join("test.md"),
+            "line one\nline two\nline three",
+        )
+        .await
+        .unwrap();
         graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
 
         let result = execute(&storage, &graph, "test")
@@ -269,7 +270,10 @@ mod tests {
         let (temp_dir, storage, mut graph) = create_test_env().await;
 
         // 10+ lines to test right-alignment
-        let content = (1..=12).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (1..=12)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(temp_dir.path().join("test.md"), &content)
             .await
             .unwrap();

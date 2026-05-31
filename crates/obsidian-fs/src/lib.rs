@@ -8,15 +8,15 @@
 mod frontmatter;
 
 pub use frontmatter::{
-    build_note_with_frontmatter, parse_frontmatter, serialize_frontmatter, split_frontmatter,
-    Frontmatter, FrontmatterError, ParsedNote,
+    Frontmatter, FrontmatterError, ParsedNote, build_note_with_frontmatter, parse_frontmatter,
+    serialize_frontmatter, split_frontmatter,
 };
 
 use serde::{Deserialize, Serialize};
 
 /// Common search paths for note lookup (relative to vault root)
 pub const COMMON_SEARCH_PATHS: &[&str] = &[
-    "",          // Root
+    "", // Root
     "knowledge",
     "journal",
     "projects",

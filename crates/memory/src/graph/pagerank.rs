@@ -17,10 +17,7 @@ const DEFAULT_MAX_ITER: usize = 100;
 /// - Random walks start at the seed node
 /// - At each step: 85% follow random link, 15% restart at seed
 /// - Iterate until convergence or max iterations
-pub fn personalized_pagerank(
-    graph: &GraphIndex,
-    seed: &str,
-) -> HashMap<String, f64> {
+pub fn personalized_pagerank(graph: &GraphIndex, seed: &str) -> HashMap<String, f64> {
     personalized_pagerank_with_params(
         graph,
         seed,
@@ -41,14 +38,13 @@ pub fn personalized_pagerank_with_params(
     // Build list of all nodes (paths)
     let nodes: Vec<String> = graph.all_paths().cloned().collect();
     let n = nodes.len();
-    
+
     // Seed is a note name, find matching paths
-    let seed_paths: Vec<&String> = nodes.iter()
-        .filter(|p| {
-            Path::new(p).file_stem().and_then(|s| s.to_str()) == Some(seed)
-        })
+    let seed_paths: Vec<&String> = nodes
+        .iter()
+        .filter(|p| Path::new(p).file_stem().and_then(|s| s.to_str()) == Some(seed))
         .collect();
-    
+
     if n == 0 || seed_paths.is_empty() {
         return HashMap::new();
     }
@@ -74,44 +70,47 @@ pub fn personalized_pagerank_with_params(
     for source_node in &nodes {
         let neighbors = graph.get_neighborhood(source_node);
         for target in neighbors {
-            incoming.entry(target).or_default().push(source_node.clone());
+            incoming
+                .entry(target)
+                .or_default()
+                .push(source_node.clone());
         }
     }
-    
+
     tracing::debug!(
         seed = seed,
         nodes = n,
         avg_incoming = incoming.values().map(|v| v.len()).sum::<usize>() / n.max(1),
         "Starting Personalized PageRank"
     );
-    
+
     // Iteratively compute PageRank
     let mut converged_at = None;
     for iteration in 0..max_iter {
         let mut new_scores: HashMap<String, f64> = HashMap::new();
-        
+
         for node in &nodes {
             let mut score = 0.0;
-            
+
             // Sum contributions from nodes that link to this node (reverse adjacency)
             if let Some(sources) = incoming.get(node) {
                 for source_node in sources {
                     let source_score = scores.get(source_node).copied().unwrap_or(0.0);
                     let source_out_degree = graph.get_neighborhood(source_node).len() as f64;
-                    
+
                     if source_out_degree > 0.0 {
                         score += source_score / source_out_degree;
                     }
                 }
             }
-            
+
             // Apply damping and personalization
             let restart_prob = personalization.get(node).copied().unwrap_or(0.0);
             score = damping * score + (1.0 - damping) * restart_prob;
-            
+
             new_scores.insert(node.clone(), score);
         }
-        
+
         // Check convergence (L1 distance)
         let mut diff = 0.0;
         for node in &nodes {
@@ -119,9 +118,9 @@ pub fn personalized_pagerank_with_params(
             let new = new_scores.get(node).copied().unwrap_or(0.0);
             diff += (new - old).abs();
         }
-        
+
         scores = new_scores;
-        
+
         // Log progress every 10 iterations
         if iteration % 10 == 0 && iteration > 0 {
             tracing::debug!(
@@ -131,13 +130,13 @@ pub fn personalized_pagerank_with_params(
                 "PageRank iteration progress"
             );
         }
-        
+
         if diff < tolerance {
             converged_at = Some(iteration);
             break;
         }
     }
-    
+
     let elapsed = start_time.elapsed();
     if let Some(iter) = converged_at {
         tracing::debug!(
@@ -154,7 +153,7 @@ pub fn personalized_pagerank_with_params(
             "PageRank did not converge"
         );
     }
-    
+
     // Normalize so all scores are relative to the max score
     // This ensures the seed (or most connected node) has score ~1.0
     let max_score = scores.values().copied().fold(0.0f64, f64::max);
@@ -163,7 +162,7 @@ pub fn personalized_pagerank_with_params(
             *score /= max_score;
         }
     }
-    
+
     // Convert path keys to note name keys for the caller
     // If multiple paths have the same note name, take the max score
     let mut name_scores: HashMap<String, f64> = HashMap::new();
@@ -173,7 +172,7 @@ pub fn personalized_pagerank_with_params(
             *entry = entry.max(score);
         }
     }
-    
+
     name_scores
 }
 
@@ -187,24 +186,24 @@ mod tests {
     fn test_linear_graph() {
         // A -> B -> C (bidirectional due to backlinks)
         let mut graph = GraphIndex::new();
-        
+
         let mut links_a = HashSet::new();
         links_a.insert("B".to_string());
         graph.update_note("A", PathBuf::from("A.md"), links_a);
-        
+
         let mut links_b = HashSet::new();
         links_b.insert("C".to_string());
         graph.update_note("B", PathBuf::from("B.md"), links_b);
-        
+
         graph.update_note("C", PathBuf::from("C.md"), HashSet::new());
-        
+
         let scores = personalized_pagerank(&graph, "A");
-        
+
         // Get scores
         let score_a = scores.get("A").copied().unwrap_or(0.0);
         let score_b = scores.get("B").copied().unwrap_or(0.0);
         let score_c = scores.get("C").copied().unwrap_or(0.0);
-        
+
         // B is directly connected to A (1-hop), C is 2-hops away
         // A should have highest score (normalized to 1.0)
         // B should be close to A since it's directly connected
@@ -219,19 +218,19 @@ mod tests {
     fn test_disconnected_nodes() {
         // A -> B, C (disconnected)
         let mut graph = GraphIndex::new();
-        
+
         let mut links_a = HashSet::new();
         links_a.insert("B".to_string());
         graph.update_note("A", PathBuf::from("A.md"), links_a);
-        
+
         graph.update_note("B", PathBuf::from("B.md"), HashSet::new());
         graph.update_note("C", PathBuf::from("C.md"), HashSet::new());
-        
+
         let scores = personalized_pagerank(&graph, "A");
-        
+
         let score_b = scores.get("B").copied().unwrap_or(0.0);
         let score_c = scores.get("C").copied().unwrap_or(0.0);
-        
+
         // B should have higher score than disconnected C
         assert!(score_b > score_c);
     }

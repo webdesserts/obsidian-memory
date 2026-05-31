@@ -82,7 +82,11 @@ impl GraphIndex {
     }
 
     /// Index a single file (extract links and update graph).
-    async fn index_file(&mut self, vault_path: &Path, file_path: &Path) -> Result<(), std::io::Error> {
+    async fn index_file(
+        &mut self,
+        vault_path: &Path,
+        file_path: &Path,
+    ) -> Result<(), std::io::Error> {
         let content = fs::read_to_string(file_path).await?;
 
         // Get note name (filename without .md extension)
@@ -119,7 +123,7 @@ impl GraphIndex {
     /// The path should be relative to the vault root (e.g., "knowledge/Note.md").
     pub fn update_note(&mut self, note_name: &str, path: PathBuf, links: HashSet<String>) {
         let path_key = path.to_string_lossy().to_string();
-        
+
         // Remove old backlinks for this path
         if let Some(old_links) = self.forward_links.get(&path_key) {
             for target in old_links.iter() {
@@ -139,7 +143,7 @@ impl GraphIndex {
 
         // Update forward links
         self.forward_links.insert(path_key.clone(), links);
-        
+
         // Update name to paths mapping
         self.name_to_paths
             .entry(note_name.to_string())
@@ -148,11 +152,11 @@ impl GraphIndex {
     }
 
     /// Remove a note from the index entirely.
-    /// 
+    ///
     /// The path should be the relative path used when the note was added.
     pub fn remove_note(&mut self, note_name: &str, path: &Path) {
         let path_key = path.to_string_lossy().to_string();
-        
+
         // Remove forward links and their backlink entries
         if let Some(links) = self.forward_links.remove(&path_key) {
             for target in links {
@@ -187,14 +191,14 @@ impl GraphIndex {
     pub fn get_backlinks(&self, note_name: &str) -> Option<&HashSet<String>> {
         self.backlinks.get(note_name)
     }
-    
+
     /// Get all paths for a given note name.
     /// Returns None if no notes with that name exist.
     /// Returns multiple paths if there are same-named notes in different folders.
     pub fn get_paths_for_name(&self, note_name: &str) -> Option<&HashSet<String>> {
         self.name_to_paths.get(note_name)
     }
-    
+
     /// Get the first path for a note name (for backward compatibility).
     /// Prefer get_paths_for_name when handling potential duplicates.
     pub fn get_path(&self, note_name: &str) -> Option<PathBuf> {
@@ -242,13 +246,16 @@ impl GraphIndex {
 
         neighborhood
     }
-    
+
     /// Get neighborhood as note names (for display/output purposes).
     pub fn get_neighborhood_names(&self, path: &str) -> HashSet<String> {
         self.get_neighborhood(path)
             .into_iter()
             .filter_map(|p| {
-                Path::new(&p).file_stem().and_then(|s| s.to_str()).map(String::from)
+                Path::new(&p)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
             })
             .collect()
     }
@@ -341,7 +348,7 @@ mod tests {
         // Note A links to Note B and Note C
         let links_a: HashSet<String> = ["Note B", "Note C"].iter().map(|s| s.to_string()).collect();
         index.update_note("Note A", PathBuf::from("Note A.md"), links_a);
-        
+
         // Add Note B and Note C so their paths exist
         index.update_note("Note B", PathBuf::from("Note B.md"), HashSet::new());
         index.update_note("Note C", PathBuf::from("Note C.md"), HashSet::new());
@@ -358,7 +365,7 @@ mod tests {
         assert!(neighborhood.contains("Note C.md"));
         assert!(neighborhood.contains("Note D.md"));
         assert_eq!(neighborhood.len(), 3);
-        
+
         // get_neighborhood_names returns note names
         let names = index.get_neighborhood_names("Note A.md");
         assert!(names.contains("Note B"));
@@ -370,11 +377,7 @@ mod tests {
     fn test_get_path() {
         let mut index = GraphIndex::new();
 
-        index.update_note(
-            "Note A",
-            PathBuf::from("folder/Note A.md"),
-            HashSet::new(),
-        );
+        index.update_note("Note A", PathBuf::from("folder/Note A.md"), HashSet::new());
 
         let path = index.get_path("Note A").unwrap();
         assert_eq!(path, PathBuf::from("folder/Note A.md"));
@@ -392,7 +395,7 @@ mod tests {
         assert!(paths.contains("folder/Note B.md"));
         assert_eq!(paths.len(), 2);
     }
-    
+
     #[test]
     fn test_same_name_different_folders() {
         let mut index = GraphIndex::new();
@@ -403,13 +406,13 @@ mod tests {
 
         // Both should exist
         assert_eq!(index.len(), 2);
-        
+
         // get_paths_for_name should return both
         let paths = index.get_paths_for_name("Index").unwrap();
         assert_eq!(paths.len(), 2);
         assert!(paths.contains("knowledge/Index.md"));
         assert!(paths.contains("projects/Index.md"));
-        
+
         // get_path returns one (for backward compat)
         let path = index.get_path("Index").unwrap();
         assert!(path.to_string_lossy().ends_with("Index.md"));

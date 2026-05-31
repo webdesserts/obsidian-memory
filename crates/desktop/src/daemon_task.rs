@@ -46,17 +46,18 @@ impl DaemonHandle {
         let token_clone = token.clone();
         tauri::async_runtime::spawn(async move {
             // Run the startup phase. Failures are fatal.
-            let (control, join_handle) = match run_with_shutdown_controlled(config, token_clone).await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!("Daemon startup failed: {e:#}");
-                    app.exit(1);
-                    // Send a stub so the receiver unblocks; the process is exiting.
-                    let _ = control_tx.send(make_stub_control());
-                    let _ = done_tx.send(());
-                    return;
-                }
-            };
+            let (control, join_handle) =
+                match run_with_shutdown_controlled(config, token_clone).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        error!("Daemon startup failed: {e:#}");
+                        app.exit(1);
+                        // Send a stub so the receiver unblocks; the process is exiting.
+                        let _ = control_tx.send(make_stub_control());
+                        let _ = done_tx.send(());
+                        return;
+                    }
+                };
 
             // Hand the control back to the spawner before the event loop starts.
             let _ = control_tx.send(control);
@@ -79,11 +80,13 @@ impl DaemonHandle {
         });
 
         // Block the setup() thread until startup is complete.
-        let control = control_rx
-            .recv()
-            .unwrap_or_else(|_| make_stub_control());
+        let control = control_rx.recv().unwrap_or_else(|_| make_stub_control());
 
-        DaemonHandle { token, control, done_rx }
+        DaemonHandle {
+            token,
+            control,
+            done_rx,
+        }
     }
 
     /// Decompose this handle into its constituent parts.
@@ -93,7 +96,6 @@ impl DaemonHandle {
     pub fn into_parts(self) -> (CancellationToken, DaemonControl, oneshot::Receiver<()>) {
         (self.token, self.control, self.done_rx)
     }
-
 }
 
 /// Build a stub `DaemonControl` for failure scenarios.

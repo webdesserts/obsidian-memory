@@ -74,7 +74,10 @@ fn send_cancel_initiate(app: &AppHandle) {
     let (reply_tx, reply_rx) = oneshot::channel::<()>();
 
     if let Err(e) = command_tx.send(DaemonCommand::CancelInitiate { reply: reply_tx }) {
-        warn!("Failed to send CancelInitiate on initiator window close: {}", e);
+        warn!(
+            "Failed to send CancelInitiate on initiator window close: {}",
+            e
+        );
         return;
     }
 
@@ -174,7 +177,10 @@ fn send_reject_inbound(app: &AppHandle) {
     let (reply_tx, reply_rx) = oneshot::channel::<()>();
 
     if let Err(e) = command_tx.send(DaemonCommand::RejectInbound { reply: reply_tx }) {
-        warn!("Failed to send RejectInbound on responder window close: {}", e);
+        warn!(
+            "Failed to send RejectInbound on responder window close: {}",
+            e
+        );
         return;
     }
 

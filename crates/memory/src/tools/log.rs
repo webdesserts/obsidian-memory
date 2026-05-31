@@ -3,7 +3,9 @@ use rmcp::model::{CallToolResult, Content, ErrorData};
 use std::path::Path;
 use tokio::fs;
 
-use super::log_format::{parse_entry_time_24h, parse_log_sections, render_log_sections, LogSection};
+use super::log_format::{
+    LogSection, parse_entry_time_24h, parse_log_sections, render_log_sections,
+};
 
 /// Format ISO week date as YYYY-Www-D (e.g., 2025-W48-1)
 /// Uses chrono's IsoWeek trait
@@ -45,8 +47,6 @@ pub fn get_day_abbreviation_from_iso(iso_week_date: &str) -> &'static str {
     }
     "???"
 }
-
-
 
 /// Format time as 12-hour clock (h:MM AM/PM)
 fn format_12_hour_time(dt: &DateTime<Local>) -> String {
@@ -102,9 +102,10 @@ pub async fn add_log(
     }
 
     // parse_log_sections sorts on parse, but we just pushed a new entry — re-sort
-    if let Some(section) = sections.iter_mut().find(|s| {
-        s.header == format!("## {} ({})", iso_week_date, day_abbrev)
-    }) {
+    if let Some(section) = sections
+        .iter_mut()
+        .find(|s| s.header == format!("## {} ({})", iso_week_date, day_abbrev))
+    {
         section.entries.sort_by(|a, b| {
             let ta = parse_entry_time_24h(a).unwrap_or((24, 0));
             let tb = parse_entry_time_24h(b).unwrap_or((24, 0));

@@ -363,9 +363,7 @@ mod tests {
     async fn test_write_fails_if_parent_missing() {
         let (_temp, storage) = create_test_storage().await;
 
-        let result = storage
-            .write("missing/parent/test", "content", None)
-            .await;
+        let result = storage.write("missing/parent/test", "content", None).await;
         assert!(matches!(result, Err(StorageError::ParentNotFound { .. })));
     }
 

@@ -34,16 +34,16 @@ pub mod sync;
 pub mod sync_engine;
 pub mod vault;
 
-pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
 #[cfg(not(target_arch = "wasm32"))]
 pub use allowlist::InMemoryAllowlist;
+pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use key_storage::{KeyStorage, KeyStorageError};
 pub use pairing::{
-    PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession,
-    compute_hmac, generate_pairing_code, verify_hmac,
+    PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
+    generate_pairing_code, verify_hmac,
 };
 pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use peers::{PeerEntry, PeerRegistry, PeerState};

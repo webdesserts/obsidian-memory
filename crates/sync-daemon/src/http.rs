@@ -3,8 +3,8 @@
 //! Provides a `/health` endpoint so load balancers and monitoring tools can
 //! verify the daemon is running. Enabled by passing `--health-listen` on startup.
 
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use tokio::net::TcpListener;
 use tracing::info;
 

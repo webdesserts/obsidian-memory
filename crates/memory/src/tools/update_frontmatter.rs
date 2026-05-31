@@ -1,4 +1,6 @@
-use obsidian_fs::{build_note_with_frontmatter, ensure_markdown_extension, parse_frontmatter, Frontmatter};
+use obsidian_fs::{
+    Frontmatter, build_note_with_frontmatter, ensure_markdown_extension, parse_frontmatter,
+};
 use rmcp::model::{CallToolResult, Content, ErrorData};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -29,9 +31,9 @@ pub async fn execute<S: Storage>(
     content_hash: &str,
 ) -> Result<CallToolResult, ErrorData> {
     // Resolve the note reference using the graph index
-    let (uri, exists) = resolve_note_uri(storage, graph, note).await.map_err(|e| {
-        ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
-    })?;
+    let (uri, exists) = resolve_note_uri(storage, graph, note)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("Failed to resolve note: {}", e), None))?;
 
     if !exists {
         return Err(ErrorData::invalid_params(
@@ -78,17 +80,22 @@ pub async fn execute<S: Storage>(
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
     // Write back via Storage trait with optimistic locking
-    storage.write(&uri, &new_content, Some(content_hash)).await.map_err(|e| match e {
-        StorageError::HashMismatch { expected, actual, .. } => ErrorData::invalid_params(
-            format!(
-                "Note modified since last read (expected hash: {}, actual: {}). \
+    storage
+        .write(&uri, &new_content, Some(content_hash))
+        .await
+        .map_err(|e| match e {
+            StorageError::HashMismatch {
+                expected, actual, ..
+            } => ErrorData::invalid_params(
+                format!(
+                    "Note modified since last read (expected hash: {}, actual: {}). \
                  Read note again to get current content and hash.",
-                expected, actual
+                    expected, actual
+                ),
+                None,
             ),
-            None,
-        ),
-        _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
-    })?;
+            _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),
+        })?;
 
     // Compute new content hash for response
     let new_hash = ContentHash::from_content(&new_content);
@@ -98,8 +105,9 @@ pub async fn execute<S: Storage>(
         content_hash: new_hash.as_str().to_string(),
     };
 
-    let json = serde_json::to_string(&response)
-        .map_err(|e| ErrorData::internal_error(format!("Failed to serialize response: {}", e), None))?;
+    let json = serde_json::to_string(&response).map_err(|e| {
+        ErrorData::internal_error(format!("Failed to serialize response: {}", e), None)
+    })?;
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
@@ -168,7 +176,9 @@ mod tests {
         assert!(!response.content_hash.is_empty());
 
         // Verify the file was updated
-        let updated = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let updated = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert!(updated.contains("type: updated"));
         assert!(updated.contains("new_field: true"));
         // Original field should still be there
@@ -209,7 +219,9 @@ mod tests {
             .await
             .expect("should succeed");
 
-        let updated = fs::read_to_string(temp_dir.path().join("test.md")).await.unwrap();
+        let updated = fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
         assert!(updated.starts_with("---\n"));
         assert!(updated.contains("type: new"));
         assert!(updated.contains("Just content, no frontmatter"));
@@ -221,21 +233,36 @@ mod tests {
 
         let initial_content = "---\ntype: project\n---\n\nProject content";
         create_test_note(temp_dir.path(), "projects/MyProject.md", initial_content).await;
-        graph.update_note("MyProject", PathBuf::from("projects/MyProject.md"), HashSet::new());
+        graph.update_note(
+            "MyProject",
+            PathBuf::from("projects/MyProject.md"),
+            HashSet::new(),
+        );
 
         let content_hash = ContentHash::from_content(initial_content);
 
         let mut updates = HashMap::new();
-        updates.insert("status".to_string(), JsonValue::String("active".to_string()));
+        updates.insert(
+            "status".to_string(),
+            JsonValue::String("active".to_string()),
+        );
 
-        let result = execute(&storage, &graph, "projects/MyProject", updates, content_hash.as_str())
-            .await
-            .expect("should succeed");
+        let result = execute(
+            &storage,
+            &graph,
+            "projects/MyProject",
+            updates,
+            content_hash.as_str(),
+        )
+        .await
+        .expect("should succeed");
 
         let response = parse_response(&result);
         assert_eq!(response.path, "projects/MyProject.md");
 
-        let updated = fs::read_to_string(temp_dir.path().join("projects/MyProject.md")).await.unwrap();
+        let updated = fs::read_to_string(temp_dir.path().join("projects/MyProject.md"))
+            .await
+            .unwrap();
         assert!(updated.contains("status: active"));
         assert!(updated.contains("type: project"));
     }

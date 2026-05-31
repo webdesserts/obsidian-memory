@@ -23,7 +23,9 @@ pub async fn execute<S: Storage>(
         let graph_read = graph.read().await;
         resolve_note_uri(storage, &graph_read, note)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("Failed to resolve note: {}", e), None))?
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to resolve note: {}", e), None)
+            })?
     };
 
     if !exists {

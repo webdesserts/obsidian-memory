@@ -18,7 +18,7 @@ use std::collections::HashMap;
 pub type Frontmatter = HashMap<String, JsonValue>;
 
 /// A parsed note with frontmatter separated from content.
-/// 
+///
 /// The `content` field borrows from `raw` to avoid unnecessary allocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedNote<'a> {
@@ -123,7 +123,10 @@ pub fn serialize_frontmatter(frontmatter: &Frontmatter) -> Result<String, Frontm
 /// Build a complete note with frontmatter and content.
 ///
 /// If frontmatter is empty, returns just the content without frontmatter block.
-pub fn build_note_with_frontmatter(frontmatter: &Frontmatter, content: &str) -> Result<String, FrontmatterError> {
+pub fn build_note_with_frontmatter(
+    frontmatter: &Frontmatter,
+    content: &str,
+) -> Result<String, FrontmatterError> {
     if frontmatter.is_empty() {
         return Ok(content.to_string());
     }
@@ -141,7 +144,9 @@ pub enum FrontmatterError {
 impl std::fmt::Display for FrontmatterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrontmatterError::SerializationError(e) => write!(f, "Failed to serialize frontmatter: {}", e),
+            FrontmatterError::SerializationError(e) => {
+                write!(f, "Failed to serialize frontmatter: {}", e)
+            }
         }
     }
 }

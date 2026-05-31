@@ -5,7 +5,9 @@
 use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
-use sync_core::allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, Result as AllowlistResult};
+use sync_core::allowlist::{
+    AllowedPeer, AllowlistError, AllowlistStorage, Result as AllowlistResult,
+};
 
 /// Filesystem implementation of AllowlistStorage.
 ///
@@ -33,8 +35,8 @@ impl AllowlistStorage for FileAllowlistStorage {
             return Ok(Vec::new());
         }
 
-        let contents = fs::read_to_string(&self.path)
-            .map_err(|e| AllowlistError::Io(e.to_string()))?;
+        let contents =
+            fs::read_to_string(&self.path).map_err(|e| AllowlistError::Io(e.to_string()))?;
 
         serde_json::from_str(&contents).map_err(|_| AllowlistError::InvalidData)
     }

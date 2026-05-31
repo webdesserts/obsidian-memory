@@ -20,10 +20,7 @@ pub fn generate_discovery_status_message(discovery_result: &DiscoveryResult, cwd
     // Disconnect detected (loose match)
     if !discovery_result.loose_matches.is_empty() {
         let m = &discovery_result.loose_matches[0];
-        let matched_on_str = m
-            .matched_on
-            .map(|o| o.as_str())
-            .unwrap_or("unknown");
+        let matched_on_str = m.matched_on.map(|o| o.as_str()).unwrap_or("unknown");
 
         let mut message = format!(
             "**Project disconnect detected**\n\nFound [[{}]] via {} match.\n\n",
@@ -184,10 +181,7 @@ mod tests {
 
         let message =
             generate_discovery_status_message(&result, &PathBuf::from("/code/company/project"));
-        assert_eq!(
-            message,
-            "Projects auto-loaded: [[My Project]], [[Company]]"
-        );
+        assert_eq!(message, "Projects auto-loaded: [[My Project]], [[Company]]");
     }
 
     #[test]

@@ -288,7 +288,10 @@ mod tests {
         let id = peer_a();
 
         storage.add_peer(id, "umbra").await.unwrap();
-        storage.update_last_seen(&id, 1_700_000_000_000).await.unwrap();
+        storage
+            .update_last_seen(&id, 1_700_000_000_000)
+            .await
+            .unwrap();
 
         let peers = storage.list_peers().await.unwrap();
         assert_eq!(peers[0].last_seen, Some(1_700_000_000_000));

@@ -27,14 +27,12 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::pairing::{
-    PairingChallenge, PairingHello, PairingResponse, PairingResult, verify_hmac,
-};
-use crate::peer_id::PeerId;
 use crate::network::streams::{read_length_prefixed, write_length_prefixed};
+use crate::pairing::{PairingChallenge, PairingHello, PairingResponse, PairingResult, verify_hmac};
+use crate::peer_id::PeerId;
 
 /// ALPN for the pairing protocol.
 pub const PAIRING_ALPN: &[u8] = b"obsidian-memory/pair/1";
@@ -64,7 +62,10 @@ pub enum PairingEvent {
     /// A new device wants to pair — the daemon must reply with a `PairingApproval`.
     InboundRequest(InboundPairingExchange),
     /// Pairing completed successfully — add the peer to the allowlist.
-    PairingCompleted { peer_id: PeerId, device_name: String },
+    PairingCompleted {
+        peer_id: PeerId,
+        device_name: String,
+    },
     /// Pairing failed (wrong code, timeout, or stream error).
     PairingFailed { peer_id: PeerId, reason: String },
 }
@@ -191,8 +192,9 @@ impl ProtocolHandler for PairingStreamHandler {
         let hello_bytes = read_length_prefixed(&mut recv)
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))?;
-        let hello: PairingHello = bincode::deserialize(&hello_bytes)
-            .map_err(|e| AcceptError::from_boxed(anyhow::anyhow!("PairingHello deserialize: {e}").into()))?;
+        let hello: PairingHello = bincode::deserialize(&hello_bytes).map_err(|e| {
+            AcceptError::from_boxed(anyhow::anyhow!("PairingHello deserialize: {e}").into())
+        })?;
 
         debug!(peer = %remote_endpoint_id, device = %hello.device_name, "Inbound pairing hello");
 
@@ -238,8 +240,9 @@ impl ProtocolHandler for PairingStreamHandler {
         };
 
         // Step 4: Write PairingChallenge
-        let challenge_bytes = bincode::serialize(&approval.challenge)
-            .map_err(|e| AcceptError::from_boxed(anyhow::anyhow!("PairingChallenge serialize: {e}").into()))?;
+        let challenge_bytes = bincode::serialize(&approval.challenge).map_err(|e| {
+            AcceptError::from_boxed(anyhow::anyhow!("PairingChallenge serialize: {e}").into())
+        })?;
         write_length_prefixed(&mut send, &challenge_bytes)
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))?;
@@ -248,8 +251,9 @@ impl ProtocolHandler for PairingStreamHandler {
         let response_bytes = read_length_prefixed(&mut recv)
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))?;
-        let response: PairingResponse = bincode::deserialize(&response_bytes)
-            .map_err(|e| AcceptError::from_boxed(anyhow::anyhow!("PairingResponse deserialize: {e}").into()))?;
+        let response: PairingResponse = bincode::deserialize(&response_bytes).map_err(|e| {
+            AcceptError::from_boxed(anyhow::anyhow!("PairingResponse deserialize: {e}").into())
+        })?;
 
         // Step 6: Verify HMAC
         let success = verify_hmac(&approval.code, remote_id.as_bytes(), &response.hmac);
@@ -271,8 +275,9 @@ impl ProtocolHandler for PairingStreamHandler {
             }
         };
 
-        let result_bytes = bincode::serialize(&result)
-            .map_err(|e| AcceptError::from_boxed(anyhow::anyhow!("PairingResult serialize: {e}").into()))?;
+        let result_bytes = bincode::serialize(&result).map_err(|e| {
+            AcceptError::from_boxed(anyhow::anyhow!("PairingResult serialize: {e}").into())
+        })?;
         write_length_prefixed(&mut send, &result_bytes)
             .await
             .map_err(|e| AcceptError::from_boxed(e.into()))?;
@@ -331,7 +336,10 @@ pub async fn pair_with_mesh(
 ) -> Result<PairingResult> {
     // Derive node_id from the endpoint's actual identity, not the caller's hello.
     let node_id = PeerId::from_bytes(*endpoint.id().as_bytes());
-    let hello = PairingHello { node_id, device_name: hello.device_name.clone() };
+    let hello = PairingHello {
+        node_id,
+        device_name: hello.device_name.clone(),
+    };
 
     let connection = endpoint
         .connect(peer, PAIRING_ALPN)
@@ -353,8 +361,8 @@ pub async fn pair_with_mesh(
     let challenge_bytes = read_length_prefixed(&mut recv)
         .await
         .context("Failed to read PairingChallenge")?;
-    let challenge: PairingChallenge = bincode::deserialize(&challenge_bytes)
-        .context("Failed to deserialize PairingChallenge")?;
+    let challenge: PairingChallenge =
+        bincode::deserialize(&challenge_bytes).context("Failed to deserialize PairingChallenge")?;
 
     debug!(
         mesh_device = %challenge.device_name,
@@ -364,7 +372,8 @@ pub async fn pair_with_mesh(
     // Step 3: Compute HMAC bound to our transport identity.
     let hmac = crate::pairing::compute_hmac(code, hello.node_id.as_bytes());
     let response = PairingResponse { hmac };
-    let response_bytes = bincode::serialize(&response).context("Failed to serialize PairingResponse")?;
+    let response_bytes =
+        bincode::serialize(&response).context("Failed to serialize PairingResponse")?;
     write_length_prefixed(&mut send, &response_bytes)
         .await
         .context("Failed to send PairingResponse")?;
@@ -374,8 +383,8 @@ pub async fn pair_with_mesh(
     let result_bytes = read_length_prefixed(&mut recv)
         .await
         .context("Failed to read PairingResult")?;
-    let result: PairingResult = bincode::deserialize(&result_bytes)
-        .context("Failed to deserialize PairingResult")?;
+    let result: PairingResult =
+        bincode::deserialize(&result_bytes).context("Failed to deserialize PairingResult")?;
 
     Ok(result)
 }
@@ -407,7 +416,10 @@ where
 {
     // Derive node_id from the endpoint's actual identity, not the caller's hello.
     let node_id = PeerId::from_bytes(*endpoint.id().as_bytes());
-    let hello = PairingHello { node_id, device_name: hello.device_name.clone() };
+    let hello = PairingHello {
+        node_id,
+        device_name: hello.device_name.clone(),
+    };
 
     let connection = endpoint
         .connect(peer, PAIRING_ALPN)
@@ -429,8 +441,8 @@ where
     let challenge_bytes = read_length_prefixed(&mut recv)
         .await
         .context("Failed to read PairingChallenge")?;
-    let challenge: PairingChallenge = bincode::deserialize(&challenge_bytes)
-        .context("Failed to deserialize PairingChallenge")?;
+    let challenge: PairingChallenge =
+        bincode::deserialize(&challenge_bytes).context("Failed to deserialize PairingChallenge")?;
 
     debug!(
         mesh_device = %challenge.device_name,
@@ -443,7 +455,8 @@ where
     // Step 4: Compute HMAC bound to our transport identity.
     let hmac = crate::pairing::compute_hmac(&code, hello.node_id.as_bytes());
     let response = PairingResponse { hmac };
-    let response_bytes = bincode::serialize(&response).context("Failed to serialize PairingResponse")?;
+    let response_bytes =
+        bincode::serialize(&response).context("Failed to serialize PairingResponse")?;
     write_length_prefixed(&mut send, &response_bytes)
         .await
         .context("Failed to send PairingResponse")?;
@@ -453,8 +466,8 @@ where
     let result_bytes = read_length_prefixed(&mut recv)
         .await
         .context("Failed to read PairingResult")?;
-    let result: PairingResult = bincode::deserialize(&result_bytes)
-        .context("Failed to deserialize PairingResult")?;
+    let result: PairingResult =
+        bincode::deserialize(&result_bytes).context("Failed to deserialize PairingResult")?;
 
     Ok(result)
 }
@@ -466,11 +479,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use iroh::{RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
-    use iroh::protocol::Router;
-    use iroh_gossip::{Gossip, net::GOSSIP_ALPN};
     use crate::network::SYNC_ALPN;
     use crate::network::streams::SyncStreamHandler;
+    use iroh::protocol::Router;
+    use iroh::{RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
+    use iroh_gossip::{Gossip, net::GOSSIP_ALPN};
 
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
@@ -488,7 +501,7 @@ mod tests {
         Router,
     )> {
         use ed25519_dalek::SigningKey;
-        use iroh::{SecretKey, Endpoint};
+        use iroh::{Endpoint, SecretKey};
 
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
@@ -516,10 +529,7 @@ mod tests {
     }
 
     /// Teach two endpoints how to reach each other directly (no relay).
-    async fn connect_pair(
-        ep_a: &iroh::Endpoint,
-        ep_b: &iroh::Endpoint,
-    ) -> anyhow::Result<()> {
+    async fn connect_pair(ep_a: &iroh::Endpoint, ep_b: &iroh::Endpoint) -> anyhow::Result<()> {
         let addr_a = ep_a.addr();
         let addr_b = ep_b.addr();
 
@@ -688,7 +698,10 @@ mod tests {
             .expect("client task panicked")?;
 
         assert!(mesh_failed, "Mesh side should report PairingFailed");
-        assert!(!client_result.success, "Client should receive success=false");
+        assert!(
+            !client_result.success,
+            "Client should receive success=false"
+        );
 
         Ok(())
     }
@@ -734,7 +747,10 @@ mod tests {
 
         // The mesh side closed without sending a challenge, so the client
         // gets an IO error trying to read the challenge.
-        assert!(result.is_err(), "Client should get an error when mesh rejects");
+        assert!(
+            result.is_err(),
+            "Client should get an error when mesh rejects"
+        );
 
         Ok(())
     }
@@ -808,23 +824,33 @@ mod tests {
                 device_name: "impersonator".to_string(),
             };
             let hello_bytes = bincode::serialize(&hello).expect("serialize failed");
-            write_length_prefixed(&mut send, &hello_bytes).await.expect("send hello failed");
+            write_length_prefixed(&mut send, &hello_bytes)
+                .await
+                .expect("send hello failed");
 
             // Read challenge.
-            let challenge_bytes = read_length_prefixed(&mut recv).await.expect("read challenge failed");
-            let _challenge: PairingChallenge = bincode::deserialize(&challenge_bytes).expect("deserialize failed");
+            let challenge_bytes = read_length_prefixed(&mut recv)
+                .await
+                .expect("read challenge failed");
+            let _challenge: PairingChallenge =
+                bincode::deserialize(&challenge_bytes).expect("deserialize failed");
 
             // Compute HMAC over the fake node_id — this won't match what the mesh expects
             // (which is HMAC over the real QUIC transport identity).
             let hmac = crate::pairing::compute_hmac(test_code, fake_peer_id.as_bytes());
             let response = PairingResponse { hmac };
             let response_bytes = bincode::serialize(&response).expect("serialize failed");
-            write_length_prefixed(&mut send, &response_bytes).await.expect("send response failed");
+            write_length_prefixed(&mut send, &response_bytes)
+                .await
+                .expect("send response failed");
             send.finish().expect("finish failed");
 
             // Read result — should be success=false.
-            let result_bytes = read_length_prefixed(&mut recv).await.expect("read result failed");
-            let result: PairingResult = bincode::deserialize(&result_bytes).expect("deserialize failed");
+            let result_bytes = read_length_prefixed(&mut recv)
+                .await
+                .expect("read result failed");
+            let result: PairingResult =
+                bincode::deserialize(&result_bytes).expect("deserialize failed");
             result
         });
 
@@ -839,7 +865,10 @@ mod tests {
             .expect("client task panicked");
 
         assert!(mesh_failed, "Mesh side should report PairingFailed");
-        assert!(!client_result.success, "Client should receive success=false for mismatched identity");
+        assert!(
+            !client_result.success,
+            "Client should receive success=false for mismatched identity"
+        );
 
         Ok(())
     }

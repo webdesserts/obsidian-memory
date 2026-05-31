@@ -10,7 +10,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::log::get_day_abbreviation_from_iso;
-use super::log_format::{parse_log_sections, render_log_sections, LogSection};
+use super::log_format::{LogSection, parse_log_sections, render_log_sections};
 
 /// Replace an entire day's log entries with new entries.
 pub async fn execute(

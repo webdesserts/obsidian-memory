@@ -38,9 +38,7 @@ impl KeyStorage for FileKeyStorage {
             .await
             .map_err(|e| KeyStorageError::Io(e.to_string()))?;
 
-        let key: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| KeyStorageError::InvalidKey)?;
+        let key: [u8; 32] = bytes.try_into().map_err(|_| KeyStorageError::InvalidKey)?;
 
         Ok(Some(key))
     }

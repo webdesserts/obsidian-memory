@@ -137,8 +137,7 @@ pub fn compute_hmac(code: &str, node_id_bytes: &[u8; 32]) -> [u8; 32] {
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(code.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(code.as_bytes()).expect("HMAC accepts any key length");
     mac.update(node_id_bytes);
     mac.finalize().into_bytes().into()
 }
@@ -151,8 +150,7 @@ pub fn verify_hmac(code: &str, node_id_bytes: &[u8; 32], hmac: &[u8; 32]) -> boo
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(code.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(code.as_bytes()).expect("HMAC accepts any key length");
     mac.update(node_id_bytes);
     mac.verify_slice(hmac).is_ok()
 }
@@ -168,7 +166,10 @@ mod tests {
         for _ in 0..20 {
             let code = generate_pairing_code();
             assert_eq!(code.len(), 6, "code should be 6 chars: {code}");
-            assert!(code.chars().all(|c| c.is_ascii_digit()), "non-digit in code: {code}");
+            assert!(
+                code.chars().all(|c| c.is_ascii_digit()),
+                "non-digit in code: {code}"
+            );
         }
     }
 

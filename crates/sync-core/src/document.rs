@@ -8,8 +8,8 @@
 //! The `_meta.doc_id` field tracks document lineage for divergent history detection.
 //! The `_meta.path` field allows detecting file moves/renames during reconciliation.
 
-use crate::markdown;
 use crate::PeerId;
+use crate::markdown;
 use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, UpdateOptions, VersionVector};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -448,13 +448,16 @@ fn loro_value_to_json(value: &loro::LoroValue) -> std::result::Result<serde_json
         loro::LoroValue::Double(n) => Ok(serde_json::json!(*n)),
         loro::LoroValue::String(s) => Ok(serde_json::Value::String(s.to_string())),
         loro::LoroValue::List(arr) => {
-            let items: std::result::Result<Vec<_>, ()> = arr.iter().map(loro_value_to_json).collect();
+            let items: std::result::Result<Vec<_>, ()> =
+                arr.iter().map(loro_value_to_json).collect();
             Ok(serde_json::Value::Array(items?))
         }
         loro::LoroValue::Map(map) => {
             let obj: std::result::Result<serde_json::Map<String, serde_json::Value>, ()> = map
                 .iter()
-                .map(|(k, v)| -> std::result::Result<_, ()> { Ok((k.clone(), loro_value_to_json(v)?)) })
+                .map(|(k, v)| -> std::result::Result<_, ()> {
+                    Ok((k.clone(), loro_value_to_json(v)?))
+                })
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }

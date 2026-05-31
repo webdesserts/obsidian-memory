@@ -26,7 +26,9 @@ pub async fn execute<S: Storage>(
         let graph_read = graph.read().await;
         resolve_note_uri(storage, &graph_read, from)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("Failed to resolve source: {}", e), None))?
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to resolve source: {}", e), None)
+            })?
     };
 
     // Destination is a literal path, not a graph lookup
@@ -106,18 +108,21 @@ pub async fn execute<S: Storage>(
     }
 
     // Perform the rename
-    storage.rename(&from_uri, to_uri).await.map_err(|e| match e {
-        StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
-            format!(
-                "Parent directory doesn't exist for '{}': {}. \
+    storage
+        .rename(&from_uri, to_uri)
+        .await
+        .map_err(|e| match e {
+            StorageError::ParentNotFound { uri, parent } => ErrorData::invalid_params(
+                format!(
+                    "Parent directory doesn't exist for '{}': {}. \
                  Create the directory first.",
-                uri,
-                parent.display()
+                    uri,
+                    parent.display()
+                ),
+                None,
             ),
-            None,
-        ),
-        _ => ErrorData::internal_error(format!("Failed to move note: {}", e), None),
-    })?;
+            _ => ErrorData::internal_error(format!("Failed to move note: {}", e), None),
+        })?;
 
     // Build response
     let backlinks_summary = if !backlinks_updated.is_empty() {
@@ -295,7 +300,14 @@ mod tests {
             .await
             .unwrap();
 
-        let result = execute(temp_dir.path(), &storage, &graph, "test", "missing/dir/test").await;
+        let result = execute(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            "missing/dir/test",
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -310,9 +322,12 @@ mod tests {
         fs::create_dir(temp_dir.path().join("knowledge"))
             .await
             .unwrap();
-        fs::write(temp_dir.path().join("knowledge/My Note.md"), "Original content")
-            .await
-            .unwrap();
+        fs::write(
+            temp_dir.path().join("knowledge/My Note.md"),
+            "Original content",
+        )
+        .await
+        .unwrap();
         {
             let mut g = graph.write().await;
             g.update_note(

@@ -486,7 +486,10 @@ mod tests {
         fs.atomic_write("file.loro", b"data").await.unwrap();
 
         assert_eq!(fs.read("file.loro").await.unwrap(), b"data");
-        assert!(!fs.exists("file.loro.tmp").await.unwrap(), "temp file should be cleaned up");
+        assert!(
+            !fs.exists("file.loro.tmp").await.unwrap(),
+            "temp file should be cleaned up"
+        );
     }
 
     #[tokio::test]

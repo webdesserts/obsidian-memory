@@ -1,7 +1,6 @@
 mod common;
 pub mod delete_note;
 pub mod edit_note;
-pub mod replace_in_note;
 pub mod get_current_datetime;
 pub mod get_note_info;
 pub mod get_weekly_note_info;
@@ -11,6 +10,7 @@ pub mod move_note;
 pub mod read_note;
 pub mod reflect;
 pub mod remember;
+pub mod replace_in_note;
 pub mod search;
 pub mod update_frontmatter;
 pub mod write_logs;
