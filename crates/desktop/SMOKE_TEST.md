@@ -23,7 +23,21 @@ We sidestep this by **seeding the satellite from umbra's vault** — the VaultId
 ## Prerequisites
 
 0. **v0.5.x code on the personal laptop.** As of writing, v0.5.x with the Phase 1.5 desktop app is **local-only on umbra — not pushed to origin.** The laptop can't build the app until it's pushed or otherwise transferred. On the laptop, verify with `git ls-remote origin v0.5.x`, then `git fetch && git checkout v0.5.x && git pull`. The Phase 1.5 tip is commit `8f9bfa4` (`docs(desktop): remove stale event-based init comment…`).
-1. Toolchain on each Mac: Rust (stable), Node + npm, and `cargo install tauri-cli --version "^2"`. No `wasm-pack` needed — the Obsidian plugin is skipped for the core sync test (the desktop app's embedded daemon watches vault files directly).
+1. Toolchain on each Mac: Rust (stable) + Node + npm. You do **not** need `cargo install tauri-cli` (we launch via `cargo run`, see below), and no `wasm-pack` (the plugin is skipped — the daemon watches files directly).
+
+## Running the app (verified — read this before the phases)
+
+⚠️ The desktop app's documented `npm run tauri dev` is **broken** for this crate's layout (the frontend is a subfolder of the tauri crate, so tauri-cli resolves the wrong cwd, and there's no `tsconfig.json` for the `tsc` build step). Launch it this way instead:
+
+1. **Build the frontend once** (emits `frontend/dist/`, including the pairing windows):
+   ```
+   cd crates/desktop/frontend && npm install && npm run build
+   ```
+2. **Run the app** from the crate dir — `build.rs` embeds the built frontend, so no dev server is needed:
+   - bash: `cd crates/desktop && OBSIDIAN_MEMORY_VAULT=<absolute-vault-path> cargo run`
+   - nushell: `cd crates/desktop; with-env {OBSIDIAN_MEMORY_VAULT: "<absolute-vault-path>"} { cargo run }`
+3. First run compiles the `desktop` + `sync-daemon` crates (~1 min). It's up when the log shows `Joined vault gossip topic` and `Health endpoint started`; verify with `curl http://127.0.0.1:8081/health` → `OK`. The tray icon appears in the menu bar.
+   - **Health port** defaults to `127.0.0.1:8081`. If that's taken, edit the `health_listen` line in `crates/desktop/src/main.rs`. (On umbra it's 8082 because llama-swap owns 8081.)
 
 ## `.sync/` file taxonomy (the seeding-critical part)
 
@@ -46,9 +60,7 @@ Do this first. If the recipe is wrong, we find out on throwaway data, not real n
 **umbra side:**
 1. Stop the old Docker `sync-daemon` (service under `docker/` at `/opt/docker/`). It binds the health port `8081` (and possibly relay `3340`), which the Tauri app also needs — they can't coexist. (The obsidian-memory MCP server is separate and keeps running.)
 2. Create a scratch vault: `mkdir ~/sync-test` with 2–3 junk `.md` files.
-3. Launch the Tauri app on it, from the repo:
-   - `cd crates/desktop/frontend` (first run here: `npm install`)
-   - nushell: `with-env {OBSIDIAN_MEMORY_VAULT: "/Users/nir/sync-test"} { npm run tauri dev }` — use an **absolute** path.
+3. Launch the app pointed at `/Users/nir/sync-test` — see **Running the app** above (build the frontend, then `cargo run`).
 4. Confirm: tray icon appears (no dock icon), `curl http://127.0.0.1:8081/health` → 200, `~/sync-test/.sync/metadata.toml` exists. Then **Quit** the app (tray → Quit) so the vault is at rest for copying.
 
 **Seed the laptop (handoff):**
@@ -57,7 +69,7 @@ Do this first. If the recipe is wrong, we find out on throwaway data, not real n
    `rm sync-test/.sync/daemon.key sync-test/.sync/daemon.toml sync-test/.sync/daemon.lock sync-test/.sync/known_peers.json`
 
 **laptop side:**
-7. Launch the Tauri app on the seeded vault — same command, `OBSIDIAN_MEMORY_VAULT=/Users/<you>/sync-test`.
+7. Launch the app on the seeded vault (see **Running the app**), with `OBSIDIAN_MEMORY_VAULT=/Users/<you>/sync-test`.
 8. Confirm tray + health, and that the junk notes copied over are present.
 
 **Pair + verify sync (both apps running):**
@@ -73,7 +85,7 @@ Only after Phase A passes.
 
 1. **Back up first.** On umbra and the laptop, make a full timestamped copy of the real `~/notes` off to the side. This is the safety net for the known corruption risk (this project has a vault-corruption history).
 2. **umbra:** ensure the old Docker daemon is stopped (done in Phase A step 1).
-3. **umbra:** launch the Tauri app on the real vault — `OBSIDIAN_MEMORY_VAULT=/Users/nir/notes npm run tauri dev`. First launch runs the v0→v1 migration (generates VaultId, builds CRDT state from your notes). umbra is now the source of truth. (The obsidian-memory MCP server also writes this vault — fine, the daemon watches files and coexists.) Let it settle, then Quit for the copy.
+3. **umbra:** launch the app on the real vault (see **Running the app**), with `OBSIDIAN_MEMORY_VAULT=/Users/nir/notes`. First launch runs the v0→v1 migration (generates VaultId, builds CRDT state from your notes). umbra is now the source of truth. (The obsidian-memory MCP server also writes this vault — fine, the daemon watches files and coexists.) Let it settle, then Quit for the copy.
 4. **laptop:** wipe the old `~/notes` (it's backed up) and seed it from umbra's migrated `~/notes` using the Phase A recipe (copy the whole dir, delete the 4 per-device files).
 5. **laptop:** launch the Tauri app on `~/notes`, pair with umbra (steps 9–11), confirm the real notes converge.
 6. From here, both run the app continuously and dogfood.

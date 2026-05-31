@@ -27,7 +27,5 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {
-    "notification": {}
-  }
+  "plugins": {}
 }

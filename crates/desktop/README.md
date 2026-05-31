@@ -33,32 +33,29 @@ signing, auto-update.
 
 ## Running
 
-The desktop app uses Tauri's CLI. Install once:
+The vault path is read from `OBSIDIAN_MEMORY_VAULT` (no `--vault` flag).
+
+> **Note:** `npm run tauri dev` / `npm run tauri build` do **not** work with
+> this crate's layout — the frontend is a subfolder of the tauri crate, so
+> tauri-cli resolves the wrong cwd, and there's no `tsconfig.json` for the
+> `tsc` build step. Run the binary directly instead; `build.rs` embeds the
+> built frontend, so no dev server is needed:
 
 ```bash
-cargo install tauri-cli --version "^2"
-```
+# 1. Build the frontend once (emits frontend/dist incl. the pairing windows)
+cd crates/desktop/frontend && npm install && npm run build
 
-The vault path is read from `OBSIDIAN_MEMORY_VAULT` (no `--vault` flag — Tauri
-CLI's `dev` mode doesn't forward trailing arguments to the bundled binary).
-
-```bash
-cd crates/desktop/frontend
-OBSIDIAN_MEMORY_VAULT=~/notes npm run tauri dev
+# 2. Run the app (compiles the crate, starts the daemon + tray)
+cd crates/desktop && OBSIDIAN_MEMORY_VAULT=~/notes cargo run
 ```
 
 On first run the tray icon appears in the menu bar. The app is dock-less by
-design — the `Accessory` activation policy is set in `main.rs`.
+design — the `Accessory` activation policy is set in `main.rs`. The health
+endpoint defaults to `127.0.0.1:8081`; change the `health_listen` port in
+`main.rs` if it's taken.
 
-To build a release `.app` bundle:
-
-```bash
-cd crates/desktop/frontend
-OBSIDIAN_MEMORY_VAULT=~/notes npm run tauri build
-```
-
-The unsigned `.app` lands in `crates/desktop/target/release/bundle/macos/`.
-v0.5.x ships ad-hoc-signed only — notarization is Phase 5.
+A packaged release `.app` (`tauri build`) isn't wired up for this layout yet —
+tracked as a follow-up.
 
 ## Architecture
 
