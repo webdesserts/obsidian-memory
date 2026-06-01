@@ -113,3 +113,84 @@ pub async fn persist_adopted_relay(vault_path: &Path, relay_urls: &[String]) {
 pub fn vault_id_from_pairing_topic(vault_topic: Option<[u8; 32]>) -> Option<VaultId> {
     vault_topic.as_ref().map(SyncNode::vault_id_from_topic)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sync_core::allowlist::InMemoryAllowlist;
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_secret_bytes([byte; 32])
+    }
+
+    /// First pair into an empty allowlist bootstraps self so the responder's
+    /// sync requests are accepted, then adds the mesh member.
+    #[tokio::test]
+    async fn first_pair_adds_self_and_mesh_member() {
+        let allowlist = InMemoryAllowlist::new();
+        let self_id = peer(1);
+        let member = peer(2);
+
+        write_pair_allowlist(&allowlist, self_id, "this-device", &[member]).await;
+
+        let peers = allowlist.list_peers().await.unwrap();
+        assert_eq!(peers.len(), 2, "self + one mesh member");
+
+        let self_entry = peers
+            .iter()
+            .find(|p| p.node_id == self_id)
+            .expect("self should be in the allowlist after first pair");
+        assert_eq!(self_entry.device_name, "this-device");
+
+        assert!(
+            peers.iter().any(|p| p.node_id == member),
+            "mesh member should be in the allowlist"
+        );
+    }
+
+    /// When the allowlist already has entries, pairing does NOT re-add self —
+    /// the self-bootstrap is a first-pair-only step — but still adds new members.
+    #[tokio::test]
+    async fn re_pair_with_nonempty_allowlist_skips_self_bootstrap() {
+        let allowlist = InMemoryAllowlist::new();
+        let self_id = peer(1);
+        let existing_member = peer(2);
+        let new_member = peer(3);
+
+        // Pre-seed a member so the allowlist is non-empty going in.
+        allowlist
+            .add_peer(existing_member, "existing")
+            .await
+            .unwrap();
+
+        write_pair_allowlist(&allowlist, self_id, "this-device", &[new_member]).await;
+
+        let peers = allowlist.list_peers().await.unwrap();
+        assert!(
+            !peers.iter().any(|p| p.node_id == self_id),
+            "self is only bootstrapped on the first (empty) pair, not re-pairs"
+        );
+        assert!(peers.iter().any(|p| p.node_id == existing_member));
+        assert!(peers.iter().any(|p| p.node_id == new_member));
+        assert_eq!(peers.len(), 2, "existing member + new member, no self");
+    }
+
+    /// Re-running the same pair is idempotent: members are keyed by node_id, so
+    /// a repeated write updates names in place rather than duplicating entries.
+    #[tokio::test]
+    async fn re_pair_is_idempotent() {
+        let allowlist = InMemoryAllowlist::new();
+        let self_id = peer(1);
+        let member = peer(2);
+
+        write_pair_allowlist(&allowlist, self_id, "this-device", &[member]).await;
+        write_pair_allowlist(&allowlist, self_id, "this-device", &[member]).await;
+
+        let peers = allowlist.list_peers().await.unwrap();
+        assert_eq!(
+            peers.len(),
+            2,
+            "re-running the pair must not duplicate self or the mesh member"
+        );
+    }
+}

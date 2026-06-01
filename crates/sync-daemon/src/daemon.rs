@@ -604,17 +604,28 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         // Recover the mesh VaultId from the topic and adopt it: rewrite
         // metadata.toml, re-join the mesh's gossip topic, re-publish mDNS.
-        if let Some(new_vault_id) =
-            crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic)
+        //
+        // A successful pair without a vault topic is protocol-impossible — the
+        // responder always sends one — but structurally possible. Treat it as a
+        // failure rather than a silent success: skipping adoption would land the
+        // device on the wrong gossip topic, so pairing "succeeds" but sync never
+        // works. Surfacing the error lets the user retry instead.
+        let Some(new_vault_id) = crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic)
+        else {
+            error!("Pairing succeeded but the mesh did not provide a vault topic");
+            let _ = reply.send(Err(
+                "Paired, but the mesh did not provide a vault topic. Try again.".to_string(),
+            ));
+            return;
+        };
+
+        if let Err(e) = self
+            .adopt_and_rejoin(new_vault_id, result.mesh_members.clone())
+            .await
         {
-            if let Err(e) = self
-                .adopt_and_rejoin(new_vault_id, result.mesh_members.clone())
-                .await
-            {
-                error!("Failed to adopt mesh VaultId after pairing: {:#}", e);
-                let _ = reply.send(Err(format!("Paired, but failed to join the mesh: {e:#}")));
-                return;
-            }
+            error!("Failed to adopt mesh VaultId after pairing: {:#}", e);
+            let _ = reply.send(Err(format!("Paired, but failed to join the mesh: {e:#}")));
+            return;
         }
 
         // Persist the mesh's relay URL for the next daemon start (not a live

@@ -895,6 +895,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             SyncAction::Pair { vault, device_name } => {
+                // Initialize tracing so allowlist/adoption warnings surface. The
+                // pairing helpers log via `tracing`, and the CLI runs without the
+                // daemon's subscriber, so without this those warnings vanish.
+                memory_common::init_tracing(false, "sync_daemon");
                 sync_daemon::pair::run(vault, device_name).await?;
                 Ok(())
             }

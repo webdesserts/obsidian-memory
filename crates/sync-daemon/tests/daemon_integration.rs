@@ -336,11 +336,11 @@ mod daemon_integration {
     /// This test FAILS on pre-feature code: without `adopt_and_rejoin`, B never
     /// leaves its own topic, no NeighborUp fires, and the pull times out.
     ///
-    /// Seeds 26/27.
+    /// Seeds 28/29.
     #[tokio::test]
     async fn test_initiator_adopts_vault_id_and_pulls() -> anyhow::Result<()> {
-        let node_a = build_node(26).await?; // responder — owns the note
-        let node_b = build_node(27).await?; // initiator — adopts A's VaultId
+        let node_a = build_node(28).await?; // responder — owns the note
+        let node_b = build_node(29).await?; // initiator — adopts A's VaultId
 
         connect_nodes(&node_a, &node_b).await?;
 

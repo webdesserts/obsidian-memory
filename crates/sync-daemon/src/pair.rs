@@ -220,10 +220,16 @@ async fn pair_inner(
     // gossip topic. The CLI process exits after pairing, so this is an on-disk
     // metadata rewrite (no live re-join). Persist the mesh relay URL too, for
     // cross-network sync on next start.
-    if let Some(new_id) = crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic) {
-        if let Err(e) = crate::pair_shared::adopt_vault_id_on_disk(vault_path, new_id).await {
-            eprintln!("Warning: failed to adopt the mesh VaultId: {}", e);
-        }
+    //
+    // A successful pair without a vault topic is protocol-impossible — the
+    // responder always sends one — but structurally possible. Treat it as a
+    // failure rather than a silent success: without the adopted id the next
+    // `memory sync up` joins the wrong gossip topic, so pairing "succeeds" but
+    // sync never works.
+    let new_id = crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic)
+        .context("Paired, but the mesh did not provide a vault topic. Try again.")?;
+    if let Err(e) = crate::pair_shared::adopt_vault_id_on_disk(vault_path, new_id).await {
+        eprintln!("Warning: failed to adopt the mesh VaultId: {}", e);
     }
     crate::pair_shared::persist_adopted_relay(vault_path, &result.relay_urls).await;
 
