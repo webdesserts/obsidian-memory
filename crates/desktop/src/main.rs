@@ -226,8 +226,17 @@ fn main() -> Result<()> {
             commands::cancel_pair_discovery,
             commands::reject_inbound_pair,
         ])
-        .run(tauri::generate_context!())
-        .map_err(|e| anyhow::anyhow!("Tauri application error: {e}"))?;
+        .build(tauri::generate_context!())
+        .map_err(|e| anyhow::anyhow!("Tauri application error: {e}"))?
+        .run(|_app, event| {
+            // Tray-only app: closing a transient window (e.g. the pair dialog)
+            // must NOT terminate the process. Tauri fires ExitRequested with
+            // code=None whenever the last window closes; only honor it when
+            // code is Some (the Quit menu calls `app.exit(0)`).
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = &event {
+                api.prevent_exit();
+            }
+        });
 
     Ok(())
 }
