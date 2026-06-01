@@ -38,8 +38,10 @@ The vault path is read from `OBSIDIAN_MEMORY_VAULT` (no `--vault` flag).
 > **Note:** `npm run tauri dev` / `npm run tauri build` do **not** work with
 > this crate's layout — the frontend is a subfolder of the tauri crate, so
 > tauri-cli resolves the wrong cwd, and there's no `tsconfig.json` for the
-> `tsc` build step. Run the binary directly instead; `build.rs` embeds the
-> built frontend, so no dev server is needed:
+> `tsc` build step. Run the binary directly instead. **Important:** the
+> frontend is embedded at **compile time** and `dist/windows/` (the pairing
+> UIs) is **not committed**, so build the frontend **before** `cargo` compiles
+> — otherwise the pairing windows open blank:
 
 ```bash
 # 1. Build the frontend once (emits frontend/dist incl. the pairing windows)
@@ -53,6 +55,10 @@ On first run the tray icon appears in the menu bar. The app is dock-less by
 design — the `Accessory` activation policy is set in `main.rs`. The health
 endpoint defaults to `127.0.0.1:8081`; change the `health_listen` port in
 `main.rs` if it's taken.
+
+**Blank pairing window?** The `windows/*.html` weren't embedded — you compiled
+before building the frontend (or changed `dist/` afterward). Run `npm run build`
+in `frontend/`, then `cargo clean -p desktop` to force a re-embed, then `cargo run`.
 
 A packaged release `.app` (`tauri build`) isn't wired up for this layout yet —
 tracked as a follow-up.
