@@ -99,7 +99,8 @@ pub struct Daemon<FS: FileSystem, AL> {
     device_name: String,
     /// Relay URL if the embedded relay is running, for distribution to new peers.
     relay_url: Option<String>,
-    #[allow(dead_code)]
+    /// The vault's filesystem path. Used by the post-pair onboarding to persist
+    /// the adopted relay URL to `daemon.toml`.
     vault_path: PathBuf,
     /// Cancellation token wired to the process shutdown signal. Calling
     /// `shutdown.cancel()` causes `run_loop` to exit cleanly.
@@ -118,6 +119,29 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// and a cancellation token so `CancelInitiate` aborts both the discovery
     /// task and any pairing attempt in progress. `None` between sessions.
     active_initiator: Option<InitiatorSession>,
+    /// Sender half of the internal initiator-outcome channel. Cloned into the
+    /// spawned pairing task so a completed `PairingResult` can be routed back to
+    /// the event loop for `&mut self` onboarding work (adopt + re-join).
+    initiator_outcome_tx: mpsc::UnboundedSender<InitiatorPairOutcome>,
+    /// Receiver half, drained in a `run_loop` `select!` arm.
+    initiator_outcome_rx: mpsc::UnboundedReceiver<InitiatorPairOutcome>,
+}
+
+/// A completed initiator pairing exchange, routed from the spawned pairing task
+/// back to the event loop so the post-pair onboarding (allowlist write, VaultId
+/// adoption + gossip re-join, relay persist) runs under `&mut self`.
+///
+/// Only a *completed* `PairingResult` travels this channel — whether it
+/// succeeded or failed the HMAC check. Cancellation and connection errors reply
+/// to the desktop oneshot directly from the spawned task and never reach here,
+/// so the event loop only ever sees outcomes that warrant adoption work.
+struct InitiatorPairOutcome {
+    result: sync_core::pairing::PairingResult,
+    responder_device_name: String,
+    /// The desktop's reply channel. The event loop sends the final success
+    /// (responder device name) or error string here after running the
+    /// post-pair work — keeping the desktop oneshot API unchanged.
+    reply: oneshot::Sender<Result<String, String>>,
 }
 
 /// State tracked between `StartDiscovery` and `SubmitCode` for an in-flight
@@ -149,6 +173,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         vault_path: PathBuf,
         shutdown: CancellationToken,
     ) -> Self {
+        // The initiator-outcome channel is internal — created here rather than
+        // passed in so the public `Daemon::new` signature (used directly by the
+        // test harness) stays unchanged.
+        let (initiator_outcome_tx, initiator_outcome_rx) = mpsc::unbounded_channel();
         Self {
             vault,
             sync_node,
@@ -167,6 +195,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             command_rx: None,
             mesh_name: None,
             active_initiator: None,
+            initiator_outcome_tx,
+            initiator_outcome_rx,
         }
     }
 
@@ -303,6 +333,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     }
                 } => {
                     self.on_daemon_command(cmd).await;
+                }
+
+                Some(outcome) = self.initiator_outcome_rx.recv() => {
+                    self.on_initiator_pair_outcome(outcome).await;
                 }
 
                 _ = self.shutdown.cancelled() => {
@@ -487,24 +521,169 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let endpoint = self.sync_node.endpoint.clone();
         let self_node_id = *self.sync_node.node_id().as_bytes();
         let device_name = self.device_name.clone();
-        let allowlist = self.allowlist.clone();
         let cancel = session.cancel.clone();
+        let outcome_tx = self.initiator_outcome_tx.clone();
 
         tokio::spawn(async move {
-            let result = tokio::select! {
+            // Run the pairing exchange. A completed exchange (success OR a failed
+            // HMAC check) must be onboarded under `&mut self` on the event loop —
+            // adopting the mesh VaultId, re-joining gossip, persisting the relay —
+            // so it's routed through the internal outcome channel. Cancellation and
+            // connection errors carry no `PairingResult` to act on, so they reply
+            // to the desktop oneshot directly here. Every path replies exactly once
+            // (directly or via the event loop) so the desktop window never hangs.
+            let exchange = tokio::select! {
                 r = run_initiator_pairing(
                     &endpoint,
                     peer_endpoint_id,
                     self_node_id,
                     &device_name,
                     code,
-                    allowlist,
                 ) => r,
-                _ = cancel.cancelled() => Err("Pairing cancelled".to_string()),
+                _ = cancel.cancelled() => {
+                    let _ = reply.send(Err("Pairing cancelled".to_string()));
+                    return;
+                }
             };
 
-            let _ = reply.send(result);
+            match exchange {
+                Ok((result, responder_device_name)) => {
+                    // Hand off to the event loop, which replies after onboarding.
+                    // If the send fails the daemon is shutting down; recover the
+                    // moved `reply` and answer with an error so the window doesn't
+                    // hang on a dropped oneshot.
+                    let outcome = InitiatorPairOutcome {
+                        result,
+                        responder_device_name,
+                        reply,
+                    };
+                    if let Err(send_err) = outcome_tx.send(outcome) {
+                        let _ = send_err
+                            .0
+                            .reply
+                            .send(Err("Daemon is shutting down.".to_string()));
+                    }
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
         });
+    }
+
+    /// Run the shared post-pair onboarding for a completed initiator exchange,
+    /// then reply to the desktop oneshot.
+    ///
+    /// Runs on the event loop (`&mut self`) so it can adopt the mesh VaultId and
+    /// re-join gossip in place. The shared helper writes the allowlist; on a
+    /// successful pair we then adopt + re-join + persist the relay. A failed HMAC
+    /// check replies with the standard "wrong/expired code" error. Every path
+    /// sends exactly one reply.
+    async fn on_initiator_pair_outcome(&mut self, outcome: InitiatorPairOutcome) {
+        let InitiatorPairOutcome {
+            result,
+            responder_device_name,
+            reply,
+        } = outcome;
+
+        if !result.success {
+            let _ = reply.send(Err(
+                "Pairing failed. The code may be wrong or expired. Try again.".to_string(),
+            ));
+            return;
+        }
+
+        let self_peer_id = PeerId::from_bytes(*self.sync_node.node_id().as_bytes());
+        crate::pair_shared::write_pair_allowlist(
+            self.allowlist.as_ref(),
+            self_peer_id,
+            &self.device_name,
+            &result.mesh_members,
+        )
+        .await;
+
+        // Recover the mesh VaultId from the topic and adopt it: rewrite
+        // metadata.toml, re-join the mesh's gossip topic, re-publish mDNS.
+        if let Some(new_vault_id) =
+            crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic)
+        {
+            if let Err(e) = self
+                .adopt_and_rejoin(new_vault_id, result.mesh_members.clone())
+                .await
+            {
+                error!("Failed to adopt mesh VaultId after pairing: {:#}", e);
+                let _ = reply.send(Err(format!("Paired, but failed to join the mesh: {e:#}")));
+                return;
+            }
+        }
+
+        // Persist the mesh's relay URL for the next daemon start (not a live
+        // endpoint rebuild — see `persist_adopted_relay`).
+        crate::pair_shared::persist_adopted_relay(&self.vault_path, &result.relay_urls).await;
+
+        let _ = reply.send(Ok(responder_device_name));
+    }
+
+    /// Adopt a new VaultId and re-subscribe to its gossip topic at runtime.
+    ///
+    /// Used after a pairing initiator joins an existing mesh: the device must
+    /// abandon its own VaultId and land on the mesh's gossip topic so a
+    /// `NeighborUp` fires and the full-sync pull begins. Steps:
+    /// 1. Rewrite `.sync/metadata.toml` + in-memory id (`Vault::adopt_vault_id`).
+    /// 2. Join gossip on the new topic, bootstrapping off the mesh members.
+    /// 3. Swap `self.vault_gossip` — dropping the old `VaultGossip` auto-leaves
+    ///    the old topic (iroh-gossip leaves once both sender + receiver drop).
+    /// 4. Re-publish mDNS so LAN discovery groups us under the new VaultId.
+    ///
+    /// Runs to completion within a single event-loop turn, so the next
+    /// `run_loop` `select!` re-borrows the freshly-swapped `self.vault_gossip`.
+    pub async fn adopt_and_rejoin(
+        &mut self,
+        new_vault_id: sync_core::VaultId,
+        mesh_members: Vec<PeerId>,
+    ) -> Result<()> {
+        // 1. Adopt the VaultId (metadata.toml + in-memory).
+        self.vault.lock().await.adopt_vault_id(new_vault_id).await?;
+
+        // 2. Bootstrap gossip off the mesh members (same filter-map as startup).
+        let bootstrap_ids: Vec<EndpointId> = mesh_members
+            .iter()
+            .filter_map(|p| {
+                EndpointId::from_bytes(p.as_bytes())
+                    .map_err(|e| warn!("Skipping invalid mesh member for gossip bootstrap: {}", e))
+                    .ok()
+            })
+            .collect();
+
+        // 3. Join the new topic and swap — the old VaultGossip drops here,
+        //    auto-leaving the old topic.
+        let new_gossip = self
+            .sync_node
+            .join_vault_gossip(&new_vault_id, bootstrap_ids)
+            .await
+            .context("Failed to re-join vault gossip on adopted VaultId")?;
+        self.vault_gossip = new_gossip;
+        info!(vault_id = %new_vault_id, "Re-joined gossip on adopted VaultId");
+
+        // 4. Re-publish mDNS under the new VaultId so LAN peers regroup us.
+        let mesh = self
+            .mesh_name
+            .clone()
+            .unwrap_or_else(|| self.device_name.clone());
+        let mesh_metadata = MeshMetadata {
+            mesh,
+            vid: new_vault_id.to_string(),
+            ver: 1,
+        };
+        let relay_url = self
+            .relay_url
+            .as_ref()
+            .and_then(|u| u.parse::<iroh::RelayUrl>().ok());
+        self.sync_node
+            .publish_mesh_info(&mesh_metadata, relay_url.as_ref());
+
+        self.emit_status().await;
+        Ok(())
     }
 
     /// Check whether a peer is allowed to sync.
@@ -991,21 +1170,22 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 }
 
-/// Drive the initiator pairing protocol against a discovered peer, then write
-/// the mesh roster to the local allowlist on success.
+/// Drive the initiator pairing protocol against a discovered peer.
 ///
-/// Mirrors the post-pair allowlist logic in `pair.rs::pair_inner` (CLI path)
-/// but uses the running daemon's allowlist handle so the in-memory cache stays
-/// consistent. Failures and warning paths return a string for the desktop UI
-/// to display verbatim — the message is shown directly in the pair window.
-async fn run_initiator_pairing<AL: AllowlistStorage + 'static>(
+/// This is the pure pairing-exchange driver — it has **no** allowlist or
+/// adoption side effects. On a completed exchange it returns the full
+/// `PairingResult` plus the responder's device name (captured from the
+/// `PairingChallenge`) so the event loop can run the shared post-pair
+/// onboarding under `&mut self`. A failed HMAC check is still a *completed*
+/// exchange and returns `Ok` — only connection errors return `Err`, whose
+/// string is shown verbatim in the desktop pair window.
+async fn run_initiator_pairing(
     endpoint: &iroh::Endpoint,
     peer_endpoint_id: EndpointId,
     self_node_id_bytes: [u8; 32],
     device_name: &str,
     code: String,
-    allowlist: Arc<AL>,
-) -> Result<String, String> {
+) -> Result<(sync_core::pairing::PairingResult, String), String> {
     let self_peer_id = PeerId::from_bytes(self_node_id_bytes);
     let hello = PairingHello {
         node_id: self_peer_id,
@@ -1028,34 +1208,8 @@ async fn run_initiator_pairing<AL: AllowlistStorage + 'static>(
     .await
     .map_err(|e| format!("Pairing connection failed: {e:#}"))?;
 
-    if !result.success {
-        return Err("Pairing failed. The code may be wrong or expired. Try again.".to_string());
-    }
-
     let responder_device_name = captured_device_name.lock().await.clone();
-
-    // Bootstrap the allowlist on first pair: add self so the responder side's
-    // sync requests are accepted once gossip joins.
-    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty()) {
-        if let Err(e) = allowlist.add_peer(self_peer_id, device_name).await {
-            warn!("Failed to add self to allowlist on first pair: {}", e);
-        }
-    }
-
-    // Add all mesh members returned by the pairing result. Device names
-    // self-heal once a gossip AllowlistUpdate arrives from the mesh.
-    for member_id in &result.mesh_members {
-        let peer = AllowedPeer::new(*member_id, "unknown");
-        if let Err(e) = allowlist.add_peer(peer.node_id, &peer.device_name).await {
-            warn!(
-                "Failed to add mesh member {} to allowlist: {}",
-                member_id, e
-            );
-        }
-    }
-
-    // Return the responder device name for the UI's success message.
-    Ok(responder_device_name)
+    Ok((result, responder_device_name))
 }
 
 /// Start the daemon and return a control handle before the event loop begins.
