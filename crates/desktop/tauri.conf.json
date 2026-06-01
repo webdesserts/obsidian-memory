@@ -3,10 +3,7 @@
   "productName": "Obsidian Memory",
   "identifier": "com.webdesserts.obsidian-memory",
   "build": {
-    "frontendDist": "frontend/dist",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd frontend && npm run dev",
-    "beforeBuildCommand": "cd frontend && npm run build"
+    "frontendDist": "frontend/dist"
   },
   "app": {
     "withGlobalTauri": true,
