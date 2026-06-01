@@ -40,6 +40,11 @@ pub type ControlState = Arc<DaemonControl>;
 /// The port the embedded iroh relay listens on.
 const RELAY_PORT: u16 = 3340;
 
+/// The port the local health endpoint binds on. 8081 is the conventional default
+/// but is commonly taken (e.g. llama-swap), so we standardize on 8082 across all
+/// machines. Make this env-configurable later if a machine ever needs to differ.
+const HEALTH_PORT: u16 = 8082;
+
 /// Detect the machine's primary LAN IP address for advertising to peers.
 ///
 /// Returns `None` if detection fails (e.g. no network interface, VPN-only config).
@@ -97,7 +102,7 @@ fn main() -> Result<()> {
     let daemon_config = DaemonRunConfig {
         vault: vault_path,
         identity_key: None,
-        health_listen: Some("127.0.0.1:8081".to_string()),
+        health_listen: Some(format!("127.0.0.1:{}", HEALTH_PORT)),
         relay_listen: Some(format!("0.0.0.0:{}", RELAY_PORT)),
         advertised_relay_url,
     };

@@ -37,8 +37,8 @@ A fresh device just **pairs** — no vault copying, no manual VaultId. On a succ
 2. **Then run the app** from the crate dir (`generate_context!` embeds `frontend/dist/` at compile time; no dev server needed):
    - bash: `cd crates/desktop && OBSIDIAN_MEMORY_VAULT=<absolute-vault-path> cargo run`
    - nushell: `cd crates/desktop; with-env {OBSIDIAN_MEMORY_VAULT: "<absolute-vault-path>"} { cargo run }`
-3. First run compiles `sync-core` + `sync-daemon` + `desktop` (~1 min). It's up when the log shows `Joined vault gossip topic` and `Health endpoint started`; verify with `curl http://127.0.0.1:8081/health` → `OK`. A single tray icon appears in the menu bar.
-   - **Health port** defaults to `127.0.0.1:8081`. If that's taken, edit the `health_listen` line in `crates/desktop/src/main.rs`. (On umbra it's set to **8082** because llama-swap owns 8081 — an uncommitted local edit.)
+3. First run compiles `sync-core` + `sync-daemon` + `desktop` (~1 min). It's up when the log shows `Joined vault gossip topic` and `Health endpoint started`; verify with `curl http://127.0.0.1:8082/health` → `OK`. A single tray icon appears in the menu bar.
+   - **Health port** is `127.0.0.1:8082` on all machines (the `HEALTH_PORT` const in `crates/desktop/src/main.rs`). 8081 is avoided because it's commonly taken (e.g. by llama-swap on umbra). Change the const if a machine ever needs to differ.
    - **Blank pairing window?** The `windows/*.html` weren't embedded — you compiled before building the frontend, or changed `dist/` afterward. Fix: run `npm run build` in `frontend/`, then **`cargo clean -p desktop`** to force a re-embed, then `cargo run` again.
 
 ## Phase A — Prove it on a SCRATCH vault (junk data, zero risk)
@@ -52,7 +52,7 @@ Do this first, on throwaway data.
 
 **laptop side:**
 3. Create your **own empty** scratch vault: `mkdir ~/sync-test`. (A couple of junk `.md` files are optional — pairing pulls umbra's regardless.)
-4. Launch the app pointed at it (see **Running the app**), `OBSIDIAN_MEMORY_VAULT=/Users/<you>/sync-test`. Confirm tray + `curl http://127.0.0.1:8081/health` → `OK`.
+4. Launch the app pointed at it (see **Running the app**), `OBSIDIAN_MEMORY_VAULT=/Users/<you>/sync-test`. Confirm tray + `curl http://127.0.0.1:8082/health` → `OK`.
    - No vault copying, no VaultId editing — the laptop starts with its own fresh VaultId; pairing reconciles it.
 
 **Pair + verify pull (both apps running):**

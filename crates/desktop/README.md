@@ -53,8 +53,8 @@ cd crates/desktop && OBSIDIAN_MEMORY_VAULT=~/notes cargo run
 
 On first run the tray icon appears in the menu bar. The app is dock-less by
 design — the `Accessory` activation policy is set in `main.rs`. The health
-endpoint defaults to `127.0.0.1:8081`; change the `health_listen` port in
-`main.rs` if it's taken.
+endpoint binds `127.0.0.1:8082` (the `HEALTH_PORT` const in `main.rs`; 8081 is
+avoided because it's commonly taken, e.g. by llama-swap). Change the const if needed.
 
 **Blank pairing window?** The `windows/*.html` weren't embedded — you compiled
 before building the frontend (or changed `dist/` afterward). Run `npm run build`
