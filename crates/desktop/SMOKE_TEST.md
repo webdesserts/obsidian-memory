@@ -1,28 +1,28 @@
 # Desktop Sync Smoke Test (v0.5.x)
 
-> Durable in-repo runbook to bring up the new v0.5.x architecture (Tauri desktop app + embedded sync-daemon) on **umbra** + a satellite Mac and validate P2P sync on LAN. Kept in the repo (not the notes vault) so it survives the vault wipe in Phase B. Hard-break migration — Michael is the only user, so we wipe satellites and reseed rather than preserve old pairings.
+> Durable in-repo runbook to bring up the new v0.5.x architecture (Tauri desktop app + embedded sync-daemon) on **umbra** + a satellite Mac and validate P2P sync on LAN. Kept in the repo (not the notes vault) so it survives the vault wipe in Phase B. Hard-break migration — Michael is the only user, so satellites are wiped and re-onboarded by **pairing**, not by preserving old pairings.
 
 **Execution roles:** Laptop-side steps are run by the Claude instance on the personal laptop. umbra-side steps are run by Michael or the umbra Claude session (umbra = this dev machine). The 6-digit pairing code is relayed by Michael between the two.
 
 ## Goal
 
-Get umbra and the personal laptop both running the v0.5.x Tauri app and **syncing the same vault**, so we can start dogfooding the new architecture. Validates build-from-source, the vault-seeding recipe, tray pairing, and the CRDT/QUIC/gossip sync engine on real LAN.
+Get umbra and the personal laptop both running the v0.5.x Tauri app and **syncing the same vault**. Validates build-from-source, tray pairing, the **pair-and-pull onboarding** (a fresh device adopts the mesh's vault and pulls it over the network), and the CRDT/QUIC/gossip sync engine on real LAN.
 
-## Why "seed from umbra" instead of "pair two fresh vaults"
+## How onboarding works now (features a + b)
 
-**Known gap (deferred TODO, also tracked in the project notes):** tray pairing reconciles the *allowlist* but **not the gossip topic**. A vault's gossip topic is derived from its random per-vault VaultId in `.sync/metadata.toml` (`crates/sync-core/src/network/node.rs:251`). The pairing handler (`crates/sync-daemon/src/daemon.rs::run_initiator_pairing`, ~lines 962–1017) receives the mesh's topic as `PairingResult.vault_topic` but drops it; the daemon only joins gossip on its *own* VaultId at startup (`daemon.rs:1292,1507`) and never re-joins. So two independently-created vaults pair "successfully" but land on different topics → they never sync.
+A fresh device just **pairs** — no vault copying, no manual VaultId. On a successful pair, the joining (initiator) device recovers the mesh's VaultId from the pairing exchange, adopts it (rewrites its `.sync/metadata.toml`), re-joins that gossip topic, and **pulls the vault's files over the network** into its configured folder. Each device keeps its **own** per-device Loro author identity (feature a), so multiple replicas editing one vault is safe (no OpId collisions).
 
-We sidestep this by **seeding the satellite from umbra's vault** — the VaultId rides along in the copied `.sync/metadata.toml`, so both share a topic. Pairing then only has to do its working half (the allowlist). The real fix (new device adopts the mesh's `vault_topic` on pair) is deferred until after dogfooding starts.
+(This replaces the earlier "seed the satellite by copying umbra's vault" workaround — that was only needed while pairing didn't convey the VaultId, which feature (b) fixed.)
 
 ## Topology
 
-- **umbra** — this machine (home server + dev host + main relay). Has a GUI → runs the **Tauri desktop app**, replacing the old Docker `sync-daemon`. Source of truth. LAN IP `192.168.68.59`.
-- **Personal laptop** — Mac with GUI → runs the **Tauri desktop app**. Satellite, seeded from umbra.
+- **umbra** — this machine (home server + dev host + main relay). Has a GUI → runs the **Tauri desktop app**, replacing the old Docker `sync` daemon. Source of truth. LAN IP `192.168.68.59`.
+- **Personal laptop** — Mac with GUI → runs the **Tauri desktop app**. Satellite — pairs into umbra's mesh and pulls.
 - Both on the home LAN. On LAN, peers connect **directly via QUIC**; umbra's relay is the cross-network fallback and is **not** exercised by this test.
 
 ## Prerequisites
 
-0. **v0.5.x code on the personal laptop.** As of writing, v0.5.x with the Phase 1.5 desktop app is **local-only on umbra — not pushed to origin.** The laptop can't build the app until it's pushed or otherwise transferred. On the laptop, verify with `git ls-remote origin v0.5.x`, then `git fetch && git checkout v0.5.x && git pull`. The Phase 1.5 tip is commit `8f9bfa4` (`docs(desktop): remove stale event-based init comment…`).
+0. **v0.5.x on the personal laptop.** v0.5.x is pushed to origin (tip includes features a + b). On the laptop: `git fetch && git checkout v0.5.x && git pull` — should land at `596dbeb` or later (the per-device-Loro-author + pair-and-pull commits).
 1. Toolchain on each Mac: Rust (stable) + Node + npm. You do **not** need `cargo install tauri-cli` (we launch via `cargo run`, see below), and no `wasm-pack` (the plugin is skipped — the daemon watches files directly).
 
 ## Running the app (verified — read this before the phases)
@@ -36,68 +36,49 @@ We sidestep this by **seeding the satellite from umbra's vault** — the VaultId
 2. **Run the app** from the crate dir — `build.rs` embeds the built frontend, so no dev server is needed:
    - bash: `cd crates/desktop && OBSIDIAN_MEMORY_VAULT=<absolute-vault-path> cargo run`
    - nushell: `cd crates/desktop; with-env {OBSIDIAN_MEMORY_VAULT: "<absolute-vault-path>"} { cargo run }`
-3. First run compiles the `desktop` + `sync-daemon` crates (~1 min). It's up when the log shows `Joined vault gossip topic` and `Health endpoint started`; verify with `curl http://127.0.0.1:8081/health` → `OK`. The tray icon appears in the menu bar.
-   - **Health port** defaults to `127.0.0.1:8081`. If that's taken, edit the `health_listen` line in `crates/desktop/src/main.rs`. (On umbra it's 8082 because llama-swap owns 8081.)
-
-## `.sync/` file taxonomy (the seeding-critical part)
-
-When seeding the satellite, **per-DEVICE** files must NOT carry over — delete them on the satellite so they regenerate fresh, otherwise you clone umbra's network identity and break the mesh:
-
-- `.sync/daemon.key` — ed25519 identity → PeerId
-- `.sync/daemon.toml` — advertises PeerId + relay_url
-- `.sync/daemon.lock` — transient flock
-- `.sync/known_peers.json` — peer discovery cache
-
-**Per-VAULT** files must be kept identical — this is how both machines share a topic and a consistent CRDT history:
-
-- `.sync/metadata.toml` — VaultId + schema version ← the critical shared file
-- `.sync/registry.loro` + any document CRDT state under `.sync/` — copied so the CRDT history is consistent. (Rebuilding independently from `.md` files risks divergent op histories → duplicated content. Copy the `.loro` state; don't let the satellite rebuild it.)
+3. First run compiles `sync-core` + `sync-daemon` + `desktop` (~1 min). It's up when the log shows `Joined vault gossip topic` and `Health endpoint started`; verify with `curl http://127.0.0.1:8081/health` → `OK`. A single tray icon appears in the menu bar.
+   - **Health port** defaults to `127.0.0.1:8081`. If that's taken, edit the `health_listen` line in `crates/desktop/src/main.rs`. (On umbra it's set to **8082** because llama-swap owns 8081 — an uncommitted local edit.)
 
 ## Phase A — Prove it on a SCRATCH vault (junk data, zero risk)
 
-Do this first. If the recipe is wrong, we find out on throwaway data, not real notes.
+Do this first, on throwaway data.
 
 **umbra side:**
-1. Stop the old Docker `sync-daemon` (service under `docker/` at `/opt/docker/`). It binds the health port `8081` (and possibly relay `3340`), which the Tauri app also needs — they can't coexist. (The obsidian-memory MCP server is separate and keeps running.)
-2. Create a scratch vault: `mkdir ~/sync-test` with 2–3 junk `.md` files.
-3. Launch the app pointed at `/Users/nir/sync-test` — see **Running the app** above (build the frontend, then `cargo run`).
-4. Confirm: tray icon appears (no dock icon), `curl http://127.0.0.1:8081/health` → 200, `~/sync-test/.sync/metadata.toml` exists. Then **Quit** the app (tray → Quit) so the vault is at rest for copying.
-
-**Seed the laptop (handoff):**
-5. Copy umbra's whole `~/sync-test` dir to the laptop over LAN (scp/rsync/AirDrop), e.g. to `/Users/<you>/sync-test`.
-6. On the laptop, delete the 4 per-device files (any that exist) so the satellite gets a fresh identity:
-   `rm sync-test/.sync/daemon.key sync-test/.sync/daemon.toml sync-test/.sync/daemon.lock sync-test/.sync/known_peers.json`
+1. Create a scratch vault: `mkdir ~/sync-test` with 2–3 junk `.md` files.
+2. Launch the app pointed at `/Users/nir/sync-test` (see **Running the app**). Confirm: single tray icon (no dock icon), `curl http://127.0.0.1:8082/health` → `OK`, `~/sync-test/.sync/metadata.toml` exists. Leave it running.
+   - (No need to stop the old Docker `sync` daemon for Phase A — it serves a *different* vault on internal port 8080, behind Colima's NAT, so it doesn't conflict on host ports or LAN mDNS. It only needs stopping in Phase B, when the Tauri app takes over the real vault.)
 
 **laptop side:**
-7. Launch the app on the seeded vault (see **Running the app**), with `OBSIDIAN_MEMORY_VAULT=/Users/<you>/sync-test`.
-8. Confirm tray + health, and that the junk notes copied over are present.
+3. Create your **own empty** scratch vault: `mkdir ~/sync-test`. (A couple of junk `.md` files are optional — pairing pulls umbra's regardless.)
+4. Launch the app pointed at it (see **Running the app**), `OBSIDIAN_MEMORY_VAULT=/Users/<you>/sync-test`. Confirm tray + `curl http://127.0.0.1:8081/health` → `OK`.
+   - No vault copying, no VaultId editing — the laptop starts with its own fresh VaultId; pairing reconciles it.
 
-**Pair + verify sync (both apps running):**
-9. On one machine: tray → "Pair with nearby device…". It scans mDNS and lists the other machine's mesh. Select it.
-10. The other machine pops a responder window + macOS notification with a **6-digit code**. Read it, enter it on the initiator. (First inbound pair may trigger a macOS notification-permission prompt — allow it. To re-test the prompt later: `tccutil reset Notifications com.webdesserts.obsidian-memory`.)
-11. Confirm pairing success — each side's `.sync/allowlist.json` now lists the other's PeerId.
-12. **The sync test:** edit a `.md` on umbra → it should appear on the laptop within a few seconds, and vice versa. Add a new file, delete a file — confirm each direction propagates.
-13. ✅ Bidirectional sync working → recipe + engine proven, proceed to Phase B. ❌ Pairs but nothing syncs → the VaultId didn't carry over; check that both `.sync/metadata.toml` are identical before going further.
+**Pair + verify pull (both apps running):**
+5. On the **laptop** (the joining device): tray → "Pair with nearby device…". It scans mDNS and lists umbra's mesh. Select it.
+6. **umbra** pops a responder window + macOS notification with a **6-digit code**. Relay it to the laptop and enter it there. (First inbound pair may trigger a macOS notification-permission prompt — allow it. To re-test: `tccutil reset Notifications com.webdesserts.obsidian-memory`.)
+7. On a successful pair the laptop **adopts umbra's VaultId, re-joins the topic, and pulls** — within a few seconds umbra's junk notes should appear in the laptop's `~/sync-test`. Confirm the laptop's `~/sync-test/.sync/metadata.toml` now matches umbra's VaultId.
+8. **Bidirectional sync:** edit a `.md` on umbra → it appears on the laptop, and vice versa. Add/delete files — confirm each direction propagates. (Keep edits **sequential** — edit, let it sync, then edit the other side — as good practice.)
+9. ✅ Pull + bidirectional sync working → onboarding proven, proceed to Phase B. ❌ Pairs but nothing pulls → check the laptop's `metadata.toml` actually adopted umbra's VaultId and that both can reach `http://192.168.68.59:3340/`.
 
 ## Phase B — Hard-break migrate the real `~/notes`
 
 Only after Phase A passes.
 
-1. **Back up first.** On umbra and the laptop, make a full timestamped copy of the real `~/notes` off to the side. This is the safety net for the known corruption risk (this project has a vault-corruption history).
-2. **umbra:** ensure the old Docker daemon is stopped (done in Phase A step 1).
-3. **umbra:** launch the app on the real vault (see **Running the app**), with `OBSIDIAN_MEMORY_VAULT=/Users/nir/notes`. First launch runs the v0→v1 migration (generates VaultId, builds CRDT state from your notes). umbra is now the source of truth. (The obsidian-memory MCP server also writes this vault — fine, the daemon watches files and coexists.) Let it settle, then Quit for the copy.
-4. **laptop:** wipe the old `~/notes` (it's backed up) and seed it from umbra's migrated `~/notes` using the Phase A recipe (copy the whole dir, delete the 4 per-device files).
-5. **laptop:** launch the Tauri app on `~/notes`, pair with umbra (steps 9–11), confirm the real notes converge.
-6. From here, both run the app continuously and dogfood.
+1. **Back up first.** On umbra and the laptop, make a full timestamped copy of the real `~/notes` off to the side. Safety net for the known corruption history.
+2. **umbra:** stop the old Docker `sync` daemon (the `sync` service under `/opt/docker/obsidian-memory/`) so the Tauri app becomes the sole syncer of the real vault. Leave the `memory` MCP container running.
+3. **umbra — clean-rebuild the real vault.** `~/notes` was edited by *multiple* devices under the old shared-author scheme (the pre-(a) corruption case), so shed its suspect CRDT history rather than trust it: with the app stopped, remove the old CRDT state (`~/notes/.sync/registry.loro` and `~/notes/.sync/documents/*.loro` if present), then launch the v0.5.x app on `~/notes`. It re-indexes the `.md` files into fresh Loro docs under umbra's device author and ensures `metadata.toml`/VaultId exist. umbra is now the clean source of truth. (The `memory` MCP server coexists — both just watch files. Confirm exact rebuild steps live when we get here.)
+4. **laptop:** wipe the old `~/notes` (it's backed up), `mkdir ~/notes` empty, launch the app on it, and **pair with umbra** (steps 5–7) — it adopts umbra's VaultId and pulls the whole vault.
+5. Confirm the real notes converge. From here, both run the app continuously and dogfood. (Disable/replace the old `obsidian-p2p-sync` plugin in each vault so its WASM node doesn't compete with the daemon.)
 
 ## Out of scope / deferred
 
-- **Pairing topic-reconciliation fix** — the known gap described above. Until fixed, every new device must be **seeded** from an existing mesh member; you can't just pair a fresh vault.
-- **Relay path** — LAN peers go direct; umbra's relay isn't exercised. Needs an off-LAN device to test.
+- **Relay path** — LAN peers go direct; umbra's relay isn't exercised here. Needs an off-LAN device to test.
 - **Mobile** — no working mobile sync in v0.5.x (WASM can't bind UDP in the mobile webview). Skip the phone.
-- **Obsidian plugin** — not needed for sync. Install later for the in-app dashboard: `cd plugin && npm install && npm run build:wasm && npm run build`, then copy `plugin/dist/obsidian-p2p-sync/*` → `<vault>/.obsidian/plugins/obsidian-p2p-sync/`.
-- **Persistent umbra service** — `npm run tauri dev` is a foreground dev process. Turning umbra's app into a launch-at-boot service (built `.app` + launchd) is a follow-up once the flow is proven.
+- **Obsidian plugin** — not needed for sync. Install later for the in-app dashboard: `cd plugin && npm install && npm run build:wasm && npm run build` (the wasm build needs a wasm-capable clang, e.g. Homebrew LLVM — Apple's default clang can't target wasm32), then copy `plugin/dist/obsidian-p2p-sync/*` → `<vault>/.obsidian/plugins/obsidian-p2p-sync/`.
+- **Persistent umbra service** — `cargo run` is a foreground dev process. Turning umbra's app into a launch-at-boot service (built `.app` + launchd) is a follow-up once the flow is proven.
+- **Multi-vault + in-app vault/folder picker** — deferred; one vault per app instance via `OBSIDIAN_MEMORY_VAULT` for now.
+- **Configurable health port** — currently hardcoded `8081`, overridden on umbra by a local edit; making it configurable (env var) is a small follow-up.
 
 ## Fallback: headless pairing (only if umbra's GUI tray is unavailable)
 
-umbra has a GUI, so use the tray. If ever needed headless: with the daemon running, on the other device run `memory sync pair --vault <path>` (initiator scans mDNS, prompts for the code on stdin); the responder's 6-digit code prints to the daemon's stderr/logs. Same wire protocol. Note this CLI path also only does the allowlist half — it still relies on the shared-VaultId seed.
+umbra has a GUI, so use the tray. If ever needed headless: with the daemon running, on the joining device run `memory sync pair --vault <path>` (it scans mDNS, prompts for the code on stdin); the responder's 6-digit code prints to the daemon's stderr/logs. The CLI path now also adopts the mesh's VaultId (metadata-only) on a successful pair — a subsequent `memory sync up` then joins the topic and pulls.
