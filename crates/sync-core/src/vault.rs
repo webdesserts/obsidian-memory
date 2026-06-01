@@ -165,6 +165,17 @@ impl SyncMetadata {
             Ok(written)
         }
     }
+
+    /// Persist this metadata to `.sync/metadata.toml` (atomic write).
+    ///
+    /// Used both by the migration path and by VaultId adoption (`Vault::adopt_vault_id`)
+    /// so the toml is serialized in exactly one place.
+    pub async fn save<F: FileSystem>(&self, fs: &F) -> Result<()> {
+        let toml_str = toml::to_string(self)
+            .map_err(|e| VaultError::Other(format!("Failed to serialize metadata: {}", e)))?;
+        fs.atomic_write(METADATA_FILE, toml_str.as_bytes()).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -929,6 +940,34 @@ impl<F: FileSystem> Vault<F> {
     /// Get the vault's identity (used as gossip topic seed and mDNS mesh grouping key).
     pub fn vault_id(&self) -> VaultId {
         self.vault_id
+    }
+
+    /// Adopt a different VaultId, rewriting `.sync/metadata.toml` to match.
+    ///
+    /// Used when a pairing initiator joins an existing mesh: it abandons its own
+    /// freshly-generated VaultId and takes on the mesh's so it lands on the same
+    /// gossip topic / mDNS group. Safe because the VaultId is purely the
+    /// replica-grouping id — the Loro author is the per-device `loro_author`, which
+    /// is untouched here (see [[Loro Peer ID Semantics]]).
+    ///
+    /// Idempotent: a no-op when `new_id` already matches the current id. The format
+    /// `version` is preserved by re-reading the existing metadata before rewriting.
+    pub async fn adopt_vault_id(&mut self, new_id: VaultId) -> Result<()> {
+        if new_id == self.vault_id {
+            return Ok(());
+        }
+
+        // Preserve the on-disk format version — only the vault_id changes.
+        let existing = SyncMetadata::load_or_migrate(&self.fs).await?;
+        let meta = SyncMetadata {
+            version: existing.version,
+            vault_id: new_id,
+        };
+        meta.save(&self.fs).await?;
+
+        self.vault_id = new_id;
+        tracing::info!(vault_id = %new_id, "Adopted mesh VaultId");
+        Ok(())
     }
 
     /// Get this device's Loro author identity.
@@ -1797,6 +1836,58 @@ mod tests {
 
         let vault2 = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
         assert_eq!(vault2.vault_id(), vault_id);
+    }
+
+    // ========== VaultId Adoption Tests ==========
+
+    #[tokio::test]
+    async fn test_adopt_vault_id_rewrites_metadata_and_persists() {
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let mut vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let original_id = vault.vault_id();
+        let adopted_id = VaultId::from(0xdeadbeefcafef00du64);
+        assert_ne!(original_id, adopted_id, "test ids must differ");
+
+        vault.adopt_vault_id(adopted_id).await.unwrap();
+
+        // In-memory id reflects the adoption.
+        assert_eq!(vault.vault_id(), adopted_id);
+
+        // Reloading the vault from disk reads the adopted id — proves persistence,
+        // not just in-memory mutation.
+        drop(vault);
+        let reloaded = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert_eq!(reloaded.vault_id(), adopted_id);
+    }
+
+    #[tokio::test]
+    async fn test_adopt_vault_id_preserves_format_version() {
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let mut vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        vault
+            .adopt_vault_id(VaultId::from(0x1111222233334444u64))
+            .await
+            .unwrap();
+
+        let bytes = fs.read(METADATA_FILE).await.unwrap();
+        let meta: SyncMetadata = toml::from_str(&String::from_utf8(bytes).unwrap()).unwrap();
+        assert_eq!(meta.version, 1, "adoption must not change the format version");
+    }
+
+    #[tokio::test]
+    async fn test_adopt_vault_id_same_id_is_noop() {
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let mut vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let current = vault.vault_id();
+
+        vault.adopt_vault_id(current).await.unwrap();
+        assert_eq!(vault.vault_id(), current);
     }
 
     #[tokio::test]

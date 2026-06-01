@@ -251,6 +251,17 @@ impl SyncNode {
         TopicId::from_bytes(bytes)
     }
 
+    /// Recover the `VaultId` encoded in a gossip topic's bytes.
+    ///
+    /// Inverse of [`vault_topic`](Self::vault_topic): reads the little-endian
+    /// `u64` back out of `topic[0..8]`. Used when a pairing initiator must adopt
+    /// the mesh's VaultId carried in `PairingResult::vault_topic` — the topic is
+    /// the only place the VaultId travels over the wire, so this is the single
+    /// defined inverse mapping rather than duplicating the id in a separate field.
+    pub fn vault_id_from_topic(topic: &[u8; 32]) -> VaultId {
+        VaultId::from(u64::from_le_bytes(topic[..8].try_into().unwrap()))
+    }
+
     /// Subscribe to gossip for a specific vault.
     ///
     /// `bootstrap_nodes` should be the `EndpointId`s of known peers for that vault.
@@ -338,5 +349,25 @@ impl SyncNode {
         self.router.shutdown().await?;
         self.endpoint.close().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `vault_topic` and `vault_id_from_topic` must be exact inverses so a pairing
+    /// initiator can recover the mesh's VaultId from the topic it receives on the wire.
+    #[test]
+    fn vault_topic_round_trips_through_vault_id_from_topic() {
+        // Cover edge values: small ids that zero-pad the high bytes, a full-width
+        // id, and the all-ones id — the bit patterns most likely to expose a
+        // byte-order or width mistake in the encode/decode pair.
+        for raw in [1u64, 0xFF, 0x1234, 0xa1b2c3d4e5f67890, u64::MAX] {
+            let vault_id = VaultId::from(raw);
+            let topic = SyncNode::vault_topic(&vault_id);
+            let recovered = SyncNode::vault_id_from_topic(topic.as_bytes());
+            assert_eq!(recovered, vault_id, "round-trip failed for {raw:#x}");
+        }
     }
 }
