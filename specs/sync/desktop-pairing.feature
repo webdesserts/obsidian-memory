@@ -33,6 +33,9 @@ Feature: Desktop tray pairing
     And clicks Pair
     Then the window confirms success and closes
     And Device A's allowlist contains Device B's PeerId
+    And Device A adopts mesh "M"'s VaultId in .sync/metadata.toml
+    And Device A re-joins the gossip topic for mesh "M"
+    And Device A pulls Device B's notes into its configured vault folder
 
   Scenario: Initiator scan times out with no meshes nearby
     Given the desktop app is running with no nearby meshes

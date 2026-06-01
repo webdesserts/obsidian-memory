@@ -24,11 +24,11 @@ mod daemon_integration {
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 
-    use sync_core::Vault;
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
     use sync_core::fs::{FileSystem, InMemoryFs};
     use sync_core::network::{SyncNode, gossip::VaultGossip};
     use sync_core::peer_id::{PeerId, VaultId};
+    use sync_core::{SyncMetadata, Vault};
 
     use sync_daemon::daemon::Daemon;
     use sync_daemon::watcher::{FileEvent, FileEventKind};
@@ -319,6 +319,141 @@ mod daemon_integration {
         daemon_b.shutdown.cancel();
         let _ = daemon_a.loop_handle.await;
         let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
+    /// A pairing initiator adopts the mesh's VaultId, re-joins its gossip topic,
+    /// and pulls the mesh's existing notes — the core of feature (b) pair-and-pull.
+    ///
+    /// A (responder) and B (initiator) start with *distinct* VaultIds, so they
+    /// sit on different gossip topics and cannot sync — this is the pre-feature
+    /// state. We then drive `Daemon::adopt_and_rejoin` on B with A's VaultId,
+    /// which rewrites B's metadata.toml and swaps its gossip subscription onto
+    /// A's topic. A `NeighborUp` fires and B's full-sync pulls A's pre-existing
+    /// note.
+    ///
+    /// This test FAILS on pre-feature code: without `adopt_and_rejoin`, B never
+    /// leaves its own topic, no NeighborUp fires, and the pull times out.
+    ///
+    /// Seeds 26/27.
+    #[tokio::test]
+    async fn test_initiator_adopts_vault_id_and_pulls() -> anyhow::Result<()> {
+        let node_a = build_node(26).await?; // responder — owns the note
+        let node_b = build_node(27).await?; // initiator — adopts A's VaultId
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Precondition: the two vaults start on DIFFERENT VaultIds. If build_node
+        // ever shared ids this would fire and the test below would pass trivially.
+        let a_vault_id = node_a.vault.lock().await.vault_id();
+        let b_vault_id = node_b.vault.lock().await.vault_id();
+        assert_ne!(
+            a_vault_id, b_vault_id,
+            "test requires distinct initial VaultIds"
+        );
+
+        // Seed a note into A's vault before any topic forms.
+        node_a
+            .fs
+            .write("notes/from-responder.md", b"# Shared from the mesh")
+            .await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/from-responder.md").await?;
+        }
+
+        // A joins gossip on A's VaultId. B joins on B's (different) VaultId — at
+        // this point they're on separate topics and cannot reach each other.
+        let a_node_endpoint = node_a.sync_node.node_id();
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&a_vault_id, vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&b_vault_id, vec![])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+
+        // Build B's daemon inline so we hold `&mut daemon` to drive adoption,
+        // mirroring test_status_broadcast_on_neighbor_events.
+        let b_vault = node_b.vault.clone();
+        let b_fs = node_b.fs.clone();
+        let (_b_file_tx, b_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let b_shutdown = CancellationToken::new();
+        let mut daemon_b = Daemon::new(
+            b_vault.clone(),
+            node_b.sync_node,
+            gossip_b,
+            b_file_rx,
+            None,
+            node_b.allowlist.clone(),
+            "device-b".to_string(),
+            None,
+            "/test-vault-b".into(),
+            b_shutdown.clone(),
+        );
+
+        // Adopt A's VaultId and re-join its gossip topic, bootstrapping off A.
+        daemon_b
+            .adopt_and_rejoin(
+                a_vault_id,
+                vec![PeerId::from_bytes(*a_node_endpoint.as_bytes())],
+            )
+            .await?;
+
+        // In-memory id reflects the adoption immediately.
+        assert_eq!(
+            b_vault.lock().await.vault_id(),
+            a_vault_id,
+            "B should have adopted A's VaultId in memory"
+        );
+
+        // Now spawn B's event loop — it's subscribed to A's topic, so NeighborUp
+        // fires and B pulls A's pre-existing note.
+        let b_loop = tokio::spawn(async move {
+            daemon_b.run_loop().await;
+        });
+
+        // Poll for the pull rather than asserting immediately: A's gossip→B sync
+        // may fire (and warn) before B's loop is ready, then B initiates its own
+        // sync from A — benign timing. wait_until rides through it.
+        wait_until("B pulled notes/from-responder.md", || {
+            let vault = b_vault.clone();
+            async move {
+                let vault = vault.lock().await;
+                vault
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/from-responder.md".to_string())
+            }
+        })
+        .await;
+
+        // The pulled content matches what A wrote.
+        let pulled = b_fs.read("notes/from-responder.md").await?;
+        assert_eq!(
+            String::from_utf8_lossy(&pulled),
+            "# Shared from the mesh",
+            "pulled note content should match A's"
+        );
+
+        // Persistence regression guard: B's metadata.toml on disk reflects the
+        // adopted id, not just the in-memory field.
+        let meta_bytes = b_fs.read(".sync/metadata.toml").await?;
+        let meta: SyncMetadata = toml::from_str(&String::from_utf8(meta_bytes.to_vec())?)?;
+        assert_eq!(
+            meta.vault_id, a_vault_id,
+            "B's metadata.toml should persist the adopted VaultId"
+        );
+
+        b_shutdown.cancel();
+        daemon_a.shutdown.cancel();
+        let _ = b_loop.await;
+        let _ = daemon_a.loop_handle.await;
 
         Ok(())
     }

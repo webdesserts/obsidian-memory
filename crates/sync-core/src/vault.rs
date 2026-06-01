@@ -1875,7 +1875,10 @@ mod tests {
 
         let bytes = fs.read(METADATA_FILE).await.unwrap();
         let meta: SyncMetadata = toml::from_str(&String::from_utf8(bytes).unwrap()).unwrap();
-        assert_eq!(meta.version, 1, "adoption must not change the format version");
+        assert_eq!(
+            meta.version, 1,
+            "adoption must not change the format version"
+        );
     }
 
     #[tokio::test]

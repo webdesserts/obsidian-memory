@@ -15,7 +15,7 @@ use iroh::address_lookup::DiscoveryEvent;
 use std::sync::Arc;
 use tracing::debug;
 
-use sync_core::allowlist::{AllowedPeer, AllowlistStorage, InMemoryAllowlist};
+use sync_core::allowlist::InMemoryAllowlist;
 use sync_core::network::{
     SyncNode,
     discovery::{DiscoveredMesh, MeshMetadata},
@@ -206,24 +206,26 @@ async fn pair_inner(
         return Ok(());
     }
 
-    // Write all mesh members to the local allowlist.
+    // Write the mesh roster to the local allowlist (shared with the tray path).
     let allowlist = FileAllowlistStorage::new(vault_path);
+    crate::pair_shared::write_pair_allowlist(
+        &allowlist,
+        self_peer_id,
+        device_name,
+        &result.mesh_members,
+    )
+    .await;
 
-    // Add self on first pair (bootstrap the allowlist).
-    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty()) {
-        if let Err(e) = allowlist.add_peer(self_peer_id, device_name).await {
-            eprintln!("Warning: failed to add self to allowlist: {}", e);
+    // Adopt the mesh's VaultId so the next `memory sync up` joins the right
+    // gossip topic. The CLI process exits after pairing, so this is an on-disk
+    // metadata rewrite (no live re-join). Persist the mesh relay URL too, for
+    // cross-network sync on next start.
+    if let Some(new_id) = crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic) {
+        if let Err(e) = crate::pair_shared::adopt_vault_id_on_disk(vault_path, new_id).await {
+            eprintln!("Warning: failed to adopt the mesh VaultId: {}", e);
         }
     }
-
-    // Add all mesh members returned by the pairing result.
-    // Device names self-heal once a gossip AllowlistUpdate arrives from the mesh.
-    for member_id in &result.mesh_members {
-        let peer = AllowedPeer::new(*member_id, "unknown");
-        if let Err(e) = allowlist.add_peer(peer.node_id, &peer.device_name).await {
-            eprintln!("Warning: failed to add mesh member to allowlist: {}", e);
-        }
-    }
+    crate::pair_shared::persist_adopted_relay(vault_path, &result.relay_urls).await;
 
     eprintln!();
     eprintln!("Pairing complete. Start the sync daemon to begin syncing.");
