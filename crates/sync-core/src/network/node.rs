@@ -107,7 +107,7 @@ pub struct SyncNode {
     router: Router,
     /// mDNS address lookup for LAN mesh discovery (native only).
     #[cfg(feature = "native")]
-    mdns: Option<iroh::address_lookup::MdnsAddressLookup>,
+    mdns: Option<iroh_mdns_address_lookup::MdnsAddressLookup>,
 }
 
 impl SyncNode {
@@ -147,7 +147,7 @@ impl SyncNode {
         info!(node_id = %endpoint.id(), "Iroh endpoint created");
 
         let mdns = {
-            use iroh::address_lookup::MdnsAddressLookup;
+            use iroh_mdns_address_lookup::MdnsAddressLookup;
             match MdnsAddressLookup::builder()
                 .service_name(MDNS_SERVICE_NAME)
                 .build(endpoint.id())
@@ -321,9 +321,10 @@ impl SyncNode {
             }
         };
 
-        let data = EndpointData::new([])
-            .with_user_data(Some(user_data))
-            .with_relay_url(relay_url.cloned());
+        let mut data = EndpointData::new(vec![]).with_user_data(user_data);
+        if let Some(url) = relay_url.cloned() {
+            data.add_relay_url(url);
+        }
 
         mdns.publish(&data);
         info!(mesh = %metadata.mesh, vid = %metadata.vid, "Published mesh info via mDNS");
@@ -338,7 +339,7 @@ impl SyncNode {
     #[cfg(feature = "native")]
     pub async fn subscribe_discovery(
         &self,
-    ) -> Option<impl n0_future::Stream<Item = iroh::address_lookup::DiscoveryEvent> + Unpin + use<>>
+    ) -> Option<impl n0_future::Stream<Item = iroh_mdns_address_lookup::DiscoveryEvent> + Unpin + use<>>
     {
         let mdns = self.mdns.as_ref()?;
         Some(mdns.subscribe().await)

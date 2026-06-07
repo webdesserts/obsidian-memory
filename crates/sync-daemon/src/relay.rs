@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use iroh::RelayUrl;
-use iroh_relay::server::{AccessConfig, Limits, RelayConfig, Server, ServerConfig};
+use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 use std::net::SocketAddr;
 use tracing::info;
 
@@ -79,17 +79,9 @@ impl EmbeddedRelay {
 
     /// Spawn the iroh relay server on `bind_addr`.
     async fn spawn_server(bind_addr: SocketAddr) -> Result<Server> {
-        let config = ServerConfig::<(), ()> {
-            relay: Some(RelayConfig {
-                http_bind_addr: bind_addr,
-                tls: None,
-                limits: Limits::default(),
-                key_cache_capacity: None,
-                access: AccessConfig::Everyone,
-            }),
-            quic: None,
-            metrics_addr: None,
-        };
+        let relay_config = RelayConfig::new(bind_addr);
+        let mut config = ServerConfig::default();
+        config.relay = Some(relay_config);
 
         Server::spawn(config)
             .await

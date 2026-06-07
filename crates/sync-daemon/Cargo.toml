@@ -44,8 +44,9 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 
 # Iroh node IDs (for EndpointId parsing)
-iroh = { version = "0.97", default-features = false }
-iroh-relay = { version = "0.97", features = ["server"] }
+iroh = { version = "1.0.0-rc.1", default-features = false }
+iroh-relay = { version = "1.0.0-rc.1", features = ["server"] }
+iroh-mdns-address-lookup = "0.3"
 
 # Cancellation tokens for daemon shutdown (shared between prod and tests)
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -58,7 +59,7 @@ reqwest = "0.13.2"
 tempfile.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-iroh-gossip = { version = "0.97", default-features = false, features = ["net"] }
+iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
 bincode.workspace = true
 anyhow.workspace = true
 sync-core = { path = "../sync-core", features = ["native"] }

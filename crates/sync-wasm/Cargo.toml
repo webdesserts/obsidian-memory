@@ -30,7 +30,7 @@ tracing-wasm = "0.2"
 getrandom_0_3.workspace = true
 # Used by WasmSyncNode bindings
 bincode.workspace = true
-iroh = { version = "0.97", default-features = false }
+iroh = { version = "1.0.0-rc.1", default-features = false }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]

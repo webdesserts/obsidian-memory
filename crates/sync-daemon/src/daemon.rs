@@ -417,7 +417,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         tokio::spawn(async move {
             use futures::StreamExt;
-            use iroh::address_lookup::DiscoveryEvent;
+            use iroh_mdns_address_lookup::DiscoveryEvent;
             use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata};
 
             let deadline = tokio::time::sleep(std::time::Duration::from_secs(
@@ -1530,7 +1530,7 @@ async fn startup_inner(
         tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
     > = {
         use futures::StreamExt;
-        use iroh::address_lookup::DiscoveryEvent;
+        use iroh_mdns_address_lookup::DiscoveryEvent;
         use sync_core::network::discovery::{
             DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata,
         };
@@ -1542,9 +1542,31 @@ async fn startup_inner(
                 while let Some(event) = stream.next().await {
                     match event {
                         DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let metadata = endpoint_info.data.user_data().and_then(|ud| {
-                                serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok()
-                            });
+                            let raw_user_data = endpoint_info
+                                .data
+                                .user_data()
+                                .map(|ud: &iroh::address_lookup::UserData| ud.as_ref().to_string());
+                            info!(
+                                peer = %endpoint_info.endpoint_id,
+                                has_user_data = raw_user_data.is_some(),
+                                user_data = ?raw_user_data,
+                                "DIAG: mDNS Discovered event"
+                            );
+                            let metadata = match raw_user_data.as_deref() {
+                                Some(s) => match serde_json::from_str::<DiscoveryMeshMetadata>(s) {
+                                    Ok(m) => Some(m),
+                                    Err(e) => {
+                                        info!(
+                                            peer = %endpoint_info.endpoint_id,
+                                            err = %e,
+                                            user_data = %s,
+                                            "DIAG: MeshMetadata JSON parse failed"
+                                        );
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
 
                             if let Some(meta) = metadata {
                                 let mesh = DiscoveredMesh {
@@ -1553,12 +1575,18 @@ async fn startup_inner(
                                     peers: vec![endpoint_info.endpoint_id],
                                     online_count: 1,
                                 };
+                                info!(
+                                    mesh = %mesh.mesh_name,
+                                    vid = %mesh.vault_id,
+                                    "DIAG: queueing DiscoveredMesh to run_loop"
+                                );
                                 let _ = tx.try_send(mesh);
                             }
                         }
                         DiscoveryEvent::Expired { endpoint_id } => {
                             debug!(peer = %endpoint_id, "mDNS: peer expired");
                         }
+                        _ => {}
                     }
                 }
             });
@@ -1759,7 +1787,7 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
         tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
     > = {
         use futures::StreamExt;
-        use iroh::address_lookup::DiscoveryEvent;
+        use iroh_mdns_address_lookup::DiscoveryEvent;
         use sync_core::network::discovery::{
             DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata,
         };
@@ -1771,7 +1799,7 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
                 while let Some(event) = stream.next().await {
                     match event {
                         DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let metadata = endpoint_info.data.user_data().and_then(|ud| {
+                            let metadata = endpoint_info.data.user_data().and_then(|ud: &iroh::address_lookup::UserData| {
                                 serde_json::from_str::<DiscoveryMeshMetadata>(ud.as_ref()).ok()
                             });
 
@@ -1789,6 +1817,7 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
                         DiscoveryEvent::Expired { endpoint_id } => {
                             debug!(peer = %endpoint_id, "mDNS: peer expired");
                         }
+                        _ => {}
                     }
                 }
             });
