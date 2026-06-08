@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::{Gossip, TopicId};
 use std::sync::Arc;
@@ -321,7 +321,13 @@ impl SyncNode {
             }
         };
 
-        let mut data = EndpointData::new(vec![]).with_user_data(user_data);
+        let bound_addrs: Vec<TransportAddr> = self
+            .endpoint
+            .bound_sockets()
+            .into_iter()
+            .map(TransportAddr::Ip)
+            .collect();
+        let mut data = EndpointData::new(bound_addrs).with_user_data(user_data);
         if let Some(url) = relay_url.cloned() {
             data.add_relay_url(url);
         }
