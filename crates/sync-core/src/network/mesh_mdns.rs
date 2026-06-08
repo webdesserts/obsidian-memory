@@ -32,27 +32,6 @@
 //! — the actor tracks the last value it was asked to set for each attribute.
 //! After every `guard.add(port, addrs)`, the actor re-applies those stored values.
 //! This makes TXT persistence unconditional regardless of caller order.
-//!
-//! ## Interface enumeration
-//!
-//! `IpClass::V4Only` eliminates the IPv6 EHOSTUNREACH storm but is insufficient on
-//! macOS hosts with multiple v4 interfaces. `swarm-discovery`'s INADDR_ANY multicast
-//! send roulettes between them on each process start — on the umbra dev rig, en1
-//! (`192.168.68.59` LAN) and en14 (`169.254.208.18` APIPA link-local) are both
-//! present, and sometimes swarm-discovery picks en14, causing 360+ EHOSTUNREACH per
-//! run and no LAN announces.
-//!
-//! `enumerate_lan_v4_interfaces()` uses `local-ip-address` to list all v4 interfaces,
-//! then drops loopback, APIPA (169.254.0.0/16), and interface-name patterns that
-//! macOS uses for VPN/Tailscale (`utun*`), AirDrop/AWDL (`awdl*`), and low-latency
-//! WLAN (`llw*`). The survivors are passed to
-//! `Discoverer::with_multicast_interfaces_v4()`, which binds iface-specific sockets
-//! for BOTH send and the multicast receive join, eliminating the roulette in both
-//! directions.
-//!
-//! Empty-survivors fallback: if no LAN v4 interface survives the filter (offline
-//! host, dev VM), we skip the call and fall through to swarm-discovery's existing
-//! INADDR_ANY behaviour. Discovery degrades but does not error.
 
 use std::{
     collections::HashMap,
@@ -69,7 +48,6 @@ use n0_future::boxed::BoxStream;
 use n0_future::task::AbortOnDropHandle;
 use swarm_discovery::{Discoverer, DropGuard, IpClass, Peer};
 use tokio::runtime::Handle;
-use local_ip_address::list_afinet_netifas;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace, warn};
@@ -246,26 +224,11 @@ impl MeshMdns {
             .encode(endpoint_id.as_bytes())
             .to_ascii_lowercase();
 
-        let multicast_ifaces = enumerate_lan_v4_interfaces();
-        let interface_count = multicast_ifaces.len();
-        info!(
-            interfaces = ?multicast_ifaces,
-            "mDNS multicast interface enumeration"
-        );
-
-        let mut discoverer = Discoverer::new_interactive(service_name.to_string(), peer_id_str)
+        let guard = Discoverer::new_interactive(service_name.to_string(), peer_id_str)
             .with_callback(callback)
             .with_ip_class(IpClass::V4Only)
-            .with_addrs(port, addrs.clone());
-
-        // Empty-survivors fallback: degrade to INADDR_ANY (swarm-discovery's default)
-        // rather than erroring — a host without a real LAN v4 interface (offline,
-        // dev VM) still gets discovery via whatever interface the kernel picks.
-        if !multicast_ifaces.is_empty() {
-            discoverer = discoverer.with_multicast_interfaces_v4(multicast_ifaces);
-        }
-
-        let guard = discoverer.spawn(rt)?;
+            .with_addrs(port, addrs.clone())
+            .spawn(rt)?;
 
         let guard = Arc::new(guard);
         let guard_for_actor = guard.clone();
@@ -447,7 +410,6 @@ impl MeshMdns {
 
         info!(
             service = %service_name,
-            lan_ifaces = interface_count,
             "mDNS mesh discovery started (V4Only)"
         );
 
@@ -498,36 +460,6 @@ impl MeshMdns {
         self.sender.send(Message::Subscribe(tx)).await.ok();
         ReceiverStream::new(rx)
     }
-}
-
-/// Enumerate IPv4 addresses suitable for binding swarm-discovery's multicast sockets.
-///
-/// Drops loopback, link-local APIPA (169.254.0.0/16), and interface-name patterns
-/// that macOS uses for VPN/Tailscale (`utun*`), AirDrop/AWDL (`awdl*`), and
-/// low-latency WLAN (`llw*`) — these inject either dead routes or hardware that
-/// doesn't participate in the LAN.
-///
-/// Returns an empty `Vec` on error (e.g., no OS networking) so callers can fall back
-/// to INADDR_ANY without hard-failing.
-fn enumerate_lan_v4_interfaces() -> Vec<std::net::Ipv4Addr> {
-    use std::net::IpAddr;
-    let Ok(ifaces) = list_afinet_netifas() else {
-        return vec![];
-    };
-    ifaces
-        .into_iter()
-        .filter(|(name, _)| {
-            !name.starts_with("lo")
-                && !name.starts_with("utun")
-                && !name.starts_with("awdl")
-                && !name.starts_with("llw")
-        })
-        .filter_map(|(_, ip)| match ip {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(_) => None,
-        })
-        .filter(|v4| !v4.is_loopback() && !v4.is_link_local())
-        .collect()
 }
 
 /// Convert a `swarm-discovery` `Peer` snapshot into an iroh `AddressLookupItem`.
