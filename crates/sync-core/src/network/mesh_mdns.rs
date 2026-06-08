@@ -510,12 +510,16 @@ fn build_service_info(
         properties.insert(RELAY_URL_ATTRIBUTE.to_string(), url.to_string());
     }
 
-    // Only include IPv4 addresses in the advertisement (matching our IPv4-only scope).
+    // Only include real IPv4 addresses — filter out 0.0.0.0 (unspecified).
+    // endpoint.bound_sockets() on a wildcard-bound iroh endpoint returns
+    // 0.0.0.0:port; mdns-sd (correctly) refuses to announce 0.0.0.0 as
+    // on-subnet for any interface, so passing it through yields an empty
+    // address set and the service is invisible to mDNSResponder.
     // Pass as &[IpAddr] — AsIpAddrs is implemented for &[I] where I: AsIpAddrs,
     // and IpAddr implements AsIpAddrs; Ipv4Addr alone does not.
     let v4_addrs: Vec<IpAddr> = addrs
         .iter()
-        .filter(|ip| ip.is_ipv4())
+        .filter(|ip| ip.is_ipv4() && !ip.is_unspecified())
         .copied()
         .collect();
 
@@ -523,6 +527,10 @@ fn build_service_info(
     // base32-encoded endpoint ID, which is always ASCII alphanumeric + lowercase.
     let host_name = format!("{instance_name}.local.");
 
+    // enable_addr_auto() instructs mdns-sd to auto-populate the host's real
+    // per-interface IPs (e.g. en1 → 192.168.68.59) and auto-update on IP change.
+    // Combined with the unspecified-filter above, this ensures we always advertise
+    // a reachable address even when the caller provides 0.0.0.0.
     ServiceInfo::new(
         service_type,
         instance_name,
@@ -531,6 +539,7 @@ fn build_service_info(
         port,
         Some(properties),
     )
+    .map(|info| info.enable_addr_auto())
 }
 
 // ---------------------------------------------------------------------------
@@ -636,10 +645,42 @@ async fn handle_service_resolved(
 // Helper: decode instance name
 // ---------------------------------------------------------------------------
 
+/// Strip the macOS mDNS conflict-resolution suffix ` (N)` from an instance name.
+///
+/// When a daemon restarts and its chosen name is already in use, mDNSResponder
+/// appends a suffix like ` (2)` — e.g. `qnca5x…sq (2)`. Without stripping it,
+/// base32 decoding fails and the peer is silently dropped. The stripping is
+/// intentionally conservative: the suffix must be at the very end, the parens
+/// must contain only ASCII digits, and there must be at least one digit.
+fn strip_conflict_suffix(name: &str) -> &str {
+    let Some(idx) = name.rfind(" (") else {
+        return name;
+    };
+    let inner = &name[idx + 2..];
+    let Some(close) = inner.find(')') else {
+        return name;
+    };
+    // Suffix must end exactly at the close paren.
+    if close + 1 != inner.len() {
+        return name;
+    }
+    // The digits between the parens must be non-empty and all ASCII decimal.
+    let digits = &inner[..close];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return name;
+    }
+    &name[..idx]
+}
+
 /// Decode a base32-lowercase instance name back to an `EndpointId`.
+///
+/// Strips any trailing macOS mDNS conflict suffix (` (N)`) before decoding
+/// so that peers that got conflict-renamed after a daemon restart are not
+/// silently dropped.
 fn decode_instance_name(instance_name: &str) -> Result<EndpointId, ()> {
+    let cleaned = strip_conflict_suffix(instance_name);
     let raw = data_encoding::BASE32_NOPAD
-        .decode(instance_name.to_ascii_uppercase().as_bytes())
+        .decode(cleaned.to_ascii_uppercase().as_bytes())
         .map_err(|_| ())?;
     if raw.len() != 32 {
         return Err(());
@@ -707,4 +748,37 @@ pub(crate) fn socket_addrs_to_port_addrs(addrs: &[SocketAddr]) -> (u16, Vec<IpAd
     let port = addrs.first().map(|a| a.port()).unwrap_or(0);
     let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
     (port, ips)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::strip_conflict_suffix;
+
+    #[test]
+    fn test_strip_conflict_suffix() {
+        // Normal conflict suffix is stripped.
+        assert_eq!(strip_conflict_suffix("qnca5xsq (2)"), "qnca5xsq");
+
+        // No suffix — returned unchanged.
+        assert_eq!(strip_conflict_suffix("qnca5xsq"), "qnca5xsq");
+
+        // Non-digit content inside parens — not a conflict suffix.
+        assert_eq!(strip_conflict_suffix("qnca5xsq (abc)"), "qnca5xsq (abc)");
+
+        // Empty parens — not a conflict suffix.
+        assert_eq!(strip_conflict_suffix("qnca5xsq ()"), "qnca5xsq ()");
+
+        // Suffix is not at the end — not stripped.
+        assert_eq!(
+            strip_conflict_suffix("qnca5xsq (2) extra"),
+            "qnca5xsq (2) extra"
+        );
+
+        // Larger conflict number works too.
+        assert_eq!(strip_conflict_suffix("qnca5xsq (123)"), "qnca5xsq");
+    }
 }
