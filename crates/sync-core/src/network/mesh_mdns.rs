@@ -24,14 +24,14 @@
 //! extracted in `publish()` — it is managed separately via `set_user_data` to
 //! avoid the clobber path where iroh's data would overwrite our JSON.
 //!
-//! ## TXT ordering (Bug 2 fix)
+//! ## TXT attribute durability
 //!
-//! `set_user_data` and `set_relay_url` now send actor messages (channel sends)
-//! instead of calling `guard.set_txt_attribute` directly. This guarantees that
-//! swarm-discovery sees `remove_all → add → set_txt_user_data → set_txt_relay`
-//! in FIFO order on a single channel, eliminating the race where `RemoveAll`
-//! (triggered by `republish_addrs` via the actor) wiped the TXT attributes
-//! that were already set by the sync `guard` calls.
+//! `guard.remove_all()` (called inside `RepublishAddrs`) wipes all TXT attributes
+//! on the peer record. To ensure `user-data` and `relay` survive every address
+//! republish — including iroh's autonomous auto-publish via `AddressLookup::publish()`
+//! — the actor tracks the last value it was asked to set for each attribute.
+//! After every `guard.add(port, addrs)`, the actor re-applies those stored values.
+//! This makes TXT persistence unconditional regardless of caller order.
 
 use std::{
     collections::HashMap,
@@ -247,6 +247,13 @@ impl MeshMdns {
                 Vec<mpsc::Sender<Result<AddressLookupItem, AddressLookupError>>>,
             > = HashMap::new();
 
+            // Last-known TXT values so RepublishAddrs can re-apply them after
+            // guard.remove_all() wipes the peer record.
+            // None = never set (leave TXT alone); Some(None) = explicitly cleared;
+            // Some(Some(x)) = set to x.
+            let mut last_user_data: Option<String> = None;
+            let mut last_relay_url: Option<Option<String>> = None;
+
             loop {
                 let msg = match rx.recv().await {
                     Some(m) => m,
@@ -340,9 +347,24 @@ impl MeshMdns {
                     Message::RepublishAddrs(port, addrs) => {
                         guard_for_actor.remove_all();
                         guard_for_actor.add(port, addrs);
+                        // Re-apply TXT attributes — remove_all() wipes everything including
+                        // user-data and relay TXT set by prior SetUserData/SetRelayUrl messages.
+                        if let Some(ref json) = last_user_data {
+                            let _ = guard_for_actor.set_txt_attribute(
+                                USER_DATA_ATTRIBUTE.to_string(),
+                                Some(json.clone()),
+                            );
+                        }
+                        if let Some(ref url) = last_relay_url {
+                            let _ = guard_for_actor.set_txt_attribute(
+                                RELAY_URL_ATTRIBUTE.to_string(),
+                                url.clone(),
+                            );
+                        }
                     }
 
                     Message::SetUserData(json) => {
+                        last_user_data = Some(json.clone());
                         if let Err(e) = guard_for_actor.set_txt_attribute(
                             USER_DATA_ATTRIBUTE.to_string(),
                             Some(json),
@@ -352,6 +374,7 @@ impl MeshMdns {
                     }
 
                     Message::SetRelayUrl(url) => {
+                        last_relay_url = Some(url.clone());
                         if let Err(e) = guard_for_actor
                             .set_txt_attribute(RELAY_URL_ATTRIBUTE.to_string(), url)
                         {
