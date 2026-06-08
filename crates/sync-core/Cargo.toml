@@ -9,7 +9,7 @@ default = ["native"]
 # Native-only: direct QUIC sockets (require OS networking) and full tokio runtime.
 # iroh/default enables direct socket binding and portmapper — not available in WASM.
 # The network module itself (gossip, streams, node) compiles for both native and WASM.
-native = ["iroh/default", "dep:swarm-discovery", "tokio/rt", "tokio/macros"]
+native = ["iroh/default", "dep:swarm-discovery", "dep:local-ip-address", "tokio/rt", "tokio/macros"]
 
 [dependencies]
 loro.workspace = true
@@ -40,6 +40,7 @@ iroh = { version = "1.0.0-rc.1", default-features = false, features = ["tls-ring
 # tokio::sync (used by gossip internals) compiles to WASM, so net works in both targets.
 iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
 swarm-discovery = { version = "0.6", optional = true }
+local-ip-address = { workspace = true, optional = true }
 data-encoding = "2"
 tokio-stream = "0.1"
 
