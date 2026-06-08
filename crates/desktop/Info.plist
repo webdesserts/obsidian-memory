@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Obsidian Memory discovers and syncs with other devices running the same vault on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_obsidian-sync._udp</string>
+	</array>
+</dict>
+</plist>
