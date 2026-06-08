@@ -10,8 +10,10 @@
 //!
 //! `mdns-sd` does the macOS-correct thing: wildcard `0.0.0.0:5353` with
 //! `SO_REUSEPORT`, per-interface `IP_MULTICAST_IF` for send, per-interface
-//! `IP_ADD_MEMBERSHIP` for receive, and `disable_interface(IfKind::IPv6)` to
-//! kill the utun-driven v6 storm cleanly.
+//! `IP_ADD_MEMBERSHIP` for receive, `disable_interface(IfKind::IPv6)` to
+//! kill the utun-driven v6 storm cleanly, and
+//! `disable_interface(IfKind::LoopbackV4)` so that `enable_addr_auto` only
+//! considers real interfaces (en0/en1) and announces on the LAN.
 //!
 //! ## Architecture
 //!
@@ -222,6 +224,14 @@ impl MeshMdns {
         // IPv6 default routes (Tailscale / VPN interfaces on macOS).
         if let Err(e) = daemon.disable_interface(IfKind::IPv6) {
             warn!("mDNS: failed to disable IPv6 interfaces: {e}");
+        }
+        // Disable the loopback IPv4 interface (127.0.0.1). mdns-sd enables it by
+        // default, so enable_addr_auto() picks up 127.0.0.1 and the daemon
+        // announces on loopback only — peers on other machines never see the
+        // service. Same-machine plugin ↔ daemon pairing is file-based (.sync/),
+        // not mDNS, so we never need loopback discovery.
+        if let Err(e) = daemon.disable_interface(IfKind::LoopbackV4) {
+            warn!("mDNS: failed to disable LoopbackV4 interface: {e}");
         }
 
         let service_type = format!("_{service_name}._udp.local.");
