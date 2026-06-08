@@ -1,13 +1,15 @@
 //! Local network mesh discovery via mDNS.
 //!
-//! Devices advertise their mesh (vault) on the LAN using iroh's `MdnsAddressLookup`
-//! with a custom service name `obsidian-sync`. Devices sharing the same `VaultId`
-//! form a single mesh — this is the foundation for the pairing flow (Item 5).
+//! Devices advertise their mesh (vault) on the LAN using `MeshMdns` — a V4-only
+//! swarm-discovery wrapper — with a custom service name `obsidian-sync`. Devices
+//! sharing the same `VaultId` form a single mesh — this is the foundation for the
+//! pairing flow.
 //!
-//! mDNS is native-only (requires OS-level networking) and is gated by the
-//! `address-lookup-mdns` feature via the `native` feature set.
+//! mDNS is native-only (requires OS-level networking) and is gated by the `native`
+//! feature set.
 
 use iroh::EndpointId;
+use iroh::address_lookup::UserData;
 use serde::{Deserialize, Serialize};
 
 /// Metadata broadcast via mDNS to identify a mesh (vault).
@@ -22,6 +24,41 @@ pub struct MeshMetadata {
     pub vid: String,
     /// Protocol version for forward compatibility.
     pub ver: u32,
+}
+
+/// Data about a discovered endpoint — analogous to `iroh_mdns_address_lookup`'s
+/// `EndpointData` but lives here so daemon code can import it without depending on
+/// the upstream crate.
+#[derive(Debug, Clone)]
+pub struct EndpointData {
+    user_data: Option<UserData>,
+}
+
+impl EndpointData {
+    pub fn new(user_data: Option<UserData>) -> Self {
+        Self { user_data }
+    }
+
+    /// Returns the optional user-defined data of the endpoint.
+    pub fn user_data(&self) -> Option<&UserData> {
+        self.user_data.as_ref()
+    }
+}
+
+/// An endpoint's ID paired with its discovery data.
+#[derive(Debug, Clone)]
+pub struct EndpointInfo {
+    pub endpoint_id: EndpointId,
+    pub data: EndpointData,
+}
+
+/// An event from the mDNS discovery stream.
+#[derive(Debug, Clone)]
+pub enum DiscoveryEvent {
+    /// A new or updated peer was discovered.
+    Discovered { endpoint_info: EndpointInfo },
+    /// A previously-discovered peer has expired off the LAN.
+    Expired { endpoint_id: EndpointId },
 }
 
 /// A discovered mesh on the local network.

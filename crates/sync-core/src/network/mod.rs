@@ -36,4 +36,6 @@ mod node;
 #[cfg(feature = "native")]
 pub mod discovery;
 #[cfg(feature = "native")]
+pub mod mesh_mdns;
+#[cfg(feature = "native")]
 pub mod pairing;

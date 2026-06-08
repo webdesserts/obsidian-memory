@@ -417,8 +417,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         tokio::spawn(async move {
             use futures::StreamExt;
-            use iroh_mdns_address_lookup::DiscoveryEvent;
-            use sync_core::network::discovery::{DiscoveredMesh, MeshMetadata};
+            use sync_core::network::discovery::{DiscoveredMesh, DiscoveryEvent, MeshMetadata};
 
             let deadline = tokio::time::sleep(std::time::Duration::from_secs(
                 INITIATOR_DISCOVERY_TIMEOUT_SECS,
@@ -1530,9 +1529,8 @@ async fn startup_inner(
         tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
     > = {
         use futures::StreamExt;
-        use iroh_mdns_address_lookup::DiscoveryEvent;
         use sync_core::network::discovery::{
-            DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata,
+            DiscoveredMesh, DiscoveryEvent, MeshMetadata as DiscoveryMeshMetadata,
         };
 
         if let Some(stream) = sync_node.subscribe_discovery().await {
@@ -1586,7 +1584,6 @@ async fn startup_inner(
                         DiscoveryEvent::Expired { endpoint_id } => {
                             debug!(peer = %endpoint_id, "mDNS: peer expired");
                         }
-                        _ => {}
                     }
                 }
             });
@@ -1787,9 +1784,8 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
         tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
     > = {
         use futures::StreamExt;
-        use iroh_mdns_address_lookup::DiscoveryEvent;
         use sync_core::network::discovery::{
-            DiscoveredMesh, MeshMetadata as DiscoveryMeshMetadata,
+            DiscoveredMesh, DiscoveryEvent, MeshMetadata as DiscoveryMeshMetadata,
         };
 
         if let Some(stream) = sync_node.subscribe_discovery().await {
@@ -1817,7 +1813,6 @@ async fn run_inner(config: DaemonRunConfig, shutdown: CancellationToken) -> Resu
                         DiscoveryEvent::Expired { endpoint_id } => {
                             debug!(peer = %endpoint_id, "mDNS: peer expired");
                         }
-                        _ => {}
                     }
                 }
             });

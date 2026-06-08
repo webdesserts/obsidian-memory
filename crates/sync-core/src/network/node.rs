@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::{Gossip, TopicId};
 use std::sync::Arc;
@@ -107,7 +107,7 @@ pub struct SyncNode {
     router: Router,
     /// mDNS address lookup for LAN mesh discovery (native only).
     #[cfg(feature = "native")]
-    mdns: Option<iroh_mdns_address_lookup::MdnsAddressLookup>,
+    mdns: Option<crate::network::mesh_mdns::MeshMdns>,
 }
 
 impl SyncNode {
@@ -147,15 +147,25 @@ impl SyncNode {
         info!(node_id = %endpoint.id(), "Iroh endpoint created");
 
         let mdns = {
-            use iroh_mdns_address_lookup::MdnsAddressLookup;
-            match MdnsAddressLookup::builder()
-                .service_name(MDNS_SERVICE_NAME)
-                .build(endpoint.id())
-            {
+            use crate::network::mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
+            let bound = endpoint.bound_sockets();
+            let (port, ips) = socket_addrs_to_port_addrs(&bound);
+            // Only advertise IPv4 sockets (V4Only mDNS scope).
+            let v4_ips: Vec<std::net::IpAddr> = ips
+                .into_iter()
+                .filter(|ip| ip.is_ipv4())
+                .collect();
+            let rt = tokio::runtime::Handle::current();
+            match MeshMdns::new(endpoint.id(), MDNS_SERVICE_NAME, port, v4_ips, &rt) {
                 Ok(mdns) => {
-                    if let Ok(lookup) = endpoint.address_lookup() {
-                        lookup.add(mdns.clone());
-                        info!("mDNS mesh discovery enabled");
+                    match endpoint.address_lookup() {
+                        Ok(lookup) => {
+                            lookup.add(mdns.clone());
+                            info!("mDNS mesh discovery enabled (V4Only)");
+                        }
+                        Err(e) => {
+                            warn!("Failed to register mDNS with address lookup: {e}");
+                        }
                     }
                     Some(mdns)
                 }
@@ -295,7 +305,7 @@ impl SyncNode {
         metadata: &crate::network::discovery::MeshMetadata,
         relay_url: Option<&RelayUrl>,
     ) {
-        use iroh::address_lookup::{AddressLookup, EndpointData};
+        use crate::network::mesh_mdns::socket_addrs_to_port_addrs;
 
         let Some(ref mdns) = self.mdns else {
             tracing::debug!("mDNS not available, skipping mesh info publish");
@@ -310,8 +320,9 @@ impl SyncNode {
             }
         };
 
-        let user_data = match json.parse::<iroh::address_lookup::UserData>() {
-            Ok(ud) => ud,
+        // Validate and send as user-data TXT attribute (routed through actor for ordering).
+        match json.parse::<iroh::address_lookup::UserData>() {
+            Ok(_) => mdns.set_user_data(&json),
             Err(e) => {
                 tracing::warn!(
                     "MeshMetadata JSON too long for mDNS UserData ({} bytes): {e}",
@@ -319,20 +330,20 @@ impl SyncNode {
                 );
                 return;
             }
-        };
-
-        let bound_addrs: Vec<TransportAddr> = self
-            .endpoint
-            .bound_sockets()
-            .into_iter()
-            .map(TransportAddr::Ip)
-            .collect();
-        let mut data = EndpointData::new(bound_addrs).with_user_data(user_data);
-        if let Some(url) = relay_url.cloned() {
-            data.add_relay_url(url);
         }
 
-        mdns.publish(&data);
+        // Re-advertise current bound addresses (IPv4 only, matching V4Only scope).
+        let bound = self.endpoint.bound_sockets();
+        let v4_bound: Vec<std::net::SocketAddr> =
+            bound.into_iter().filter(|sa| sa.is_ipv4()).collect();
+        if !v4_bound.is_empty() {
+            let (port, ips) = socket_addrs_to_port_addrs(&v4_bound);
+            mdns.republish_addrs(port, ips);
+        }
+
+        // Set relay URL TXT attribute (routed through actor, sequenced after addrs).
+        mdns.set_relay_url(relay_url.map(|u| u.as_str()));
+
         info!(mesh = %metadata.mesh, vid = %metadata.vid, "Published mesh info via mDNS");
     }
 
@@ -345,7 +356,7 @@ impl SyncNode {
     #[cfg(feature = "native")]
     pub async fn subscribe_discovery(
         &self,
-    ) -> Option<impl n0_future::Stream<Item = iroh_mdns_address_lookup::DiscoveryEvent> + Unpin + use<>>
+    ) -> Option<impl n0_future::Stream<Item = crate::network::discovery::DiscoveryEvent> + Unpin + use<>>
     {
         let mdns = self.mdns.as_ref()?;
         Some(mdns.subscribe().await)

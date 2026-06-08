@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use iroh_mdns_address_lookup::DiscoveryEvent;
+use sync_core::network::discovery::DiscoveryEvent;
 use std::sync::Arc;
 use tracing::debug;
 
