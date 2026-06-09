@@ -8,12 +8,24 @@
 //! - `INADDR_ANY` join roulettes between IPv4 interfaces on multi-interface hosts.
 //! - IPv6 join storms `EHOSTUNREACH` on hosts with utun-injected IPv6 default routes.
 //!
-//! `mdns-sd` does the macOS-correct thing: wildcard `0.0.0.0:5353` with
-//! `SO_REUSEPORT`, per-interface `IP_MULTICAST_IF` for send, per-interface
-//! `IP_ADD_MEMBERSHIP` for receive, `disable_interface(IfKind::IPv6)` to
-//! kill the utun-driven v6 storm cleanly, and
-//! `disable_interface(IfKind::LoopbackV4)` so that `enable_addr_auto` only
-//! considers real interfaces (en0/en1) and announces on the LAN.
+//! `mdns-sd` does the macOS-correct thing: wildcard bind with `SO_REUSEPORT`,
+//! per-interface `IP_MULTICAST_IF` for send, per-interface `IP_ADD_MEMBERSHIP`
+//! for receive, `disable_interface(IfKind::IPv6)` to kill the utun-driven v6
+//! storm cleanly, and `disable_interface(IfKind::LoopbackV4)` so that
+//! `enable_addr_auto` only considers real interfaces (en0/en1) and announces
+//! on the LAN.
+//!
+//! ## Custom port (5454, not 5353)
+//!
+//! We bind on `MESH_MDNS_PORT` (5454) instead of the standard mDNS port (5353).
+//! Even with `SO_REUSEPORT`, when macOS `mDNSResponder` is already bound to
+//! `:5353`, the kernel load-balances incoming multicast across the REUSEPORT
+//! group — our socket can be starved of receives while `mDNSResponder` collects
+//! the wire traffic. Using 5454 makes our daemon the sole listener on its port,
+//! so every announce from a peer reaches us. We never used system Bonjour
+//! interop (peers talk daemon-to-daemon), so the only loss is `dns-sd` CLI
+//! visibility. Both publisher and browser share one `ServiceDaemon`, so the
+//! port choice applies symmetrically.
 //!
 //! ## Architecture
 //!
@@ -69,6 +81,15 @@ const RELAY_URL_ATTRIBUTE: &str = "relay";
 
 /// Provenance string reported in `AddressLookupItem`s from this service.
 const MDNS_PROVENANCE: &str = "mesh-mdns";
+
+/// UDP port for our mDNS daemon — deliberately NOT 5353.
+///
+/// Using a custom port makes our `ServiceDaemon` the sole listener on its
+/// port, eliminating `SO_REUSEPORT` competition with macOS `mDNSResponder`.
+/// We never use system Bonjour interop (peers talk daemon-to-daemon), so the
+/// only loss is `dns-sd` CLI visibility. 5454 is the port `mdns-sd`'s own
+/// docs recommend for this exact scenario.
+const MESH_MDNS_PORT: u16 = 5454;
 
 /// Messages sent to the actor from the public API and the browse bridge.
 #[derive(Debug)]
@@ -218,7 +239,7 @@ impl MeshMdns {
         addrs: Vec<IpAddr>,
         rt: &Handle,
     ) -> Result<Self, mdns_sd::Error> {
-        let daemon = ServiceDaemon::new()?;
+        let daemon = ServiceDaemon::new_with_port(MESH_MDNS_PORT)?;
 
         // Disable IPv6 to prevent EHOSTUNREACH storms from utun-injected
         // IPv6 default routes (Tailscale / VPN interfaces on macOS).
