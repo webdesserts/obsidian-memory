@@ -89,14 +89,12 @@ const MDNS_PROVENANCE: &str = "mesh-mdns";
 
 /// Re-query interval while at least one subscriber (the pair window) is open.
 ///
-/// On each tick the actor calls `daemon.verify()` for all known peers (preventing
-/// TTL-driven prune) and restarts the browse to elicit PTR responses from quiet
-/// peers that have backed off their announcements.
+/// On each tick the actor restarts the browse, which causes mdns-sd to fire a
+/// fresh PTR query and elicit re-announcements from all visible peers. This is
+/// sufficient on its own: `stop_browse` wipes the SRV/TXT cache, so the
+/// subsequent `browse` starts clean and responds to replies from quiet peers that
+/// have backed off their announcements.
 const REQUERY_INTERVAL: Duration = Duration::from_millis(1500);
-
-/// Timeout per `daemon.verify()` call. Kept well under `REQUERY_INTERVAL` so
-/// that a tick that verifies several peers completes before the next tick fires.
-const VERIFY_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// UDP port for our mDNS daemon — deliberately NOT 5353.
 ///
@@ -318,9 +316,19 @@ impl MeshMdns {
         //
         // The watch channel lets the requery path (handled by the actor on
         // Message::Requery) swap the bridge to a fresh flume receiver after
-        // calling stop_browse + browse. The bridge's tokio::select! drains the
-        // current receiver and switches when a new one arrives via watch.changed().
-        // flume's recv_async() is cancel-safe, so no events are lost mid-drain.
+        // calling stop_browse + browse.
+        //
+        // Invariant: a watch-queued receiver swap must take priority over an old
+        // receiver closing. On every Requery tick the actor drops the old flume
+        // Sender (via stop_browse) AND sends a new receiver via the watch — both
+        // may become ready simultaneously. We use `biased;` with the watch branch
+        // first so the swap always wins when both fire. As belt-and-suspenders,
+        // the Err(_) arm also checks has_changed() before returning, covering any
+        // residual window where the select poll order doesn't fully protect us.
+        //
+        // Note: flume 0.11.x recv_async() is NOT cancel-safe. We avoid relying on
+        // cancel-safety here — the biased ordering ensures we don't drop the new
+        // receiver by cancelling the watch branch.
         let browse_recv = daemon.browse(&service_type)?;
         let (browse_recv_tx, browse_recv_rx) = watch::channel(browse_recv);
         let browse_recv_tx = Arc::new(browse_recv_tx);
@@ -330,6 +338,15 @@ impl MeshMdns {
             let mut current_recv = recv_watch.borrow_and_update().clone();
             loop {
                 tokio::select! {
+                    biased;
+                    // Check for a replacement receiver first. On every Requery tick the
+                    // actor drops the old flume Sender (stop_browse) and sends a new
+                    // receiver via the watch — both branches may be ready simultaneously.
+                    // Prioritising the watch branch ensures we swap before seeing the
+                    // Err(_) from the old closed receiver.
+                    Ok(()) = recv_watch.changed() => {
+                        current_recv = recv_watch.borrow_and_update().clone();
+                    }
                     // Drain the current flume receiver.
                     result = current_recv.recv_async() => {
                         match result {
@@ -338,13 +355,19 @@ impl MeshMdns {
                                     return;
                                 }
                             }
-                            // Flume channel closed — actor is shutting down.
-                            Err(_) => return,
+                            // The flume channel closed. This happens on every browse
+                            // restart (stop_browse drops the old Sender) and also on actor
+                            // shutdown. Check whether the watch has a new receiver queued
+                            // — if so, swap and keep running; only return when there truly
+                            // is no replacement (actor is shutting down).
+                            Err(_) => {
+                                if recv_watch.has_changed().unwrap_or(false) {
+                                    current_recv = recv_watch.borrow_and_update().clone();
+                                } else {
+                                    return;
+                                }
+                            }
                         }
-                    }
-                    // Actor sent a replacement receiver after a browse restart.
-                    Ok(()) = recv_watch.changed() => {
-                        current_recv = recv_watch.borrow_and_update().clone();
                     }
                 }
             }
@@ -517,22 +540,17 @@ impl MeshMdns {
                     }
 
                     Message::Requery => {
-                        // Verify all known peers so mdns-sd doesn't prune them on TTL expiry.
-                        for endpoint_id in peers.keys() {
-                            let instance = data_encoding::BASE32_NOPAD
-                                .encode(endpoint_id.as_bytes())
-                                .to_ascii_lowercase();
-                            let fullname = format!("{instance}.{service_type}");
-                            if let Err(e) = daemon.verify(fullname, VERIFY_TIMEOUT) {
-                                trace!(%endpoint_id, "mDNS: verify failed: {e}");
-                            }
-                        }
                         // Restart the browse to reset PTR backoff and elicit fresh
-                        // responses from peers that have gone quiet.
+                        // announcements from peers that have gone quiet. stop_browse
+                        // wipes the SRV/TXT cache, so the subsequent browse fires a
+                        // clean PTR query; responders re-announce within ms on LAN.
+                        // No separate verify() call is needed: stop_browse + browse
+                        // covers both known-but-pruned peers and unknown new peers.
                         let _ = daemon.stop_browse(&service_type);
                         match daemon.browse(&service_type) {
                             Ok(new_recv) => {
-                                // Hand the new receiver to the bridge task.
+                                // Hand the new receiver to the bridge task so it
+                                // can drain events from the fresh browse session.
                                 let _ = actor_browse_recv_tx.send(new_recv);
                             }
                             Err(e) => {
@@ -711,6 +729,16 @@ impl MeshMdns {
     #[cfg(test)]
     fn requery_is_active(&self) -> bool {
         self.requery_active.load(Ordering::Relaxed)
+    }
+
+    /// Directly inject a `Requery` message into the actor, triggering a
+    /// browse restart and bridge receiver swap without waiting for the timer.
+    ///
+    /// Only available in `#[cfg(test)]`. Used to exercise the bridge swap path
+    /// in deterministic tests without sleeping for `REQUERY_INTERVAL`.
+    #[cfg(test)]
+    async fn trigger_requery_for_test(&self) {
+        self.sender.send(Message::Requery).await.ok();
     }
 }
 
@@ -1229,5 +1257,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(mdns.requery_is_active(), expected, "{msg}");
+    }
+
+    /// The bridge task must survive multiple consecutive Requery cycles and
+    /// continue delivering events after each browse restart + receiver swap.
+    ///
+    /// This test catches B1: on the broken code the bridge exits on the first
+    /// Requery tick (~50% chance per tick) because `Err(_)` from the closed old
+    /// flume receiver races against the watch-queued new receiver without `biased`.
+    /// After a few cycles the bridge is almost certainly dead and subsequent
+    /// `SeedPeerForTest` events never reach the subscriber.
+    #[tokio::test]
+    async fn bridge_survives_multiple_requery_cycles() {
+        let rt = Handle::current();
+        let own_id = test_endpoint_id(0xDD);
+        let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
+
+        // Subscribe so there is a live subscriber to receive events.
+        let mut stream = mdns.subscribe().await;
+
+        // Fire two Requery cycles back-to-back. Each cycle calls stop_browse
+        // (drops the old flume Sender) and browse (issues new Sender), exercising
+        // the bridge swap path twice.
+        mdns.trigger_requery_for_test().await;
+        mdns.trigger_requery_for_test().await;
+
+        // Seed a peer AFTER both Requery cycles. If the bridge is dead the actor
+        // receives the SeedPeerForTest message (the actor itself is fine) but the
+        // bridge never delivers any further Message::Peer events — which means the
+        // subscriber never sees this Discovered event.
+        let post_requery_peer = test_endpoint_id(0x30);
+        mdns.seed_peer_for_test(post_requery_peer, snapshot_without_data()).await;
+
+        // The Discovered event must arrive within a generous timeout. On the broken
+        // code this times out: the bridge exited after the first or second Requery.
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out: bridge likely died after Requery cycle(s)")
+            .expect("stream ended unexpectedly");
+
+        match event {
+            DiscoveryEvent::Discovered { endpoint_info } => {
+                assert_eq!(
+                    endpoint_info.endpoint_id, post_requery_peer,
+                    "wrong peer received after requery"
+                );
+            }
+            DiscoveryEvent::Expired { .. } => panic!("unexpected Expired event"),
+        }
     }
 }
