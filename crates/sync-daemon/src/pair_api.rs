@@ -92,12 +92,20 @@ pub enum DaemonCommand {
     StartDiscovery {
         reply: mpsc::UnboundedSender<sync_core::network::discovery::DiscoveredMesh>,
     },
-    /// Submit the 6-digit pairing code for the currently-selected mesh.
+    /// Connect to the selected mesh's peer and initiate the pairing handshake,
+    /// causing the responder to generate + display the 6-digit code. Parks the
+    /// QUIC connection open awaiting a later `SubmitCode`. On successful connect
+    /// the reply carries the responder's device name — the UI's cue to show the
+    /// code entry step.
+    RequestPairing {
+        vault_id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Deliver the typed 6-digit code into the parked pairing request.
     ///
-    /// `vault_id` identifies which discovered mesh to connect to. `code` is the
-    /// 6-digit numeric code shown on the responder device. The daemon resolves
-    /// the peer endpoint from the most recent discovery scan and drives the
-    /// pairing exchange. On success, the reply carries the peer's device name.
+    /// Must be called after `RequestPairing` succeeds. Unblocks the parked QUIC
+    /// connection and drives the HMAC exchange. On success the reply carries the
+    /// responder's device name; on failure it carries a human-readable error.
     SubmitCode {
         vault_id: String,
         code: String,

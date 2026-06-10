@@ -133,27 +133,33 @@ pub struct Daemon<FS: FileSystem, AL> {
 ///
 /// Only a *completed* `PairingResult` travels this channel — whether it
 /// succeeded or failed the HMAC check. Cancellation and connection errors reply
-/// to the desktop oneshot directly from the spawned task and never reach here,
-/// so the event loop only ever sees outcomes that warrant adoption work.
+/// directly from the spawned task and never reach here, so the event loop only
+/// ever sees outcomes that warrant adoption work.
 struct InitiatorPairOutcome {
     result: sync_core::pairing::PairingResult,
     responder_device_name: String,
-    /// The desktop's reply channel. The event loop sends the final success
-    /// (responder device name) or error string here after running the
-    /// post-pair work — keeping the desktop oneshot API unchanged.
-    reply: oneshot::Sender<Result<String, String>>,
 }
 
-/// State tracked between `StartDiscovery` and `SubmitCode` for an in-flight
-/// initiator pairing session. The discovery task writes to `discovered` as
-/// mDNS produces results; `SubmitCode` reads it to look up the peer endpoint
-/// for the user-selected mesh.
+/// State tracked between `StartDiscovery`, `RequestPairing`, and `SubmitCode`
+/// for an in-flight initiator pairing session.
+///
+/// The discovery task writes to `discovered` as mDNS produces results.
+/// `RequestPairing` resolves the peer, parks the QUIC connection, and stores
+/// `code_tx`. `SubmitCode` stores `submit_reply` then fires `code_tx` to
+/// unblock the parked task.
 struct InitiatorSession {
     /// Maps `vault_id` to the first observed peer's endpoint, used by
-    /// `SubmitCode` to dial the mesh.
+    /// `RequestPairing` to dial the mesh.
     discovered: Arc<Mutex<HashMap<String, EndpointId>>>,
     /// Cancels the discovery scan and any in-progress pairing attempt.
     cancel: CancellationToken,
+    /// Filled by `RequestPairing` after the parked task spawns. `SubmitCode`
+    /// takes it to unblock the `get_code` callback with the typed code.
+    code_tx: Option<oneshot::Sender<String>>,
+    /// Stored by `SubmitCode` so the final `PairingResult` routes back to the
+    /// Pair button's reply after post-pair onboarding. Taken by
+    /// `on_initiator_pair_outcome`.
+    submit_reply: Option<oneshot::Sender<Result<String, String>>>,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -353,6 +359,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             DaemonCommand::StartDiscovery { reply } => {
                 self.start_initiator_discovery(reply).await;
             }
+            DaemonCommand::RequestPairing { vault_id, reply } => {
+                self.request_initiator_pairing(vault_id, reply).await;
+            }
             DaemonCommand::SubmitCode {
                 vault_id,
                 code,
@@ -407,6 +416,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         self.active_initiator = Some(InitiatorSession {
             discovered: discovered.clone(),
             cancel: cancel.clone(),
+            code_tx: None,
+            submit_reply: None,
         });
 
         let Some(stream) = self.sync_node.subscribe_discovery().await else {
@@ -485,19 +496,20 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         });
     }
 
-    /// Run the pairing exchange for the user-selected mesh.
+    /// Connect to the selected mesh's peer and park the QUIC connection open.
     ///
-    /// Looks up the peer endpoint from the active discovery session, then
-    /// spawns a task that drives `pair_with_mesh_interactive` and writes the
-    /// resulting mesh members to the local allowlist on success. The peer's
-    /// device name is returned via `reply` so the UI can confirm.
-    async fn submit_initiator_code(
+    /// Step 1 of the two-step GUI pairing flow. Resolves the peer endpoint from
+    /// the active discovery session, spawns a task that opens the QUIC connection
+    /// and sends `PairingHello` (triggering the responder to generate + display its
+    /// code), then parks awaiting a code delivered later by `SubmitCode`. On
+    /// connect, `reply` receives `Ok(responder_device_name)` — the UI's cue to
+    /// reveal the code entry step. Connect errors reply `Err(...)` directly.
+    async fn request_initiator_pairing(
         &mut self,
         vault_id: String,
-        code: String,
         reply: oneshot::Sender<Result<String, String>>,
     ) {
-        let Some(session) = self.active_initiator.as_ref() else {
+        let Some(session) = self.active_initiator.as_mut() else {
             let _ = reply.send(Err(
                 "No active pairing session. Click 'Pair with nearby device…' first.".to_string(),
             ));
@@ -517,61 +529,111 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         };
 
+        // Cancel any prior parked pairing attempt before spawning a fresh one.
+        // (Covers re-request after a failed connect.)
+        session.cancel.cancel();
+        let cancel = CancellationToken::new();
+        session.cancel = cancel.clone();
+        session.code_tx = None;
+        session.submit_reply = None;
+
+        let (code_tx, code_rx) = oneshot::channel::<String>();
+        session.code_tx = Some(code_tx);
+
         let endpoint = self.sync_node.endpoint.clone();
         let self_node_id = *self.sync_node.node_id().as_bytes();
         let device_name = self.device_name.clone();
-        let cancel = session.cancel.clone();
         let outcome_tx = self.initiator_outcome_tx.clone();
 
         tokio::spawn(async move {
-            // Run the pairing exchange. A completed exchange (success OR a failed
-            // HMAC check) must be onboarded under `&mut self` on the event loop —
-            // adopting the mesh VaultId, re-joining gossip, persisting the relay —
-            // so it's routed through the internal outcome channel. Cancellation and
-            // connection errors carry no `PairingResult` to act on, so they reply
-            // to the desktop oneshot directly here. Every path replies exactly once
-            // (directly or via the event loop) so the desktop window never hangs.
             let exchange = tokio::select! {
-                r = run_initiator_pairing(
+                r = run_initiator_pairing_parked(
                     &endpoint,
                     peer_endpoint_id,
                     self_node_id,
                     &device_name,
-                    code,
+                    reply,
+                    code_rx,
                 ) => r,
                 _ = cancel.cancelled() => {
-                    let _ = reply.send(Err("Pairing cancelled".to_string()));
+                    // Cancellation drops code_rx, which wakes any awaiting code_tx.send()
+                    // in SubmitCode with a SendError (harmless — SubmitCode checks for that).
                     return;
                 }
             };
 
             match exchange {
-                Ok((result, responder_device_name)) => {
-                    // Hand off to the event loop, which replies after onboarding.
-                    // If the send fails the daemon is shutting down; recover the
-                    // moved `reply` and answer with an error so the window doesn't
-                    // hang on a dropped oneshot.
+                Some((result, responder_device_name)) => {
+                    // A completed exchange (success or bad HMAC) must be onboarded under
+                    // `&mut self`. If the send fails the daemon is shutting down.
                     let outcome = InitiatorPairOutcome {
                         result,
                         responder_device_name,
-                        reply,
                     };
-                    if let Err(send_err) = outcome_tx.send(outcome) {
-                        let _ = send_err
-                            .0
-                            .reply
-                            .send(Err("Daemon is shutting down.".to_string()));
-                    }
+                    let _ = outcome_tx.send(outcome);
                 }
-                Err(e) => {
-                    let _ = reply.send(Err(e));
+                None => {
+                    // Connect error — already replied via connect_reply inside the function.
                 }
             }
         });
     }
 
+    /// Deliver the typed 6-digit code into the parked pairing request.
+    ///
+    /// Step 2 of the two-step GUI pairing flow. Takes `code_tx` from the session
+    /// (set by `RequestPairing`) to unblock the parked `get_code` callback.
+    /// Stores `reply` on the session so `on_initiator_pair_outcome` can route the
+    /// final `PairingResult` back to the Pair button after post-pair onboarding.
+    async fn submit_initiator_code(
+        &mut self,
+        vault_id: String,
+        code: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    ) {
+        let Some(session) = self.active_initiator.as_mut() else {
+            let _ = reply.send(Err(
+                "No active pairing session. Click 'Pair with nearby device…' first.".to_string(),
+            ));
+            return;
+        };
+
+        // Verify the code is for the mesh currently being paired.
+        {
+            let map = session.discovered.lock().await;
+            if !map.contains_key(&vault_id) {
+                let _ = reply.send(Err(
+                    "Selected mesh has no discovered peers yet. Wait for discovery to find a peer."
+                        .to_string(),
+                ));
+                return;
+            }
+        }
+
+        let Some(code_tx) = session.code_tx.take() else {
+            let _ = reply.send(Err(
+                "No pairing request in progress. Click 'Request pairing' first.".to_string(),
+            ));
+            return;
+        };
+
+        // Store the Pair button's reply before unblocking the parked task. The
+        // outcome channel routes the PairingResult back here after onboarding.
+        session.submit_reply = Some(reply);
+
+        if code_tx.send(code).is_err() {
+            // The parked task has already exited (connect error or cancellation).
+            let reply = session.submit_reply.take();
+            if let Some(r) = reply {
+                let _ = r.send(Err(
+                    "Pairing request is no longer active. Try again.".to_string(),
+                ));
+            }
+        }
+    }
+
     /// Run the shared post-pair onboarding for a completed initiator exchange,
-    /// then reply to the desktop oneshot.
+    /// then reply to the desktop Pair button's oneshot.
     ///
     /// Runs on the event loop (`&mut self`) so it can adopt the mesh VaultId and
     /// re-join gossip in place. The shared helper writes the allowlist; on a
@@ -582,8 +644,19 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let InitiatorPairOutcome {
             result,
             responder_device_name,
-            reply,
         } = outcome;
+
+        // Recover the Pair button's reply oneshot from the session. If absent
+        // (race: session was cancelled between SubmitCode and here), log + drop.
+        let reply = self
+            .active_initiator
+            .as_mut()
+            .and_then(|s| s.submit_reply.take());
+
+        let Some(reply) = reply else {
+            warn!("on_initiator_pair_outcome: no submit_reply to route result (session cancelled?)");
+            return;
+        };
 
         if !result.success {
             let _ = reply.send(Err(
@@ -1180,22 +1253,29 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 }
 
-/// Drive the initiator pairing protocol against a discovered peer.
+/// Drive the initiator pairing protocol against a discovered peer, parking
+/// between connect and code submission.
 ///
-/// This is the pure pairing-exchange driver — it has **no** allowlist or
-/// adoption side effects. On a completed exchange it returns the full
-/// `PairingResult` plus the responder's device name (captured from the
-/// `PairingChallenge`) so the event loop can run the shared post-pair
-/// onboarding under `&mut self`. A failed HMAC check is still a *completed*
-/// exchange and returns `Ok` — only connection errors return `Err`, whose
-/// string is shown verbatim in the desktop pair window.
-async fn run_initiator_pairing(
+/// This is the pure pairing-exchange driver for the two-step GUI flow. It has
+/// **no** allowlist or adoption side effects. The function:
+/// 1. Opens the QUIC connection and sends `PairingHello` (triggering the
+///    responder to generate + display its 6-digit code).
+/// 2. Fires `connect_reply` `Ok(responder_device_name)` to signal the GUI to
+///    reveal the code entry step.
+/// 3. Parks awaiting a code delivered via `code_rx` (filled by `SubmitCode`).
+/// 4. Sends `PairingResponse { hmac(code) }` and awaits `PairingResult`.
+///
+/// Returns `Some((result, responder_device_name))` on a completed exchange
+/// (success or failed HMAC check). Returns `None` when a connection error
+/// occurs — `connect_reply` carries the `Err` in that case.
+async fn run_initiator_pairing_parked(
     endpoint: &iroh::Endpoint,
     peer_endpoint_id: EndpointId,
     self_node_id_bytes: [u8; 32],
     device_name: &str,
-    code: String,
-) -> Result<(sync_core::pairing::PairingResult, String), String> {
+    connect_reply: oneshot::Sender<Result<String, String>>,
+    code_rx: oneshot::Receiver<String>,
+) -> Option<(sync_core::pairing::PairingResult, String)> {
     let self_peer_id = PeerId::from_bytes(self_node_id_bytes);
     let hello = PairingHello {
         node_id: self_peer_id,
@@ -1207,19 +1287,50 @@ async fn run_initiator_pairing(
     let captured_device_name = Arc::new(Mutex::new(String::new()));
     let captured_device_name_setter = captured_device_name.clone();
 
-    let result = pair_with_mesh_interactive(endpoint, peer_endpoint_id, &hello, move |challenge| {
-        let code = code.clone();
-        let setter = captured_device_name_setter.clone();
-        async move {
-            *setter.lock().await = challenge.device_name;
-            Ok(code)
-        }
-    })
-    .await
-    .map_err(|e| format!("Pairing connection failed: {e:#}"))?;
+    // `connect_reply` must be fired exactly once. Move it into an Option so
+    // the error path can take it without risk of a second fire.
+    let connect_reply_cell = Arc::new(Mutex::new(Some(connect_reply)));
+    let connect_reply_for_closure = connect_reply_cell.clone();
 
-    let responder_device_name = captured_device_name.lock().await.clone();
-    Ok((result, responder_device_name))
+    let result = pair_with_mesh_interactive(
+        endpoint,
+        peer_endpoint_id,
+        &hello,
+        move |challenge| {
+            let setter = captured_device_name_setter.clone();
+            let reply_cell = connect_reply_for_closure.clone();
+            let code_rx = code_rx; // move into closure — runs exactly once
+            async move {
+                let responder_name = challenge.device_name.clone();
+                *setter.lock().await = responder_name.clone();
+
+                // Signal the GUI: connection established, responder is showing its code.
+                if let Some(reply) = reply_cell.lock().await.take() {
+                    let _ = reply.send(Ok(responder_name));
+                }
+
+                // Park here until SubmitCode delivers the typed code.
+                code_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("pairing cancelled before code was entered"))
+            }
+        },
+    )
+    .await;
+
+    match result {
+        Ok(pairing_result) => {
+            let responder_device_name = captured_device_name.lock().await.clone();
+            Some((pairing_result, responder_device_name))
+        }
+        Err(e) => {
+            // Connection error — fire connect_reply with the error if not already sent.
+            if let Some(reply) = connect_reply_cell.lock().await.take() {
+                let _ = reply.send(Err(format!("Pairing connection failed: {e:#}")));
+            }
+            None
+        }
+    }
 }
 
 /// Start the daemon and return a control handle before the event loop begins.
