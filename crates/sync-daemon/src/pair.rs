@@ -107,7 +107,12 @@ async fn pair_inner(
                             peers: vec![],
                             online_count: 0,
                         });
-                        entry.peers.push(endpoint_info.endpoint_id);
+                        // A single peer re-announces many times during the discovery
+                        // window (fast-burst requery fires ~every 1.5s), so only add
+                        // an endpoint_id that hasn't been seen yet.
+                        if !entry.peers.contains(&endpoint_info.endpoint_id) {
+                            entry.peers.push(endpoint_info.endpoint_id);
+                        }
                         entry.online_count = entry.peers.len();
                         debug!(mesh = %meta.mesh, vid = %meta.vid, "Discovered mesh");
                     }
