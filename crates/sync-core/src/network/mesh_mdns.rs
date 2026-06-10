@@ -56,11 +56,13 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use iroh::EndpointId;
 use iroh::address_lookup::{
@@ -71,8 +73,8 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use n0_future::boxed::BoxStream;
 use n0_future::task::AbortOnDropHandle;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc::{self, error::TrySendError}, watch};
-use tokio::time;
+use tokio::sync::{mpsc::{self, error::TrySendError}, watch, Notify};
+use tokio::time::{self, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace, warn};
 
@@ -87,14 +89,41 @@ const RELAY_URL_ATTRIBUTE: &str = "relay";
 /// Provenance string reported in `AddressLookupItem`s from this service.
 const MDNS_PROVENANCE: &str = "mesh-mdns";
 
-/// Re-query interval while at least one subscriber (the pair window) is open.
-///
-/// On each tick the actor restarts the browse, which causes mdns-sd to fire a
-/// fresh PTR query and elicit re-announcements from all visible peers. This is
-/// sufficient on its own: `stop_browse` wipes the SRV/TXT cache, so the
-/// subsequent `browse` starts clean and responds to replies from quiet peers that
-/// have backed off their announcements.
-const REQUERY_INTERVAL: Duration = Duration::from_millis(1500);
+// Re-query cadence constants.
+//
+// On each tick the actor restarts the browse, which causes mdns-sd to fire a
+// fresh PTR query and elicit re-announcements from all visible peers. This is
+// sufficient on its own: `stop_browse` wipes the SRV/TXT cache, so the
+// subsequent `browse` starts clean and responds to replies from quiet peers that
+// have backed off their announcements.
+//
+// Two phases balance discovery latency against steady-state query volume:
+//
+// - Fast phase: `FAST_REQUERY_INTERVAL` ticks for `FAST_PHASE_DURATION` after
+//   each new `Message::Subscribe`. Meets the ~1-2s cold-discovery SLA when a
+//   pair window opens.
+// - Slow phase: `SLOW_REQUERY_INTERVAL` once the fast burst expires. Far below
+//   the 120s SRV/A TTL, so known peers never time out, with ~40-80× less
+//   traffic than the old flat 1.5s cadence.
+//
+// The fast burst triggers on each new Subscribe (not at task lifetime) because
+// the daemon holds a persistent discovery subscriber: the requery task runs
+// continuously and must re-enter fast mode each time a pair window opens.
+// A `tokio::sync::Notify` wakes the task mid-sleep so mid-slow-phase Subscribes
+// get a fast burst immediately.
+
+/// Fast re-query cadence used for ~`FAST_PHASE_DURATION` after each new
+/// `Message::Subscribe`. Tuned for the ~1-2s cold-discovery SLA when a pair
+/// window opens against an idle peer.
+const FAST_REQUERY_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Slow steady-state cadence between fast bursts. 30s ≪ 120s SRV/A TTL, so
+/// known peers never time out, with margin for dropped multicast packets.
+const SLOW_REQUERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Duration of the fast burst after each new `Subscribe`. ~3 fast ticks at the
+/// fast interval, sized to cover cold discovery without over-querying.
+const FAST_PHASE_DURATION: Duration = Duration::from_secs(5);
 
 /// UDP port for our mDNS daemon — deliberately NOT 5353.
 ///
@@ -213,6 +242,10 @@ pub struct MeshMdns {
     /// is connected and the re-query task is running. Exposed for testing only.
     #[cfg(test)]
     requery_active: Arc<AtomicBool>,
+    /// Counts every `Message::Requery` sent by the requery task. Exposed for
+    /// deterministic cadence assertions in virtual-time tests.
+    #[cfg(test)]
+    requery_count: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for MeshMdns {
@@ -410,6 +443,22 @@ impl MeshMdns {
         #[cfg(test)]
         let requery_active_shared = Arc::clone(&requery_active_for_actor);
 
+        // Shared fast-phase deadline: Some(Instant) while we're in the fast burst
+        // after a Subscribe; None (or expired) in the slow phase.
+        // Uses tokio::time::Instant so tokio::time::pause()/advance() drives it
+        // deterministically in virtual-time tests.
+        let fast_until: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+
+        // Wakes the requery task when a new Subscribe arrives mid-slow-sleep so the
+        // task re-evaluates the cadence without waiting for the full slow interval.
+        let requery_wake: Arc<Notify> = Arc::new(Notify::new());
+
+        // Counts every Message::Requery sent; only compiled in for test builds.
+        #[cfg(test)]
+        let requery_count_for_actor = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let requery_count_shared = Arc::clone(&requery_count_for_actor);
+
         let actor = async move {
             let tx = actor_tx_clone;
             let mut peers: HashMap<EndpointId, PeerSnapshot> = HashMap::new();
@@ -433,6 +482,8 @@ impl MeshMdns {
             let mut last_addrs: Vec<IpAddr> = addrs;
 
             let requery_active = requery_active_for_actor;
+            #[cfg(test)]
+            let requery_count = requery_count_for_actor;
 
             // Handle to the requery task — kept here so it's aborted if the
             // actor exits before the last subscriber drops.
@@ -499,9 +550,9 @@ impl MeshMdns {
                         // Replay every cached peer to the new subscriber before adding it
                         // to the broadcast set. A replayed peer may be momentarily stale
                         // (its TTL could expire between this push and the next re-query
-                        // tick); that's acceptable — the re-query loop (Fix C) reconciles
-                        // within ~1.5s via a `ServiceRemoved` → `Expired` event, and the
-                        // pair UI tolerates an `Expired` following a `Discovered`.
+                        // tick); that's acceptable — the re-query loop reconciles quickly
+                        // via a `ServiceRemoved` → `Expired` event, and the pair UI
+                        // tolerates an `Expired` following a `Discovered`.
                         // Replay-then-push ordering ensures the subscriber sees every
                         // known peer at least once and does not miss concurrent live events.
                         for (endpoint_id, snapshot) in &peers {
@@ -513,23 +564,56 @@ impl MeshMdns {
                         }
                         subscribers.push(sender);
 
+                        // Every Subscribe (not just the first) resets the fast-phase
+                        // deadline. Write the deadline BEFORE notifying so the task
+                        // always reads a fresh deadline when it wakes from notified().
+                        {
+                            let mut guard = fast_until.lock().unwrap();
+                            *guard = Some(Instant::now() + FAST_PHASE_DURATION);
+                        }
+                        requery_wake.notify_one();
+
                         // Start the re-query task on the first subscriber.
                         if !requery_active.load(Ordering::Relaxed) {
                             requery_active.store(true, Ordering::Relaxed);
                             let flag = Arc::clone(&requery_active);
                             let actor_tx = tx.clone();
+                            let fast_until_task = Arc::clone(&fast_until);
+                            let requery_wake_task = Arc::clone(&requery_wake);
+                            #[cfg(test)]
+                            let requery_count_task = Arc::clone(&requery_count);
                             let handle = AbortOnDropHandle::new(tokio::spawn(async move {
-                                let mut interval =
-                                    time::interval(REQUERY_INTERVAL);
-                                // First tick fires immediately; skip it — we just
-                                // replayed the cache so a re-query this instant adds
-                                // no value and causes an unnecessary browse restart.
-                                interval.tick().await;
                                 loop {
-                                    interval.tick().await;
+                                    // Pick interval based on current phase.
+                                    let next = {
+                                        let guard = fast_until_task.lock().unwrap();
+                                        match *guard {
+                                            Some(deadline) if Instant::now() < deadline => {
+                                                FAST_REQUERY_INTERVAL
+                                            }
+                                            _ => SLOW_REQUERY_INTERVAL,
+                                        }
+                                    };
+
+                                    // Sleep `next`, but wake early if a new Subscribe
+                                    // extends the deadline. On wake-via-notify, restart
+                                    // the loop to re-read the deadline; don't requery
+                                    // yet — Subscribe semantically means "open a pair
+                                    // window," the handler already replayed the cache,
+                                    // and the cadence is what changes, not the
+                                    // immediate action.
+                                    tokio::select! {
+                                        _ = time::sleep(next) => {}
+                                        _ = requery_wake_task.notified() => {
+                                            continue;
+                                        }
+                                    }
+
                                     if !flag.load(Ordering::Relaxed) {
                                         break;
                                     }
+                                    #[cfg(test)]
+                                    requery_count_task.fetch_add(1, Ordering::Relaxed);
                                     if actor_tx.send(Message::Requery).await.is_err() {
                                         break;
                                     }
@@ -652,6 +736,8 @@ impl MeshMdns {
             browse_recv_tx,
             #[cfg(test)]
             requery_active: requery_active_shared,
+            #[cfg(test)]
+            requery_count: requery_count_shared,
         })
     }
 
@@ -686,11 +772,13 @@ impl MeshMdns {
     ///
     /// Each subscriber gets an independent channel. Already-known peers are
     /// replayed immediately to the new subscriber before any future events are
-    /// delivered, so callers always see the full current peer set. While at least
-    /// one subscriber is connected the actor also runs an active re-query loop
-    /// (1.5s ticks) that re-announces quiet peers and restarts the PTR browse,
-    /// ensuring peers that have backed off their announcements are re-discovered
-    /// quickly. The loop stops when the last subscriber drops.
+    /// delivered, so callers always see the full current peer set.
+    ///
+    /// Each call also resets a fast-phase burst: for `FAST_PHASE_DURATION` (5s)
+    /// after this subscribe the requery task fires at `FAST_REQUERY_INTERVAL`
+    /// (1.5s), covering the ~1-2s cold-discovery SLA when a pair window opens.
+    /// After the burst the task drops to `SLOW_REQUERY_INTERVAL` (30s) until the
+    /// next subscribe. The task stops when the last subscriber drops.
     pub async fn subscribe(&self) -> impl n0_future::Stream<Item = DiscoveryEvent> + Unpin + use<> {
         let (tx, rx) = mpsc::channel(20);
         self.sender.send(Message::Subscribe(tx)).await.ok();
@@ -729,6 +817,16 @@ impl MeshMdns {
     #[cfg(test)]
     fn requery_is_active(&self) -> bool {
         self.requery_active.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of `Message::Requery` messages sent by the
+    /// requery task since this `MeshMdns` was created.
+    ///
+    /// Only available in `#[cfg(test)]`. Used by virtual-time cadence tests to
+    /// assert the fast/slow phase split without real-time waits.
+    #[cfg(test)]
+    pub(crate) fn requery_count(&self) -> usize {
+        self.requery_count.load(Ordering::Relaxed)
     }
 
     /// Directly inject a `Requery` message into the actor, triggering a
@@ -1060,6 +1158,7 @@ mod tests {
 
     use super::{
         strip_conflict_suffix, DiscoveryEvent, MeshMdns, PeerSnapshot,
+        FAST_PHASE_DURATION, FAST_REQUERY_INTERVAL, SLOW_REQUERY_INTERVAL,
     };
 
     // Helper: generate a deterministic test EndpointId from a seed byte.
@@ -1305,5 +1404,114 @@ mod tests {
             }
             DiscoveryEvent::Expired { .. } => panic!("unexpected Expired event"),
         }
+    }
+
+    /// Advances virtual time in small steps and yields between each step.
+    ///
+    /// `tokio::time::advance()` moves the clock but does not guarantee that tasks
+    /// whose timers fired will have been polled before it returns. When `dur` spans
+    /// multiple timer intervals, a single advance fires all timers simultaneously
+    /// but the woken tasks may not run until the next yield. Stepping through the
+    /// duration in increments (each ≤ `step`) interleaves task execution with clock
+    /// advancement, so timer-driven counters are accurate by the end of the call.
+    async fn advance_and_drain(dur: Duration) {
+        // Step size slightly smaller than FAST_REQUERY_INTERVAL so we never skip
+        // over a fast-phase tick boundary. Using 1s steps is simple and reliable
+        // across the 1.5s fast and 30s slow intervals used in these tests.
+        let step = Duration::from_secs(1);
+        let mut remaining = dur;
+        while remaining > Duration::ZERO {
+            let tick = remaining.min(step);
+            tokio::time::advance(tick).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            remaining = remaining.saturating_sub(tick);
+        }
+    }
+
+    /// After a Subscribe the requery task fires at the fast interval for
+    /// FAST_PHASE_DURATION, yielding ~3 requeries in that window.
+    #[tokio::test(start_paused = true)]
+    async fn fast_burst_followed_by_slow_phase() {
+        let rt = Handle::current();
+        let own_id = test_endpoint_id(0xE0);
+        let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
+
+        let _stream = mdns.subscribe().await;
+        advance_and_drain(Duration::from_millis(10)).await;
+        let baseline = mdns.requery_count();
+
+        // Advance past the entire fast phase + one more fast tick.
+        advance_and_drain(FAST_PHASE_DURATION + FAST_REQUERY_INTERVAL).await;
+
+        let count = mdns.requery_count() - baseline;
+        assert!(
+            (3..=5).contains(&count),
+            "expected ~3-4 fast-phase requeries in {:?}, got {count}",
+            FAST_PHASE_DURATION + FAST_REQUERY_INTERVAL
+        );
+    }
+
+    /// Once the fast burst expires the task settles to SLOW_REQUERY_INTERVAL,
+    /// and no requery fires in the middle of the slow interval.
+    #[tokio::test(start_paused = true)]
+    async fn requery_decays_to_slow_phase_after_fast_burst() {
+        let rt = Handle::current();
+        let own_id = test_endpoint_id(0xE1);
+        let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
+
+        let _stream = mdns.subscribe().await;
+        advance_and_drain(Duration::from_millis(10)).await;
+
+        // Burn through fast phase + safety margin so we are unambiguously slow.
+        advance_and_drain(FAST_PHASE_DURATION + Duration::from_secs(2)).await;
+        let after_fast = mdns.requery_count();
+
+        // Advance just under one slow interval — no new requery.
+        advance_and_drain(SLOW_REQUERY_INTERVAL - Duration::from_secs(2)).await;
+        assert_eq!(
+            mdns.requery_count(),
+            after_fast,
+            "no requery should fire in the middle of the slow interval"
+        );
+
+        // Advance past the slow interval — exactly one requery.
+        advance_and_drain(Duration::from_secs(4)).await;
+        let delta = mdns.requery_count() - after_fast;
+        assert!(
+            (1..=2).contains(&delta),
+            "expected 1 slow requery after SLOW_REQUERY_INTERVAL, got {delta}"
+        );
+    }
+
+    /// A second Subscribe while the task is mid-slow-sleep wakes it and resets
+    /// the fast-phase deadline, so requeries resume at FAST_REQUERY_INTERVAL
+    /// without waiting the full SLOW_REQUERY_INTERVAL.
+    #[tokio::test(start_paused = true)]
+    async fn new_subscribe_during_slow_phase_resets_to_fast() {
+        let rt = Handle::current();
+        let own_id = test_endpoint_id(0xE2);
+        let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
+
+        let _stream1 = mdns.subscribe().await;
+        advance_and_drain(Duration::from_millis(10)).await;
+
+        // Consume the initial fast burst, settle into slow phase.
+        advance_and_drain(FAST_PHASE_DURATION + Duration::from_secs(10)).await;
+        let after_slow_settled = mdns.requery_count();
+
+        // Subscribe again — bumps the fast-phase deadline AND wakes the task.
+        let _stream2 = mdns.subscribe().await;
+        advance_and_drain(Duration::from_millis(10)).await;
+
+        // Advance one fast interval + small margin. Should see at least 1 new requery.
+        // Without the wake mechanism this would fail (task is mid-slow-sleep until T+36).
+        advance_and_drain(FAST_REQUERY_INTERVAL + Duration::from_millis(500)).await;
+        let delta = mdns.requery_count() - after_slow_settled;
+        assert!(
+            (1..=2).contains(&delta),
+            "expected fast requery after second Subscribe within {:?}, got {delta}",
+            FAST_REQUERY_INTERVAL + Duration::from_millis(500)
+        );
     }
 }
