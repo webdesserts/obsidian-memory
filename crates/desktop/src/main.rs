@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 
     memory_common::init_tracing(false, "desktop");
 
-    info!("Starting Obsidian Memory desktop app");
+    info!("Starting Memory");
     info!("Vault: {:?}", vault_path);
 
     // Detect the LAN IP for the relay's advertised URL. The relay binds to
