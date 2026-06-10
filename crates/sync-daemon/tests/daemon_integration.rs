@@ -771,13 +771,15 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// `DaemonCommand::SubmitCode` returns a clear error when `RequestPairing`
-    /// was never called — the session exists (StartDiscovery ran) but no parked
-    /// connection is waiting for the code.
+    /// `DaemonCommand::SubmitCode` returns a "no pairing request in progress"
+    /// error when the vault_id is known (in discovered) but `RequestPairing`
+    /// was never called — the `code_tx`-missing guard at `daemon.rs:613` is
+    /// exercised directly.
     ///
     /// Seed 65 reserved.
     #[tokio::test]
     async fn test_submit_code_without_request_returns_error() -> anyhow::Result<()> {
+        use iroh::EndpointId;
         use sync_daemon::daemon::Daemon;
         use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
         use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -785,6 +787,9 @@ mod daemon_integration {
         let node = build_node(65).await?;
         let vault_id = shared_vault_id();
         let gossip = node.sync_node.join_vault_gossip(&vault_id, vec![]).await?;
+
+        // Capture the node's endpoint_id before moving node.sync_node.
+        let endpoint_id: EndpointId = node.sync_node.node_id();
 
         let (_file_event_tx, file_event_rx) =
             mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
@@ -809,24 +814,22 @@ mod daemon_integration {
         let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
         daemon.wire_control(status_tx, pairing_tx, command_rx, "Test Vault".to_string());
 
+        // Seed the discovered map so the vault_id check in submit_initiator_code
+        // passes. This means the code_tx-missing check at daemon.rs:613 is the
+        // one that fires — directly exercising that guard path.
+        daemon
+            .test_seed_discovered("target-vault".to_string(), endpoint_id)
+            .await;
+
         let loop_handle = tokio::spawn(async move {
             daemon.run_loop().await;
         });
 
-        // Simulate having done StartDiscovery by sending it (the daemon will
-        // handle it and park the session — but with no mDNS, the discovered map
-        // stays empty and the discovery task exits immediately). What matters is
-        // that active_initiator is Some (session exists).
-        let (disc_tx, _disc_rx) = mpsc::unbounded_channel();
-        command_tx.send(DaemonCommand::StartDiscovery { reply: disc_tx })?;
-
-        // Brief pause to let StartDiscovery run on the event loop.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Now send SubmitCode without any prior RequestPairing.
+        // Send SubmitCode with the known vault_id but no prior RequestPairing.
+        // The code_tx-missing guard should fire.
         let (reply_tx, reply_rx) = oneshot::channel::<Result<String, String>>();
         command_tx.send(DaemonCommand::SubmitCode {
-            vault_id: "any-vault".to_string(),
+            vault_id: "target-vault".to_string(),
             code: "123456".to_string(),
             reply: reply_tx,
         })?;
@@ -836,25 +839,239 @@ mod daemon_integration {
             .expect("daemon did not reply to SubmitCode within 2s")
             .expect("daemon dropped the reply channel");
 
-        // The error may be "no pairing request in progress" (if a mesh was already
-        // discovered) or "no discovered peers" (if the discovered map is empty —
-        // e.g. no mDNS in tests). Either way, the daemon must reply immediately
-        // rather than hanging, and the error must be human-readable.
         let err = reply.expect_err("expected Err when no RequestPairing was sent");
         assert!(
-            !err.is_empty(),
-            "error message should not be empty, got: {err}"
-        );
-        assert!(
-            err.to_lowercase().contains("request")
-                || err.to_lowercase().contains("in progress")
-                || err.to_lowercase().contains("peers")
-                || err.to_lowercase().contains("discovered"),
-            "error message should be actionable, got: {err}"
+            err.to_lowercase().contains("request") || err.to_lowercase().contains("in progress"),
+            "error should describe the missing request step, got: {err}"
         );
 
         shutdown.cancel();
         let _ = loop_handle.await;
+        Ok(())
+    }
+
+    /// Two-daemon happy path: RequestPairing → SubmitCode → adopt + pull.
+    ///
+    /// This test exercises the full two-step command sequence through the real
+    /// daemon event loop, covering:
+    /// - `connect_reply` receives `Ok(responder_device_name)` after connect
+    /// - `code_tx`/`code_rx` park+unblock between the two commands
+    /// - `submit_reply` routes the final `PairingResult` through `on_initiator_pair_outcome`
+    /// - Post-pair onboarding (allowlist write, VaultId adoption, gossip re-join, pull)
+    ///
+    /// Daemon A (responder, "device-a") already has a note. Daemon B (initiator,
+    /// "device-b") drives `RequestPairing` to connect; A emits the 6-digit code
+    /// via its pairing broadcast; B's `SubmitCode` delivers the code to the parked
+    /// task. On success B adopts A's VaultId, pulls A's note, and both allowlists
+    /// carry both peers.
+    ///
+    /// Seeds 66/67 reserved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_two_step_pairing_request_then_submit() -> anyhow::Result<()> {
+        use iroh::EndpointId;
+        use sync_daemon::daemon::Daemon;
+        use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
+        use tokio::sync::{broadcast, mpsc, oneshot, watch};
+
+        let node_a = build_node(66).await?; // responder
+        let node_b = build_node(67).await?; // initiator
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let a_vault_id = node_a.vault.lock().await.vault_id();
+        let b_vault_id = node_b.vault.lock().await.vault_id();
+        assert_ne!(a_vault_id, b_vault_id, "test requires distinct initial VaultIds");
+
+        // Seed a note into A's vault so B can prove it pulled via full sync.
+        node_a
+            .fs
+            .write("notes/pair-test.md", b"# From the responder mesh")
+            .await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/pair-test.md").await?;
+        }
+
+        // Both nodes join gossip on their own VaultId — separate topics until B adopts A's.
+        let a_endpoint_id = node_a.sync_node.node_id();
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&a_vault_id, vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&b_vault_id, vec![])
+            .await?;
+
+        // Build daemon A (responder) with DaemonControl so we can intercept
+        // the InboundRequest pairing event to get the 6-digit code.
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let a_allowlist = node_a.allowlist.clone();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            a_allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-a".into(),
+            a_shutdown.clone(),
+        );
+
+        let (a_status_tx, _) = watch::channel(DaemonStatus::initial());
+        let (a_pairing_tx, mut a_pairing_rx): (broadcast::Sender<PairingUiEvent>, _) =
+            broadcast::channel(16);
+        let (_a_cmd_tx, a_cmd_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+        daemon_a.wire_control(a_status_tx, a_pairing_tx, a_cmd_rx, "Mesh A".to_string());
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // Build daemon B (initiator) with DaemonControl for command_tx.
+        let b_vault = node_b.vault.clone();
+        let b_fs = node_b.fs.clone();
+        let b_allowlist = node_b.allowlist.clone();
+        let (_b_file_tx, b_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let b_shutdown = CancellationToken::new();
+        let mut daemon_b = Daemon::new(
+            b_vault.clone(),
+            node_b.sync_node,
+            gossip_b,
+            b_file_rx,
+            None,
+            b_allowlist.clone(),
+            "device-b".to_string(),
+            None,
+            "/test-vault-b".into(),
+            b_shutdown.clone(),
+        );
+
+        let (b_status_tx, _) = watch::channel(DaemonStatus::initial());
+        let (b_pairing_tx, _b_pairing_rx): (broadcast::Sender<PairingUiEvent>, _) =
+            broadcast::channel(16);
+        let (b_cmd_tx, b_cmd_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+        daemon_b.wire_control(b_status_tx, b_pairing_tx, b_cmd_rx, "Mesh B".to_string());
+
+        // Seed B's discovered map with A's endpoint — this replaces mDNS in tests.
+        let a_endpoint: EndpointId = a_endpoint_id;
+        daemon_b
+            .test_seed_discovered(a_vault_id.to_string(), a_endpoint)
+            .await;
+
+        let b_loop = tokio::spawn(async move {
+            daemon_b.run_loop().await;
+        });
+
+        // ── Step 1: RequestPairing ────────────────────────────────────────────
+        // B connects to A, A generates its 6-digit code and emits InboundRequest.
+
+        let (req_reply_tx, req_reply_rx) = oneshot::channel::<Result<String, String>>();
+        b_cmd_tx.send(DaemonCommand::RequestPairing {
+            vault_id: a_vault_id.to_string(),
+            reply: req_reply_tx,
+        })?;
+
+        // Await both connect_reply and A's InboundRequest concurrently. The connect
+        // reply fires after A sends its PairingChallenge; the broadcast fires at the
+        // same point on A's event loop. We need both: the reply to confirm the right
+        // device name, and the code to forward to SubmitCode.
+        let (connect_result, pairing_code) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(10), req_reply_rx)
+                    .await
+                    .expect("RequestPairing did not resolve within 10s")
+                    .expect("daemon dropped RequestPairing reply channel")
+            },
+            async {
+                // Wait for A to emit its InboundRequest event carrying the code.
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), a_pairing_rx.recv()).await {
+                        Ok(Ok(PairingUiEvent::InboundRequest { code, .. })) => break code,
+                        Ok(Ok(_)) => continue, // other event — not what we want
+                        Ok(Err(_)) => panic!("A's pairing broadcast channel closed unexpectedly"),
+                        Err(_) => panic!("timed out waiting for A's InboundRequest pairing event"),
+                    }
+                }
+            }
+        );
+
+        let responder_device_name = connect_result
+            .expect("RequestPairing should succeed with Ok(device_name)");
+        assert_eq!(
+            responder_device_name, "device-a",
+            "connect_reply should carry A's device name"
+        );
+
+        // ── Step 2: SubmitCode ────────────────────────────────────────────────
+        // Deliver the code to the parked task; B completes the HMAC exchange.
+
+        let (submit_reply_tx, submit_reply_rx) = oneshot::channel::<Result<String, String>>();
+        b_cmd_tx.send(DaemonCommand::SubmitCode {
+            vault_id: a_vault_id.to_string(),
+            code: pairing_code,
+            reply: submit_reply_tx,
+        })?;
+
+        let submit_result = tokio::time::timeout(Duration::from_secs(10), submit_reply_rx)
+            .await
+            .expect("SubmitCode did not resolve within 10s")
+            .expect("daemon dropped SubmitCode reply channel");
+
+        let paired_device = submit_result.expect("SubmitCode should succeed");
+        assert_eq!(
+            paired_device, "device-a",
+            "submit_reply should carry A's device name after successful pairing"
+        );
+
+        // ── Assertions ───────────────────────────────────────────────────────
+
+        // B adopted A's VaultId.
+        assert_eq!(
+            b_vault.lock().await.vault_id(),
+            a_vault_id,
+            "B should have adopted A's VaultId after pairing"
+        );
+
+        // B pulled A's pre-existing note via NeighborUp + full sync.
+        wait_until("B pulled notes/pair-test.md from A", || {
+            let vault = b_vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/pair-test.md".to_string())
+            }
+        })
+        .await;
+
+        let pulled = b_fs.read("notes/pair-test.md").await?;
+        assert_eq!(
+            String::from_utf8_lossy(&pulled),
+            "# From the responder mesh",
+            "pulled note content should match A's"
+        );
+
+        // Both allowlists carry both peers.
+        let b_peers = b_allowlist.list_peers().await?;
+        let b_peer_ids: Vec<_> = b_peers.iter().map(|p| &p.node_id).collect();
+        let a_node_peer_id = PeerId::from_bytes(*a_endpoint_id.as_bytes());
+        assert!(
+            b_peer_ids.contains(&&a_node_peer_id),
+            "B's allowlist should contain A's PeerId after pairing"
+        );
+
+        b_shutdown.cancel();
+        a_shutdown.cancel();
+        let _ = b_loop.await;
+        let _ = a_loop.await;
+
         Ok(())
     }
 

@@ -206,6 +206,29 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
+    /// Seed the active initiator's discovered map for testing.
+    ///
+    /// Integration tests have no mDNS, so there's no natural way for the
+    /// discovered map to be populated. This helper pre-populates `vault_id →
+    /// endpoint_id` so tests can drive `RequestPairing` without real mDNS.
+    ///
+    /// This method is `pub` solely for integration test access — use only in
+    /// test code. Production callers should go through `StartDiscovery`.
+    pub async fn test_seed_discovered(&mut self, vault_id: String, endpoint_id: iroh::EndpointId) {
+        if self.active_initiator.is_none() {
+            let cancel = CancellationToken::new();
+            self.active_initiator = Some(InitiatorSession {
+                discovered: Arc::new(Mutex::new(HashMap::new())),
+                cancel,
+                code_tx: None,
+                submit_reply: None,
+            });
+        }
+        if let Some(ref session) = self.active_initiator {
+            session.discovered.lock().await.insert(vault_id, endpoint_id);
+        }
+    }
+
     /// Wire control channels into this daemon, enabling tray integration.
     ///
     /// Called by `run_with_shutdown_controlled` after `Daemon::new()` succeeds
@@ -598,13 +621,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         };
 
-        // Verify the code is for the mesh currently being paired.
+        // Verify the code is for the mesh that was selected at request time.
+        // This fires when the vault_id doesn't match the discovered map — e.g.
+        // a stale window submitting a code for a mesh that was never discovered
+        // in this session.
         {
             let map = session.discovered.lock().await;
             if !map.contains_key(&vault_id) {
                 let _ = reply.send(Err(
-                    "Selected mesh has no discovered peers yet. Wait for discovery to find a peer."
-                        .to_string(),
+                    "That mesh is no longer the active pairing target.".to_string(),
                 ));
                 return;
             }

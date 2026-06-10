@@ -117,9 +117,9 @@ These are non-blocking but worth tracking:
 - `crates/sync-daemon/src/daemon.rs` is ~1600 lines and growing. Worth
   splitting into something like `daemon/mod.rs` + `daemon/initiator.rs` +
   `daemon/responder.rs` before Phase 6 adds more handlers.
-- `run_initiator_pairing` (daemon.rs) and `pair.rs::pair_inner` (CLI) share
-  the post-pair allowlist-write logic. Extracting into a `pair_shared.rs`
-  helper would prevent drift. Reviewer flagged in Wave A.
+- `run_initiator_pairing_parked` (daemon.rs) drives the two-step GUI flow;
+  `pair.rs::pair_inner` (CLI) drives the equivalent single-step flow. Both
+  share post-pair logic via `pair_shared::write_pair_allowlist`.
 - `SyncNode::subscribe_discovery()` is called twice in production (once by
   the daemon's run_loop, once per `DaemonCommand::StartDiscovery`). Verified
   in passing that iroh's `MdnsAddressLookup` supports multiple subscribers;
