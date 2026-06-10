@@ -24,18 +24,40 @@ Feature: Desktop tray pairing
 
   # --- Initiator flow ---
 
-  Scenario: Initiator pairs with a discovered mesh on the LAN
+  Scenario: Initiator pairs with a discovered mesh using the two-step flow
     Given the desktop app is running on Device A
     And a separate daemon is advertising mesh "M" on the LAN
     When the user clicks "Pair with nearby device…" on Device A
-    Then a window opens listing mesh "M" in the dropdown
-    When the user enters the 6-digit code shown on Device B
-    And clicks Pair
-    Then the window confirms success and closes
+    Then a window opens with mesh "M" in the dropdown
+    And the "Request pairing" button is enabled
+    And no code entry step is visible yet
+    When the user selects mesh "M" and clicks "Request pairing"
+    Then the button disables and the mesh dropdown locks
+    And the daemon connects to Device B, triggering B to display its 6-digit code
+    And stage 2 becomes visible with the prompt "Enter the code shown on <Device B>"
+    When the user enters the 6-digit code shown on Device B and clicks Pair
+    Then the window confirms "Paired with <Device B>. Closing…" and closes
     And Device A's allowlist contains Device B's PeerId
     And Device A adopts mesh "M"'s VaultId in .sync/metadata.toml
     And Device A re-joins the gossip topic for mesh "M"
     And Device A pulls Device B's notes into its configured vault folder
+
+  Scenario: Requesting a code reveals the code entry step
+    Given the initiator window is open with mesh "M" discovered
+    When the user selects mesh "M" and clicks "Request pairing"
+    Then the daemon fires RequestPairing for that vault_id
+    And on connect success the stage 2 code input appears
+    And the code input is focused
+    And the prompt names the responder device
+
+  Scenario: Re-requesting after a failed connect starts fresh
+    Given the initiator window is open with a mesh selected
+    And the user clicks "Request pairing" but the connect fails
+    Then an error is shown in the status area
+    And the "Request pairing" button re-enables
+    And the mesh dropdown unlocks
+    When the user clicks "Request pairing" again
+    Then a new RequestPairing command is sent cancelling the prior attempt
 
   Scenario: Initiator scan times out with no meshes nearby
     Given the desktop app is running with no nearby meshes
@@ -50,11 +72,15 @@ Feature: Desktop tray pairing
     And the active discovery scan terminates
     And starting a fresh pairing session is possible immediately
 
-  Scenario: Initiator surfaces a clear error when no discovered peer matches
-    Given the user submits a 6-digit code with no mesh selected
-    Or the user submits a code for a mesh that has not yet been discovered
-    Then the pairing attempt should fail with a "no discovered peers" message
-    And the Pair button should re-enable so the user can retry
+  Scenario: Initiator surfaces a clear error when no discovered peer is available at request time
+    Given the user clicks "Request pairing" for a mesh that has no discovered peers
+    Then RequestPairing fails with a "no discovered peers" message
+    And the "Request pairing" button re-enables so the user can retry
+
+  Scenario: Submitting a code without a prior RequestPairing returns a clear error
+    Given the user somehow invokes SubmitCode without a prior RequestPairing
+    Then the daemon replies with "no pairing request in progress"
+    And the daemon does not hang
 
   # --- Responder flow ---
 
