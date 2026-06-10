@@ -69,6 +69,7 @@
           opt.value = mesh.vault_id;
           opt.textContent = `${mesh.mesh_name} (${mesh.online_count} online)`;
           meshSel.appendChild(opt);
+          scanStatus.textContent = `Scanning… found ${meshes.size} so far`;
         });
 
         await listen('pair://discovery-finished', () => {
