@@ -222,6 +222,7 @@ fn main() -> Result<()> {
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             commands::start_pair_discovery,
+            commands::request_pairing,
             commands::submit_pair_code,
             commands::cancel_pair_discovery,
             commands::reject_inbound_pair,

@@ -79,11 +79,42 @@ pub async fn start_pair_discovery(
     Ok(())
 }
 
+/// Connect to the selected mesh and park the QUIC connection, triggering the
+/// responder to generate + display its 6-digit code.
+///
+/// Step 1 of the two-step GUI pairing flow. Sends `DaemonCommand::RequestPairing`
+/// and waits until the connection is established and the responder is showing its
+/// code. On success, returns the responder's device name so the UI can show
+/// "Enter the code shown on <device>". On failure, returns an error string so the
+/// UI can re-enable the Request button and let the user retry.
+#[tauri::command]
+pub async fn request_pairing(
+    vault_id: String,
+    control: State<'_, ControlState>,
+) -> Result<PairSuccessResult, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    control
+        .command_tx
+        .send(DaemonCommand::RequestPairing {
+            vault_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| "Daemon is not running".to_string())?;
+
+    let device_name = reply_rx
+        .await
+        .map_err(|_| "Daemon disconnected before replying".to_string())??;
+
+    Ok(PairSuccessResult { device_name })
+}
+
 /// Submit the 6-digit pairing code for the currently-selected mesh.
 ///
-/// Sends `DaemonCommand::SubmitCode` and waits for the daemon to complete the
-/// pairing exchange. Returns the paired device's name on success, or an error
-/// string on failure.
+/// Step 2 of the two-step GUI pairing flow. Requires a prior `request_pairing`
+/// call to have succeeded. Sends `DaemonCommand::SubmitCode` and waits for the
+/// daemon to complete the HMAC exchange. Returns the paired device's name on
+/// success, or an error string on failure.
 #[tauri::command]
 pub async fn submit_pair_code(
     vault_id: String,
