@@ -2657,6 +2657,149 @@ mod tests {
         assert!(vault2.is_file_deleted("note.md"));
     }
 
+    /// A registry-mediated move (tree.mov, same node, new parent path) must clean up
+    /// the old physical .md and .loro on the RECEIVER. Without this, every move leaves
+    /// an untracked orphan at the old path on every peer — the bug that accumulated 25
+    /// stranded root notes in production.
+    #[tokio::test]
+    async fn test_move_syncs_via_registry_removes_old_path() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Create file in vault1
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+
+        // Handshake so both vaults have note.md
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
+            .await
+            .unwrap();
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        assert!(!vault1.is_file_deleted("note.md"));
+        assert!(!vault2.is_file_deleted("note.md"));
+        assert!(fs2.exists("note.md").await.unwrap());
+        let old_sync_path = vault2.document_sync_path("note.md");
+
+        // Move note.md → moved/note.md on vault1 (mirror test_rename_file_updates_tree:
+        // write the target file, then rename_file performs the tree.mov + fs cleanup).
+        fs1.write("moved/note.md", b"# Hello").await.unwrap();
+        fs1.delete("note.md").await.unwrap();
+        vault1
+            .rename_file("note.md", "moved/note.md")
+            .await
+            .unwrap();
+
+        // Sync again — vault2 should see the move via registry
+        let request2 = vault2.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
+        let (_, _) = vault2
+            .process_sync_message(&exchange2.unwrap())
+            .await
+            .unwrap();
+
+        // Old path must be gone on the receiver: no orphaned .md, no orphaned .loro.
+        assert!(
+            !fs2.exists("note.md").await.unwrap(),
+            "old .md at note.md should be removed on the receiver after a move"
+        );
+        assert!(
+            !fs2.exists(&old_sync_path).await.unwrap(),
+            "old .loro for note.md should be removed on the receiver after a move"
+        );
+
+        // New path must exist with the original content.
+        assert!(
+            fs2.exists("moved/note.md").await.unwrap(),
+            "moved/note.md should exist on the receiver after a move"
+        );
+        let moved_content = fs2.read("moved/note.md").await.unwrap();
+        assert_eq!(moved_content, b"# Hello");
+    }
+
+    /// Swap case: two files exchange paths in a SINGLE registry exchange. The naive
+    /// move-cleanup (delete every vacated old_path) would delete the file the OTHER node
+    /// just moved into and strip its document update — permanent data loss on the receiver.
+    /// The fix excludes any old_path that an alive node now occupies. This pins that
+    /// exclusion against regression.
+    #[tokio::test]
+    async fn test_swap_move_syncs_via_registry() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Create two files in vault1
+        fs1.write("a.md", b"# AAA").await.unwrap();
+        fs1.write("b.md", b"# BBB").await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_peer_id()).await.unwrap();
+
+        // Handshake so both vaults have a.md and b.md
+        let vault2 = Vault::init(Arc::clone(&fs2), test_peer_id_2())
+            .await
+            .unwrap();
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+
+        assert_eq!(fs2.read("a.md").await.unwrap(), b"# AAA");
+        assert_eq!(fs2.read("b.md").await.unwrap(), b"# BBB");
+
+        // Swap on vault1: a.md → b.md and b.md → a.md via a temp path. Both moves accumulate
+        // in the registry and reach vault2 in ONE exchange.
+        fs1.write("tmp.md", b"# AAA").await.unwrap();
+        fs1.delete("a.md").await.unwrap();
+        vault1.rename_file("a.md", "tmp.md").await.unwrap();
+
+        fs1.write("a.md", b"# BBB").await.unwrap();
+        fs1.delete("b.md").await.unwrap();
+        vault1.rename_file("b.md", "a.md").await.unwrap();
+
+        fs1.write("b.md", b"# AAA").await.unwrap();
+        fs1.delete("tmp.md").await.unwrap();
+        vault1.rename_file("tmp.md", "b.md").await.unwrap();
+
+        // Sync the whole swap to vault2 in one exchange
+        let request2 = vault2.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
+        let (_, _) = vault2
+            .process_sync_message(&exchange2.unwrap())
+            .await
+            .unwrap();
+
+        // The B1 exclusion's job: both swapped-into paths must SURVIVE on the receiver.
+        // Without it, the naive move-cleanup deletes the file an alive node just moved into,
+        // so `fs2.exists(...)` goes false (data loss). With it, both files remain present.
+        // The final swapped CONTENT would be handled by apply_single_update's divergent-history
+        // reconciliation if content changes accompanied the move; this test pins the structural
+        // survival invariant, not the content flip (content was seeded at the pre-swap handshake
+        // and content correctness in the swap case is out of scope for this move-cleanup fix).
+        assert!(
+            fs2.exists("a.md").await.unwrap(),
+            "a.md must survive — not be deleted by b's vacate-cleanup"
+        );
+        assert!(
+            fs2.exists("b.md").await.unwrap(),
+            "b.md must survive — not be deleted by a's vacate-cleanup"
+        );
+    }
+
     // ========== SyncState Tests ==========
 
     #[test]

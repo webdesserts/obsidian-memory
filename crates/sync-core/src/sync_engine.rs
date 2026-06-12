@@ -19,6 +19,7 @@ use crate::fs::FileSystem;
 use crate::sync::{SyncMessage, SyncRequestData, SyncResponseData};
 use crate::vault::Vault;
 
+use loro::TreeID;
 use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -458,14 +459,43 @@ impl<F: FileSystem> Vault<F> {
 
     /// Apply registry updates from a sync response.
     ///
-    /// Imports the registry CRDT updates, identifies deleted paths, rebuilds the
-    /// path cache, and cleans up the filesystem for any deleted files.
+    /// Imports the registry CRDT updates, then cleans up the filesystem for paths the
+    /// registry vacated on this device:
     ///
-    /// Returns the list of paths that were deleted by this registry update, so the
-    /// caller can filter them out of subsequent document updates (which would
-    /// otherwise re-create the deleted files on disk).
+    /// - **Deletes** — a node whose path is now tombstoned in the tree. Detected from the
+    ///   pre-rebuild cache because Loro doesn't expose a deleted node's parent (so its path
+    ///   isn't walkable after rebuild).
+    /// - **Moves** — a node (same TreeID) that now lives at a different path than it did
+    ///   before this import (a `tree.mov` on the sender). The old physical .md/.loro would
+    ///   otherwise be left stranded as untracked orphans on every receiver. Detected by
+    ///   diffing the pre-import `path_to_node` snapshot against the rebuilt cache.
+    ///
+    /// A vacated path that some alive node NOW occupies is excluded from cleanup (B1): in a
+    /// swap (A leaves P1 while B moves into P1 in the same import) deleting B's freshly
+    /// arrived file — and dropping its document update — would be permanent data loss.
+    ///
+    /// Returns the union of removed (deleted + moved-away) paths, so the caller can strip
+    /// them from subsequent document updates (which would otherwise re-create the file on
+    /// disk under the old path).
+    ///
+    /// Out of scope here: emitting tombstones for paths that were never cached on this
+    /// device (uncached deletes/moves). That's the disk↔registry reconcile work item, not a
+    /// gap in this function — this function only reconciles paths it can observe vacating.
+    ///
+    /// Duplicate-node shadowing gap: when two alive nodes share one path (known production
+    /// debris), the rebuilt cache keeps one winner per path, so `node_to_new_path` (built by
+    /// inverting that cache) omits the shadowed node's TreeID. A genuine move of the shadowed
+    /// node is therefore not detected, leaving its old .md/.loro stranded. The failure mode is
+    /// always a missed cleanup (an orphan), never a false deletion. Resolved by the queued
+    /// registry-dedupe work item that removes duplicate nodes.
     async fn apply_registry_updates(&self, data: &[u8]) -> Result<Vec<String>> {
         debug!("apply_registry_updates: data_len={}", data.len());
+
+        // Snapshot the pre-import path→node mapping so we can detect moves after the cache is
+        // rebuilt. TreeID is Copy; `.clone()` copies the HashMap out of the guard, which is a
+        // temporary dropped at the end of this statement — before rebuild_path_cache
+        // re-acquires the same lock.
+        let pre_import_paths: HashMap<String, TreeID> = self.path_to_node().clone();
 
         // Import registry updates
         self.registry_mut().import(data).map_err(|e| {
@@ -494,8 +524,30 @@ impl<F: FileSystem> Vault<F> {
         // path is not blocked — no separate record/clear bookkeeping is needed here.
         self.rebuild_path_cache();
 
-        // Clean up filesystem for deleted files
-        self.apply_registry_changes(&deleted_paths).await?;
+        // Detect moves: an old path whose node (same TreeID) now lives at a different path.
+        // This is orthogonal to the deleted-paths set above (which keys on tombstoned nodes);
+        // a moved node stays alive, just under a new path.
+        let mut removed_paths = deleted_paths;
+        {
+            let rebuilt_cache = self.path_to_node();
+            let node_to_new_path: HashMap<TreeID, &String> =
+                rebuilt_cache.iter().map(|(p, id)| (*id, p)).collect();
+
+            for (old_path, node_id) in &pre_import_paths {
+                if let Some(new_path) = node_to_new_path.get(node_id)
+                    && *new_path != old_path
+                {
+                    // B1 exclusion: a vacated path that an alive node now occupies must be
+                    // neither fs-cleaned nor filtered from doc updates (the swap case).
+                    if !rebuilt_cache.contains_key(old_path) {
+                        removed_paths.push(old_path.clone());
+                    }
+                }
+            }
+        }
+
+        // Clean up filesystem for vacated (deleted + moved-away) paths
+        self.apply_registry_changes(&removed_paths).await?;
 
         // Save updated registry to disk
         let registry_bytes = self
@@ -514,10 +566,10 @@ impl<F: FileSystem> Vault<F> {
         self.mark_registry_synced();
 
         debug!(
-            "apply_registry_updates: complete, deleted={:?}",
-            deleted_paths
+            "apply_registry_updates: complete, removed={:?}",
+            removed_paths
         );
-        Ok(deleted_paths)
+        Ok(removed_paths)
     }
 
     /// Apply filesystem cleanup for a set of deleted paths.
