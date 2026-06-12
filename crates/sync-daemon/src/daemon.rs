@@ -1387,9 +1387,32 @@ pub async fn run_with_shutdown_controlled(
     let startup_result = tokio::select! {
         result = startup_inner(&config, shutdown.clone()) => result,
         _ = shutdown.cancelled() => {
-            // Cancel during startup — lock cleanup via RAII, relay_url cleanup deferred
-            // (same reasoning as in run_with_shutdown).
+            // Cancel during startup — DaemonLock cleanup is RAII (dropped with the future).
             info!("Daemon shutdown requested during startup — exiting cleanly");
+
+            // Best-effort: if startup_inner wrote relay_url to daemon.toml before the
+            // future was cancelled (it writes synchronously after the relay starts, then
+            // awaits SyncNode::new), clear it now. Without this, the file is left with a
+            // stale relay_url that peers could read between this cancelled run and the next
+            // startup (which also clears it, but only after re-starting).
+            let config_path = config.vault.join(".sync/daemon.toml");
+            if config_path.exists() {
+                match std::fs::read_to_string(&config_path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| toml::from_str::<DaemonConfig>(&s).map_err(Into::into))
+                {
+                    Ok(mut cfg) if cfg.relay_url.is_some() => {
+                        if let Err(e) = cfg.set_relay_url(None, &config.vault) {
+                            warn!("Failed to clear relay URL after mid-startup cancel: {}", e);
+                        }
+                    }
+                    Ok(_) => {} // relay_url already absent — nothing to do
+                    Err(e) => {
+                        warn!("Could not parse daemon.toml to clear relay URL after cancel: {}", e);
+                    }
+                }
+            }
+
             // Return a no-op handle that resolves immediately.
             let handle = tokio::spawn(async { Ok(()) });
             let (status_tx, status_rx) = watch::channel(DaemonStatus::initial());
