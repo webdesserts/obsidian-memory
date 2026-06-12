@@ -1853,4 +1853,148 @@ mod tests {
             "tombstone on root note.md must not be cleared by unrelated update"
         );
     }
+
+    /// After a daemon restart, a registry tombstone must still block resurrection.
+    ///
+    /// This is the production "charon recreated 12 deleted root notes" bug: the old guard
+    /// lived in an in-memory session set that was empty after restart, so a stale peer's
+    /// DocumentUpdate for a long-deleted path created the file as a disk orphan. The fix
+    /// derives the guard from the persisted registry, so it survives the reload.
+    #[tokio::test]
+    async fn test_cold_restart_tombstone_blocks_resurrection() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Vault 1 creates note.md and syncs it to vault 2.
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2())
+            .await
+            .unwrap();
+
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+        assert!(fs2.exists("note.md").await.unwrap(), "setup: vault2 should have note.md");
+
+        // Vault 2 deletes the file locally (disk delete, then registry tombstone).
+        // delete_file persists the registry, so the tombstone is on fs2's disk.
+        fs2.delete("note.md").await.unwrap();
+        vault2.delete_file("note.md").await.unwrap();
+
+        // Simulate a daemon restart: reload vault2 from its persisted storage. The reload
+        // gets a fresh SyncState with an empty session set; the guard must instead come
+        // from the registry re-imported off disk.
+        drop(vault2);
+        let vault2 = Vault::load(Arc::clone(&fs2), test_author_2())
+            .await
+            .unwrap();
+        assert!(
+            vault2.is_path_deleted_in_registry("note.md"),
+            "deleted path must be recovered from the persisted registry after restart"
+        );
+
+        // A stale vault1 still has the file and broadcasts a DocumentUpdate.
+        let update = vault1
+            .prepare_document_update("note.md")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The reloaded vault2 must NOT resurrect the file.
+        let (_, modified) = vault2.process_sync_message(&update).await.unwrap();
+        assert!(
+            modified.is_empty(),
+            "post-restart DocumentUpdate for a deleted path must be skipped (got modified={:?})",
+            modified
+        );
+        assert!(
+            !fs2.exists("note.md").await.unwrap(),
+            "deleted file must not reappear on disk after restart + inbound DocumentUpdate"
+        );
+    }
+
+    /// After a restart, a peer's legitimate re-create at a previously-deleted path must
+    /// still be accepted — "alive wins" survives the reload. Without it, the restored
+    /// tombstone would block the new file forever.
+    #[tokio::test]
+    async fn test_cold_restart_alive_node_allows_create() {
+        use std::sync::Arc;
+
+        let fs1 = Arc::new(InMemoryFs::new());
+        let fs2 = Arc::new(InMemoryFs::new());
+
+        // Vault 1 creates note.md and syncs it to vault 2.
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        let vault1 = Vault::init(Arc::clone(&fs1), test_author()).await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        let vault2 = Vault::init(Arc::clone(&fs2), test_author_2())
+            .await
+            .unwrap();
+
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+        assert!(fs2.exists("note.md").await.unwrap(), "setup: vault2 should have note.md");
+
+        // Both vaults delete note.md independently — both persist a tombstone.
+        fs1.delete("note.md").await.unwrap();
+        vault1.delete_file("note.md").await.unwrap();
+        fs2.delete("note.md").await.unwrap();
+        vault2.delete_file("note.md").await.unwrap();
+
+        // Restart vault2 — the persisted tombstone is restored into deleted_paths.
+        drop(vault2);
+        let vault2 = Vault::load(Arc::clone(&fs2), test_author_2())
+            .await
+            .unwrap();
+        assert!(
+            vault2.is_path_deleted_in_registry("note.md"),
+            "tombstone should be restored after restart before the re-create syncs"
+        );
+
+        // Vault 1 re-creates note.md as a brand-new alive registry node.
+        fs1.write("note.md", b"# Brand new").await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+
+        // Vault 1 syncs the new alive node + document to the reloaded vault2. The registry
+        // import → rebuild_path_cache sees note.md alive and drops it from deleted_paths
+        // (alive wins), so the document create is allowed.
+        let request2 = vault2.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
+        let (_, modified) = vault2
+            .process_sync_message(&exchange2.unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            modified.contains(&"note.md".to_string()),
+            "re-create must be allowed after restart (got modified={:?})",
+            modified
+        );
+        assert!(
+            fs2.exists("note.md").await.unwrap(),
+            "re-created file must appear on the reloaded vault2's filesystem"
+        );
+        let doc = vault2.get_document("note.md").await.unwrap();
+        assert!(
+            doc.to_markdown().contains("Brand new"),
+            "reloaded vault2 must have the re-created content"
+        );
+    }
 }
