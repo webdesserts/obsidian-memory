@@ -21,12 +21,7 @@ use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 use sync_daemon::relay::EmbeddedRelay;
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
-/// Generate a deterministic 32-byte key seed from a small integer.
-fn seed(n: u8) -> [u8; 32] {
-    [n; 32]
-}
+mod common;
 
 // ── tests ─────────────────────────────────────────────────────────────────
 
@@ -49,8 +44,8 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 
     // Create two nodes that only know about the relay — no direct address
     // exchange. They can only reach each other by routing through the relay.
-    let node_a = SyncNode::new(seed(101), Some(&relay_url), allowlist_a.clone()).await?;
-    let node_b = SyncNode::new(seed(102), Some(&relay_url), allowlist_b.clone()).await?;
+    let node_a = SyncNode::new(common::seed(101), Some(&relay_url), allowlist_a.clone()).await?;
+    let node_b = SyncNode::new(common::seed(102), Some(&relay_url), allowlist_b.clone()).await?;
 
     // Pre-populate each allowlist with the other node's PeerId so gossip is accepted.
     let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
@@ -152,7 +147,7 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(seed(10), None, allowlist).await?;
+    let node = SyncNode::new(common::seed(10), None, allowlist).await?;
 
     // Use a second node's id as the "peer" and a standalone relay URL.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -198,7 +193,7 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(seed(30), None, allowlist).await?;
+    let node = SyncNode::new(common::seed(30), None, allowlist).await?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let relay = EmbeddedRelay::start(bind_addr).await?;
@@ -226,7 +221,7 @@ async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_empty_peer_relays_leaves_lookup_empty() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(seed(20), None, allowlist).await?;
+    let node = SyncNode::new(common::seed(20), None, allowlist).await?;
 
     // A deterministic peer id derived from a key seed (distinct from the node's own seed).
     let peer_secret = SecretKey::from_bytes(&[99u8; 32]);
@@ -277,8 +272,8 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
     // Node A: home relay = R_a (url_a is in its RelayMap).
     // Node B: home relay = R_b (url_b is in its RelayMap).
     // Neither node has the other's relay in its own RelayMap.
-    let node_a = SyncNode::new(seed(51), Some(&url_a), allowlist_a.clone()).await?;
-    let node_b = SyncNode::new(seed(52), Some(&url_b), allowlist_b.clone()).await?;
+    let node_a = SyncNode::new(common::seed(51), Some(&url_a), allowlist_a.clone()).await?;
+    let node_b = SyncNode::new(common::seed(52), Some(&url_b), allowlist_b.clone()).await?;
 
     let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
     let peer_b = PeerId::from_bytes(*node_b.node_id().as_bytes());

@@ -15,6 +15,8 @@
 /// into `file_event_tx` — no real OS filesystem required.
 ///
 /// Seeds 20+ are used to avoid collisions with sync_workflow.rs (seeds 1–10).
+mod common;
+
 mod daemon_integration {
     use std::sync::Arc;
     use std::time::Duration;
@@ -34,11 +36,6 @@ mod daemon_integration {
     use sync_daemon::watcher::{FileEvent, FileEventKind};
 
     // ── helpers ───────────────────────────────────────────────────────────────
-
-    /// Deterministic 32-byte seed for building test nodes.
-    fn seed(n: u8) -> [u8; 32] {
-        [n; 32]
-    }
 
     /// Shared gossip topic so all test daemons join the same swarm.
     fn shared_vault_id() -> VaultId {
@@ -77,12 +74,12 @@ mod daemon_integration {
         let fs = Arc::new(InMemoryFs::new());
         // Author Loro ops under a per-device PeerId derived from this node's
         // secret seed, so each node is a distinct Loro replica.
-        let author = PeerId::from_secret_bytes(seed(seed_byte));
+        let author = PeerId::from_secret_bytes(super::common::seed(seed_byte));
         let vault = Vault::init(fs.clone(), author).await?;
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let sync_node = SyncNode::new(seed(seed_byte), None, allowlist.clone()).await?;
+        let sync_node = SyncNode::new(super::common::seed(seed_byte), None, allowlist.clone()).await?;
 
         let memory_lookup = MemoryLookup::new();
         sync_node.endpoint.address_lookup()?.add(memory_lookup);
