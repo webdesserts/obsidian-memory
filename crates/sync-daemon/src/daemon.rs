@@ -15,7 +15,7 @@ use crate::persistence::DaemonConfig;
 use crate::relay::EmbeddedRelay;
 use crate::watcher::{FileEvent, FileEventKind, FileWatcher};
 use anyhow::{Context, Result};
-use iroh::EndpointId;
+use iroh::{EndpointId, RelayUrl};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1604,6 +1604,42 @@ async fn startup_inner(
         .context("Failed to create iroh SyncNode")?;
 
     info!(node_id = %sync_node.node_id(), "Iroh node started");
+
+    // Seed the address-lookup service with known peer relay hints so gossip
+    // bootstrap can reach off-LAN peers through their relay without waiting
+    // for re-pairing. Each entry was recorded via upsert_peer_relay at
+    // pairing time. Malformed entries are skipped with a warning.
+    let seeded_count = {
+        let mut count = 0usize;
+        for peer_relay in &daemon_config.peer_relays {
+            let endpoint_id = match peer_relay.endpoint_id.parse::<EndpointId>() {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(
+                        endpoint_id = %peer_relay.endpoint_id,
+                        "Skipping peer relay hint — invalid endpoint_id: {e}"
+                    );
+                    continue;
+                }
+            };
+            let relay_url_parsed = match peer_relay.relay_url.parse::<RelayUrl>() {
+                Ok(url) => url,
+                Err(e) => {
+                    warn!(
+                        relay_url = %peer_relay.relay_url,
+                        "Skipping peer relay hint — invalid relay URL: {e}"
+                    );
+                    continue;
+                }
+            };
+            sync_node.add_peer_relay(endpoint_id, &relay_url_parsed);
+            count += 1;
+        }
+        count
+    };
+    if seeded_count > 0 {
+        info!(count = seeded_count, "Seeded peer relay hints into address lookup");
+    }
 
     let mesh_name = daemon_config.mesh_name.clone().unwrap_or_else(|| {
         config

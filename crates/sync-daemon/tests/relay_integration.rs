@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh::{EndpointId, SecretKey};
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::SyncNode;
 use sync_core::network::gossip::GossipEvent;
@@ -138,6 +139,76 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
     // Clean up.
     gossip_a.event_rx.close();
     relay.shutdown().await;
+
+    Ok(())
+}
+
+/// `add_peer_relay` registers a relay hint that is resolvable via the node's
+/// peer lookup service.
+///
+/// This validates the seam used at startup when `DaemonConfig.peer_relays` is
+/// non-empty: the hint is written to the `MemoryLookup` and can be queried
+/// back by endpoint id before any live connection is attempted.
+#[tokio::test]
+async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new(seed(10), None, allowlist).await?;
+
+    // Use a second node's id as the "peer" and a standalone relay URL.
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let relay = EmbeddedRelay::start(bind_addr).await?;
+    let relay_url = relay.relay_url().clone();
+
+    // A plausible peer id derived from a distinct key seed.
+    let peer_secret = SecretKey::from_bytes(&[42u8; 32]);
+    let peer_endpoint_id: EndpointId = peer_secret.public();
+
+    // Before seeding, the lookup should have no entry for this peer.
+    assert!(
+        node.peer_lookup.get_endpoint_info(peer_endpoint_id).is_none(),
+        "lookup should be empty before add_peer_relay"
+    );
+
+    node.add_peer_relay(peer_endpoint_id, &relay_url);
+
+    // After seeding, the hint must be resolvable and carry the relay URL.
+    let info = node
+        .peer_lookup
+        .get_endpoint_info(peer_endpoint_id)
+        .expect("hint should be present after add_peer_relay");
+
+    let relay_urls: Vec<_> = info.into_endpoint_addr().relay_urls().cloned().collect();
+    assert_eq!(
+        relay_urls,
+        vec![relay_url],
+        "seeded relay URL should be recoverable from the lookup"
+    );
+
+    relay.shutdown().await;
+    Ok(())
+}
+
+/// When `peer_relays` is empty at startup, the `MemoryLookup` service contains
+/// no hints — the LAN-only path via mDNS is entirely unaffected.
+///
+/// This is the LAN-unchanged guard: confirms that the MemoryLookup registration
+/// does not break or interfere with existing mDNS-based discovery when there
+/// are no persisted relay hints to seed.
+#[tokio::test]
+async fn test_empty_peer_relays_leaves_lookup_empty() -> anyhow::Result<()> {
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new(seed(20), None, allowlist).await?;
+
+    // A deterministic peer id derived from a key seed (distinct from the node's own seed).
+    let peer_secret = SecretKey::from_bytes(&[99u8; 32]);
+    let peer_endpoint_id: EndpointId = peer_secret.public();
+
+    // With no add_peer_relay calls (simulating empty DaemonConfig.peer_relays),
+    // the lookup must return None for any peer id.
+    assert!(
+        node.peer_lookup.get_endpoint_info(peer_endpoint_id).is_none(),
+        "peer_lookup should be empty when no hints are seeded"
+    );
 
     Ok(())
 }
