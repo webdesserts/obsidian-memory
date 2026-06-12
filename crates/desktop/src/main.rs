@@ -58,6 +58,74 @@ fn detect_lan_ip() -> Option<std::net::IpAddr> {
     local_ip_address::local_ip().ok()
 }
 
+/// Resolve the URL to advertise for this node's embedded relay.
+///
+/// Priority (highest to lowest):
+/// 1. `OBSIDIAN_MEMORY_RELAY_URL` env var — explicit stable URL (e.g. umbra running
+///    with a public hostname). Takes precedence over everything when set and non-empty.
+/// 2. Detected LAN IP — the default on a machine without a stable public URL.
+/// 3. `None` — relay starts but can't be reached by off-LAN peers.
+///
+/// Extracted as a pure function so the logic is testable without launching Tauri.
+fn resolve_advertised_relay_url(
+    env_val: Option<String>,
+    detected: Option<std::net::IpAddr>,
+) -> Option<String> {
+    if let Some(url) = env_val.filter(|v| !v.is_empty()) {
+        return Some(url);
+    }
+    detected.map(|ip| format!("http://{}:{}/", ip, RELAY_PORT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn env_override_wins_over_detected_ip() {
+        let env_url = Some("http://umbra.computer:3340/".to_string());
+        let detected = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+        assert_eq!(
+            resolve_advertised_relay_url(env_url, detected),
+            Some("http://umbra.computer:3340/".to_string()),
+        );
+    }
+
+    #[test]
+    fn env_override_wins_even_without_detected_ip() {
+        let env_url = Some("http://umbra.computer:3340/".to_string());
+        assert_eq!(
+            resolve_advertised_relay_url(env_url, None),
+            Some("http://umbra.computer:3340/".to_string()),
+        );
+    }
+
+    #[test]
+    fn detected_ip_used_when_no_env_override() {
+        let detected = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+        assert_eq!(
+            resolve_advertised_relay_url(None, detected),
+            Some(format!("http://192.168.1.10:{}/", RELAY_PORT)),
+        );
+    }
+
+    #[test]
+    fn empty_env_var_falls_through_to_detected_ip() {
+        // An empty env var is treated as unset — the user didn't intend an override.
+        let detected = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            resolve_advertised_relay_url(Some(String::new()), detected),
+            Some(format!("http://10.0.0.1:{}/", RELAY_PORT)),
+        );
+    }
+
+    #[test]
+    fn none_when_no_env_and_no_detected_ip() {
+        assert_eq!(resolve_advertised_relay_url(None, None), None);
+    }
+}
+
 fn main() -> Result<()> {
     // Read the vault path from the environment — the only supported configuration
     // surface in Phase 1. Phase 6 adds a vault-picker UI.
@@ -80,13 +148,21 @@ fn main() -> Result<()> {
     info!("Starting Memory");
     info!("Vault: {:?}", vault_path);
 
-    // Detect the LAN IP for the relay's advertised URL. The relay binds to
-    // 0.0.0.0:RELAY_PORT (all interfaces) but peers need a dialable address.
-    let advertised_relay_url = match detect_lan_ip() {
-        Some(ip) => {
-            let url = format!("http://{}:{}/", ip, RELAY_PORT);
+    // Resolve the URL advertised to peers for this node's embedded relay.
+    //
+    // The env var `OBSIDIAN_MEMORY_RELAY_URL` takes precedence so stable-hostname
+    // machines (e.g. umbra) can advertise a public URL instead of the detected LAN
+    // IP. When unset, fall back to LAN IP detection. Log which source won.
+    let env_relay_url = std::env::var("OBSIDIAN_MEMORY_RELAY_URL").ok();
+    let detected_ip = detect_lan_ip();
+    let advertised_relay_url = resolve_advertised_relay_url(env_relay_url.clone(), detected_ip);
+
+    match &advertised_relay_url {
+        Some(url) if env_relay_url.as_deref().is_some_and(|v| !v.is_empty()) => {
+            info!("Relay will advertise URL from OBSIDIAN_MEMORY_RELAY_URL: {}", url);
+        }
+        Some(url) => {
             info!("Relay will advertise LAN URL: {}", url);
-            Some(url)
         }
         None => {
             warn!(
@@ -95,9 +171,8 @@ fn main() -> Result<()> {
                  Check your network connection.",
                 RELAY_PORT
             );
-            None
         }
-    };
+    }
 
     let daemon_config = DaemonRunConfig {
         vault: vault_path,
