@@ -286,10 +286,18 @@ impl SyncNode {
     /// called at startup for each entry in `DaemonConfig.peer_relays`, and at
     /// runtime after a successful pairing.
     ///
-    /// The hint does not guarantee reachability — if the relay is unreachable the
-    /// connection attempt falls back to direct paths found via mDNS.
+    /// If the relay is unreachable off-LAN, connection attempts through that hint
+    /// will simply fail; there is no automatic fallback to mDNS off-LAN because
+    /// mDNS does not operate across network boundaries.
     #[cfg(feature = "native")]
     pub fn add_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
+        if endpoint_id == self.node_id() {
+            tracing::warn!(
+                "add_peer_relay called with our own EndpointId — ignoring to prevent \
+                 self-connect (iroh rejects self-directed relay paths)"
+            );
+            return;
+        }
         let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.clone());
         self.peer_lookup.add_endpoint_info(addr);
     }

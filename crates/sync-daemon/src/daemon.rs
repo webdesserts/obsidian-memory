@@ -138,6 +138,11 @@ pub struct Daemon<FS: FileSystem, AL> {
 struct InitiatorPairOutcome {
     result: sync_core::pairing::PairingResult,
     responder_device_name: String,
+    /// The transport-verified `EndpointId` of the responder — the QUIC connection
+    /// target the initiator dialed. Used to key the persisted relay hint so we
+    /// don't infer the responder's identity from `mesh_members` (which is not
+    /// transport-verified).
+    responder_endpoint_id: EndpointId,
 }
 
 /// State tracked between `StartDiscovery`, `RequestPairing`, and `SubmitCode`
@@ -589,9 +594,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 Some((result, responder_device_name)) => {
                     // A completed exchange (success or bad HMAC) must be onboarded under
                     // `&mut self`. If the send fails the daemon is shutting down.
+                    //
+                    // `peer_endpoint_id` is the QUIC connection target the initiator dialed
+                    // — transport-verified by the TLS handshake. We carry it through so
+                    // `on_initiator_pair_outcome` can key the persisted relay hint without
+                    // guessing from `mesh_members`.
                     let outcome = InitiatorPairOutcome {
                         result,
                         responder_device_name,
+                        responder_endpoint_id: peer_endpoint_id,
                     };
                     let _ = outcome_tx.send(outcome);
                 }
@@ -669,6 +680,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let InitiatorPairOutcome {
             result,
             responder_device_name,
+            responder_endpoint_id,
         } = outcome;
 
         // Recover the Pair button's reply oneshot from the session. If absent
@@ -725,9 +737,20 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         }
 
-        // Persist the mesh's relay URL for the next daemon start (not a live
-        // endpoint rebuild — see `persist_adopted_relay`).
-        crate::pair_shared::persist_adopted_relay(&self.vault_path, &result.relay_urls).await;
+        // Persist the responder's relay URL keyed by their transport-verified
+        // EndpointId and seed the live lookup so the current session can reach
+        // them through their relay without a restart.
+        //
+        // `responder_endpoint_id` is the QUIC connection target the initiator
+        // dialed — not inferred from `mesh_members` — so the binding is correct
+        // even if `mesh_members` ordering or contents differ.
+        crate::pair_shared::persist_adopted_relay(
+            &self.vault_path,
+            responder_endpoint_id,
+            &result.relay_urls,
+            &self.sync_node,
+        )
+        .await;
 
         let _ = reply.send(Ok(responder_device_name));
     }

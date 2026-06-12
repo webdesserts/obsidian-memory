@@ -188,6 +188,35 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `add_peer_relay` silently ignores a call where the target id equals the
+/// node's own EndpointId, leaving the lookup empty.
+///
+/// iroh rejects self-directed relay paths, so seeding our own id into the
+/// lookup is a footgun (`upsert_peer_relay` in persistence skips self, but
+/// `add_peer_relay` is also called directly after pairing; this guard closes
+/// the gap at the method level).
+#[tokio::test]
+async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new(seed(30), None, allowlist).await?;
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let relay = EmbeddedRelay::start(bind_addr).await?;
+    let relay_url = relay.relay_url().clone();
+
+    // Calling add_peer_relay with our own id should be a no-op.
+    node.add_peer_relay(node.node_id(), &relay_url);
+
+    // The lookup must remain empty — no self-hint was registered.
+    assert!(
+        node.peer_lookup.get_endpoint_info(node.node_id()).is_none(),
+        "self-id should not be seeded into the peer lookup"
+    );
+
+    relay.shutdown().await;
+    Ok(())
+}
+
 /// When `peer_relays` is empty at startup, the `MemoryLookup` service contains
 /// no hints — the LAN-only path via mDNS is entirely unaffected.
 ///

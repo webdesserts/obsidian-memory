@@ -236,7 +236,13 @@ async fn pair_inner(
     if let Err(e) = crate::pair_shared::adopt_vault_id_on_disk(vault_path, new_id).await {
         eprintln!("Warning: failed to adopt the mesh VaultId: {}", e);
     }
-    crate::pair_shared::persist_adopted_relay(vault_path, &result.relay_urls).await;
+    crate::pair_shared::persist_adopted_relay(
+        &vault_path,
+        peer_endpoint_id,
+        &result.relay_urls,
+        &sync_node,
+    )
+    .await;
 
     eprintln!();
     eprintln!("Pairing complete. Start the sync daemon to begin syncing.");
