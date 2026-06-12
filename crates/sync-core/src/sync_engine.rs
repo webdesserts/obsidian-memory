@@ -1765,7 +1765,10 @@ mod tests {
         vault1.fs.write("note.md", b"# Brand new").await.unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
         // on_file_changed -> register_file writes a new alive node for the path, so the
-        // registry no longer reports it deleted.
+        // registry no longer reports it deleted. This intentionally checks registry-tree
+        // truth (is_file_deleted), NOT the deleted_paths session set: by design that set
+        // keeps a stale entry until the next rebuild_path_cache, and the entry is
+        // unreachable for in-cache documents (inbound updates take the exists/merge branch).
         assert!(!vault1.is_file_deleted("note.md"), "register_file must make the path alive again");
 
         // Vault 1 syncs to vault 2. The SyncExchange delivers:

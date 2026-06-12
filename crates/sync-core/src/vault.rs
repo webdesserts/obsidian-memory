@@ -1395,8 +1395,15 @@ impl<F: FileSystem> Vault<F> {
 
         // Deleted file paths recovered from node meta. A deleted node's real path is not
         // walkable (Loro reports its parent as `Deleted`), so we read the `path` meta
-        // written at registration. Nodes deleted before that meta existed are skipped
-        // (the documented residual gap — their historic tombstones aren't path-recoverable).
+        // written at registration.
+        //
+        // Residual gap: the `path` meta is only written by builds that include this change,
+        // so any node deleted before this build first ran on a given device carries no
+        // `path` meta and is skipped here. In practice that means pre-existing production
+        // tombstones are NOT guarded — only deletions made post-upgrade are recoverable by
+        // path and thus protected against restart-time resurrection. This is bounded: those
+        // historic tombstones have already CRDT-synced to peers, and every delete from here
+        // forward is fully durable. Closing it would require a one-time backfill (out of scope).
         let mut deleted_paths: HashSet<String> = HashSet::new();
 
         for node_id in tree.nodes() {
@@ -1589,9 +1596,12 @@ impl<F: FileSystem> Vault<F> {
         // Update cache
         self.path_to_node_mut().insert(path.to_string(), node_id);
 
-        // A local re-create at a previously-deleted path is now alive in the cache; the
-        // next rebuild_path_cache drops it from deleted_paths ("alive wins"), so no
-        // explicit un-tombstone is needed.
+        // A local re-create at a previously-deleted path leaves the path in deleted_paths
+        // until the next rebuild_path_cache. That stale entry is harmless: on_file_changed
+        // has already written the .loro and cached the document, so any inbound
+        // DocumentUpdate for this path takes the exists/merge branch in apply_single_update
+        // and never reaches the is_path_deleted_in_registry guard. The next
+        // rebuild_path_cache then drops the path ("alive wins") as eventual cleanup.
 
         tracing::debug!("Registered file in tree: {}", path);
         Ok(node_id)
