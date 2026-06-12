@@ -427,25 +427,27 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 
     /// Handle a file modification — update vault state then notify peers.
+    ///
+    /// The sync-flag early-return was removed: `on_file_changed` is echo-safe
+    /// (diff-and-merge returns false when content is unchanged) so we always apply
+    /// the event and gate the broadcast on whether the doc actually changed.
     async fn on_file_modified(&mut self, path: &str) {
         let vault = self.vault.lock().await;
-
-        if vault.consume_sync_flag(path) {
-            debug!("Skipping broadcast for synced file: {}", path);
-            return;
-        }
 
         // Always update vault state so .loro files stay current for future sync exchanges.
         // Without this, edits made while no peers are connected would be silently lost
         // when a peer connects — prepare_sync_request trusts .loro state, with no fallback.
-        if let Err(e) = vault.on_file_changed(path).await {
-            error!("Failed to process file change for {}: {}", path, e);
-            return;
-        }
+        let changed = match vault.on_file_changed(path).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to process file change for {}: {}", path, e);
+                return;
+            }
+        };
 
         drop(vault);
 
-        if self.peer_registry.lock().await.alive_count() == 0 {
+        if !changed || self.peer_registry.lock().await.alive_count() == 0 {
             return;
         }
 

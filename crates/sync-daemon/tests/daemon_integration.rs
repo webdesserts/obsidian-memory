@@ -526,17 +526,19 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// The sync flag prevents a locally-written file from triggering a re-broadcast.
+    /// An inbound-sync write does not trigger a re-broadcast when the OS watcher
+    /// fires a spurious `Modified` event for the same path.
     ///
-    /// When the daemon receives a file via inbound sync, the vault records a sync
-    /// flag for that path. If the OS watcher then fires `Modified` for that same
-    /// path, `on_file_modified` consumes the sync flag and skips broadcasting.
+    /// After receiving a file via inbound sync, the file watcher may fire `Modified`
+    /// for the path the daemon just wrote. Because `on_file_changed` is echo-safe
+    /// (diff-and-merge returns `false` when the disk content matches the stored Loro
+    /// state), the daemon sees `changed = false` and skips broadcasting.
     ///
-    /// We verify this by injecting a spurious `Modified` for a synced path and
-    /// asserting B's file content remains unchanged — no corruption from an extra
-    /// on_file_changed call replaying stale local state.
+    /// We verify by injecting a spurious `Modified` on B after A→B sync completes
+    /// and asserting B's content is unchanged — no corruption from re-broadcasting
+    /// stale local state.
     #[tokio::test]
-    async fn test_sync_flag_prevents_rebroadcast() -> anyhow::Result<()> {
+    async fn test_inbound_sync_does_not_rebroadcast() -> anyhow::Result<()> {
         let node_a = build_node(26).await?;
         let node_b = build_node(27).await?;
 
@@ -1351,6 +1353,96 @@ mod daemon_integration {
         let _ = b_loop.await;
         let _ = a_loop.await;
         relay.shutdown().await;
+
+        Ok(())
+    }
+
+    /// A real local edit propagates to a peer even when the sync flag is armed for that path.
+    ///
+    /// Background: `mark_synced` simulates the lingering-flag window that arises when an
+    /// inbound sync write triggers a watcher event that is processed after the TTL — or
+    /// simply when the flag is stale. Before the fix, `on_file_modified` consumed the flag
+    /// and returned early, skipping both `vault.on_file_changed` and the gossip broadcast.
+    /// The peer would never receive the edit; the next full sync would revert it.
+    ///
+    /// After the fix the daemon always calls `vault.on_file_changed`, which is echo-safe
+    /// (returns false for unchanged content), and gates the broadcast on the returned bool.
+    ///
+    /// Seeds 70/71 reserved.
+    #[tokio::test]
+    async fn test_local_edit_during_armed_flag_propagates_to_peer() -> anyhow::Result<()> {
+        let node_a = build_node(70).await?;
+        let node_b = build_node(71).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Create the initial file on A and let it sync to B so B is primed.
+        daemon_a
+            .fs
+            .write("notes/flag-edit.md", b"# Original")
+            .await?;
+        inject_modified(&daemon_a, "notes/flag-edit.md");
+
+        wait_until("B has initial notes/flag-edit.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/flag-edit.md".to_string())
+            }
+        })
+        .await;
+
+        // Arm the sync flag on A for this path — simulates the lingering-flag window
+        // after an inbound sync write where the watcher event arrives late.
+        {
+            let vault = daemon_a.vault.lock().await;
+            vault.mark_synced("notes/flag-edit.md");
+        }
+
+        // Make a real local edit to the file on A's filesystem.
+        daemon_a
+            .fs
+            .write("notes/flag-edit.md", b"# Edited after sync flag armed")
+            .await?;
+
+        // Inject the modification event — this is what the OS watcher would deliver.
+        inject_modified(&daemon_a, "notes/flag-edit.md");
+
+        // B must receive the updated content despite the armed flag on A.
+        wait_until("B has the edited content of notes/flag-edit.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                let vault = vault.lock().await;
+                if let Ok(content) = vault.get_document("notes/flag-edit.md").await {
+                    content.body().to_string().contains("Edited after sync flag armed")
+                } else {
+                    false
+                }
+            }
+        })
+        .await;
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
 
         Ok(())
     }

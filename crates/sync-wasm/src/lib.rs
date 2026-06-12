@@ -363,6 +363,7 @@ mod wasm_impl {
             self.inner
                 .on_file_changed(path)
                 .await
+                .map(|_| ())
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 

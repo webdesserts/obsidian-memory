@@ -1059,6 +1059,13 @@ impl<F: FileSystem> Vault<F> {
 
     /// Check if a path was synced and consume the flag.
     /// Returns true once (and clears the flag), false on subsequent calls.
+    ///
+    /// Note: the production read-side (daemon `on_file_modified`/`on_file_deleted`) no
+    /// longer consults this flag — those handlers now gate on the apply primitives'
+    /// return values (`on_file_changed` → bool, `delete_file` → bool). The arming side
+    /// (`mark_synced`) still feeds `pending_reconcile` which is load-bearing for
+    /// `ensure_consistency`. Reap the `synced_paths` echo machinery in a later cleanup
+    /// once the concurrent sync_engine work lands.
     pub fn consume_sync_flag(&self, path: &str) -> bool {
         self.sync_state.consume_synced(path)
     }
@@ -1194,10 +1201,17 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Uses diff-and-merge to update existing documents, preserving peer ID.
     /// Only creates a new document if no .loro file exists on disk.
-    pub async fn on_file_changed(&self, path: &str) -> Result<()> {
+    /// Returns `true` if the document body or frontmatter actually changed, `false` if the
+    /// disk content was identical to the stored Loro state (a sync echo or redundant watcher
+    /// event). Callers can gate broadcasts on this bool without consulting the sync flag.
+    ///
+    /// Note: stored Loro bodies are outputs of a prior `markdown::parse`, which strips leading
+    /// newlines — that invariant is what makes the body round-trip echo-stable. Don't change
+    /// parse's newline handling without revisiting this comparison.
+    pub async fn on_file_changed(&self, path: &str) -> Result<bool> {
         // Skip non-markdown files and .sync directory
         if !path.ends_with(".md") || path.starts_with(SYNC_DIR) {
-            return Ok(());
+            return Ok(false);
         }
 
         // Load the current file content
@@ -1221,7 +1235,7 @@ impl<F: FileSystem> Vault<F> {
             } else {
                 tracing::debug!("No changes detected (sync echo): {}", path);
             }
-            return Ok(());
+            return Ok(body_changed || fm_changed);
         }
 
         // Check if .loro exists on disk but not in cache (cold cache scenario)
@@ -1243,7 +1257,7 @@ impl<F: FileSystem> Vault<F> {
             }
 
             self.documents_mut().insert(path.to_string(), doc);
-            return Ok(());
+            return Ok(body_changed || fm_changed);
         }
 
         // Document doesn't exist anywhere - create new (this is the only time we need new peer ID)
@@ -1257,7 +1271,7 @@ impl<F: FileSystem> Vault<F> {
 
         tracing::debug!("Created new document: {}", path);
 
-        Ok(())
+        Ok(true)
     }
 
     /// Save a document to disk (both markdown and sync state)
