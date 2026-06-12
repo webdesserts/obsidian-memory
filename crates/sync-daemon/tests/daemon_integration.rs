@@ -1446,4 +1446,87 @@ mod daemon_integration {
 
         Ok(())
     }
+
+    /// A real local delete tombstones the registry and propagates to a peer even
+    /// when the sync flag is armed for that path.
+    ///
+    /// Before the fix, `on_file_deleted` consumed the flag and returned early,
+    /// producing no tombstone and no broadcast. On the next full sync the peer
+    /// would re-deliver the file, resurrecting it. After the fix the daemon always
+    /// calls `vault.delete_file`, which is idempotent (returns false for an
+    /// already-absent path) and only broadcasts when it returns true.
+    ///
+    /// Seeds 72/73 reserved.
+    #[tokio::test]
+    async fn test_local_delete_during_armed_flag_propagates_to_peer() -> anyhow::Result<()> {
+        let node_a = build_node(72).await?;
+        let node_b = build_node(73).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Create a file on A and let it sync to B so both have it.
+        daemon_a
+            .fs
+            .write("notes/flag-delete.md", b"# To be deleted")
+            .await?;
+        inject_modified(&daemon_a, "notes/flag-delete.md");
+
+        wait_until("B has notes/flag-delete.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/flag-delete.md".to_string())
+            }
+        })
+        .await;
+
+        // Arm the sync flag on A — simulates the lingering-flag window.
+        {
+            let vault = daemon_a.vault.lock().await;
+            vault.mark_synced("notes/flag-delete.md");
+        }
+
+        // Delete the file on A's filesystem and inject the Deleted event.
+        daemon_a.fs.delete("notes/flag-delete.md").await?;
+        inject_deleted(&daemon_a, "notes/flag-delete.md");
+
+        // B must tombstone the file despite the armed flag on A.
+        wait_until("B no longer has notes/flag-delete.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                !vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/flag-delete.md".to_string())
+            }
+        })
+        .await;
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
 }

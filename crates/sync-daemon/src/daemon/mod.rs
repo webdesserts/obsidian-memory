@@ -391,22 +391,28 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 
     /// Handle a file deletion — update vault state then notify peers.
+    ///
+    /// The sync-flag early-return was removed: `delete_file` is idempotent (returns
+    /// false for an already-absent path) so we always apply the event and gate the
+    /// broadcast on whether a live node was actually tombstoned.
     async fn on_file_deleted(&mut self, path: &str) {
         info!("File deleted: {}", path);
 
         let vault = self.vault.lock().await;
 
-        if vault.consume_sync_flag(path) {
-            debug!("Skipping broadcast for synced deletion: {}", path);
-            return;
-        }
-
-        if let Err(e) = vault.delete_file(path).await {
-            error!("Failed to delete file {}: {}", path, e);
-            return;
-        }
+        let deleted = match vault.delete_file(path).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to delete file {}: {}", path, e);
+                return;
+            }
+        };
 
         drop(vault);
+
+        if !deleted {
+            return;
+        }
 
         if self.peer_registry.lock().await.alive_count() > 0 {
             if let Err(e) = self.vault_gossip.broadcast_change(path).await {

@@ -28,7 +28,7 @@ mod echo_suppression {
         PeerId::from_secret_bytes([99u8; 32])
     }
 
-    // ── on_file_changed return value ──────────────────────────────────────────
+    // ── on_file_changed return value ─────────────────────────────────────────
 
     /// `on_file_changed` returns `true` when the file body has changed.
     #[tokio::test]
@@ -147,6 +147,101 @@ mod echo_suppression {
             body_text.contains("Edited after sync"),
             "cold vault must see the edited content — .loro snapshot must have been persisted; got: {:?}",
             body_text
+        );
+    }
+
+    // ── delete_file return value ───────────────────────────────────────────────
+
+    /// `delete_file` returns `true` when a live tree node is tombstoned.
+    #[tokio::test]
+    async fn delete_file_returns_true_for_live_node() {
+        let dir = tempdir().expect("tempdir");
+        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
+        let vault = Vault::init(fs.clone(), test_author())
+            .await
+            .expect("vault init");
+
+        fs.write("to-delete.md", b"# Delete me").await.expect("write");
+        vault
+            .on_file_changed("to-delete.md")
+            .await
+            .expect("index");
+
+        let deleted = vault
+            .delete_file("to-delete.md")
+            .await
+            .expect("delete_file");
+        assert!(deleted, "delete_file should return true when deleting a live node");
+    }
+
+    /// `delete_file` returns `false` when called a second time on the same path
+    /// (the node is already tombstoned — idempotent no-op).
+    #[tokio::test]
+    async fn delete_file_returns_false_for_already_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
+        let vault = Vault::init(fs.clone(), test_author())
+            .await
+            .expect("vault init");
+
+        fs.write("to-delete.md", b"# Delete me").await.expect("write");
+        vault
+            .on_file_changed("to-delete.md")
+            .await
+            .expect("index");
+
+        let first_delete = vault
+            .delete_file("to-delete.md")
+            .await
+            .expect("first delete_file");
+        assert!(first_delete, "first delete_file should return true");
+
+        let second_delete = vault
+            .delete_file("to-delete.md")
+            .await
+            .expect("second delete_file (idempotent)");
+        assert!(
+            !second_delete,
+            "second delete_file should return false (already-deleted no-op)"
+        );
+    }
+
+    /// Proves the Vault primitive is flag-agnostic: `mark_synced` has no effect on
+    /// `delete_file`, which always tombstones the registry entry. The daemon-handler
+    /// regression (early-return producing no tombstone or broadcast) is covered by
+    /// `test_local_delete_during_armed_flag_propagates_to_peer` in
+    /// `daemon_integration.rs`.
+    #[tokio::test]
+    async fn local_delete_during_armed_flag_still_tombstones() {
+        let dir = tempdir().expect("tempdir");
+        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
+        let vault = Vault::init(fs.clone(), test_author())
+            .await
+            .expect("vault init");
+
+        fs.write("flagged.md", b"# Will be deleted").await.expect("write");
+        vault
+            .on_file_changed("flagged.md")
+            .await
+            .expect("index");
+
+        // Arm the sync flag — simulates the lingering-flag window.
+        vault.mark_synced("flagged.md");
+
+        // Delete the file — must succeed even with the flag armed.
+        let deleted = vault
+            .delete_file("flagged.md")
+            .await
+            .expect("delete_file");
+        assert!(
+            deleted,
+            "delete_file must return true for a real delete even when sync flag was armed"
+        );
+
+        // The vault must now report the file as deleted.
+        assert!(
+            vault.is_file_deleted("flagged.md"),
+            "vault must report the file as deleted after delete_file"
         );
     }
 }

@@ -497,6 +497,7 @@ mod wasm_impl {
             self.inner
                 .delete_file(path)
                 .await
+                .map(|_| ())
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 

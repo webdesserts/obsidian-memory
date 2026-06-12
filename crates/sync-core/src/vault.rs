@@ -1519,7 +1519,11 @@ impl<F: FileSystem> Vault<F> {
 
     /// Delete a file from the tree (CRDT operation - tracked, reversible).
     /// Also cleans up the .loro document file.
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
+    ///
+    /// Returns `true` if a live tree node was tombstoned, `false` if the path was
+    /// already absent from the registry (idempotent no-op). Callers can gate
+    /// broadcasts on this bool without consulting the sync flag.
+    pub async fn delete_file(&self, path: &str) -> Result<bool> {
         Self::validate_sync_path(path)?;
 
         if let Some(node_id) = self.find_node_by_path(path) {
@@ -1544,9 +1548,10 @@ impl<F: FileSystem> Vault<F> {
             self.documents_mut().remove(path);
 
             tracing::info!("Deleted file from tree: {}", path);
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Rename/move a file in the tree (CRDT operation via tree move).
