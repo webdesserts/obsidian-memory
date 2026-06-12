@@ -77,22 +77,23 @@ mod reconcile_missing_file {
 
         // Pre-fix: returns Err("… IO error: No such file or directory (os error 2)")
         // before keep.md's deletion is processed — the whole batch is dropped.
-        let result = vault.process_sync_message(&msg_bytes).await;
-        assert!(
-            result.is_ok(),
-            "process_sync_message must not abort due to ENOENT on a pending-reconcile \
-             path; got: {:?}",
-            result.unwrap_err()
-        );
+        let (_, modified) = vault
+            .process_sync_message(&msg_bytes)
+            .await
+            .expect(
+                "process_sync_message must not abort due to ENOENT on a pending-reconcile \
+                 path (pre-fix: Vault error: Filesystem error: IO error: No such file or \
+                 directory (os error 2))"
+            );
 
-        // The inbound FileDeleted for keep.md must have applied: keep.md should
-        // no longer appear in the vault's file list.
-        let files = vault.list_files().await.expect("list_files");
+        // The inbound FileDeleted for keep.md must have applied: the vault reports
+        // keep.md in the modified paths list. (list_files scans the filesystem, not
+        // the CRDT tree — physical removal is the daemon's job after processing.)
         assert!(
-            !files.contains(&"keep.md".to_string()),
-            "keep.md should have been removed by the inbound FileDeleted message, \
-             but vault still lists: {:?}",
-            files
+            modified.contains(&"keep.md".to_string()),
+            "keep.md should appear in modified paths after the inbound FileDeleted \
+             message applied; got: {:?}",
+            modified
         );
     }
 }

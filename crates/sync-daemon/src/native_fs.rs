@@ -1,9 +1,21 @@
 //! Native filesystem implementation using tokio::fs.
 
 use async_trait::async_trait;
+use std::io;
 use std::path::PathBuf;
 use sync_core::fs::{FileEntry, FileStat, FileSystem, FsError, Result};
 use tokio::fs;
+
+/// Map a tokio/std io error to FsError, preserving NotFound so callers
+/// (e.g. the reconcile skip-deleted guard) can match on it. The `InMemoryFs`
+/// test double already returns NotFound; this closes that prod/test gap.
+fn map_io_err(path: &str, e: io::Error) -> FsError {
+    match e.kind() {
+        io::ErrorKind::NotFound => FsError::NotFound(path.to_string()),
+        io::ErrorKind::AlreadyExists => FsError::AlreadyExists(path.to_string()),
+        _ => FsError::Io(e.to_string()),
+    }
+}
 
 /// Native filesystem implementation for the daemon
 pub struct NativeFs {
@@ -30,7 +42,7 @@ impl FileSystem for NativeFs {
         let full_path = self.full_path(path);
         fs::read(&full_path)
             .await
-            .map_err(|e| FsError::Io(e.to_string()))
+            .map_err(|e| map_io_err(path, e))
     }
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
@@ -80,16 +92,16 @@ impl FileSystem for NativeFs {
         let full_path = self.full_path(path);
         let metadata = fs::metadata(&full_path)
             .await
-            .map_err(|e| FsError::Io(e.to_string()))?;
+            .map_err(|e| map_io_err(path, e))?;
 
         if metadata.is_dir() {
             fs::remove_dir(&full_path)
                 .await
-                .map_err(|e| FsError::Io(e.to_string()))
+                .map_err(|e| map_io_err(path, e))
         } else {
             fs::remove_file(&full_path)
                 .await
-                .map_err(|e| FsError::Io(e.to_string()))
+                .map_err(|e| map_io_err(path, e))
         }
     }
 
@@ -102,7 +114,7 @@ impl FileSystem for NativeFs {
         let full_path = self.full_path(path);
         let metadata = fs::metadata(&full_path)
             .await
-            .map_err(|e| FsError::Io(e.to_string()))?;
+            .map_err(|e| map_io_err(path, e))?;
 
         let mtime_millis = metadata
             .modified()
@@ -132,7 +144,7 @@ impl FileSystem for NativeFs {
         let to_path = self.full_path(to);
         fs::rename(&from_path, &to_path)
             .await
-            .map_err(|e| FsError::Io(e.to_string()))
+            .map_err(|e| map_io_err(from, e))
     }
 }
 
