@@ -87,8 +87,9 @@ mod reconcile_missing_file {
             );
 
         // The inbound FileDeleted for keep.md must have applied: the vault reports
-        // keep.md in the modified paths list. (list_files scans the filesystem, not
-        // the CRDT tree — physical removal is the daemon's job after processing.)
+        // keep.md in the modified paths list. `delete_file` removes only the CRDT
+        // node and `.loro` doc; physical `.md` removal is the daemon's responsibility
+        // after processing, so asserting the file is gone from disk would be wrong here.
         assert!(
             modified.contains(&"keep.md".to_string()),
             "keep.md should appear in modified paths after the inbound FileDeleted \

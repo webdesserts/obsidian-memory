@@ -7,6 +7,17 @@
 //!
 //! Uses `cfg(target_arch = "wasm32")` (not `cfg(feature = "native")`) to vary the
 //! `Send + Sync` trait bounds. See the crate-level doc in `lib.rs` for why.
+//!
+//! ## Error contract
+//!
+//! All `FileSystem` implementations **must** return `FsError::NotFound` when an
+//! operation targets a path that does not exist (read, stat, delete, rename with a
+//! missing source). Callers branch on this variant — most critically, the
+//! `ensure_consistency` skip-deleted guard matches `FsError::NotFound` to safely
+//! ignore paths that were removed between `mark_synced` and the next reconcile pass.
+//! Returning `FsError::Io` for ENOENT breaks that guard and aborts the entire
+//! inbound sync batch. Every implementation must pass the shared conformance suite
+//! in the [`conformance`] module.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -57,32 +68,37 @@ pub struct FileEntry {
 ///
 /// On native platforms, implementations must be `Send + Sync` for use across threads.
 /// On WASM (wasm32), these bounds are relaxed since WASM is single-threaded.
+///
+/// See the module-level doc for the required error contract all implementations must
+/// uphold. Every implementation must pass the [`conformance`] suite.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg(not(target_arch = "wasm32"))]
 pub trait FileSystem: Send + Sync {
-    /// Read file contents
+    /// Read file contents. Returns `FsError::NotFound` if the path does not exist.
     async fn read(&self, path: &str) -> Result<Vec<u8>>;
 
-    /// Write file contents (creates parent directories if needed)
+    /// Write file contents (creates parent directories if needed).
     async fn write(&self, path: &str, content: &[u8]) -> Result<()>;
 
-    /// List directory contents
+    /// List directory contents.
     async fn list(&self, path: &str) -> Result<Vec<FileEntry>>;
 
-    /// Delete file or empty directory
+    /// Delete file or empty directory. Returns `FsError::NotFound` if the path does
+    /// not exist.
     async fn delete(&self, path: &str) -> Result<()>;
 
-    /// Check if path exists
+    /// Check if path exists.
     async fn exists(&self, path: &str) -> Result<bool>;
 
-    /// Get file metadata
+    /// Get file metadata. Returns `FsError::NotFound` if the path does not exist.
     async fn stat(&self, path: &str) -> Result<FileStat>;
 
-    /// Create directory (and parents if needed)
+    /// Create directory (and parents if needed).
     async fn mkdir(&self, path: &str) -> Result<()>;
 
-    /// Rename/move a file or directory
+    /// Rename/move a file or directory. Returns `FsError::NotFound` if `from` does
+    /// not exist.
     async fn rename(&self, from: &str, to: &str) -> Result<()>;
 
     /// Write file contents atomically via write-to-temp + rename.
@@ -103,32 +119,37 @@ pub trait FileSystem: Send + Sync {
 }
 
 /// Platform-independent filesystem abstraction (WASM version without Send + Sync).
+///
+/// See the module-level doc for the required error contract all implementations must
+/// uphold. Every implementation must pass the [`conformance`] suite.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg(target_arch = "wasm32")]
 pub trait FileSystem {
-    /// Read file contents
+    /// Read file contents. Returns `FsError::NotFound` if the path does not exist.
     async fn read(&self, path: &str) -> Result<Vec<u8>>;
 
-    /// Write file contents (creates parent directories if needed)
+    /// Write file contents (creates parent directories if needed).
     async fn write(&self, path: &str, content: &[u8]) -> Result<()>;
 
-    /// List directory contents
+    /// List directory contents.
     async fn list(&self, path: &str) -> Result<Vec<FileEntry>>;
 
-    /// Delete file or empty directory
+    /// Delete file or empty directory. Returns `FsError::NotFound` if the path does
+    /// not exist.
     async fn delete(&self, path: &str) -> Result<()>;
 
-    /// Check if path exists
+    /// Check if path exists.
     async fn exists(&self, path: &str) -> Result<bool>;
 
-    /// Get file metadata
+    /// Get file metadata. Returns `FsError::NotFound` if the path does not exist.
     async fn stat(&self, path: &str) -> Result<FileStat>;
 
-    /// Create directory (and parents if needed)
+    /// Create directory (and parents if needed).
     async fn mkdir(&self, path: &str) -> Result<()>;
 
-    /// Rename/move a file or directory
+    /// Rename/move a file or directory. Returns `FsError::NotFound` if `from` does
+    /// not exist.
     async fn rename(&self, from: &str, to: &str) -> Result<()>;
 
     /// Write file contents atomically via write-to-temp + rename.
@@ -396,6 +417,170 @@ impl FileSystem for InMemoryFs {
     }
 }
 
+/// Shared conformance suite that validates the `FileSystem` error contract.
+///
+/// Any `FileSystem` implementation can call [`assert_fs_contract`] in its test suite
+/// to verify it upholds the contract documented on the trait. Passing this suite is
+/// required for all implementations (see module-level doc).
+///
+/// The module is compiled unconditionally (no `cfg(test)`) so crates outside
+/// sync-core (e.g. sync-daemon) can import it without enabling a separate feature.
+/// It has no native-only dependencies and compiles for `wasm32`.
+pub mod conformance {
+    use super::{FileSystem, FsError};
+
+    /// Assert that `read` on a missing path returns `FsError::NotFound`.
+    pub async fn assert_read_missing_returns_not_found<F: FileSystem>(fs: &F) {
+        let err = fs
+            .read("__conformance_missing__.md")
+            .await
+            .expect_err("read of missing path should fail");
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "read: expected FsError::NotFound for missing path, got: {:?}",
+            err
+        );
+    }
+
+    /// Assert that `stat` on a missing path returns `FsError::NotFound`.
+    pub async fn assert_stat_missing_returns_not_found<F: FileSystem>(fs: &F) {
+        let err = fs
+            .stat("__conformance_missing__.md")
+            .await
+            .expect_err("stat of missing path should fail");
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "stat: expected FsError::NotFound for missing path, got: {:?}",
+            err
+        );
+    }
+
+    /// Assert that `delete` on a missing path returns `FsError::NotFound`.
+    pub async fn assert_delete_missing_returns_not_found<F: FileSystem>(fs: &F) {
+        let err = fs
+            .delete("__conformance_missing__.md")
+            .await
+            .expect_err("delete of missing path should fail");
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "delete: expected FsError::NotFound for missing path, got: {:?}",
+            err
+        );
+    }
+
+    /// Assert that `rename` with a missing source returns `FsError::NotFound`.
+    pub async fn assert_rename_missing_returns_not_found<F: FileSystem>(fs: &F) {
+        let err = fs
+            .rename("__conformance_missing__.md", "__conformance_dest__.md")
+            .await
+            .expect_err("rename of missing source should fail");
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "rename: expected FsError::NotFound for missing source, got: {:?}",
+            err
+        );
+    }
+
+    /// Assert that writing then reading a file round-trips the bytes correctly.
+    pub async fn assert_write_then_read_roundtrips<F: FileSystem>(fs: &F) {
+        let content = b"conformance test content";
+        fs.write("__conformance_roundtrip__.txt", content)
+            .await
+            .expect("write should succeed");
+        let read_back = fs
+            .read("__conformance_roundtrip__.txt")
+            .await
+            .expect("read after write should succeed");
+        assert_eq!(
+            read_back, content,
+            "write-then-read: bytes did not round-trip"
+        );
+    }
+
+    /// Assert that `stat` on an existing file reports `is_dir = false`.
+    pub async fn assert_stat_existing_file_is_not_dir<F: FileSystem>(fs: &F) {
+        fs.write("__conformance_stat__.txt", b"data")
+            .await
+            .expect("write should succeed");
+        let stat = fs
+            .stat("__conformance_stat__.txt")
+            .await
+            .expect("stat of existing file should succeed");
+        assert!(
+            !stat.is_dir,
+            "stat: expected is_dir=false for a regular file"
+        );
+    }
+
+    /// Assert that deleting an existing file, then reading it, returns `FsError::NotFound`.
+    pub async fn assert_delete_then_read_returns_not_found<F: FileSystem>(fs: &F) {
+        fs.write("__conformance_delete__.txt", b"data")
+            .await
+            .expect("write should succeed");
+        fs.delete("__conformance_delete__.txt")
+            .await
+            .expect("delete of existing file should succeed");
+        let err = fs
+            .read("__conformance_delete__.txt")
+            .await
+            .expect_err("read after delete should fail");
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "delete-then-read: expected FsError::NotFound, got: {:?}",
+            err
+        );
+    }
+
+    /// Assert that renaming an existing file makes the old path return `FsError::NotFound`
+    /// and the new path readable with the original content.
+    pub async fn assert_rename_then_read_old_not_found_new_succeeds<F: FileSystem>(fs: &F) {
+        let content = b"rename me";
+        fs.write("__conformance_rename_src__.txt", content)
+            .await
+            .expect("write should succeed");
+        fs.rename(
+            "__conformance_rename_src__.txt",
+            "__conformance_rename_dst__.txt",
+        )
+        .await
+        .expect("rename should succeed");
+
+        let old_err = fs
+            .read("__conformance_rename_src__.txt")
+            .await
+            .expect_err("read of old path after rename should fail");
+        assert!(
+            matches!(old_err, FsError::NotFound(_)),
+            "rename-old-path: expected FsError::NotFound, got: {:?}",
+            old_err
+        );
+
+        let new_content = fs
+            .read("__conformance_rename_dst__.txt")
+            .await
+            .expect("read of new path after rename should succeed");
+        assert_eq!(
+            new_content, content,
+            "rename: new path content did not match original"
+        );
+    }
+
+    /// Run the full `FileSystem` error contract conformance suite against `fs`.
+    ///
+    /// Call this from both the `InMemoryFs` and `NativeFs` test suites (and any future
+    /// implementation) to ensure all implementations agree on the contract.
+    pub async fn assert_fs_contract<F: FileSystem>(fs: &F) {
+        assert_read_missing_returns_not_found(fs).await;
+        assert_stat_missing_returns_not_found(fs).await;
+        assert_delete_missing_returns_not_found(fs).await;
+        assert_rename_missing_returns_not_found(fs).await;
+        assert_write_then_read_roundtrips(fs).await;
+        assert_stat_existing_file_is_not_dir(fs).await;
+        assert_delete_then_read_returns_not_found(fs).await;
+        assert_rename_then_read_old_not_found_new_succeeds(fs).await;
+    }
+}
+
 // Implement FileSystem for Arc<T> where T: FileSystem
 // This allows sharing a filesystem between multiple Vaults in tests
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -438,6 +623,13 @@ impl<T: FileSystem + Send + Sync> FileSystem for std::sync::Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify that `InMemoryFs` upholds the full `FileSystem` error contract.
+    #[tokio::test]
+    async fn inmemory_fs_passes_conformance_suite() {
+        let fs = InMemoryFs::new();
+        conformance::assert_fs_contract(&fs).await;
+    }
 
     #[tokio::test]
     async fn test_inmemory_fs_basic_operations() {

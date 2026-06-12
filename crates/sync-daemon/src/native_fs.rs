@@ -12,6 +12,9 @@ use tokio::fs;
 fn map_io_err(path: &str, e: io::Error) -> FsError {
     match e.kind() {
         io::ErrorKind::NotFound => FsError::NotFound(path.to_string()),
+        // AlreadyExists arm: pre-emptive parity with ObsidianFs/InMemoryFs — no
+        // current caller in NativeFs branches on this variant, but having it here
+        // keeps all three implementations consistent.
         io::ErrorKind::AlreadyExists => FsError::AlreadyExists(path.to_string()),
         _ => FsError::Io(e.to_string()),
     }
@@ -142,6 +145,9 @@ impl FileSystem for NativeFs {
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         let from_path = self.full_path(from);
         let to_path = self.full_path(to);
+        // The error is keyed to `from`. A destination-side ENOENT (e.g. missing parent
+        // directory) also surfaces as NotFound(from) — acceptable because no caller
+        // inspects the path in the error to distinguish the two cases.
         fs::rename(&from_path, &to_path)
             .await
             .map_err(|e| map_io_err(from, e))
@@ -151,38 +157,17 @@ impl FileSystem for NativeFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use sync_core::fs::conformance;
     use tempfile::tempdir;
 
-    /// `read` on a nonexistent path must return `FsError::NotFound`, not `FsError::Io`.
+    /// Verify that `NativeFs` upholds the full `FileSystem` error contract.
     ///
-    /// The skip-deleted-file guard in `ensure_consistency` matches only
-    /// `FsError::NotFound`, so returning `FsError::Io` for ENOENT causes the guard
-    /// to miss and the entire inbound batch is aborted.
+    /// This replaces the standalone read/stat NotFound unit tests, which are now
+    /// covered (along with delete, rename, and round-trip cases) by the shared suite.
     #[tokio::test]
-    async fn read_missing_path_returns_not_found() {
+    async fn native_fs_passes_conformance_suite() {
         let dir = tempdir().expect("tempdir");
-        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
-
-        let err = fs.read("nonexistent.md").await.unwrap_err();
-        assert!(
-            matches!(err, FsError::NotFound(_)),
-            "expected FsError::NotFound for a missing path, got: {:?}",
-            err
-        );
-    }
-
-    /// `stat` on a nonexistent path must return `FsError::NotFound`, not `FsError::Io`.
-    #[tokio::test]
-    async fn stat_missing_path_returns_not_found() {
-        let dir = tempdir().expect("tempdir");
-        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
-
-        let err = fs.stat("nonexistent.md").await.unwrap_err();
-        assert!(
-            matches!(err, FsError::NotFound(_)),
-            "expected FsError::NotFound for a missing path, got: {:?}",
-            err
-        );
+        let fs = NativeFs::new(dir.path().to_path_buf());
+        conformance::assert_fs_contract(&fs).await;
     }
 }
