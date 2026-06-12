@@ -124,7 +124,7 @@
           const result = await invoke('request_pairing', { vaultId: meshSel.value });
           // Connection established — responder is now showing the code.
           codePrompt.textContent = `Enter the code shown on ${result.device_name}:`;
-          stage2.style.display = '';
+          stage2.style.display = 'block';
           codeInp.focus();
         } catch (e) {
           status.className = 'row error';

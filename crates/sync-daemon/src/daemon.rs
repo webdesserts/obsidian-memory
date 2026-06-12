@@ -1680,21 +1680,15 @@ async fn startup_inner(
                                 .data
                                 .user_data()
                                 .map(|ud: &iroh::address_lookup::UserData| ud.as_ref().to_string());
-                            info!(
-                                peer = %endpoint_info.endpoint_id,
-                                has_user_data = raw_user_data.is_some(),
-                                user_data = ?raw_user_data,
-                                "DIAG: mDNS Discovered event"
-                            );
                             let metadata = match raw_user_data.as_deref() {
                                 Some(s) => match serde_json::from_str::<DiscoveryMeshMetadata>(s) {
                                     Ok(m) => Some(m),
                                     Err(e) => {
-                                        info!(
+                                        warn!(
                                             peer = %endpoint_info.endpoint_id,
                                             err = %e,
                                             user_data = %s,
-                                            "DIAG: MeshMetadata JSON parse failed"
+                                            "mDNS: discarding peer with malformed mesh metadata"
                                         );
                                         None
                                     }
@@ -1709,11 +1703,6 @@ async fn startup_inner(
                                     peers: vec![endpoint_info.endpoint_id],
                                     online_count: 1,
                                 };
-                                info!(
-                                    mesh = %mesh.mesh_name,
-                                    vid = %mesh.vault_id,
-                                    "DIAG: queueing DiscoveredMesh to run_loop"
-                                );
                                 let _ = tx.try_send(mesh);
                             }
                         }
