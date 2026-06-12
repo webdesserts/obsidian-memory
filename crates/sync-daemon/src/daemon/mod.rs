@@ -9,10 +9,12 @@
 
 mod startup;
 mod initiator;
+mod sync_exchange;
 
 // Re-export public names so `sync_daemon::daemon::X` paths stay byte-identical.
 pub use startup::{run, run_with_shutdown, run_with_shutdown_controlled};
 use initiator::{InitiatorPairOutcome, InitiatorSession};
+use sync_exchange::{SyncExchangeKind, spawn_sync_exchange};
 
 use crate::pair_api::{
     ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary,
@@ -37,7 +39,7 @@ use sync_core::network::{
 use sync_core::pairing::{PairingChallenge, PairingSession};
 use sync_core::{PeerId, PeerRegistry, Vault};
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -495,54 +497,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // continue processing inbound sync requests. When both peers fire
         // NeighborUp simultaneously, each needs to respond to the other's
         // inbound sync — which can only happen if the event loop isn't blocked.
-        let vault = self.vault.clone();
-        let allowlist = self.allowlist.clone();
-        let peer_registry = self.peer_registry.clone();
-        let endpoint = self.sync_node.endpoint.clone();
-
-        tokio::spawn(async move {
-            let response_bytes = match sync_core::network::streams::connect_and_sync_raw(
-                &endpoint,
-                node_id,
-                &request_bytes,
-            )
-            .await
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    // NeighborUp fires before the peer's QUIC listener is ready on some
-                    // OS configurations. Log a warning and move on — the peer will initiate
-                    // a sync in the other direction.
-                    warn!("Failed to connect for sync with {}: {}", node_id, e);
-                    return;
-                }
-            };
-
-            let vault = vault.lock().await;
-            match vault.process_sync_message(&response_bytes).await {
-                Ok((_, modified_paths)) => {
-                    peer_registry.lock().await.update_last_seen(&peer_id);
-                    if let Err(e) = allowlist.update_last_seen(&peer_id, now_ms()).await {
-                        warn!(
-                            "Failed to update allowlist last_seen for {}: {}",
-                            node_id, e
-                        );
-                    }
-                    if !modified_paths.is_empty() {
-                        info!(
-                            "Synced {} file(s) from {} on NeighborUp",
-                            modified_paths.len(),
-                            node_id
-                        );
-                    } else {
-                        debug!("Full sync with {} complete — no changes", node_id);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to process sync response from {}: {}", node_id, e);
-                }
-            }
-        });
+        spawn_sync_exchange(
+            node_id,
+            peer_id,
+            request_bytes,
+            self.vault.clone(),
+            self.allowlist.clone(),
+            self.peer_registry.clone(),
+            self.sync_node.endpoint.clone(),
+            SyncExchangeKind::NeighborUp,
+        );
     }
 
     /// A peer left the gossip swarm.
@@ -577,47 +541,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         };
         drop(vault);
 
-        let vault = self.vault.clone();
-        let allowlist = self.allowlist.clone();
-        let peer_registry = self.peer_registry.clone();
-        let endpoint = self.sync_node.endpoint.clone();
-
-        tokio::spawn(async move {
-            let response_bytes = match sync_core::network::streams::connect_and_sync_raw(
-                &endpoint,
-                from,
-                &request_bytes,
-            )
-            .await
-            {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("Failed to pull change from {}: {}", from, e);
-                    return;
-                }
-            };
-
-            let vault = vault.lock().await;
-            match vault.process_sync_message(&response_bytes).await {
-                Ok((_, modified_paths)) => {
-                    peer_registry.lock().await.update_last_seen(&peer_id);
-                    if let Err(e) = allowlist.update_last_seen(&peer_id, now_ms()).await {
-                        warn!("Failed to update allowlist last_seen for {}: {}", from, e);
-                    }
-                    if !modified_paths.is_empty() {
-                        info!(
-                            "Pulled {} file(s) from {} after change notification on {}",
-                            modified_paths.len(),
-                            from,
-                            path
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to process pulled change from {}: {}", from, e);
-                }
-            }
-        });
+        spawn_sync_exchange(
+            from,
+            peer_id,
+            request_bytes,
+            self.vault.clone(),
+            self.allowlist.clone(),
+            self.peer_registry.clone(),
+            self.sync_node.endpoint.clone(),
+            SyncExchangeKind::ChangePull { path },
+        );
     }
 
     /// Handle an allowlist update received via gossip from a mesh member.

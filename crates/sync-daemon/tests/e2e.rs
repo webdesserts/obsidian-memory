@@ -293,11 +293,11 @@ async fn test_run_with_shutdown_cancels_after_startup() {
 
 /// `run_with_shutdown` with `relay_listen` + `advertised_relay_url` writes the
 /// advertised URL (not the bound localhost address) to daemon.toml's `relay_url`
-/// field, and starts cleanly when a pre-seeded `peer_relays` entry is present.
+/// field, and round-trips a pre-seeded `peer_relays` entry without erasing it.
 ///
 /// This pins the two behaviors fixed by the umbra-relay branch:
 /// - The headless path no longer ignores `advertised_relay_url`.
-/// - The headless path no longer skips peer-relay-hint seeding.
+/// - Startup does not erase existing `peer_relays` entries when writing `relay_url`.
 ///
 /// What is pinned vs what isn't:
 /// - **Pinned**: daemon.toml's `relay_url` field equals the advertised URL after
