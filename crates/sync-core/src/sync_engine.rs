@@ -21,7 +21,7 @@ use crate::vault::Vault;
 
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum SyncEngineError {
@@ -488,8 +488,29 @@ impl<F: FileSystem> Vault<F> {
                 .collect()
         };
 
+        // Record every deleted path as tombstoned so that inbound DocumentUpdates
+        // for these paths (arriving via real-time broadcast) don't resurrect them.
+        for path in &deleted_paths {
+            self.record_tombstoned(path);
+        }
+
         // Rebuild path cache from updated tree (skips deleted nodes)
         self.rebuild_path_cache();
+
+        // After the cache is rebuilt, clear any tombstones for paths that now have an
+        // alive registry node. A peer legitimately re-created the file (new CRDT node at
+        // the same path), and the tombstone from the prior deletion must not block it.
+        // Collect keys first to avoid holding the path_to_node guard across un_tombstone.
+        let alive_paths: Vec<String> = self.path_to_node().keys().cloned().collect();
+        for path in &alive_paths {
+            if self.is_tombstoned(path) {
+                debug!(
+                    "apply_registry_updates: clearing tombstone for re-created path: {}",
+                    path
+                );
+                self.un_tombstone(path);
+            }
+        }
 
         // Clean up filesystem for deleted files
         self.apply_registry_changes(&deleted_paths).await?;
@@ -697,6 +718,28 @@ impl<F: FileSystem> Vault<F> {
 
             Ok(modified)
         } else {
+            // Before creating a new document, check whether this path has been tombstoned in
+            // the local registry. A tombstoned path means the local device explicitly deleted
+            // this file (or received a deletion via registry sync). Creating it here would
+            // resurrect it, causing ping-pong deletion loops between peers.
+            //
+            // We only skip when the path is KNOWN tombstoned in this session. Brand-new paths
+            // (never seen by this device) are not in the set, so they still create correctly.
+            //
+            // Legit re-create path: if a peer creates a brand-new registry node at a
+            // previously-deleted path, apply_registry_updates clears the tombstone via
+            // un_tombstone() after rebuild_path_cache() sees the path as alive again. The
+            // next DocumentUpdate for that path reaches here with is_tombstoned=false, and
+            // the create proceeds. Locally, register_file() also clears the tombstone so a
+            // user re-creating the file on disk doesn't stay blocked.
+            if self.is_tombstoned(path) {
+                info!(
+                    "apply_single_update: skipping create for registry-deleted path: {}",
+                    path
+                );
+                return Ok(false);
+            }
+
             // Document is new - create directly from sync data; new ops author under this device
             let doc = NoteDocument::from_bytes(path, data, self.loro_author)?;
 
@@ -1642,5 +1685,187 @@ mod tests {
         // When syncing legacy (no doc_id) with new (has doc_id), should assume compatible
         // This is tested implicitly by the fallback in apply_single_update:
         // match (&local_doc_id, &remote_doc_id) { ... _ => false }
+    }
+
+    // ========== Resurrection Guard Tests ==========
+
+    /// A locally-deleted file must not be resurrected by an inbound DocumentUpdate for
+    /// the same path. Without the fix, apply_single_update's new-document branch would
+    /// create the file unconditionally because neither cache nor disk have it.
+    #[tokio::test]
+    async fn test_document_update_skipped_for_registry_deleted_path() {
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        // Vault 1 creates note.md and syncs it to vault 2.
+        fs1.write("note.md", b"# Hello").await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
+
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+        assert!(vault2.fs.exists("note.md").await.unwrap(), "setup: vault2 should have note.md");
+
+        // Vault 2 deletes the file locally: remove from disk first (user action),
+        // then update the registry tree via delete_file.
+        vault2.fs.delete("note.md").await.unwrap();
+        vault2.delete_file("note.md").await.unwrap();
+        assert!(!vault2.fs.exists("note.md").await.unwrap(), "note.md should be gone after delete");
+        assert!(vault2.is_file_deleted("note.md"), "registry should show path as deleted");
+
+        // Vault 1 still has the file and broadcasts a DocumentUpdate (real-time sync path).
+        let update = vault1
+            .prepare_document_update("note.md")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Vault 2 receives the DocumentUpdate — must NOT resurrect the file.
+        let (_, modified) = vault2.process_sync_message(&update).await.unwrap();
+
+        assert!(
+            modified.is_empty(),
+            "DocumentUpdate for a locally-deleted path must be skipped (got modified={:?})",
+            modified
+        );
+        assert!(
+            !vault2.fs.exists("note.md").await.unwrap(),
+            "deleted file must not reappear on disk after inbound DocumentUpdate"
+        );
+    }
+
+    /// Both peers delete a file; then one peer creates a brand-new file at the same path
+    /// (a fresh registry node). The other peer must receive it — the tombstone from the
+    /// earlier deletion must be cleared when the new alive registry node arrives.
+    ///
+    /// Without un_tombstone in apply_registry_updates, vault2's tombstone set blocks the
+    /// DocumentUpdate forever and note.md never reappears on vault2's filesystem.
+    #[tokio::test]
+    async fn test_legit_recreate_after_registry_alive_node_applies() {
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        // Both vaults start with note.md and sync it.
+        fs1.write("note.md", b"# Original").await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
+
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+        assert!(vault2.fs.exists("note.md").await.unwrap(), "setup: both vaults should have note.md");
+
+        // Both vaults delete note.md independently — both get tombstones.
+        vault1.fs.delete("note.md").await.unwrap();
+        vault1.delete_file("note.md").await.unwrap();
+        vault2.fs.delete("note.md").await.unwrap();
+        vault2.delete_file("note.md").await.unwrap();
+        assert!(vault1.is_tombstoned("note.md"), "vault1 must tombstone the path");
+        assert!(vault2.is_tombstoned("note.md"), "vault2 must tombstone the path");
+
+        // Vault 1 creates a brand-new note.md (new registry node at the same path).
+        vault1.fs.write("note.md", b"# Brand new").await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        // on_file_changed calls register_file internally, which clears vault1's tombstone.
+        assert!(!vault1.is_tombstoned("note.md"), "register_file must clear vault1's tombstone");
+
+        // Vault 1 syncs to vault 2. The SyncExchange delivers:
+        // 1. Registry updates — vault1's new alive node for note.md. apply_registry_updates
+        //    calls un_tombstone after rebuild_path_cache sees the path as alive again.
+        // 2. Document updates — vault2 can now create note.md from the sync data.
+        let request2 = vault2.prepare_sync_request().await.unwrap();
+        let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
+        let (_, modified) = vault2
+            .process_sync_message(&exchange2.unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            modified.contains(&"note.md".to_string()),
+            "legit re-create must propagate to vault2 (got modified={:?})",
+            modified
+        );
+        assert!(
+            vault2.fs.exists("note.md").await.unwrap(),
+            "re-created file must appear on vault2's filesystem"
+        );
+        let doc = vault2.get_document("note.md").await.unwrap();
+        assert!(
+            doc.to_markdown().contains("Brand new"),
+            "vault2 must have the re-created content"
+        );
+    }
+
+    /// A tombstone for "dir/note.md" must not block a DocumentUpdate for "note.md"
+    /// (a different path at root level), and vice versa. Full-path comparison is required.
+    #[tokio::test]
+    async fn test_tombstone_check_uses_full_path_not_name() {
+        let fs1 = InMemoryFs::new();
+        let fs2 = InMemoryFs::new();
+
+        // Vault 1 has both root-level note.md and nested/note.md; sync to vault 2.
+        fs1.write("note.md", b"# Root note").await.unwrap();
+        fs1.write("nested/note.md", b"# Nested note").await.unwrap();
+        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
+        vault1.on_file_changed("note.md").await.unwrap();
+        vault1.on_file_changed("nested/note.md").await.unwrap();
+        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
+
+        let request = vault2.prepare_sync_request().await.unwrap();
+        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
+        let (final_resp, _) = vault2
+            .process_sync_message(&exchange.unwrap())
+            .await
+            .unwrap();
+        if let Some(resp) = final_resp {
+            vault1.process_sync_message(&resp).await.unwrap();
+        }
+        assert!(vault2.fs.exists("note.md").await.unwrap());
+        assert!(vault2.fs.exists("nested/note.md").await.unwrap());
+
+        // Vault 2 deletes only the root-level note.md (user removes the file, then the
+        // daemon calls delete_file to tombstone it in the registry tree).
+        vault2.fs.delete("note.md").await.unwrap();
+        vault2.delete_file("note.md").await.unwrap();
+        assert!(vault2.is_tombstoned("note.md"), "root note.md should be tombstoned");
+        assert!(!vault2.is_tombstoned("nested/note.md"), "nested/note.md must NOT be tombstoned");
+
+        // Vault 1 updates nested/note.md and broadcasts a DocumentUpdate.
+        vault1.fs.write("nested/note.md", b"# Updated nested").await.unwrap();
+        vault1.on_file_changed("nested/note.md").await.unwrap();
+        let update = vault1
+            .prepare_document_update("nested/note.md")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Vault 2 receives the update for nested/note.md — must NOT be blocked by the
+        // root note.md tombstone (different full path).
+        let (_, modified) = vault2.process_sync_message(&update).await.unwrap();
+        assert!(
+            modified.contains(&"nested/note.md".to_string()),
+            "DocumentUpdate for nested/note.md must apply even though root note.md is tombstoned"
+        );
+
+        // Root note.md must still be absent (tombstone holds).
+        assert!(
+            !vault2.fs.exists("note.md").await.unwrap(),
+            "tombstone on root note.md must not be cleared by unrelated update"
+        );
     }
 }

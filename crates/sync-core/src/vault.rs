@@ -250,6 +250,13 @@ pub struct SyncState {
     pending_reconcile: Arc<Mutex<HashSet<String>>>,
     /// Registry may need reconciliation before next sync import
     registry_pending: Arc<Mutex<bool>>,
+    /// Paths that have been tombstoned in the registry tree (locally deleted or received
+    /// via registry sync). Used to prevent inbound DocumentUpdates from resurrecting files
+    /// the local device has deleted.
+    ///
+    /// Note: This set is in-memory only and is not persisted across daemon restarts.
+    /// It covers the primary live-session resurrection scenario.
+    tombstoned_paths: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Time-to-live for sync flags. Flags older than this are considered stale.
@@ -262,6 +269,7 @@ impl Default for SyncState {
             synced_paths: Arc::new(Mutex::new(HashMap::new())),
             pending_reconcile: Arc::new(Mutex::new(HashSet::new())),
             registry_pending: Arc::new(Mutex::new(false)),
+            tombstoned_paths: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -340,6 +348,36 @@ impl SyncState {
     /// Returns true if registry needs reconciliation.
     pub fn take_registry_pending(&self) -> bool {
         std::mem::take(&mut *self.registry_pending.lock().unwrap())
+    }
+
+    /// Record that a path has been tombstoned in the registry tree.
+    ///
+    /// Called when a file is locally deleted or when a registry sync delivers a deletion.
+    /// The set survives only for the lifetime of this session (not persisted to disk).
+    pub fn record_tombstoned(&self, path: &str) {
+        self.tombstoned_paths
+            .lock()
+            .unwrap()
+            .insert(path.to_string());
+    }
+
+    /// Check whether the given path is known to be tombstoned in the registry tree.
+    ///
+    /// Returns true only for paths explicitly recorded via `record_tombstoned`. Paths
+    /// not in the set are treated as potentially new (not tombstoned), which preserves
+    /// the create-if-new behavior for brand-new paths the registry hasn't seen yet.
+    pub fn is_tombstoned(&self, path: &str) -> bool {
+        self.tombstoned_paths.lock().unwrap().contains(path)
+    }
+
+    /// Remove a path from the tombstone set, allowing future creates at that path.
+    ///
+    /// Called when a new alive registry node arrives at a previously-deleted path
+    /// (a peer legitimately re-created the file) or when the local user re-creates a
+    /// file at a previously-deleted path. Without this, the tombstone would block the
+    /// re-create forever in the current session.
+    pub fn un_tombstone(&self, path: &str) {
+        self.tombstoned_paths.lock().unwrap().remove(path);
     }
 }
 
@@ -1025,6 +1063,21 @@ impl<F: FileSystem> Vault<F> {
         self.sync_state.consume_synced(path)
     }
 
+    /// Record that a path has been tombstoned in the registry tree.
+    pub(crate) fn record_tombstoned(&self, path: &str) {
+        self.sync_state.record_tombstoned(path);
+    }
+
+    /// Check whether the given path is known to be tombstoned in the registry tree.
+    pub(crate) fn is_tombstoned(&self, path: &str) -> bool {
+        self.sync_state.is_tombstoned(path)
+    }
+
+    /// Remove a path from the tombstone set (peer re-created the file or user re-created locally).
+    pub(crate) fn un_tombstone(&self, path: &str) {
+        self.sync_state.un_tombstone(path);
+    }
+
     /// Get the version vector for a document as encoded bytes.
     ///
     /// Returns None if the document hasn't been loaded.
@@ -1442,6 +1495,10 @@ impl<F: FileSystem> Vault<F> {
         // Update cache
         self.path_to_node_mut().insert(path.to_string(), node_id);
 
+        // A local re-create at a previously-deleted path clears the tombstone so that
+        // outbound sync of this new file isn't accidentally suppressed.
+        self.un_tombstone(path);
+
         tracing::debug!("Registered file in tree: {}", path);
         Ok(node_id)
     }
@@ -1455,6 +1512,10 @@ impl<F: FileSystem> Vault<F> {
             let tree = self.file_tree();
             tree.delete(node_id)
                 .map_err(|e| VaultError::Other(format!("Failed to delete file node: {}", e)))?;
+
+            // Record the tombstone so inbound DocumentUpdates don't resurrect this path.
+            // Must happen before removing from path_to_node so the path is still known.
+            self.record_tombstoned(path);
 
             // Remove from cache
             self.path_to_node_mut().remove(path);
