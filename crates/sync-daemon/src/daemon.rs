@@ -880,6 +880,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             error!("Failed to process file change for {}: {}", path, e);
             return;
         }
+        // Persist any new registry registration produced by on_file_changed.
+        // on_file_changed is sync-agnostic (called from both watcher and reconcile paths);
+        // the caller owns the flush decision. Reconcile batches to one save; watcher events
+        // each get their own flush so restarts don't lose newly-created file nodes.
+        if let Err(e) = vault.save_registry().await {
+            error!("Failed to persist registry after file change for {}: {}", path, e);
+            return;
+        }
 
         drop(vault);
 

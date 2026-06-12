@@ -363,6 +363,12 @@ mod wasm_impl {
             self.inner
                 .on_file_changed(path)
                 .await
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            // Persist any new registry registration. on_file_changed is shared between
+            // the watcher path and reconcile; watcher calls flush here, reconcile batches.
+            self.inner
+                .save_registry()
+                .await
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
