@@ -360,10 +360,17 @@ mod wasm_impl {
         /// Updates the Loro document to match the file content.
         #[wasm_bindgen(js_name = onFileChanged)]
         pub async fn on_file_changed(&self, path: &str) -> Result<(), JsError> {
+            // The bool return (whether the doc changed) is unused on the wasm side;
+            // `?` discards it while still propagating errors.
             self.inner
                 .on_file_changed(path)
                 .await
-                .map(|_| ())
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            // Persist any new registry registration. on_file_changed is shared between
+            // the watcher path and reconcile; watcher calls flush here, reconcile batches.
+            self.inner
+                .save_registry()
+                .await
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 

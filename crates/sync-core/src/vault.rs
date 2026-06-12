@@ -759,11 +759,11 @@ impl<F: FileSystem> Vault<F> {
                     report.reindexed.push(path.clone());
                 }
             } else {
-                // Truly new file (not a move target)
+                // Truly new file (not a move target). on_file_changed registers the
+                // new file node in the tree as part of creating its document, so no
+                // separate register_file call is needed here.
                 tracing::info!("New file detected, indexing: {}", path);
                 self.on_file_changed(path).await?;
-                // Register in tree for delete/rename tracking
-                self.register_file(path)?;
                 report.indexed.push(path.clone());
             }
         }
@@ -776,6 +776,14 @@ impl<F: FileSystem> Vault<F> {
                 tracing::warn!("Orphaned .loro file (deleted?): {}", old_path);
                 report.orphaned.push(old_path);
             }
+        }
+
+        // Persist the new-file registrations made during this reconcile pass. Batched
+        // here (not per on_file_changed call) to avoid O(n) snapshot writes when
+        // hundreds of files are indexed at startup. Moves aren't included: each move
+        // goes through migrate_document, which already persists its own registration.
+        if !report.indexed.is_empty() {
+            self.save_registry().await?;
         }
 
         Ok(report)
@@ -806,6 +814,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Register in tree (the old path's node was already processed as orphaned)
         self.register_file(new_path)?;
+        self.save_registry().await?;
 
         Ok(())
     }
@@ -1291,6 +1300,26 @@ impl<F: FileSystem> Vault<F> {
         Ok(())
     }
 
+    /// Persist the registry CRDT to `.sync/registry.loro`.
+    ///
+    /// Must be called after every local mutation of the registry tree
+    /// (register, delete, rename). The caller is responsible for deciding
+    /// when to flush — individual mutations call this once after each change;
+    /// batch operations (e.g. `reconcile`) call it once after the full batch to
+    /// avoid O(n) writes during startup with hundreds of files.
+    ///
+    /// `register_file` is sync (no wide ripple to callers), so it cannot call
+    /// this itself. All async callers that invoke `register_file` are responsible
+    /// for calling `save_registry()` after the mutation reaches a consistent state.
+    pub async fn save_registry(&self) -> Result<()> {
+        let bytes = self
+            .registry()
+            .export(loro::ExportMode::Snapshot)
+            .map_err(|e| VaultError::Other(format!("Failed to export registry: {}", e)))?;
+        self.fs.atomic_write(REGISTRY_FILE, &bytes).await?;
+        Ok(())
+    }
+
     /// List all markdown files in the vault
     pub async fn list_files(&self) -> Result<Vec<String>> {
         let mut files = Vec::new();
@@ -1328,14 +1357,23 @@ impl<F: FileSystem> Vault<F> {
     /// by the CRDT before any sync operations.
     async fn index_existing_files(&self) -> Result<()> {
         let files = self.list_files().await?;
+        let mut any_registered = false;
 
         for path in files {
             // Process each file as if it was just changed
             // This creates the Loro document and saves the sync state
+            let was_registered = !self.path_to_node().contains_key(&path);
             if let Err(e) = self.on_file_changed(&path).await {
                 // Log but don't fail - some files might have issues
                 tracing::warn!("Failed to index file {}: {}", path, e);
+            } else if was_registered && self.path_to_node().contains_key(&path) {
+                any_registered = true;
             }
+        }
+
+        // Batch: persist all registrations with one write instead of one per file.
+        if any_registered {
+            self.save_registry().await?;
         }
 
         Ok(())
@@ -1473,6 +1511,14 @@ impl<F: FileSystem> Vault<F> {
 
     /// Register a new file in the tree (creates parent folders as needed).
     /// Returns the TreeID of the created file node.
+    ///
+    /// # Persistence
+    ///
+    /// This mutates the registry CRDT tree **in memory only**. It is sync, so it
+    /// cannot flush on its own — callers own persistence. Async callers must follow
+    /// it with `save_registry()` once the mutation reaches a consistent state, or the
+    /// registration silently dies on the next restart. (Kept `pub` because the
+    /// sync-wasm shim calls it across crate boundaries.)
     pub fn register_file(&self, path: &str) -> Result<TreeID> {
         Self::validate_sync_path(path)?;
 
@@ -1547,11 +1593,22 @@ impl<F: FileSystem> Vault<F> {
             // Remove from documents cache
             self.documents_mut().remove(path);
 
-            tracing::info!("Deleted file from tree: {}", path);
-            return Ok(true);
-        }
+            // Persist the deletion tombstone immediately so peers importing the
+            // saved registry see the op even if the process restarts before the
+            // next inbound sync triggers apply_registry_updates.
+            self.save_registry().await?;
 
-        Ok(false)
+            tracing::info!("Deleted file from tree: {}", path);
+            Ok(true)
+        } else {
+            // The path carries the same diagnostic via the `false` return for daemon
+            // callers, but the warn stays for non-daemon callers that ignore the bool.
+            tracing::warn!(
+                "delete_file: no registry node for '{}' — no tombstone recorded",
+                path
+            );
+            Ok(false)
+        }
     }
 
     /// Rename/move a file in the tree (CRDT operation via tree move).
@@ -1594,8 +1651,9 @@ impl<F: FileSystem> Vault<F> {
                     self.documents_mut().insert(new_path.to_string(), doc);
                 }
 
-                // Register in tree
+                // Register in tree and persist
                 self.register_file(new_path)?;
+                self.save_registry().await?;
                 return Ok(());
             } else if self.fs.exists(new_path).await.unwrap_or(false) {
                 // Target already exists (rename already happened) - just register it
@@ -1605,6 +1663,7 @@ impl<F: FileSystem> Vault<F> {
                     new_path
                 );
                 self.register_file(new_path)?;
+                self.save_registry().await?;
 
                 // Clean up orphaned .loro at old path if it exists
                 let old_sync = self.document_sync_path(old_path);
@@ -1671,6 +1730,9 @@ impl<F: FileSystem> Vault<F> {
         if let Some(doc) = doc {
             self.documents_mut().insert(new_path.to_string(), doc);
         }
+
+        // Persist the move op so restarts see the updated registry.
+        self.save_registry().await?;
 
         tracing::info!("Renamed file in tree: {} -> {}", old_path, new_path);
         Ok(())
@@ -2222,24 +2284,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_file_survives_reload() {
-        // A registration must be persisted immediately. A fresh load over the same
-        // fs must find the path in the registry tree, not re-create a duplicate node.
+        // Validates the bare register + caller-flush contract: register_file mutates
+        // the tree in memory only, and the async caller's save_registry() is what makes
+        // the node durable. This must isolate the contract from init's batched index
+        // save AND from reconcile re-registering on reload:
+        //   - init with NO pre-existing file, so the index pass registers nothing.
+        //   - register the file AFTER init, then flush explicitly via save_registry().
+        //   - delete the markdown before reloading, so reconcile has nothing to
+        //     re-register — a node present after reload can only come from the
+        //     persisted registry snapshot, not a fresh index pass.
         use std::sync::Arc;
         let fs = Arc::new(InMemoryFs::new());
 
-        // Write and register the file
-        fs.write("note.md", b"# Hello").await.unwrap();
         let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Bare sync registration (in memory) followed by the explicit caller flush.
+        fs.write("note.md", b"# Hello").await.unwrap();
         vault.register_file("note.md").unwrap();
+        vault.save_registry().await.unwrap();
+
+        // Remove the markdown so reload's reconcile can't re-register it from disk.
+        fs.delete("note.md").await.unwrap();
         drop(vault);
 
-        // Load a fresh vault over the same fs
+        // Load a fresh vault over the same fs — the node must come from the persisted
+        // registry, proving register_file's mutation was flushed to disk.
         let vault2 = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
-
-        // The path must be present in the registry (not treated as a new file)
         assert!(
             vault2.path_to_node().contains_key("note.md"),
-            "registered path must survive a reload"
+            "registered path must survive a reload via the persisted registry"
         );
     }
 
@@ -2249,15 +2322,22 @@ mod tests {
         // registry see the deletion op. After reload the path must be absent from
         // the alive set, and a fresh peer importing the saved registry must also see
         // the node as deleted (tombstone carried in the CRDT snapshot).
+        //
+        // The test mirrors the daemon sequence: the OS/user deletes the markdown file
+        // first, then delete_file records the CRDT tombstone. Without the markdown on
+        // disk, reconcile during reload has nothing to re-register.
         use std::sync::Arc;
         let fs = Arc::new(InMemoryFs::new());
 
-        // Register, then delete the file
+        // Register the file via init's index pass
         fs.write("note.md", b"# Hello").await.unwrap();
         let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        vault.on_file_changed("note.md").await.unwrap();
+
+        // Simulate the daemon sequence: filesystem delete first, then CRDT tombstone
+        fs.delete("note.md").await.unwrap();
         vault.delete_file("note.md").await.unwrap();
-        // Grab the registry snapshot before dropping so we can verify it carries the op
+
+        // Grab the registry snapshot to verify it carries the tombstone op
         let saved_bytes = fs.read(REGISTRY_FILE).await.unwrap();
         drop(vault);
 
@@ -2286,14 +2366,18 @@ mod tests {
     #[tokio::test]
     async fn test_rename_file_survives_reload() {
         // A rename must persist the updated registry so the new path (not the old)
-        // survives a reload.
+        // survives a reload. The test simulates the real watcher sequence: the OS
+        // moves the file (old gone, new exists), then rename_file records the CRDT op.
         use std::sync::Arc;
         let fs = Arc::new(InMemoryFs::new());
 
+        // Start with old.md registered
         fs.write("old.md", b"# Content").await.unwrap();
         let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
-        vault.on_file_changed("old.md").await.unwrap();
-        // Write the target file so rename_file can read it
+
+        // Simulate OS-level rename: delete old, create new on the filesystem.
+        // rename_file is called after the FS move, matching the daemon's event sequence.
+        fs.delete("old.md").await.unwrap();
         fs.write("new.md", b"# Content").await.unwrap();
         vault.rename_file("old.md", "new.md").await.unwrap();
         drop(vault);

@@ -451,6 +451,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
         };
 
+        // Persist any new registry registration produced by on_file_changed.
+        // on_file_changed is sync-agnostic (called from both the watcher and reconcile
+        // paths); the caller owns the flush decision. Reconcile batches to one save;
+        // watcher events each flush here so a restart doesn't lose newly-created file nodes.
+        if let Err(e) = vault.save_registry().await {
+            error!("Failed to persist registry after file change for {}: {}", path, e);
+            return;
+        }
+
         drop(vault);
 
         if !changed || self.peer_registry.lock().await.alive_count() == 0 {
