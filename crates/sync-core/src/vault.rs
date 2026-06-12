@@ -2214,6 +2214,149 @@ mod tests {
 
     // ========== Tree Operation Tests ==========
 
+    // ========== Registry Persistence Tests ==========
+    //
+    // These tests verify that local registry tree mutations (register, delete,
+    // rename) survive a process restart — i.e., the in-memory LoroDoc is written
+    // to disk after each mutation so a fresh Vault::load recovers the same state.
+
+    #[tokio::test]
+    async fn test_register_file_survives_reload() {
+        // A registration must be persisted immediately. A fresh load over the same
+        // fs must find the path in the registry tree, not re-create a duplicate node.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // Write and register the file
+        fs.write("note.md", b"# Hello").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        vault.register_file("note.md").unwrap();
+        drop(vault);
+
+        // Load a fresh vault over the same fs
+        let vault2 = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // The path must be present in the registry (not treated as a new file)
+        assert!(
+            vault2.path_to_node().contains_key("note.md"),
+            "registered path must survive a reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_tombstone_survives_reload() {
+        // A deletion tombstone must be persisted so that peers importing the saved
+        // registry see the deletion op. After reload the path must be absent from
+        // the alive set, and a fresh peer importing the saved registry must also see
+        // the node as deleted (tombstone carried in the CRDT snapshot).
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // Register, then delete the file
+        fs.write("note.md", b"# Hello").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        vault.on_file_changed("note.md").await.unwrap();
+        vault.delete_file("note.md").await.unwrap();
+        // Grab the registry snapshot before dropping so we can verify it carries the op
+        let saved_bytes = fs.read(REGISTRY_FILE).await.unwrap();
+        drop(vault);
+
+        // Reload — path must still be gone from alive set
+        let vault2 = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            !vault2.path_to_node().contains_key("note.md"),
+            "deleted path must not reappear after reload"
+        );
+
+        // A fresh peer importing the saved registry must also see the node deleted
+        let peer_doc = loro::LoroDoc::new();
+        peer_doc.import(&saved_bytes).unwrap();
+        let peer_tree = peer_doc.get_tree(REGISTRY_TREE);
+        let any_alive = peer_tree
+            .nodes()
+            .into_iter()
+            .filter(|id| !peer_tree.is_node_deleted(id).unwrap_or(true))
+            .count();
+        assert_eq!(
+            any_alive, 0,
+            "saved registry must carry the deletion tombstone for peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_file_survives_reload() {
+        // A rename must persist the updated registry so the new path (not the old)
+        // survives a reload.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("old.md", b"# Content").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        vault.on_file_changed("old.md").await.unwrap();
+        // Write the target file so rename_file can read it
+        fs.write("new.md", b"# Content").await.unwrap();
+        vault.rename_file("old.md", "new.md").await.unwrap();
+        drop(vault);
+
+        let vault2 = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            vault2.path_to_node().contains_key("new.md"),
+            "renamed path must survive reload"
+        );
+        assert!(
+            !vault2.path_to_node().contains_key("old.md"),
+            "old path must not appear in registry after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_batch_registrations_survive_reload() {
+        // Reconcile can register hundreds of files during startup. The registrations
+        // must be batched (one save at the end of reconcile, not per-file) and must
+        // survive a second load. This test verifies correctness; the per-file O(n)
+        // write cost is the failure mode we're guarding against structurally.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // Pre-populate several markdown files before init so reconcile finds them
+        fs.write("a.md", b"# A").await.unwrap();
+        fs.write("b.md", b"# B").await.unwrap();
+        fs.write("c.md", b"# C").await.unwrap();
+
+        // init already calls index_existing_files, which registers via on_file_changed
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        drop(_vault);
+
+        // Second load must find all three paths already in the registry
+        let vault2 = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            vault2.path_to_node().contains_key("a.md"),
+            "a.md must survive reload"
+        );
+        assert!(
+            vault2.path_to_node().contains_key("b.md"),
+            "b.md must survive reload"
+        );
+        assert!(
+            vault2.path_to_node().contains_key("c.md"),
+            "c.md must survive reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_warns_on_untracked_path() {
+        // delete_file on a path with no registry node must emit a warn log and
+        // succeed silently (no error). This makes the silent no-op diagnosable.
+        // We can't easily assert on tracing output, so this just confirms the
+        // current Result::Ok behavior is preserved after the warn is added.
+        let fs = InMemoryFs::new();
+        let vault = Vault::init(fs, test_peer_id()).await.unwrap();
+
+        // Calling delete on an unregistered path must not return an error
+        let result = vault.delete_file("untracked.md").await;
+        assert!(result.is_ok(), "delete of untracked path must succeed silently");
+    }
+
     #[tokio::test]
     async fn test_delete_file_removes_from_tree() {
         let fs = InMemoryFs::new();
