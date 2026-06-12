@@ -15,6 +15,8 @@
 /// into `file_event_tx` — no real OS filesystem required.
 ///
 /// Seeds 20+ are used to avoid collisions with sync_workflow.rs (seeds 1–10).
+mod common;
+
 mod daemon_integration {
     use std::sync::Arc;
     use std::time::Duration;
@@ -34,11 +36,6 @@ mod daemon_integration {
     use sync_daemon::watcher::{FileEvent, FileEventKind};
 
     // ── helpers ───────────────────────────────────────────────────────────────
-
-    /// Deterministic 32-byte seed for building test nodes.
-    fn seed(n: u8) -> [u8; 32] {
-        [n; 32]
-    }
 
     /// Shared gossip topic so all test daemons join the same swarm.
     fn shared_vault_id() -> VaultId {
@@ -77,12 +74,12 @@ mod daemon_integration {
         let fs = Arc::new(InMemoryFs::new());
         // Author Loro ops under a per-device PeerId derived from this node's
         // secret seed, so each node is a distinct Loro replica.
-        let author = PeerId::from_secret_bytes(seed(seed_byte));
+        let author = PeerId::from_secret_bytes(super::common::seed(seed_byte));
         let vault = Vault::init(fs.clone(), author).await?;
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let sync_node = SyncNode::new(seed(seed_byte), None, allowlist.clone()).await?;
+        let sync_node = SyncNode::new(super::common::seed(seed_byte), None, allowlist.clone()).await?;
 
         let memory_lookup = MemoryLookup::new();
         sync_node.endpoint.address_lookup()?.add(memory_lookup);
@@ -1142,6 +1139,219 @@ mod daemon_integration {
 
         shutdown.cancel();
         let _ = loop_handle.await;
+        Ok(())
+    }
+
+    /// After a successful two-step pairing, the responder's (endpoint_id, relay_url)
+    /// is persisted to B's `DaemonConfig.peer_relays` AND seeded into B's live
+    /// `peer_lookup`, keyed by the responder's transport-verified EndpointId.
+    ///
+    /// This test verifies commit 4 of the Umbra Relay plan:
+    /// - `persist_adopted_relay` now takes the responder's `EndpointId` explicitly
+    ///   and writes to `peer_relays` (not the discarded `relay_url` field).
+    /// - After persist, `sync_node.add_peer_relay` is called so the current session
+    ///   benefits without restart.
+    /// - The stored entry survives a config reload.
+    ///
+    /// A's relay URL is the transport-verified source: it is A's `relay_url` field
+    /// (the URL A advertises in `PairingResult.relay_urls`), and A's `EndpointId` is
+    /// the QUIC connection target B dialed — not inferred from `mesh_members`.
+    ///
+    /// Seeds 68/69 reserved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pairing_persists_responder_relay() -> anyhow::Result<()> {
+        use iroh::EndpointId;
+        use sync_daemon::daemon::Daemon;
+        use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
+        use sync_daemon::persistence::DaemonConfig;
+        use sync_daemon::relay::EmbeddedRelay;
+        use tempfile::TempDir;
+        use tokio::sync::{broadcast, mpsc, oneshot, watch};
+
+        let node_a = build_node(68).await?; // responder
+        let node_b = build_node(69).await?; // initiator
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let a_vault_id = node_a.vault.lock().await.vault_id();
+        let b_vault_id = node_b.vault.lock().await.vault_id();
+        assert_ne!(a_vault_id, b_vault_id, "test requires distinct initial VaultIds");
+
+        // Start a relay for A to advertise. This gives `relay_urls` something to
+        // carry over the pairing wire so B can persist A's relay after onboarding.
+        let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+        let relay_url = relay.relay_url().clone();
+        let relay_url_str = relay_url.to_string();
+
+        let a_endpoint_id: EndpointId = node_a.sync_node.node_id();
+
+        // Clone B's peer_lookup handle BEFORE moving sync_node into Daemon::new.
+        // MemoryLookup is Arc-backed, so the clone stays live and reflects any
+        // add_peer_relay calls made on the daemon's internal copy.
+        let b_peer_lookup = node_b.sync_node.peer_lookup.clone();
+
+        // B needs a real on-disk vault path so `persist_adopted_relay` can write
+        // `DaemonConfig.peer_relays` to `daemon.toml` and we can reload it.
+        let b_vault_dir = TempDir::new()?;
+        let b_vault_path = b_vault_dir.path().to_path_buf();
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&a_vault_id, vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&b_vault_id, vec![])
+            .await?;
+
+        // Build daemon A (responder) — pass A's relay URL so `PairingResult.relay_urls`
+        // carries it over the wire to B.
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let a_allowlist = node_a.allowlist.clone();
+        let a_vault_path = TempDir::new()?;
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            a_allowlist.clone(),
+            "device-a".to_string(),
+            Some(relay_url_str.clone()),
+            a_vault_path.path().into(),
+            a_shutdown.clone(),
+        );
+
+        let (a_status_tx, _) = watch::channel(DaemonStatus::initial());
+        let (a_pairing_tx, mut a_pairing_rx): (broadcast::Sender<PairingUiEvent>, _) =
+            broadcast::channel(16);
+        let (_a_cmd_tx, a_cmd_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+        daemon_a.wire_control(a_status_tx, a_pairing_tx, a_cmd_rx, "Mesh A".to_string());
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // Build daemon B (initiator) — use the real temp vault path.
+        let b_vault = node_b.vault.clone();
+        let b_allowlist = node_b.allowlist.clone();
+        let (_b_file_tx, b_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let b_shutdown = CancellationToken::new();
+        let mut daemon_b = Daemon::new(
+            b_vault.clone(),
+            node_b.sync_node,
+            gossip_b,
+            b_file_rx,
+            None,
+            b_allowlist.clone(),
+            "device-b".to_string(),
+            None,
+            b_vault_path.clone(),
+            b_shutdown.clone(),
+        );
+
+        let (b_status_tx, _) = watch::channel(DaemonStatus::initial());
+        let (b_pairing_tx, _): (broadcast::Sender<PairingUiEvent>, _) = broadcast::channel(16);
+        let (b_cmd_tx, b_cmd_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+        daemon_b.wire_control(b_status_tx, b_pairing_tx, b_cmd_rx, "Mesh B".to_string());
+
+        daemon_b
+            .test_seed_discovered(a_vault_id.to_string(), a_endpoint_id)
+            .await;
+
+        let b_loop = tokio::spawn(async move {
+            daemon_b.run_loop().await;
+        });
+
+        // ── Step 1: RequestPairing ────────────────────────────────────────────
+
+        let (req_reply_tx, req_reply_rx) = oneshot::channel::<Result<String, String>>();
+        b_cmd_tx.send(DaemonCommand::RequestPairing {
+            vault_id: a_vault_id.to_string(),
+            reply: req_reply_tx,
+        })?;
+
+        let (connect_result, pairing_code) = tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(10), req_reply_rx)
+                    .await
+                    .expect("RequestPairing did not resolve within 10s")
+                    .expect("daemon dropped RequestPairing reply channel")
+            },
+            async {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(10), a_pairing_rx.recv()).await {
+                        Ok(Ok(PairingUiEvent::InboundRequest { code, .. })) => break code,
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(_)) => panic!("A's pairing broadcast channel closed unexpectedly"),
+                        Err(_) => panic!("timed out waiting for A's InboundRequest pairing event"),
+                    }
+                }
+            }
+        );
+
+        connect_result.expect("RequestPairing should succeed with Ok(device_name)");
+
+        // ── Step 2: SubmitCode ────────────────────────────────────────────────
+
+        let (submit_reply_tx, submit_reply_rx) = oneshot::channel::<Result<String, String>>();
+        b_cmd_tx.send(DaemonCommand::SubmitCode {
+            vault_id: a_vault_id.to_string(),
+            code: pairing_code,
+            reply: submit_reply_tx,
+        })?;
+
+        tokio::time::timeout(Duration::from_secs(10), submit_reply_rx)
+            .await
+            .expect("SubmitCode did not resolve within 10s")
+            .expect("daemon dropped SubmitCode reply channel")
+            .expect("SubmitCode should succeed");
+
+        // ── Assertions ───────────────────────────────────────────────────────
+
+        // Give the daemon's async `persist_adopted_relay` a moment to finish writing
+        // before we reload the config.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Live lookup: B's peer_lookup should carry A's (endpoint_id, relay_url).
+        // This proves `add_peer_relay` was called on the current session after pairing.
+        let hint = b_peer_lookup
+            .get_endpoint_info(a_endpoint_id)
+            .expect("B's peer_lookup should have A's relay hint after pairing");
+        let hint_relay_urls: Vec<_> = hint
+            .into_endpoint_addr()
+            .relay_urls()
+            .cloned()
+            .collect();
+        assert!(
+            hint_relay_urls.iter().any(|u| u.to_string() == relay_url_str),
+            "B's live peer_lookup hint should contain A's relay URL, got: {:?}",
+            hint_relay_urls,
+        );
+
+        // Persistence: reload B's DaemonConfig and verify peer_relays was written.
+        // `DaemonConfig::load_or_generate` reads from the real temp vault path.
+        let (b_config, _) = DaemonConfig::load_or_generate(&b_vault_path, None)
+            .await
+            .expect("should be able to reload B's daemon config");
+        let a_endpoint_hex = a_endpoint_id.to_string();
+        let persisted = b_config
+            .peer_relays
+            .iter()
+            .find(|r| r.endpoint_id == a_endpoint_hex)
+            .expect("B's peer_relays should contain A's entry after pairing");
+        assert_eq!(
+            persisted.relay_url, relay_url_str,
+            "persisted relay_url should match A's advertised URL"
+        );
+
+        b_shutdown.cancel();
+        a_shutdown.cancel();
+        let _ = b_loop.await;
+        let _ = a_loop.await;
+        relay.shutdown().await;
+
         Ok(())
     }
 }

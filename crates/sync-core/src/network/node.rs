@@ -9,6 +9,8 @@ use ed25519_dalek::SigningKey;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
+#[cfg(feature = "native")]
+use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::{Gossip, TopicId};
 use std::sync::Arc;
@@ -108,6 +110,17 @@ pub struct SyncNode {
     /// mDNS address lookup for LAN mesh discovery (native only).
     #[cfg(feature = "native")]
     mdns: Option<crate::network::mesh_mdns::MeshMdns>,
+    /// In-memory address lookup seeded with known peer relay hints (native only).
+    ///
+    /// Populated at startup from `DaemonConfig.peer_relays` so gossip bootstrap
+    /// can resolve off-LAN peers through their relay before mDNS finds them.
+    /// Also updated at runtime after pairing via `add_peer_relay`.
+    ///
+    /// Exposed as `pub` so integration tests can inspect hint registration
+    /// without a live connection — the canonical production verification path
+    /// is full gossip connectivity (see relay_integration tests).
+    #[cfg(feature = "native")]
+    pub peer_lookup: MemoryLookup,
 }
 
 impl SyncNode {
@@ -176,6 +189,21 @@ impl SyncNode {
             }
         };
 
+        // Register the peer-relay MemoryLookup alongside mDNS so gossip can
+        // resolve off-LAN peers through hints seeded from persisted peer_relays.
+        // Registration failure is non-fatal — we warn and continue without hints,
+        // mirroring the mDNS registration pattern above.
+        let peer_lookup = MemoryLookup::with_provenance("peer_relays");
+        match endpoint.address_lookup() {
+            Ok(lookup) => {
+                lookup.add(peer_lookup.clone());
+                info!("Peer relay address lookup registered");
+            }
+            Err(e) => {
+                warn!("Failed to register peer relay address lookup: {e}");
+            }
+        }
+
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
 
@@ -199,6 +227,7 @@ impl SyncNode {
             inbound_pairing_rx,
             router,
             mdns,
+            peer_lookup,
         })
     }
 
@@ -248,6 +277,29 @@ impl SyncNode {
     /// This node's iroh EndpointId (matches our ed25519 public key).
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Seed a relay hint for a peer into the address-lookup service (native only).
+    ///
+    /// After this call, gossip bootstrap with the peer's bare `EndpointId` will
+    /// resolve the hint and attempt a connection through their relay. This is
+    /// called at startup for each entry in `DaemonConfig.peer_relays`, and at
+    /// runtime after a successful pairing.
+    ///
+    /// If the relay is unreachable off-LAN, connection attempts through that hint
+    /// will simply fail; there is no automatic fallback to mDNS off-LAN because
+    /// mDNS does not operate across network boundaries.
+    #[cfg(feature = "native")]
+    pub fn add_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
+        if endpoint_id == self.node_id() {
+            tracing::warn!(
+                "add_peer_relay called with our own EndpointId — ignoring to prevent \
+                 self-connect (iroh rejects self-directed relay paths)"
+            );
+            return;
+        }
+        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.clone());
+        self.peer_lookup.add_endpoint_info(addr);
     }
 
     /// Derive a deterministic gossip TopicId from a VaultId.

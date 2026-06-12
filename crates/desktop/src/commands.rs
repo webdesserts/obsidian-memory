@@ -16,6 +16,26 @@ use sync_daemon::pair_api::DaemonCommand;
 
 use crate::ControlState;
 
+/// Send a oneshot `DaemonCommand` and await its reply.
+///
+/// `make_cmd` receives the reply sender and wraps it into the appropriate
+/// `DaemonCommand` variant. Returns an error string if the daemon's command
+/// channel is closed (not running) or if the reply channel is dropped before
+/// the daemon responds (disconnected mid-flight).
+async fn dispatch<T>(
+    control: &ControlState,
+    make_cmd: impl FnOnce(oneshot::Sender<T>) -> DaemonCommand,
+) -> Result<T, String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    control
+        .command_tx
+        .send(make_cmd(reply_tx))
+        .map_err(|_| "Daemon is not running".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "Daemon disconnected before replying".to_string())
+}
+
 /// Payload emitted to the pair-initiator window for each discovered mesh.
 #[derive(Serialize, Clone)]
 pub struct MeshDiscoveredPayload {
@@ -92,20 +112,8 @@ pub async fn request_pairing(
     vault_id: String,
     control: State<'_, ControlState>,
 ) -> Result<PairSuccessResult, String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    control
-        .command_tx
-        .send(DaemonCommand::RequestPairing {
-            vault_id,
-            reply: reply_tx,
-        })
-        .map_err(|_| "Daemon is not running".to_string())?;
-
-    let device_name = reply_rx
-        .await
-        .map_err(|_| "Daemon disconnected before replying".to_string())??;
-
+    let device_name =
+        dispatch(&control, |reply| DaemonCommand::RequestPairing { vault_id, reply }).await??;
     Ok(PairSuccessResult { device_name })
 }
 
@@ -121,21 +129,8 @@ pub async fn submit_pair_code(
     code: String,
     control: State<'_, ControlState>,
 ) -> Result<PairSuccessResult, String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    control
-        .command_tx
-        .send(DaemonCommand::SubmitCode {
-            code,
-            vault_id,
-            reply: reply_tx,
-        })
-        .map_err(|_| "Daemon is not running".to_string())?;
-
-    let device_name = reply_rx
-        .await
-        .map_err(|_| "Daemon disconnected before replying".to_string())??;
-
+    let device_name =
+        dispatch(&control, |reply| DaemonCommand::SubmitCode { code, vault_id, reply }).await??;
     Ok(PairSuccessResult { device_name })
 }
 
@@ -146,18 +141,7 @@ pub async fn submit_pair_code(
 /// after pairing has already completed but the window is still closing.
 #[tauri::command]
 pub async fn cancel_pair_discovery(control: State<'_, ControlState>) -> Result<(), String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    control
-        .command_tx
-        .send(DaemonCommand::CancelInitiate { reply: reply_tx })
-        .map_err(|_| "Daemon is not running".to_string())?;
-
-    reply_rx
-        .await
-        .map_err(|_| "Daemon disconnected before replying".to_string())?;
-
-    Ok(())
+    dispatch(&control, |reply| DaemonCommand::CancelInitiate { reply }).await
 }
 
 /// Reject the currently-active inbound pairing request. Idempotent.
@@ -169,16 +153,5 @@ pub async fn cancel_pair_discovery(control: State<'_, ControlState>) -> Result<(
 /// safely after the daemon has already failed or completed the exchange.
 #[tauri::command]
 pub async fn reject_inbound_pair(control: State<'_, ControlState>) -> Result<(), String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    control
-        .command_tx
-        .send(DaemonCommand::RejectInbound { reply: reply_tx })
-        .map_err(|_| "Daemon is not running".to_string())?;
-
-    reply_rx
-        .await
-        .map_err(|_| "Daemon disconnected before replying".to_string())?;
-
-    Ok(())
+    dispatch(&control, |reply| DaemonCommand::RejectInbound { reply }).await
 }

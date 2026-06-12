@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use iroh::{EndpointId, RelayUrl};
 use sync_core::SyncMetadata;
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::network::SyncNode;
@@ -72,28 +73,42 @@ pub async fn adopt_vault_id_on_disk(vault_path: &Path, new_id: VaultId) -> anyho
     Ok(())
 }
 
-/// Persist the mesh's relay URL to `daemon.toml` for the next daemon start.
+/// Persist the responder's relay URL keyed by their `EndpointId` and seed the
+/// live address-lookup so the current session can route through their relay
+/// without a restart.
 ///
-/// The joiner has no relay URL of its own, so cross-network sync would silently
-/// fail without this. We persist the first non-empty entry. This is a
-/// persist-for-next-start step, NOT a live endpoint rebuild: the adopted relay
-/// takes effect when the daemon next starts and reads `daemon.toml`. For v0.5.x
-/// LAN pairing this limitation is invisible — LAN sync uses direct QUIC + mDNS
-/// and doesn't need the relay; the persisted URL benefits the next cross-network
-/// session.
+/// `responder_id` is the transport-verified identity of the QUIC connection the
+/// initiator dialed — not inferred from `PairingResult.mesh_members` — so the
+/// binding is correct even if `mesh_members` ordering or content differs.
 ///
-/// Loading `DaemonConfig::load_or_generate` on a fresh vault generates the device
-/// keypair as a side effect; that is acceptable — a device pairing in needs an
-/// identity anyway.
-pub async fn persist_adopted_relay(vault_path: &Path, relay_urls: &[String]) {
-    let Some(url) = relay_urls.iter().find(|u| !u.is_empty()).cloned() else {
+/// `relay_urls` is currently always single-source (the responder's own relay),
+/// so binding `relay_urls.first()` to `responder_id` is sound. Mesh-wide relay
+/// propagation (other members' relays) is deferred.
+///
+/// **Asymmetry note:** the responder side does NOT learn the initiator's relay
+/// today — the `PairingHello` message does not carry a relay URL. That
+/// propagation is deferred to a future phase.
+///
+/// Loading `DaemonConfig::load_or_generate` on a fresh vault generates the
+/// device keypair as a side effect; that is acceptable — a device pairing in
+/// needs an identity anyway.
+pub async fn persist_adopted_relay(
+    vault_path: &Path,
+    responder_id: EndpointId,
+    relay_urls: &[String],
+    sync_node: &SyncNode,
+) {
+    let Some(url_str) = relay_urls.iter().find(|u| !u.is_empty()).cloned() else {
         return;
     };
 
+    let responder_id_hex = responder_id.to_string();
+
     match DaemonConfig::load_or_generate(vault_path, None).await {
         Ok((mut config, _identity)) => {
-            if let Err(e) = config.set_relay_url(Some(url), vault_path) {
+            if let Err(e) = config.upsert_peer_relay(&responder_id_hex, &url_str, vault_path) {
                 warn!("Failed to persist adopted relay URL: {}", e);
+                return;
             }
         }
         Err(e) => {
@@ -101,7 +116,19 @@ pub async fn persist_adopted_relay(vault_path: &Path, relay_urls: &[String]) {
                 "Failed to load daemon config to persist adopted relay URL: {}",
                 e
             );
+            return;
         }
+    }
+
+    // Seed the live lookup so gossip can route to the responder through their
+    // relay in the current session without waiting for a restart.
+    if let Ok(relay_url) = url_str.parse::<RelayUrl>() {
+        sync_node.add_peer_relay(responder_id, &relay_url);
+    } else {
+        warn!(
+            url = %url_str,
+            "Adopted relay URL is not a valid RelayUrl — skipping live lookup seed"
+        );
     }
 }
 

@@ -291,6 +291,148 @@ async fn test_run_with_shutdown_cancels_after_startup() {
     result.expect("run_with_shutdown returned an error after clean shutdown");
 }
 
+/// `run_with_shutdown` with `relay_listen` + `advertised_relay_url` writes the
+/// advertised URL (not the bound localhost address) to daemon.toml's `relay_url`
+/// field, and round-trips a pre-seeded `peer_relays` entry without erasing it.
+///
+/// This pins the two behaviors fixed by the umbra-relay branch:
+/// - The headless path no longer ignores `advertised_relay_url`.
+/// - Startup does not erase existing `peer_relays` entries when writing `relay_url`.
+///
+/// What is pinned vs what isn't:
+/// - **Pinned**: daemon.toml's `relay_url` field equals the advertised URL after
+///   startup, not the bound `127.0.0.1` address.
+/// - **Pinned**: a pre-seeded `peer_relays` entry round-trips cleanly — startup
+///   completes without error, and daemon.toml still contains the entry after
+///   startup (it is not erased by set_relay_url or any startup path).
+/// - **Not pinned**: in-process MemoryLookup state — the address-lookup table
+///   inside the running SyncNode is not observable through the headless API.
+///   The in-process seeding behavior is covered by startup_inner's unit path;
+///   here we assert the file-level invariant and clean startup.
+#[tokio::test]
+async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
+    use std::fs;
+    use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown};
+    use sync_daemon::persistence::{DaemonConfig, PeerRelay};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let vault_path = temp_dir.path().to_path_buf();
+
+    // Bind a health port so we can poll for full startup before cancelling.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind health port");
+    let health_addr = listener.local_addr().expect("Failed to get local addr");
+    drop(listener);
+
+    // Bind the relay on a random port to avoid conflicts.
+    let relay_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind relay port");
+    let relay_addr = relay_listener.local_addr().expect("Failed to get relay addr");
+    drop(relay_listener);
+
+    // TEST-NET-2 (RFC 5737) — documentation address, never dialed.
+    // We use it as the advertised URL so it's clearly distinct from the bound
+    // 127.0.0.1 address, without risking a real network dial.
+    let advertised_url = "http://198.51.100.7:3340/".to_string();
+
+    // Pre-seed a peer_relays entry in daemon.toml before startup. The entry uses
+    // a valid 64-hex endpoint_id (distinct from our own, so self-skip won't drop it)
+    // and an arbitrary relay URL. Startup should load and forward this to the
+    // address-lookup service, leaving the file entry intact.
+    let sync_dir = vault_path.join(".sync");
+    fs::create_dir_all(&sync_dir).expect("Failed to create .sync dir");
+
+    // Generate an identity so we have a known peer_id to construct the TOML.
+    // We write a minimal daemon.toml with the peer_relay pre-seeded; startup
+    // will generate daemon.key and extend the file normally.
+    let peer_relay_endpoint = "b".repeat(64); // 64 hex chars, distinct from any real id
+    let peer_relay_url = "http://peer-relay.example.com:3340/";
+
+    // Write a bare daemon.toml — peer_id will be filled on first keygen, but we need
+    // the peer_relays there. Use DaemonConfig::load_or_generate to produce a valid
+    // config, then inject the peer relay and re-save before the daemon starts.
+    let (mut seed_config, _seed_key) = DaemonConfig::load_or_generate(&vault_path, None)
+        .await
+        .expect("Failed to seed initial config");
+    seed_config
+        .peer_relays
+        .push(PeerRelay { endpoint_id: peer_relay_endpoint.clone(), relay_url: peer_relay_url.to_string() });
+    seed_config.save(&vault_path).expect("Failed to save seeded config");
+
+    let config = DaemonRunConfig {
+        vault: vault_path.clone(),
+        identity_key: None,
+        health_listen: Some(health_addr.to_string()),
+        relay_listen: Some(relay_addr.to_string()),
+        advertised_relay_url: Some(advertised_url.clone()),
+    };
+
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    let handle = tokio::spawn(run_with_shutdown(config, shutdown.clone()));
+
+    // Poll the health endpoint until fully started.
+    let client = reqwest::Client::new();
+    let health_url = format!("http://{}/health", health_addr);
+    let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if tokio::time::Instant::now() >= startup_deadline {
+            panic!("daemon did not start within 20s");
+        }
+        if client
+            .get(&health_url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // --- Assert 1: relay_url in daemon.toml equals the ADVERTISED URL, not bound addr ---
+    let toml_contents =
+        fs::read_to_string(vault_path.join(".sync/daemon.toml")).expect("Failed to read daemon.toml");
+    assert!(
+        toml_contents.contains(&advertised_url),
+        "daemon.toml must contain the advertised relay URL ({advertised_url}), got:\n{toml_contents}"
+    );
+    // The bound address (127.0.0.1 with the relay's port) must NOT appear as relay_url —
+    // that would mean the advertised_relay_url override was silently ignored.
+    let bound_prefix = format!("http://{}:{}", relay_addr.ip(), relay_addr.port());
+    assert!(
+        !toml_contents.contains(&format!("relay_url = \"{bound_prefix}")),
+        "daemon.toml must NOT contain the raw bound address as relay_url; advertised URL should win"
+    );
+
+    // --- Assert 2: peer_relays entry round-tripped cleanly ---
+    // The pre-seeded entry must still be in daemon.toml after startup — startup
+    // must not erase peer_relays when writing relay_url.
+    assert!(
+        toml_contents.contains(&peer_relay_endpoint),
+        "daemon.toml must still contain the pre-seeded peer_relay endpoint_id after startup"
+    );
+    assert!(
+        toml_contents.contains(peer_relay_url),
+        "daemon.toml must still contain the pre-seeded peer_relay URL after startup"
+    );
+
+    // Shut down cleanly.
+    shutdown_clone.cancel();
+    let result = timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("daemon did not shut down within 15s after cancel")
+        .expect("tokio task panicked");
+    result.expect("run_with_shutdown returned an error after clean shutdown");
+}
+
 // ============================================================================
 // run_with_shutdown_controlled Tests
 // ============================================================================

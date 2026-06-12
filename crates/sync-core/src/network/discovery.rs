@@ -11,6 +11,7 @@
 use iroh::EndpointId;
 use iroh::address_lookup::UserData;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Metadata broadcast via mDNS to identify a mesh (vault).
 ///
@@ -75,4 +76,115 @@ pub struct DiscoveredMesh {
     pub peers: Vec<EndpointId>,
     /// Number of online devices (equal to `peers.len()` at discovery time).
     pub online_count: usize,
+}
+
+/// Parse a `DiscoveryEvent::Discovered` into a single-peer `DiscoveredMesh`.
+///
+/// Returns `None` for `DiscoveryEvent::Expired` or when the peer's user-data
+/// cannot be parsed as `MeshMetadata`. Malformed metadata is logged as a warning
+/// (peer id + parse error + raw user-data) so operators can diagnose mDNS issues
+/// without needing a debugger.
+///
+/// Callers that need to accumulate multiple peers per mesh (e.g. the CLI scanner)
+/// should fold successive calls into their own `HashMap` keyed by `vault_id`.
+pub fn mesh_from_discovery_event(event: &DiscoveryEvent) -> Option<DiscoveredMesh> {
+    let DiscoveryEvent::Discovered { endpoint_info } = event else {
+        return None;
+    };
+
+    let raw = endpoint_info.data.user_data()?;
+    let s = raw.as_ref();
+
+    let meta: MeshMetadata = match serde_json::from_str(s) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                peer = %endpoint_info.endpoint_id,
+                err = %e,
+                user_data = %s,
+                "mDNS: discarding peer with malformed mesh metadata"
+            );
+            return None;
+        }
+    };
+
+    Some(DiscoveredMesh {
+        mesh_name: meta.mesh.clone(),
+        vault_id: meta.vid.clone(),
+        peers: vec![endpoint_info.endpoint_id],
+        online_count: 1,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::SecretKey;
+
+    use super::*;
+
+    /// Generate a deterministic test EndpointId from a seed byte.
+    fn test_endpoint_id(seed: u8) -> EndpointId {
+        SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// Build a `DiscoveryEvent::Discovered` with `user_data` set to the given string.
+    fn discovered_event(endpoint_id: EndpointId, user_data_str: &str) -> DiscoveryEvent {
+        DiscoveryEvent::Discovered {
+            endpoint_info: EndpointInfo {
+                endpoint_id,
+                data: EndpointData::new(Some(user_data_str.parse().unwrap())),
+            },
+        }
+    }
+
+    #[test]
+    fn valid_metadata_returns_single_peer_mesh() {
+        let id = test_endpoint_id(1);
+        let meta = MeshMetadata {
+            mesh: "Michael's Notes".into(),
+            vid: "deadbeef".into(),
+            ver: 1,
+        };
+        let event = discovered_event(id, &serde_json::to_string(&meta).unwrap());
+
+        let mesh = mesh_from_discovery_event(&event).expect("should parse valid metadata");
+        assert_eq!(mesh.mesh_name, "Michael's Notes");
+        assert_eq!(mesh.vault_id, "deadbeef");
+        assert_eq!(mesh.peers, vec![id]);
+        assert_eq!(mesh.online_count, 1);
+    }
+
+    #[test]
+    fn malformed_json_returns_none() {
+        let id = test_endpoint_id(2);
+        let event = discovered_event(id, "not valid json {{{");
+        assert!(mesh_from_discovery_event(&event).is_none());
+    }
+
+    #[test]
+    fn missing_required_field_returns_none() {
+        // Missing `vid` — serde will fail to deserialize.
+        let id = test_endpoint_id(3);
+        let event = discovered_event(id, r#"{"mesh":"My Notes","ver":1}"#);
+        assert!(mesh_from_discovery_event(&event).is_none());
+    }
+
+    #[test]
+    fn expired_event_returns_none() {
+        let event = DiscoveryEvent::Expired {
+            endpoint_id: test_endpoint_id(4),
+        };
+        assert!(mesh_from_discovery_event(&event).is_none());
+    }
+
+    #[test]
+    fn no_user_data_returns_none() {
+        let event = DiscoveryEvent::Discovered {
+            endpoint_info: EndpointInfo {
+                endpoint_id: test_endpoint_id(5),
+                data: EndpointData::new(None),
+            },
+        };
+        assert!(mesh_from_discovery_event(&event).is_none());
+    }
 }

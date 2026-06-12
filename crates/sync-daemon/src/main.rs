@@ -29,6 +29,15 @@ struct Args {
     #[arg(long)]
     identity_key: Option<PathBuf>,
 
+    /// URL to advertise to peers for this node's embedded relay.
+    ///
+    /// Use this on machines that bind the relay on 0.0.0.0 but need to advertise
+    /// a stable public hostname (e.g. `http://umbra.computer:3340/`). Peers dial
+    /// this URL to reach the relay; without it they can only reach the relay via
+    /// LAN mDNS discovery.
+    #[arg(long)]
+    advertised_relay_url: Option<String>,
+
     /// Enable verbose logging
     #[arg(long)]
     verbose: bool,
@@ -41,9 +50,40 @@ impl From<Args> for DaemonRunConfig {
             identity_key: args.identity_key,
             health_listen: args.health_listen,
             relay_listen: args.relay_listen,
-            // CLI callers don't set the advertised URL — they bind and advertise the same address.
-            advertised_relay_url: None,
+            advertised_relay_url: args.advertised_relay_url,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `--advertised-relay-url` maps through to `DaemonRunConfig.advertised_relay_url`.
+    #[test]
+    fn advertised_relay_url_arg_wires_into_run_config() {
+        let args = Args::parse_from([
+            "sync-daemon",
+            "--vault",
+            "/tmp/vault",
+            "--advertised-relay-url",
+            "http://umbra.computer:3340/",
+        ]);
+
+        let config: DaemonRunConfig = args.into();
+        assert_eq!(
+            config.advertised_relay_url,
+            Some("http://umbra.computer:3340/".to_string()),
+        );
+    }
+
+    /// Without `--advertised-relay-url`, `DaemonRunConfig.advertised_relay_url` is `None`.
+    #[test]
+    fn advertised_relay_url_defaults_to_none() {
+        let args = Args::parse_from(["sync-daemon", "--vault", "/tmp/vault"]);
+        let config: DaemonRunConfig = args.into();
+        assert_eq!(config.advertised_relay_url, None);
     }
 }
 

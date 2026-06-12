@@ -11,14 +11,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use sync_core::network::discovery::DiscoveryEvent;
 use std::sync::Arc;
 use tracing::debug;
 
 use sync_core::allowlist::InMemoryAllowlist;
 use sync_core::network::{
     SyncNode,
-    discovery::{DiscoveredMesh, MeshMetadata},
+    discovery::{DiscoveredMesh, mesh_from_discovery_event},
     pairing::pair_with_mesh_interactive,
 };
 use sync_core::pairing::PairingHello;
@@ -94,28 +93,21 @@ async fn pair_inner(
         tokio::select! {
             biased;
             Some(event) = discovery_stream.next() => {
-                if let DiscoveryEvent::Discovered { endpoint_info, .. } = event {
-                    let metadata = endpoint_info
-                        .data
-                        .user_data()
-                        .and_then(|ud| serde_json::from_str::<MeshMetadata>(ud.as_ref()).ok());
-
-                    if let Some(meta) = metadata {
-                        let entry = meshes.entry(meta.vid.clone()).or_insert_with(|| DiscoveredMesh {
-                            mesh_name: meta.mesh.clone(),
-                            vault_id: meta.vid.clone(),
-                            peers: vec![],
-                            online_count: 0,
-                        });
-                        // A single peer re-announces many times during the discovery
-                        // window (fast-burst requery fires ~every 1.5s), so only add
-                        // an endpoint_id that hasn't been seen yet.
-                        if !entry.peers.contains(&endpoint_info.endpoint_id) {
-                            entry.peers.push(endpoint_info.endpoint_id);
-                        }
-                        entry.online_count = entry.peers.len();
-                        debug!(mesh = %meta.mesh, vid = %meta.vid, "Discovered mesh");
+                if let Some(mesh) = mesh_from_discovery_event(&event) {
+                    // A single peer re-announces many times during the discovery
+                    // window (fast-burst requery fires ~every 1.5s), so only add
+                    // an endpoint_id that hasn't been seen yet.
+                    let endpoint_id = mesh.peers[0];
+                    let entry = meshes.entry(mesh.vault_id.clone()).or_insert_with(|| DiscoveredMesh {
+                        peers: vec![],
+                        online_count: 0,
+                        ..mesh.clone()
+                    });
+                    if !entry.peers.contains(&endpoint_id) {
+                        entry.peers.push(endpoint_id);
                     }
+                    entry.online_count = entry.peers.len();
+                    debug!(mesh = %mesh.mesh_name, vid = %mesh.vault_id, "Discovered mesh");
                 }
             }
             _ = &mut deadline => {
@@ -236,7 +228,13 @@ async fn pair_inner(
     if let Err(e) = crate::pair_shared::adopt_vault_id_on_disk(vault_path, new_id).await {
         eprintln!("Warning: failed to adopt the mesh VaultId: {}", e);
     }
-    crate::pair_shared::persist_adopted_relay(vault_path, &result.relay_urls).await;
+    crate::pair_shared::persist_adopted_relay(
+        &vault_path,
+        peer_endpoint_id,
+        &result.relay_urls,
+        &sync_node,
+    )
+    .await;
 
     eprintln!();
     eprintln!("Pairing complete. Start the sync daemon to begin syncing.");
