@@ -456,7 +456,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         tokio::spawn(async move {
             use futures::StreamExt;
-            use sync_core::network::discovery::{DiscoveredMesh, DiscoveryEvent, MeshMetadata};
+            use sync_core::network::discovery::mesh_from_discovery_event;
 
             let deadline = tokio::time::sleep(std::time::Duration::from_secs(
                 INITIATOR_DISCOVERY_TIMEOUT_SECS,
@@ -467,47 +467,30 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             loop {
                 tokio::select! {
                     Some(event) = stream.next() => {
-                        if let DiscoveryEvent::Discovered { endpoint_info, .. } = event {
-                            let metadata = endpoint_info
-                                .data
-                                .user_data()
-                                .and_then(|ud| {
-                                    serde_json::from_str::<MeshMetadata>(ud.as_ref()).ok()
-                                });
+                        if let Some(mesh) = mesh_from_discovery_event(&event) {
+                            // Dedupe by vault_id: only emit on first sighting.
+                            // mDNS re-advertises every ~5s, so without this guard
+                            // the UI would receive a flood of identical events.
+                            // This is stricter than `pair.rs` — the CLI tracks
+                            // additional peers in the same mesh and updates
+                            // `online_count`. Phase 1.5's UI displays only the
+                            // mesh name + a "1 online" hint, so the first sighting
+                            // is enough; a richer peer count is Phase 6 work.
+                            let endpoint_id = mesh.peers[0];
+                            let mut map = discovered.lock().await;
+                            let is_new = !map.contains_key(&mesh.vault_id);
+                            map.entry(mesh.vault_id.clone()).or_insert(endpoint_id);
+                            drop(map);
 
-                            if let Some(meta) = metadata {
-                                let endpoint_id = endpoint_info.endpoint_id;
+                            if !is_new {
+                                continue;
+                            }
 
-                                // Dedupe by vault_id: only emit on first sighting.
-                                // mDNS re-advertises every ~5s, so without this guard
-                                // the UI would receive a flood of identical events.
-                                // This is stricter than `pair.rs` — the CLI tracks
-                                // additional peers in the same mesh and updates
-                                // `online_count`. Phase 1.5's UI displays only the
-                                // mesh name + a "1 online" hint, so the first sighting
-                                // is enough; a richer peer count is Phase 6 work.
-                                let mut map = discovered.lock().await;
-                                let is_new = !map.contains_key(&meta.vid);
-                                map.entry(meta.vid.clone()).or_insert(endpoint_id);
-                                drop(map);
-
-                                if !is_new {
-                                    continue;
-                                }
-
-                                let mesh = DiscoveredMesh {
-                                    mesh_name: meta.mesh.clone(),
-                                    vault_id: meta.vid.clone(),
-                                    peers: vec![endpoint_id],
-                                    online_count: 1,
-                                };
-
-                                // Send failures mean the desktop dropped the
-                                // receiver (window closed) — stop the scan early.
-                                if reply.send(mesh).is_err() {
-                                    debug!("Initiator discovery reply channel closed; ending scan");
-                                    return;
-                                }
+                            // Send failures mean the desktop dropped the
+                            // receiver (window closed) — stop the scan early.
+                            if reply.send(mesh).is_err() {
+                                debug!("Initiator discovery reply channel closed; ending scan");
+                                return;
                             }
                         }
                     }
@@ -1714,9 +1697,7 @@ async fn startup_inner(
         tokio::sync::mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>,
     > = {
         use futures::StreamExt;
-        use sync_core::network::discovery::{
-            DiscoveredMesh, DiscoveryEvent, MeshMetadata as DiscoveryMeshMetadata,
-        };
+        use sync_core::network::discovery::{DiscoveryEvent, mesh_from_discovery_event};
 
         if let Some(stream) = sync_node.subscribe_discovery().await {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -1724,34 +1705,8 @@ async fn startup_inner(
                 futures::pin_mut!(stream);
                 while let Some(event) = stream.next().await {
                     match event {
-                        DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                            let raw_user_data = endpoint_info
-                                .data
-                                .user_data()
-                                .map(|ud: &iroh::address_lookup::UserData| ud.as_ref().to_string());
-                            let metadata = match raw_user_data.as_deref() {
-                                Some(s) => match serde_json::from_str::<DiscoveryMeshMetadata>(s) {
-                                    Ok(m) => Some(m),
-                                    Err(e) => {
-                                        warn!(
-                                            peer = %endpoint_info.endpoint_id,
-                                            err = %e,
-                                            user_data = %s,
-                                            "mDNS: discarding peer with malformed mesh metadata"
-                                        );
-                                        None
-                                    }
-                                },
-                                None => None,
-                            };
-
-                            if let Some(meta) = metadata {
-                                let mesh = DiscoveredMesh {
-                                    mesh_name: meta.mesh.clone(),
-                                    vault_id: meta.vid.clone(),
-                                    peers: vec![endpoint_info.endpoint_id],
-                                    online_count: 1,
-                                };
+                        DiscoveryEvent::Discovered { .. } => {
+                            if let Some(mesh) = mesh_from_discovery_event(&event) {
                                 let _ = tx.try_send(mesh);
                             }
                         }
