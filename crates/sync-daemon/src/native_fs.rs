@@ -135,3 +135,42 @@ impl FileSystem for NativeFs {
             .map_err(|e| FsError::Io(e.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// `read` on a nonexistent path must return `FsError::NotFound`, not `FsError::Io`.
+    ///
+    /// The skip-deleted-file guard in `ensure_consistency` matches only
+    /// `FsError::NotFound`, so returning `FsError::Io` for ENOENT causes the guard
+    /// to miss and the entire inbound batch is aborted.
+    #[tokio::test]
+    async fn read_missing_path_returns_not_found() {
+        let dir = tempdir().expect("tempdir");
+        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
+
+        let err = fs.read("nonexistent.md").await.unwrap_err();
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "expected FsError::NotFound for a missing path, got: {:?}",
+            err
+        );
+    }
+
+    /// `stat` on a nonexistent path must return `FsError::NotFound`, not `FsError::Io`.
+    #[tokio::test]
+    async fn stat_missing_path_returns_not_found() {
+        let dir = tempdir().expect("tempdir");
+        let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
+
+        let err = fs.stat("nonexistent.md").await.unwrap_err();
+        assert!(
+            matches!(err, FsError::NotFound(_)),
+            "expected FsError::NotFound for a missing path, got: {:?}",
+            err
+        );
+    }
+}
