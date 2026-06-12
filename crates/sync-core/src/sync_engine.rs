@@ -488,29 +488,11 @@ impl<F: FileSystem> Vault<F> {
                 .collect()
         };
 
-        // Record every deleted path as tombstoned so that inbound DocumentUpdates
-        // for these paths (arriving via real-time broadcast) don't resurrect them.
-        for path in &deleted_paths {
-            self.record_tombstoned(path);
-        }
-
-        // Rebuild path cache from updated tree (skips deleted nodes)
+        // Rebuild path cache from the updated tree. This also re-derives the deleted-paths
+        // guard set from registry truth (reading each deleted file node's `path` meta) and
+        // applies "alive wins", so a peer's legitimate re-create at a previously-deleted
+        // path is not blocked — no separate record/clear bookkeeping is needed here.
         self.rebuild_path_cache();
-
-        // After the cache is rebuilt, clear any tombstones for paths that now have an
-        // alive registry node. A peer legitimately re-created the file (new CRDT node at
-        // the same path), and the tombstone from the prior deletion must not block it.
-        // Collect keys first to avoid holding the path_to_node guard across un_tombstone.
-        let alive_paths: Vec<String> = self.path_to_node().keys().cloned().collect();
-        for path in &alive_paths {
-            if self.is_tombstoned(path) {
-                debug!(
-                    "apply_registry_updates: clearing tombstone for re-created path: {}",
-                    path
-                );
-                self.un_tombstone(path);
-            }
-        }
 
         // Clean up filesystem for deleted files
         self.apply_registry_changes(&deleted_paths).await?;
@@ -718,21 +700,22 @@ impl<F: FileSystem> Vault<F> {
 
             Ok(modified)
         } else {
-            // Before creating a new document, check whether this path has been tombstoned in
-            // the local registry. A tombstoned path means the local device explicitly deleted
-            // this file (or received a deletion via registry sync). Creating it here would
+            // Before creating a new document, check whether this path's registry tree node
+            // is currently deleted. A deleted path means the local device explicitly deleted
+            // this file (or received the deletion via registry sync). Creating it here would
             // resurrect it, causing ping-pong deletion loops between peers.
             //
-            // We only skip when the path is KNOWN tombstoned in this session. Brand-new paths
-            // (never seen by this device) are not in the set, so they still create correctly.
+            // The deleted-paths set is registry-truth, derived in rebuild_path_cache from the
+            // persisted tree, so it guards across a daemon restart (unlike the old in-memory
+            // session set). We only skip when the path is KNOWN deleted; brand-new paths are
+            // not in the set and still create correctly.
             //
-            // Legit re-create path: if a peer creates a brand-new registry node at a
-            // previously-deleted path, apply_registry_updates clears the tombstone via
-            // un_tombstone() after rebuild_path_cache() sees the path as alive again. The
-            // next DocumentUpdate for that path reaches here with is_tombstoned=false, and
-            // the create proceeds. Locally, register_file() also clears the tombstone so a
-            // user re-creating the file on disk doesn't stay blocked.
-            if self.is_tombstoned(path) {
+            // Legit re-create: when a peer creates a brand-new registry node at a
+            // previously-deleted path, apply_registry_updates runs rebuild_path_cache first,
+            // which sees the path as alive and drops it from the set ("alive wins"). The next
+            // DocumentUpdate for that path reaches here not-deleted and the create proceeds.
+            // Locally, register_file makes the path alive in the cache for the same effect.
+            if self.is_path_deleted_in_registry(path) {
                 info!(
                     "apply_single_update: skipping create for registry-deleted path: {}",
                     path
@@ -1746,7 +1729,7 @@ mod tests {
     /// (a fresh registry node). The other peer must receive it — the tombstone from the
     /// earlier deletion must be cleared when the new alive registry node arrives.
     ///
-    /// Without un_tombstone in apply_registry_updates, vault2's tombstone set blocks the
+    /// Without alive-wins in rebuild_path_cache, vault2's deleted-paths set blocks the
     /// DocumentUpdate forever and note.md never reappears on vault2's filesystem.
     #[tokio::test]
     async fn test_legit_recreate_after_registry_alive_node_applies() {
@@ -1775,18 +1758,20 @@ mod tests {
         vault1.delete_file("note.md").await.unwrap();
         vault2.fs.delete("note.md").await.unwrap();
         vault2.delete_file("note.md").await.unwrap();
-        assert!(vault1.is_tombstoned("note.md"), "vault1 must tombstone the path");
-        assert!(vault2.is_tombstoned("note.md"), "vault2 must tombstone the path");
+        assert!(vault1.is_path_deleted_in_registry("note.md"), "vault1 must mark the path deleted");
+        assert!(vault2.is_path_deleted_in_registry("note.md"), "vault2 must mark the path deleted");
 
         // Vault 1 creates a brand-new note.md (new registry node at the same path).
         vault1.fs.write("note.md", b"# Brand new").await.unwrap();
         vault1.on_file_changed("note.md").await.unwrap();
-        // on_file_changed calls register_file internally, which clears vault1's tombstone.
-        assert!(!vault1.is_tombstoned("note.md"), "register_file must clear vault1's tombstone");
+        // on_file_changed -> register_file writes a new alive node for the path, so the
+        // registry no longer reports it deleted.
+        assert!(!vault1.is_file_deleted("note.md"), "register_file must make the path alive again");
 
         // Vault 1 syncs to vault 2. The SyncExchange delivers:
         // 1. Registry updates — vault1's new alive node for note.md. apply_registry_updates
-        //    calls un_tombstone after rebuild_path_cache sees the path as alive again.
+        //    runs rebuild_path_cache, whose alive-wins drop clears the path from vault2's
+        //    deleted-paths set.
         // 2. Document updates — vault2 can now create note.md from the sync data.
         let request2 = vault2.prepare_sync_request().await.unwrap();
         let (exchange2, _) = vault1.process_sync_message(&request2).await.unwrap();
@@ -1842,8 +1827,8 @@ mod tests {
         // daemon calls delete_file to tombstone it in the registry tree).
         vault2.fs.delete("note.md").await.unwrap();
         vault2.delete_file("note.md").await.unwrap();
-        assert!(vault2.is_tombstoned("note.md"), "root note.md should be tombstoned");
-        assert!(!vault2.is_tombstoned("nested/note.md"), "nested/note.md must NOT be tombstoned");
+        assert!(vault2.is_path_deleted_in_registry("note.md"), "root note.md should be deleted");
+        assert!(!vault2.is_path_deleted_in_registry("nested/note.md"), "nested/note.md must NOT be deleted");
 
         // Vault 1 updates nested/note.md and broadcasts a DocumentUpdate.
         vault1.fs.write("nested/note.md", b"# Updated nested").await.unwrap();

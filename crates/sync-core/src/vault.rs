@@ -86,6 +86,13 @@ const TREE_META_TYPE: &str = "type";
 const TREE_META_NAME: &str = "name";
 /// Tree node meta field: deterministic hash for document identity.
 const TREE_META_DOC_ID: &str = "doc_id";
+/// Tree node meta field: full path of the file (e.g. `dir/note.md`).
+///
+/// Written at registration so a node's path survives deletion: Loro does not
+/// expose a deleted node's real parent (`tree.parent` returns `Deleted`), so the
+/// path stored here is the only way to recover which path a deleted node held —
+/// the basis for the registry-truth resurrection guard.
+const TREE_META_PATH: &str = "path";
 
 /// Current version of the .sync/ directory format.
 /// Bump this when any breaking change is made to file layout, Loro schema, or naming.
@@ -250,13 +257,14 @@ pub struct SyncState {
     pending_reconcile: Arc<Mutex<HashSet<String>>>,
     /// Registry may need reconciliation before next sync import
     registry_pending: Arc<Mutex<bool>>,
-    /// Paths that have been tombstoned in the registry tree (locally deleted or received
-    /// via registry sync). Used to prevent inbound DocumentUpdates from resurrecting files
-    /// the local device has deleted.
+    /// Paths whose registry tree node is currently deleted. Used to prevent inbound
+    /// DocumentUpdates from resurrecting files the local device (or a peer) has deleted.
     ///
-    /// Note: This set is in-memory only and is not persisted across daemon restarts.
-    /// It covers the primary live-session resurrection scenario.
-    tombstoned_paths: Arc<Mutex<HashSet<String>>>,
+    /// This set is derived from registry truth: `rebuild_path_cache` recomputes it from
+    /// the persisted tree on every rebuild (so it survives a daemon restart), and
+    /// `delete_file` inserts synchronously so a local delete guards inbound updates before
+    /// the next registry sync. The two are complementary, not exclusive.
+    deleted_paths: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Time-to-live for sync flags. Flags older than this are considered stale.
@@ -269,7 +277,7 @@ impl Default for SyncState {
             synced_paths: Arc::new(Mutex::new(HashMap::new())),
             pending_reconcile: Arc::new(Mutex::new(HashSet::new())),
             registry_pending: Arc::new(Mutex::new(false)),
-            tombstoned_paths: Arc::new(Mutex::new(HashSet::new())),
+            deleted_paths: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -350,34 +358,32 @@ impl SyncState {
         std::mem::take(&mut *self.registry_pending.lock().unwrap())
     }
 
-    /// Record that a path has been tombstoned in the registry tree.
+    /// Mark a single path as deleted in the registry tree.
     ///
-    /// Called when a file is locally deleted or when a registry sync delivers a deletion.
-    /// The set survives only for the lifetime of this session (not persisted to disk).
-    pub fn record_tombstoned(&self, path: &str) {
-        self.tombstoned_paths
+    /// Called synchronously by `delete_file` so an inbound DocumentUpdate arriving before
+    /// the next registry sync is still guarded against resurrecting the just-deleted path.
+    pub fn mark_path_deleted(&self, path: &str) {
+        self.deleted_paths
             .lock()
             .unwrap()
             .insert(path.to_string());
     }
 
-    /// Check whether the given path is known to be tombstoned in the registry tree.
+    /// Replace the entire deleted-paths set with one freshly derived from registry truth.
     ///
-    /// Returns true only for paths explicitly recorded via `record_tombstoned`. Paths
-    /// not in the set are treated as potentially new (not tombstoned), which preserves
-    /// the create-if-new behavior for brand-new paths the registry hasn't seen yet.
-    pub fn is_tombstoned(&self, path: &str) -> bool {
-        self.tombstoned_paths.lock().unwrap().contains(path)
+    /// Called by `rebuild_path_cache`, which recomputes the set from the persisted tree —
+    /// so the guard survives a daemon restart, and "alive wins" (a path occupied by any
+    /// alive node) is honored by construction (such paths are simply not in `paths`).
+    pub fn replace_deleted_paths(&self, paths: HashSet<String>) {
+        *self.deleted_paths.lock().unwrap() = paths;
     }
 
-    /// Remove a path from the tombstone set, allowing future creates at that path.
+    /// Check whether the given path's registry tree node is currently deleted.
     ///
-    /// Called when a new alive registry node arrives at a previously-deleted path
-    /// (a peer legitimately re-created the file) or when the local user re-creates a
-    /// file at a previously-deleted path. Without this, the tombstone would block the
-    /// re-create forever in the current session.
-    pub fn un_tombstone(&self, path: &str) {
-        self.tombstoned_paths.lock().unwrap().remove(path);
+    /// Returns true only for paths known-deleted in the registry. Paths not in the set are
+    /// treated as potentially new, which preserves create-if-new for brand-new paths.
+    pub fn is_path_deleted_in_registry(&self, path: &str) -> bool {
+        self.deleted_paths.lock().unwrap().contains(path)
     }
 }
 
@@ -1079,19 +1085,14 @@ impl<F: FileSystem> Vault<F> {
         self.sync_state.consume_synced(path)
     }
 
-    /// Record that a path has been tombstoned in the registry tree.
-    pub(crate) fn record_tombstoned(&self, path: &str) {
-        self.sync_state.record_tombstoned(path);
+    /// Mark a single path as deleted in the registry tree (synchronous local-delete guard).
+    pub(crate) fn mark_path_deleted(&self, path: &str) {
+        self.sync_state.mark_path_deleted(path);
     }
 
-    /// Check whether the given path is known to be tombstoned in the registry tree.
-    pub(crate) fn is_tombstoned(&self, path: &str) -> bool {
-        self.sync_state.is_tombstoned(path)
-    }
-
-    /// Remove a path from the tombstone set (peer re-created the file or user re-created locally).
-    pub(crate) fn un_tombstone(&self, path: &str) {
-        self.sync_state.un_tombstone(path);
+    /// Check whether the given path's registry tree node is currently deleted.
+    pub(crate) fn is_path_deleted_in_registry(&self, path: &str) -> bool {
+        self.sync_state.is_path_deleted_in_registry(path)
     }
 
     /// Get the version vector for a document as encoded bytes.
@@ -1392,35 +1393,65 @@ impl<F: FileSystem> Vault<F> {
         self.path_to_node_mut().clear();
         let tree = self.file_tree();
 
-        // Iterate over all non-deleted nodes
+        // Deleted file paths recovered from node meta. A deleted node's real path is not
+        // walkable (Loro reports its parent as `Deleted`), so we read the `path` meta
+        // written at registration. Nodes deleted before that meta existed are skipped
+        // (the documented residual gap — their historic tombstones aren't path-recoverable).
+        let mut deleted_paths: HashSet<String> = HashSet::new();
+
         for node_id in tree.nodes() {
-            // Skip deleted nodes
-            if tree.is_node_deleted(&node_id).unwrap_or(true) {
+            let is_deleted = tree.is_node_deleted(&node_id).unwrap_or(true);
+
+            let Ok(meta) = tree.get_meta(node_id) else {
+                continue;
+            };
+
+            let node_type = meta.get(TREE_META_TYPE).and_then(|v| {
+                if let loro::ValueOrContainer::Value(val) = v {
+                    val.as_string().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+
+            // Only file nodes participate in the path cache and the deleted-paths guard.
+            if node_type.as_deref() != Some("file") {
                 continue;
             }
 
-            // Only cache file nodes (not folders)
-            if let Ok(meta) = tree.get_meta(node_id) {
-                let node_type = meta.get(TREE_META_TYPE).and_then(|v| {
-                    if let loro::ValueOrContainer::Value(val) = v {
-                        val.as_string().map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                });
-
-                if node_type.as_deref() == Some("file") {
-                    if let Some(path) = self.get_node_path(&node_id) {
-                        self.path_to_node_mut().insert(path, node_id);
-                    }
+            if is_deleted {
+                if let Some(path) = Self::tree_meta_string(&meta, TREE_META_PATH) {
+                    deleted_paths.insert(path);
                 }
+            } else if let Some(path) = self.get_node_path(&node_id) {
+                self.path_to_node_mut().insert(path, node_id);
             }
         }
+
+        // Alive wins: a path occupied by any alive node is not deleted, regardless of any
+        // duplicate-node debris or a re-create-after-delete that left an old deleted node
+        // carrying the same `path` meta.
+        for alive_path in self.path_to_node().keys() {
+            deleted_paths.remove(alive_path);
+        }
+
+        self.sync_state.replace_deleted_paths(deleted_paths);
 
         tracing::debug!(
             "Rebuilt path cache with {} entries",
             self.path_to_node().len()
         );
+    }
+
+    /// Read a string-valued tree node meta field, or None if absent / not a string.
+    fn tree_meta_string(meta: &loro::LoroMap, key: &str) -> Option<String> {
+        meta.get(key).and_then(|v| {
+            if let loro::ValueOrContainer::Value(val) = v {
+                val.as_string().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
     }
 
     /// Get the path for a node by walking up the tree
@@ -1551,13 +1582,16 @@ impl<F: FileSystem> Vault<F> {
             .map_err(|e| VaultError::Other(format!("Failed to set file name: {}", e)))?;
         meta.insert(TREE_META_DOC_ID, simple_hash(path))
             .map_err(|e| VaultError::Other(format!("Failed to set doc_id: {}", e)))?;
+        // Store the full path so the node's path is recoverable after deletion.
+        meta.insert(TREE_META_PATH, path)
+            .map_err(|e| VaultError::Other(format!("Failed to set path meta: {}", e)))?;
 
         // Update cache
         self.path_to_node_mut().insert(path.to_string(), node_id);
 
-        // A local re-create at a previously-deleted path clears the tombstone so that
-        // outbound sync of this new file isn't accidentally suppressed.
-        self.un_tombstone(path);
+        // A local re-create at a previously-deleted path is now alive in the cache; the
+        // next rebuild_path_cache drops it from deleted_paths ("alive wins"), so no
+        // explicit un-tombstone is needed.
 
         tracing::debug!("Registered file in tree: {}", path);
         Ok(node_id)
@@ -1577,9 +1611,11 @@ impl<F: FileSystem> Vault<F> {
             tree.delete(node_id)
                 .map_err(|e| VaultError::Other(format!("Failed to delete file node: {}", e)))?;
 
-            // Record the tombstone so inbound DocumentUpdates don't resurrect this path.
-            // Must happen before removing from path_to_node so the path is still known.
-            self.record_tombstoned(path);
+            // Mark the path deleted synchronously so an inbound DocumentUpdate arriving
+            // before the next registry sync doesn't resurrect it. rebuild_path_cache also
+            // derives this from registry truth, but it isn't called from delete_file, so
+            // the synchronous insert is what guards the live-session window.
+            self.mark_path_deleted(path);
 
             // Remove from cache
             self.path_to_node_mut().remove(path);
@@ -1710,6 +1746,11 @@ impl<F: FileSystem> Vault<F> {
             .map_err(|e| VaultError::Other(format!("Failed to update file name: {}", e)))?;
         meta.insert(TREE_META_DOC_ID, simple_hash(new_path))
             .map_err(|e| VaultError::Other(format!("Failed to update doc_id: {}", e)))?;
+        // This main path moves the node via tree.mov() rather than register_file, so the
+        // path meta must be updated explicitly to keep the deleted-path guard accurate if
+        // the renamed node is later deleted.
+        meta.insert(TREE_META_PATH, new_path)
+            .map_err(|e| VaultError::Other(format!("Failed to update path meta: {}", e)))?;
 
         // Update caches
         self.path_to_node_mut().remove(old_path);
@@ -2957,6 +2998,7 @@ mod tests {
         assert_eq!(TREE_META_TYPE, "type");
         assert_eq!(TREE_META_NAME, "name");
         assert_eq!(TREE_META_DOC_ID, "doc_id");
+        assert_eq!(TREE_META_PATH, "path");
     }
 
     #[test]
