@@ -76,6 +76,69 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Union `incoming` into `existing`, resolving same-`node_id` conflicts so the
+/// mesh converges to one roster regardless of who paired whom.
+///
+/// The merge is the CRDT-ish rule the allowlist relies on for convergence:
+///
+/// - **Tombstone precedence.** A removal must win over a re-add, otherwise any
+///   peer that still holds the live row would resurrect a revoked peer. So a
+///   tombstone beats a live row, and a tombstone is never resurrected by a stale
+///   live row. Between two tombstones the later `removed_at` wins (equal
+///   `removed_at` are equivalent — either may win).
+/// - **Live vs live** (same `node_id`, neither removed): `device_name` takes the
+///   incoming value (preserves `add_peer`'s name-update and the placeholder
+///   "unknown" self-heal), `paired_at` takes the MIN (the earliest pairing is the
+///   truest origin), `last_seen` takes the MAX (most recent sighting).
+///
+/// Entries present in only one side are carried through unchanged.
+fn merge_roster_entries(existing: &[AllowedPeer], incoming: &[AllowedPeer]) -> Vec<AllowedPeer> {
+    let mut merged = existing.to_vec();
+
+    for inc in incoming {
+        match merged.iter_mut().find(|p| p.node_id == inc.node_id) {
+            None => merged.push(inc.clone()),
+            Some(local) => *local = merge_pair(local, inc),
+        }
+    }
+
+    merged
+}
+
+/// Resolve a single same-`node_id` conflict per the rules in `merge_roster_entries`.
+fn merge_pair(local: &AllowedPeer, incoming: &AllowedPeer) -> AllowedPeer {
+    match (local.removed, incoming.removed) {
+        // Both tombstones: keep the later removal (equal removed_at: equivalent).
+        (true, true) => {
+            if incoming.removed_at >= local.removed_at {
+                incoming.clone()
+            } else {
+                local.clone()
+            }
+        }
+        // A tombstone on either side wins — a removal is never undone by a live row.
+        (true, false) => local.clone(),
+        (false, true) => incoming.clone(),
+        // Live vs live: name<-incoming, paired_at<-min, last_seen<-max.
+        (false, false) => AllowedPeer {
+            node_id: local.node_id,
+            device_name: incoming.device_name.clone(),
+            paired_at: local.paired_at.min(incoming.paired_at),
+            last_seen: max_opt(local.last_seen, incoming.last_seen),
+            removed: false,
+            removed_at: None,
+        },
+    }
+}
+
+/// Maximum of two optional timestamps, treating `None` as "no value".
+fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (some, None) | (None, some) => some,
+    }
+}
+
 /// Abstracts loading and persisting the allowlist of authorized peers.
 ///
 /// The allowlist controls which devices are permitted to sync with this vault.
@@ -142,6 +205,20 @@ pub trait AllowlistStorage: Send + Sync {
         }
         Ok(())
     }
+
+    /// Merge an incoming roster (e.g. received from a mesh peer) into local storage.
+    ///
+    /// Unions by `node_id` with tombstone-precedence so the mesh converges to one
+    /// roster (see `merge_roster_entries` for the full rule). Idempotent: re-merging
+    /// the same roster is a no-op. Saves only when the merge changed something.
+    async fn merge_roster(&self, incoming: &[AllowedPeer]) -> Result<()> {
+        let existing = self.list_peers().await?;
+        let merged = merge_roster_entries(&existing, incoming);
+        if merged != existing {
+            self.save_peers(&merged).await?;
+        }
+        Ok(())
+    }
 }
 
 /// WASM version of the AllowlistStorage trait (without Send + Sync bounds).
@@ -204,6 +281,20 @@ pub trait AllowlistStorage {
         if let Some(peer) = peers.iter_mut().find(|p| &p.node_id == node_id) {
             peer.last_seen = Some(timestamp_ms);
             self.save_peers(&peers).await?;
+        }
+        Ok(())
+    }
+
+    /// Merge an incoming roster (e.g. received from a mesh peer) into local storage.
+    ///
+    /// Unions by `node_id` with tombstone-precedence so the mesh converges to one
+    /// roster (see `merge_roster_entries` for the full rule). Idempotent: re-merging
+    /// the same roster is a no-op. Saves only when the merge changed something.
+    async fn merge_roster(&self, incoming: &[AllowedPeer]) -> Result<()> {
+        let existing = self.list_peers().await?;
+        let merged = merge_roster_entries(&existing, incoming);
+        if merged != existing {
+            self.save_peers(&merged).await?;
         }
         Ok(())
     }
@@ -396,5 +487,143 @@ mod tests {
 
         let peers = storage.list_peers().await.unwrap();
         assert!(peers.is_empty());
+    }
+
+    // --- merge_roster (union with tombstone-precedence) ---
+
+    fn live(id: PeerId, name: &str, paired_at: u64) -> AllowedPeer {
+        AllowedPeer {
+            node_id: id,
+            device_name: name.into(),
+            paired_at,
+            last_seen: None,
+            removed: false,
+            removed_at: None,
+        }
+    }
+
+    fn tombstone(id: PeerId, removed_at: u64) -> AllowedPeer {
+        AllowedPeer {
+            node_id: id,
+            device_name: "gone".into(),
+            paired_at: 1,
+            last_seen: None,
+            removed: true,
+            removed_at: Some(removed_at),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_adds_unknown_peer() {
+        let storage = InMemoryAllowlist::new();
+        let a = peer_a();
+        let c = peer_b();
+        storage.save_peers(&[live(a, "a", 100)]).await.unwrap();
+
+        // A roster from a peer that knows C (which we don't) converges us to {A, C}.
+        storage.merge_roster(&[live(c, "c", 200)]).await.unwrap();
+
+        assert!(storage.is_allowed(&a).await.unwrap());
+        assert!(storage.is_allowed(&c).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_incoming_tombstone_revokes_live() {
+        // Local has C live; an incoming roster carries C as a tombstone (someone
+        // revoked C). The tombstone must win — C becomes untrusted.
+        let storage = InMemoryAllowlist::new();
+        let c = peer_a();
+        storage.save_peers(&[live(c, "c", 100)]).await.unwrap();
+
+        storage.merge_roster(&[tombstone(c, 500)]).await.unwrap();
+
+        assert!(!storage.is_allowed(&c).await.unwrap());
+        let peers = storage.list_peers().await.unwrap();
+        assert_eq!(peers.len(), 1, "tombstone replaces the live row, not appends");
+        assert!(peers[0].removed);
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_stale_live_does_not_resurrect_tombstone() {
+        // Local has C tombstoned (we revoked C). An incoming roster from a peer
+        // that still has C live must NOT bring C back — removals win over re-adds.
+        let storage = InMemoryAllowlist::new();
+        let c = peer_a();
+        storage.save_peers(&[tombstone(c, 500)]).await.unwrap();
+
+        storage.merge_roster(&[live(c, "c", 100)]).await.unwrap();
+
+        assert!(!storage.is_allowed(&c).await.unwrap());
+        let peers = storage.list_peers().await.unwrap();
+        assert!(peers[0].removed, "a stale live row must not resurrect a tombstone");
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_later_tombstone_wins() {
+        // Two tombstones for the same peer: the later removed_at wins.
+        let storage = InMemoryAllowlist::new();
+        let c = peer_a();
+        storage.save_peers(&[tombstone(c, 100)]).await.unwrap();
+
+        storage.merge_roster(&[tombstone(c, 900)]).await.unwrap();
+
+        let peers = storage.list_peers().await.unwrap();
+        assert_eq!(peers[0].removed_at, Some(900));
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_live_vs_live_tiebreak() {
+        // Same live peer on both sides: device_name<-incoming, paired_at<-min,
+        // last_seen<-max (the S1 live-vs-live rule).
+        let storage = InMemoryAllowlist::new();
+        let c = peer_a();
+        let mut local = live(c, "old-name", 200);
+        local.last_seen = Some(50);
+        storage.save_peers(&[local]).await.unwrap();
+
+        let mut incoming = live(c, "new-name", 100);
+        incoming.last_seen = Some(80);
+        storage.merge_roster(&[incoming]).await.unwrap();
+
+        let peers = storage.list_peers().await.unwrap();
+        assert_eq!(peers[0].device_name, "new-name", "name takes incoming");
+        assert_eq!(peers[0].paired_at, 100, "paired_at takes the earliest");
+        assert_eq!(peers[0].last_seen, Some(80), "last_seen takes the most recent");
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_is_idempotent() {
+        // Re-merging an identical roster must not change anything.
+        let storage = InMemoryAllowlist::new();
+        let a = peer_a();
+        let c = peer_b();
+        let roster = vec![live(a, "a", 100), tombstone(c, 500)];
+        storage.save_peers(&roster).await.unwrap();
+
+        storage.merge_roster(&roster).await.unwrap();
+        storage.merge_roster(&roster).await.unwrap();
+
+        let peers = storage.list_peers().await.unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers, roster);
+    }
+
+    #[tokio::test]
+    async fn test_merge_roster_back_compat_entry() {
+        // An old-format entry (no `removed` field) deserializes as live and merges
+        // as a live peer — a tombstone for it would still win, but on its own it's
+        // trusted.
+        let json = r#"[{
+            "node_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "device_name": "legacy",
+            "paired_at": 1,
+            "last_seen": null
+        }]"#;
+        let incoming: Vec<AllowedPeer> = serde_json::from_str(json).unwrap();
+
+        let storage = InMemoryAllowlist::new();
+        storage.merge_roster(&incoming).await.unwrap();
+
+        assert!(storage.is_allowed(&incoming[0].node_id).await.unwrap());
     }
 }
