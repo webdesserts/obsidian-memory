@@ -424,7 +424,7 @@ async fn startup_inner(
     // from there into the spawned run_loop task. Dropping it would stop OS events.
     let (file_event_rx, watcher) = watcher.into_event_rx();
 
-    let daemon = Daemon::new(
+    let mut daemon = Daemon::new(
         Arc::new(Mutex::new(vault)),
         sync_node,
         vault_gossip,
@@ -436,6 +436,11 @@ async fn startup_inner(
         config.vault.clone(),
         shutdown,
     );
+
+    // Give the reconnect supervisor its starting address book — the same persisted
+    // hints the lookup was just seeded with. After a partition, the supervisor
+    // re-seeds and re-bootstraps gossip from this snapshot without a restart.
+    daemon.seed_peer_relays_snapshot(daemon_config.peer_relays.clone());
 
     Ok(StartupBundle {
         daemon,

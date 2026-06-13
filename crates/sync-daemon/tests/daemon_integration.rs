@@ -1529,4 +1529,239 @@ mod daemon_integration {
 
         Ok(())
     }
+
+    // ── reconnect supervisor ──────────────────────────────────────────────────
+
+    /// The reconnect supervisor re-bootstraps gossip from a seeded hint so a
+    /// partitioned daemon reconnects without a restart.
+    ///
+    /// This exercises a COLD START (B never bootstraps to A) rather than a live
+    /// partition, but the two are functionally equivalent for recovery: after a
+    /// `NeighborDown` the connection close clears iroh's `selected_path` and the
+    /// remote-state actor idles out (~60s), so both paths hit the same address
+    /// lookup on the supervisor's re-dial. Live post-partition recovery is
+    /// validated on the real mesh after merge.
+    ///
+    /// Setup: A and B are wired for connectivity (`connect_nodes`) and both join
+    /// the shared topic, but B does NOT bootstrap off A — so no swarm forms and A
+    /// stays at zero neighbors. A's supervisor snapshot carries B's hint. When
+    /// the tick fires, A re-bootstraps toward B, `NeighborUp` fires, and A's
+    /// full-sync pulls a note B never could have delivered while partitioned.
+    ///
+    /// Seeds 80/81 reserved.
+    #[tokio::test]
+    async fn supervisor_rebootstraps_after_zero_neighbors() -> anyhow::Result<()> {
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(80).await?;
+        let node_b = build_node(81).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Seed a note into B's vault so A can prove it pulled after reconnecting.
+        node_b
+            .fs
+            .write(
+                "notes/from-partitioned-peer.md",
+                b"# Delivered after reconnect",
+            )
+            .await?;
+        {
+            let vault = node_b.vault.lock().await;
+            vault
+                .on_file_changed("notes/from-partitioned-peer.md")
+                .await?;
+        }
+
+        // B's hint, as it would appear in A's persisted snapshot. The relay URL
+        // only needs to parse — direct addresses from `connect_nodes` carry the
+        // actual dial.
+        let b_endpoint_hex = node_b.sync_node.node_id().to_string();
+        let b_hint = PeerRelay {
+            endpoint_id: b_endpoint_hex,
+            relay_url: "http://example.com:3340/".to_string(),
+        };
+
+        // A joins with no bootstrap; B joins with no bootstrap (NOT off A). They
+        // share a topic but never dial each other — A is partitioned at zero
+        // neighbors, the production failure shape.
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+
+        // Build A's daemon inline so we can seed its supervisor snapshot and shrink
+        // the tick before the loop starts.
+        let a_vault = node_a.vault.clone();
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            a_vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-a".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.seed_peer_relays_snapshot(vec![b_hint]);
+        daemon_a.set_reconnect_interval(Duration::from_millis(200));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // B's daemon just needs to be alive to answer A's sync pull.
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // A's supervisor re-bootstraps toward B; NeighborUp fires; A pulls B's note.
+        wait_until(
+            "A pulled notes/from-partitioned-peer.md after reconnect",
+            || {
+                let vault = a_vault.clone();
+                async move {
+                    vault
+                        .lock()
+                        .await
+                        .list_files()
+                        .await
+                        .unwrap_or_default()
+                        .contains(&"notes/from-partitioned-peer.md".to_string())
+                }
+            },
+        )
+        .await;
+
+        a_shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = a_loop.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
+    /// When already connected, the supervisor stays idle — it does not churn the
+    /// swarm or revert a healthy sync.
+    ///
+    /// A and B pair up normally (B bootstraps off A) and sync a file. A's
+    /// supervisor snapshot still carries B's hint, but because A has a live
+    /// neighbor the tick gates out at step 1 every wake. We prove non-interference
+    /// by syncing a SECOND file across several tick periods after connection: if
+    /// the supervisor were re-bootstrapping or otherwise disturbing the swarm, the
+    /// steady-state sync would be at risk.
+    ///
+    /// Seeds 82/83 reserved.
+    #[tokio::test]
+    async fn supervisor_idle_when_connected() -> anyhow::Result<()> {
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(82).await?;
+        let node_b = build_node(83).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let b_hint = PeerRelay {
+            endpoint_id: node_b.sync_node.node_id().to_string(),
+            relay_url: "http://example.com:3340/".to_string(),
+        };
+
+        // A and B form a normal swarm (B bootstraps off A).
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let a_vault = node_a.vault.clone();
+        let a_fs = node_a.fs.clone();
+        let (a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            a_vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-a".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.seed_peer_relays_snapshot(vec![b_hint]);
+        // Fast tick so several supervisor wakes occur during the test window.
+        daemon_a.set_reconnect_interval(Duration::from_millis(100));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // First sync: proves the swarm formed.
+        a_fs.write("notes/first.md", b"# First").await?;
+        a_file_tx
+            .send(FileEvent {
+                path: "notes/first.md".to_string(),
+                kind: FileEventKind::Modified,
+            })
+            .expect("file event channel closed");
+
+        wait_until("B has notes/first.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/first.md".to_string())
+            }
+        })
+        .await;
+
+        // Let several supervisor ticks fire while connected — they must gate out.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Second sync still works: the supervisor did not disturb the swarm.
+        a_fs.write("notes/second.md", b"# Second").await?;
+        a_file_tx
+            .send(FileEvent {
+                path: "notes/second.md".to_string(),
+                kind: FileEventKind::Modified,
+            })
+            .expect("file event channel closed");
+
+        wait_until("B has notes/second.md after idle supervisor ticks", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/second.md".to_string())
+            }
+        })
+        .await;
+
+        a_shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = a_loop.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
 }

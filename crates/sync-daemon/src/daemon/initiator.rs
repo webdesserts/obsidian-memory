@@ -405,6 +405,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         )
         .await;
 
+        // Keep the reconnect supervisor's in-memory snapshot in step with what
+        // `persist_adopted_relay` just wrote to disk, so a post-pair partition can
+        // re-dial this peer without a restart. Mirrors persist's URL selection
+        // (first non-empty advertised relay).
+        if let Some(url_str) = result.relay_urls.iter().find(|u| !u.is_empty()).cloned() {
+            self.upsert_peer_relay_snapshot(responder_endpoint_id.to_string(), url_str);
+        }
+
         let _ = reply.send(Ok(responder_device_name));
     }
 

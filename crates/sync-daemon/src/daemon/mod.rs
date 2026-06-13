@@ -359,11 +359,141 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     self.on_initiator_pair_outcome(outcome).await;
                 }
 
+                _ = self.reconnect_tick.tick() => {
+                    self.on_reconnect_tick().await;
+                }
+
                 _ = self.shutdown.cancelled() => {
                     info!("Shutting down");
                     break;
                 }
             }
+        }
+    }
+
+    /// Reconnect supervisor: heal a partition by re-seeding relay hints and
+    /// re-bootstrapping gossip, without a process restart.
+    ///
+    /// Runs on a steady tick; backoff (tracked in `reconnect_backoff_ms` /
+    /// `next_attempt_at_ms`) decides whether a given wake actually attempts a
+    /// re-dial. The state machine:
+    ///
+    /// 1. A live neighbor → connected. Reset backoff and return (no log spam).
+    /// 2. No known peer relays → nothing to chase (unpaired or hint-less). Return.
+    /// 3. Not yet due (`now_ms() < next_attempt_at_ms`) → return.
+    /// 4. Attempt: overwrite each peer's relay hint (`set_peer_relay`, clearing
+    ///    any stale URL) and call `rejoin_peers` with the peer EndpointIds. A
+    ///    successful re-dial surfaces as a normal `NeighborUp` → `on_neighbor_up`
+    ///    → full sync, exactly like a fresh start. Then grow the backoff.
+    ///
+    /// Backoff resets on the tick that observes a live neighbor (step 1), not in
+    /// `on_neighbor_up`, keeping the supervisor state machine self-contained; the
+    /// one-tick reset lag is harmless.
+    async fn on_reconnect_tick(&mut self) {
+        // Step 1: connected — reset and stay quiet.
+        if self.peer_registry.lock().await.alive_count() > 0 {
+            self.reconnect_backoff_ms = RECONNECT_BASE_MS;
+            self.next_attempt_at_ms = 0;
+            return;
+        }
+
+        // Step 2: no hints to chase.
+        if self.peer_relays.is_empty() {
+            return;
+        }
+
+        // Step 3: not yet due.
+        if now_ms() < self.next_attempt_at_ms {
+            return;
+        }
+
+        // Step 4: re-seed every known hint (overwrite stale relays) and collect
+        // the peer EndpointIds to re-bootstrap gossip toward.
+        let mut bootstrap_ids: Vec<EndpointId> = Vec::new();
+        for peer_relay in &self.peer_relays {
+            let Ok(endpoint_id) = peer_relay.endpoint_id.parse::<EndpointId>() else {
+                // Malformed snapshot entry — skip silently; startup already warned
+                // about this entry at load time.
+                continue;
+            };
+            if let Ok(relay_url) = peer_relay.relay_url.parse::<iroh::RelayUrl>() {
+                self.sync_node.set_peer_relay(endpoint_id, &relay_url);
+            }
+            // Even if the relay URL is unparseable, still try to re-bootstrap by
+            // EndpointId — mDNS or a previously-seeded direct address may resolve.
+            bootstrap_ids.push(endpoint_id);
+        }
+
+        if bootstrap_ids.is_empty() {
+            return;
+        }
+
+        let attempt_count = bootstrap_ids.len();
+        if let Err(e) = self.vault_gossip.rejoin_peers(bootstrap_ids).await {
+            warn!("Reconnect attempt failed to re-bootstrap gossip: {e}");
+        } else {
+            info!(
+                hints = attempt_count,
+                backoff_ms = self.reconnect_backoff_ms,
+                "Reconnect attempt: re-seeded hints, re-bootstrapping gossip"
+            );
+        }
+
+        // Grow backoff and schedule the next attempt.
+        self.reconnect_backoff_ms = next_reconnect_backoff(self.reconnect_backoff_ms);
+        self.next_attempt_at_ms = now_ms() + self.reconnect_backoff_ms;
+    }
+
+    /// Shrink the reconnect-supervisor tick interval so integration tests can
+    /// observe recovery within `wait_until`'s 10s budget.
+    ///
+    /// This method is `pub` solely for integration test access — call it before
+    /// `run_loop` starts. Production uses the [`RECONNECT_BASE_MS`] cadence built
+    /// in `Daemon::new`. It cannot be `#[cfg(test)]`: integration-test binaries
+    /// compile this crate without the `test` cfg, so the gate would break them.
+    /// Do not call from production code paths.
+    pub fn set_reconnect_interval(&mut self, period: std::time::Duration) {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.reconnect_tick = tick;
+    }
+
+    /// Populate the in-memory peer-relay snapshot the supervisor re-dials from.
+    ///
+    /// Called once at startup with the entries from `DaemonConfig.peer_relays`
+    /// (the same source the startup lookup seeding uses) and again by pairing
+    /// when a new peer's relay is learned. Held in memory rather than reloaded
+    /// from disk per tick so the integration harness — which runs against a
+    /// non-existent vault path — can seed it directly.
+    ///
+    /// Asymmetry (inherited from pairing, see `pair_shared.rs`): only the
+    /// INITIATOR learns and persists the responder's relay, so after a fresh
+    /// pair only the initiator's snapshot gains an entry — the responder can't
+    /// supervisor-reconnect to the initiator until a learn-on-exchange
+    /// follow-up ships or it initiates a pairing itself.
+    ///
+    /// In `MemoryLookup` test wiring the actual dial resolves via direct
+    /// addresses, so a seeded relay URL only needs to parse, not point anywhere
+    /// real.
+    pub fn seed_peer_relays_snapshot(&mut self, peer_relays: Vec<crate::persistence::PeerRelay>) {
+        self.peer_relays = peer_relays;
+    }
+
+    /// Record a single learned/refreshed peer relay into the in-memory snapshot
+    /// (last-write-wins per endpoint_id), keeping the supervisor's view current
+    /// after a runtime pairing without a restart.
+    pub fn upsert_peer_relay_snapshot(&mut self, endpoint_id: String, relay_url: String) {
+        if let Some(existing) = self
+            .peer_relays
+            .iter_mut()
+            .find(|r| r.endpoint_id == endpoint_id)
+        {
+            existing.relay_url = relay_url;
+        } else {
+            self.peer_relays.push(crate::persistence::PeerRelay {
+                endpoint_id,
+                relay_url,
+            });
         }
     }
 
