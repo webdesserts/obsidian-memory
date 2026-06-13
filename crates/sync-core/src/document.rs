@@ -555,6 +555,26 @@ mod tests {
     }
 
     #[test]
+    fn test_document_container_names() {
+        // These literal strings ARE the on-disk .loro document wire format: the
+        // container/field names under which every note's meta, frontmatter, and
+        // body are stored. Changing a VALUE (not just the const name) makes this
+        // build write/read note documents under different keys than every other
+        // build in the fleet, silently breaking cross-version .loro compatibility.
+        //
+        // A round-trip test can't catch such a rename: it uses the SAME renamed
+        // const on both the writer and reader side, so it stays green while the
+        // format diverges fleet-wide. Only asserting the literal values catches it.
+        // Restores a tripwire dropped in the vault test migration
+        // (see note Architecture/Sync Split Review 2026-06-13).
+        assert_eq!(META_CONTAINER, "_meta");
+        assert_eq!(META_DOC_ID, "doc_id");
+        assert_eq!(META_PATH, "path");
+        assert_eq!(FRONTMATTER_CONTAINER, "frontmatter");
+        assert_eq!(BODY_CONTAINER, "body");
+    }
+
+    #[test]
     fn test_new_document() {
         let doc = NoteDocument::new("test.md", test_author());
         assert_eq!(doc.path(), "test.md");

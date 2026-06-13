@@ -1070,6 +1070,26 @@ mod tests {
         PeerId::from_bytes(bytes)
     }
 
+    // ========== Format-Stability Tripwire (inline: pub(crate) consts) ==========
+
+    #[test]
+    fn test_tree_meta_field_names() {
+        // These literal strings ARE the on-disk .loro registry-tree wire format.
+        // Changing a VALUE (not just the const name) makes this build write/read
+        // tree-node meta under different keys than every other build in the fleet,
+        // silently breaking cross-version .loro compatibility.
+        //
+        // A round-trip test can't catch such a rename: it uses the SAME renamed
+        // const on both the writer and reader side, so it stays green while the
+        // format diverges fleet-wide. Only asserting the literal values catches it.
+        // Restores a tripwire dropped in the vault test migration
+        // (see note Architecture/Sync Split Review 2026-06-13).
+        assert_eq!(TREE_META_TYPE, "type");
+        assert_eq!(TREE_META_NAME, "name");
+        assert_eq!(TREE_META_DOC_ID, "doc_id");
+        assert_eq!(TREE_META_PATH, "path");
+    }
+
     #[tokio::test]
     async fn test_reconcile_orphan_warning_uses_hash_for_empty_path() {
         // A legacy orphan .loro persisted with META_PATH="" (written by the
