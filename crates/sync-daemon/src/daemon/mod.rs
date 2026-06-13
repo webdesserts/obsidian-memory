@@ -46,6 +46,25 @@ pub(super) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// First reconnect attempt fires ~5s after a daemon drops to zero neighbors —
+/// fast enough that a brief flap heals quickly, slow enough to let a transient
+/// blip self-resolve before the supervisor acts.
+const RECONNECT_BASE_MS: u64 = 5_000;
+
+/// Steady-state partition retry ceiling. With 2× growth from the 5s base, a
+/// peer offline for hours costs one re-seed + one `rejoin_peers` per minute —
+/// negligible CPU and one log line/minute — while still reconnecting within a
+/// minute once the peer returns (vs the pre-supervisor "never").
+const RECONNECT_CAP_MS: u64 = 60_000;
+
+/// Advance the reconnect backoff: double, saturating at the cap.
+///
+/// The supervisor resets to [`RECONNECT_BASE_MS`] whenever it observes a live
+/// neighbor; this only grows the interval while partitioned.
+fn next_reconnect_backoff(current: u64) -> u64 {
+    current.saturating_mul(2).min(RECONNECT_CAP_MS)
+}
+
 /// Configuration for running the sync daemon.
 pub struct DaemonRunConfig {
     pub vault: PathBuf,
@@ -126,6 +145,23 @@ pub struct Daemon<FS: FileSystem, AL> {
     initiator_outcome_tx: mpsc::UnboundedSender<InitiatorPairOutcome>,
     /// Receiver half, drained in a `run_loop` `select!` arm.
     initiator_outcome_rx: mpsc::UnboundedReceiver<InitiatorPairOutcome>,
+
+    // ── reconnect supervisor ────────────────────────────────────────────────
+    /// Steady wake cadence for the reconnect supervisor. Backoff decides whether
+    /// a given wake actually attempts a re-dial (see `next_attempt_at_ms`).
+    reconnect_tick: tokio::time::Interval,
+    /// Current reconnect backoff in ms. Starts at [`RECONNECT_BASE_MS`], doubles
+    /// (capped at [`RECONNECT_CAP_MS`]) on each partitioned attempt, resets on the
+    /// tick that observes a live neighbor.
+    reconnect_backoff_ms: u64,
+    /// Earliest wall-clock ms for the next reconnect attempt. `0` = attempt now.
+    next_attempt_at_ms: u64,
+    /// In-memory snapshot of persisted peer relay hints, the supervisor's source
+    /// of truth for who to re-dial. Populated at startup from `DaemonConfig` and
+    /// updated when pairing learns a peer's relay. Held in memory (not reloaded
+    /// from disk per tick) so the test harness — which uses a non-existent vault
+    /// path — can seed it directly without writing `daemon.toml`.
+    peer_relays: Vec<crate::persistence::PeerRelay>,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -149,6 +185,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // passed in so the public `Daemon::new` signature (used directly by the
         // test harness) stays unchanged.
         let (initiator_outcome_tx, initiator_outcome_rx) = mpsc::unbounded_channel();
+
+        // The reconnect supervisor wakes on a steady cadence; backoff (tracked in
+        // the fields below) gates whether a wake actually re-dials. `Delay` skips
+        // missed ticks rather than bursting to catch up after a slow turn.
+        let mut reconnect_tick =
+            tokio::time::interval(std::time::Duration::from_millis(RECONNECT_BASE_MS));
+        reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         Self {
             vault,
             sync_node,
@@ -169,6 +213,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             active_initiator: None,
             initiator_outcome_tx,
             initiator_outcome_rx,
+            reconnect_tick,
+            reconnect_backoff_ms: RECONNECT_BASE_MS,
+            next_attempt_at_ms: 0,
+            peer_relays: Vec::new(),
         }
     }
 
@@ -788,3 +836,33 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 }
 
+#[cfg(test)]
+mod backoff_tests {
+    use super::{RECONNECT_BASE_MS, RECONNECT_CAP_MS, next_reconnect_backoff};
+
+    /// Backoff doubles from the base, saturates at the cap, and never overflows.
+    #[test]
+    fn reconnect_backoff_grows_and_caps() {
+        // Doubling from the base.
+        assert_eq!(
+            next_reconnect_backoff(RECONNECT_BASE_MS),
+            RECONNECT_BASE_MS * 2
+        );
+
+        // Climbs toward the cap, then saturates there.
+        let mut cur = RECONNECT_BASE_MS;
+        for _ in 0..20 {
+            cur = next_reconnect_backoff(cur);
+            assert!(cur <= RECONNECT_CAP_MS, "backoff must never exceed the cap");
+        }
+        assert_eq!(cur, RECONNECT_CAP_MS, "backoff should reach the cap");
+        assert_eq!(
+            next_reconnect_backoff(RECONNECT_CAP_MS),
+            RECONNECT_CAP_MS,
+            "backoff at the cap stays at the cap"
+        );
+
+        // Saturating multiply guards against overflow near u64::MAX.
+        assert_eq!(next_reconnect_backoff(u64::MAX), RECONNECT_CAP_MS);
+    }
+}

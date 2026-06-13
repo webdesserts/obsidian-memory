@@ -440,4 +440,27 @@ mod network_integration {
 
         Ok(())
     }
+
+    /// `rejoin_peers` forwards to the gossip sender on an already-subscribed topic
+    /// without re-subscribing.
+    ///
+    /// The reconnect supervisor calls this on a partitioned daemon to re-bootstrap
+    /// gossip toward known peers. Here we verify the method path succeeds against a
+    /// live subscription — a single node re-joining an empty peer set is a no-op at
+    /// the swarm level but exercises the `Command::JoinPeers` send. A full two-peer
+    /// re-dial is validated at the daemon level by the supervisor integration test.
+    #[tokio::test]
+    async fn rejoin_peers_forwards_to_gossip_sender() -> anyhow::Result<()> {
+        let node = make_test_node(seed(55), Arc::new(InMemoryAllowlist::new())).await?;
+        let vault_id: VaultId = "feedfacefeedface".parse().unwrap();
+
+        let gossip = node.join_vault_gossip(&vault_id, vec![]).await?;
+
+        gossip
+            .rejoin_peers(vec![])
+            .await
+            .expect("rejoin_peers should succeed on a subscribed topic");
+
+        Ok(())
+    }
 }

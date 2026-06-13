@@ -179,6 +179,21 @@ impl VaultGossip {
         self.broadcast_message(&msg).await
     }
 
+    /// Re-bootstrap gossip toward a set of known peers without re-subscribing.
+    ///
+    /// Sends `Command::JoinPeers` to the gossip actor on the already-subscribed
+    /// topic, telling HyParView to (re-)dial those peers. Used by the reconnect
+    /// supervisor to recover from a partition: after a `NeighborDown`, neither
+    /// side dials the other again on its own, so the supervisor re-seeds relay
+    /// hints and calls this to re-establish the swarm. Re-subscribing would churn
+    /// the swarm; `join_peers` is the targeted re-bootstrap.
+    pub async fn rejoin_peers(&self, peers: Vec<EndpointId>) -> Result<()> {
+        self.sender
+            .join_peers(peers)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
+    }
+
     /// Serialize and broadcast a [`GossipMessage`] envelope.
     async fn broadcast_message(&mut self, msg: &GossipMessage) -> Result<()> {
         let bytes: Bytes = bincode::serialize(msg)?.into();

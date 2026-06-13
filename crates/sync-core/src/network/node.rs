@@ -302,6 +302,27 @@ impl SyncNode {
         self.peer_lookup.add_endpoint_info(addr);
     }
 
+    /// Replace a peer's relay hint in the address-lookup service (native only).
+    ///
+    /// Unlike `add_peer_relay`, which unions the new relay with any existing
+    /// addresses for the peer, this completely overwrites the prior entry. Used
+    /// when refreshing a hint that may be stale: the reconnect supervisor re-seeds
+    /// before re-bootstrapping, and learn-on-exchange replaces a moved peer's relay.
+    /// A union would let a stale, dead relay URL linger alongside the fresh one and
+    /// keep getting dialed; the overwrite guarantees only the latest hint remains.
+    #[cfg(feature = "native")]
+    pub fn set_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
+        if endpoint_id == self.node_id() {
+            tracing::warn!(
+                "set_peer_relay called with our own EndpointId — ignoring to prevent \
+                 self-connect (iroh rejects self-directed relay paths)"
+            );
+            return;
+        }
+        let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.clone());
+        self.peer_lookup.set_endpoint_info(addr);
+    }
+
     /// Derive a deterministic gossip TopicId from a VaultId.
     ///
     /// Each vault gets its own gossip topic, scoped to peers who share that vault.
