@@ -120,6 +120,22 @@ pub struct DaemonRunConfig {
     pub advertised_relay_url: Option<String>,
 }
 
+/// A peer's freshness, observed from a successful background sync exchange.
+///
+/// `spawn_sync_exchange` runs in a detached task with no `&mut self`, so it
+/// can't refresh the supervisor snapshot directly. It sends this back to the
+/// run-loop (mirroring the initiator-outcome channel) where `on_exchange_learned`
+/// applies it — resetting the hint's throttle the instant a peer is reachable,
+/// which is what makes stale-hint eviction safe.
+struct ExchangeLearned {
+    /// The peer we just synced with.
+    endpoint_id: EndpointId,
+    /// The active relay URL iroh reported for the peer, if it connected through
+    /// a relay. `None` for a LAN-direct connection (no relay path) — we still
+    /// stamp success, we just don't overwrite the stored URL with nothing.
+    relay_url: Option<iroh::RelayUrl>,
+}
+
 /// Daemon state holding all components.
 ///
 /// Generic over the filesystem (`FS`) and allowlist storage (`AL`) so that
@@ -180,6 +196,12 @@ pub struct Daemon<FS: FileSystem, AL> {
     initiator_outcome_tx: mpsc::UnboundedSender<InitiatorPairOutcome>,
     /// Receiver half, drained in a `run_loop` `select!` arm.
     initiator_outcome_rx: mpsc::UnboundedReceiver<InitiatorPairOutcome>,
+    /// Sender half of the learn-on-exchange channel. Cloned into each spawned
+    /// sync-exchange task so a successful sync routes the peer's observed relay
+    /// back to the event loop for `&mut self` snapshot/persist refresh.
+    exchange_learn_tx: mpsc::UnboundedSender<ExchangeLearned>,
+    /// Receiver half, drained in a `run_loop` `select!` arm.
+    exchange_learn_rx: mpsc::UnboundedReceiver<ExchangeLearned>,
 
     // ── reconnect supervisor ────────────────────────────────────────────────
     /// Steady wake cadence for the reconnect supervisor. Per-hint backoff
@@ -212,10 +234,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         vault_path: PathBuf,
         shutdown: CancellationToken,
     ) -> Self {
-        // The initiator-outcome channel is internal — created here rather than
-        // passed in so the public `Daemon::new` signature (used directly by the
-        // test harness) stays unchanged.
+        // The initiator-outcome and learn-on-exchange channels are internal —
+        // created here rather than passed in so the public `Daemon::new`
+        // signature (used directly by the test harness) stays unchanged.
         let (initiator_outcome_tx, initiator_outcome_rx) = mpsc::unbounded_channel();
+        let (exchange_learn_tx, exchange_learn_rx) = mpsc::unbounded_channel();
 
         // The reconnect supervisor wakes on a steady cadence; backoff (tracked in
         // the fields below) gates whether a wake actually re-dials. `Delay` skips
@@ -244,6 +267,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             active_initiator: None,
             initiator_outcome_tx,
             initiator_outcome_rx,
+            exchange_learn_tx,
+            exchange_learn_rx,
             reconnect_tick,
             peer_relays: Vec::new(),
         }
@@ -388,6 +413,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     self.on_initiator_pair_outcome(outcome).await;
                 }
 
+                Some(learned) = self.exchange_learn_rx.recv() => {
+                    self.on_exchange_learned(learned).await;
+                }
+
                 _ = self.reconnect_tick.tick() => {
                     self.on_reconnect_tick().await;
                 }
@@ -530,6 +559,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // load → record_hint_failure (which saves) → done, per due hint.
         match crate::persistence::DaemonConfig::load_or_generate(&self.vault_path, None).await {
             Ok((mut config, _identity)) => {
+                // `load_or_generate` discards `relay_url` (runtime state); restore
+                // the daemon's advertised URL so saving the hint change doesn't
+                // clobber it out of daemon.toml.
+                config.relay_url = self.relay_url.clone();
                 for hex in &due_hex {
                     if let Err(e) = config.record_hint_failure(hex, now, &self.vault_path) {
                         warn!("Failed to persist reconnect hint failure: {e}");
@@ -543,6 +576,78 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 warn!("Failed to load daemon config to persist hint failure: {e}");
             }
         }
+    }
+
+    /// Refresh a peer's hint after a successful background sync exchange.
+    ///
+    /// This is what makes stale-hint eviction safe: a reachable peer's hint is
+    /// continuously reset (success stamped, `failure_count` zeroed) so it never
+    /// goes stale, and a fresh relay URL learned mid-session replaces a moved
+    /// peer's stale one. Touches three places, kept in step:
+    ///
+    /// 1. **In-memory snapshot** (supervisor's truth): stamp + reset the matching
+    ///    hint. If we learned a relay for a peer we had NO hint for, INSERT one —
+    ///    this fixes the responder-side asymmetry where only the pairing initiator
+    ///    ever persisted the other side's relay.
+    /// 2. **Disk** (`daemon.toml`): `upsert_peer_relay` when a URL was learned
+    ///    (stamps success + saves), else `mark_peer_relay_success` (no invented
+    ///    URL). Both no-op gracefully if the entry/config is absent.
+    /// 3. **Live lookup** (`set_peer_relay`): only when a URL is known, so the
+    ///    next dial uses the fresh hint.
+    async fn on_exchange_learned(&mut self, learned: ExchangeLearned) {
+        let endpoint_hex = learned.endpoint_id.to_string();
+        let now = now_ms();
+
+        // (1) In-memory snapshot.
+        if let Some(hint) = self
+            .peer_relays
+            .iter_mut()
+            .find(|r| r.endpoint_id == endpoint_hex)
+        {
+            hint.last_success_ms = Some(now);
+            hint.failure_count = 0;
+            if let Some(ref url) = learned.relay_url {
+                hint.relay_url = url.to_string();
+            }
+        } else if let Some(ref url) = learned.relay_url {
+            // No hint yet, but we learned this peer's relay — record it so the
+            // supervisor can reach them on a future restart (responder-asymmetry fix).
+            let mut entry =
+                crate::persistence::PeerRelay::new(endpoint_hex.clone(), url.to_string());
+            entry.last_success_ms = Some(now);
+            self.peer_relays.push(entry);
+        }
+
+        // (2) Persist. Load → mutate → save, mirroring the failure-persist path.
+        match crate::persistence::DaemonConfig::load_or_generate(&self.vault_path, None).await {
+            Ok((mut config, _identity)) => {
+                // Preserve the daemon's advertised relay_url, which `load_or_generate`
+                // discards as runtime state — saving the hint must not clobber it.
+                config.relay_url = self.relay_url.clone();
+                let result = match learned.relay_url {
+                    Some(ref url) => config.upsert_peer_relay(
+                        &endpoint_hex,
+                        &url.to_string(),
+                        now,
+                        &self.vault_path,
+                    ),
+                    None => config.mark_peer_relay_success(&endpoint_hex, now, &self.vault_path),
+                };
+                if let Err(e) = result {
+                    warn!("Failed to persist learned peer relay: {e}");
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load daemon config to persist learned peer relay: {e}");
+            }
+        }
+
+        // (3) Live re-seed so the next dial uses the fresh hint.
+        if let Some(url) = learned.relay_url {
+            self.sync_node.set_peer_relay(learned.endpoint_id, &url);
+        }
+
+        debug!(endpoint_id = %endpoint_hex, "Refreshed peer relay hint on successful exchange");
     }
 
     /// Shrink the reconnect-supervisor tick interval so integration tests can
@@ -799,6 +904,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.allowlist.clone(),
             self.peer_registry.clone(),
             self.sync_node.endpoint.clone(),
+            self.exchange_learn_tx.clone(),
             SyncExchangeKind::NeighborUp,
         );
     }
@@ -843,6 +949,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.allowlist.clone(),
             self.peer_registry.clone(),
             self.sync_node.endpoint.clone(),
+            self.exchange_learn_tx.clone(),
             SyncExchangeKind::ChangePull { path },
         );
     }
