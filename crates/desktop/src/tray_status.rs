@@ -20,9 +20,15 @@ use tracing::{debug, warn};
 /// All handle types implement `Clone` (Tauri 2 wraps them in `Arc`), so storing
 /// them here lets the driver task update text in-place without rebuilding the
 /// menu from scratch on every status change.
+///
+/// `autostart_item` is included so a future settings panel can read or update
+/// the check state without rebuilding the menu. The status driver itself does
+/// not currently update it (the check state is set at startup from
+/// `autolaunch().is_enabled()` and toggled in-place by the menu-event handler).
 pub struct TrayMenuHandles {
     pub status_item: tauri::menu::MenuItem<tauri::Wry>,
     pub pair_item: tauri::menu::MenuItem<tauri::Wry>,
+    pub autostart_item: tauri::menu::CheckMenuItem<tauri::Wry>,
 }
 
 /// Format the status line from a `DaemonStatus` snapshot.

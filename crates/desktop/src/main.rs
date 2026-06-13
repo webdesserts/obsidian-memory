@@ -21,9 +21,10 @@ use sync_daemon::daemon::DaemonRunConfig;
 use sync_daemon::pair_api::DaemonControl;
 use tauri::{
     Manager,
-    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
+    menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -341,9 +342,13 @@ fn main() -> Result<()> {
     info!("Starting Memory");
 
     tauri::Builder::default()
-        // tauri-plugin-store must be registered before setup() so that
-        // app.store() is usable inside the setup hook.
+        // Plugins must be registered before setup() so that their APIs are
+        // available inside the setup hook via app.store() and app.autolaunch().
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None, // no extra args — vault path is read from the store, not CLI
+        ))
         .setup(move |app| {
             // --- Vault path resolution (amendment S2: daemon_config built here) ---
             //
@@ -461,13 +466,26 @@ fn main() -> Result<()> {
                 .enabled(false) // display-only label, not interactive
                 .build(app)?;
 
+            // Read the autostart state from the OS (the LaunchAgent plist) to
+            // reflect what was previously registered, not what the store says.
+            // The store is written only on change; the plist is ground truth.
+            let is_autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+
+            let autostart_item = CheckMenuItemBuilder::new("Launch at Login")
+                .id("toggle-autostart")
+                .checked(is_autostart_enabled)
+                .build(app)?;
+
             let pair_item = MenuItemBuilder::new("Pair with nearby device…")
                 .id("pair")
                 .build(app)?;
 
+            // Menu order: [status, sep, autostart, sep, pair, sep, quit]
             let menu = MenuBuilder::new(app)
                 .items(&[
                     &status_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &autostart_item,
                     &PredefinedMenuItem::separator(app)?,
                     &pair_item,
                     &PredefinedMenuItem::separator(app)?,
@@ -476,6 +494,9 @@ fn main() -> Result<()> {
                 .build()?;
 
             let icon = tauri::include_image!("icons/32x32.png");
+
+            // Clone handles for the event closure before ownership moves into TrayIconBuilder.
+            let autostart_item_for_events = autostart_item.clone();
 
             let app_for_events = handle.clone();
             TrayIconBuilder::new()
@@ -498,6 +519,54 @@ fn main() -> Result<()> {
                             warn!("Failed to open pair initiator window: {}", e);
                         }
                     }
+                    "toggle-autostart" => {
+                        let app = app_for_events.clone();
+                        let item = autostart_item_for_events.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let autolaunch = app.autolaunch();
+
+                            // Read current state from the OS plist (ground truth).
+                            let currently_enabled = autolaunch.is_enabled().unwrap_or(false);
+
+                            // Toggle the LaunchAgent registration. Only update the
+                            // checkmark and persist the new state when the OS call
+                            // succeeds (amendment B1). On failure, warn and leave the
+                            // menu reflecting the actual registered state.
+                            let result = if currently_enabled {
+                                autolaunch.disable()
+                            } else {
+                                autolaunch.enable()
+                            };
+
+                            match result {
+                                Ok(()) => {
+                                    let new_state = !currently_enabled;
+                                    // Update the checkmark on the main thread
+                                    // (macOS panics on menu mutations off main thread).
+                                    let _ = app.run_on_main_thread(move || {
+                                        let _ = item.set_checked(new_state);
+                                    });
+                                    // Persist the new autostart state to the store.
+                                    let mut settings = match AppSettings::load(&app) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to load app settings for autostart save: {e}"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    settings.set_autostart_enabled(new_state);
+                                    if let Err(e) = settings.save(&app) {
+                                        warn!("Failed to save autostart state: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to toggle autostart: {e}");
+                                }
+                            }
+                        });
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|_tray, event| {
@@ -519,6 +588,7 @@ fn main() -> Result<()> {
             let handles = tray_status::TrayMenuHandles {
                 status_item,
                 pair_item,
+                autostart_item,
             };
             tray_status::start(handle.clone(), handles, status_rx);
 
