@@ -117,6 +117,47 @@ impl NoteDocument {
         })
     }
 
+    /// Create a NoteDocument by importing existing Loro bytes WITHOUT overwriting
+    /// the stored `META_PATH`.
+    ///
+    /// Unlike `from_bytes`, which records the caller-supplied path into `META_PATH`
+    /// (correct for reindex/migration where the current path is authoritative), this
+    /// variant leaves the document's own stored path intact so `stored_path()` returns
+    /// the path the document was originally written under.
+    ///
+    /// Intended ONLY for read-without-mutating cases: the reconcile orphan-loader (to
+    /// recover a deleted file's real path for cleanup/reporting) and stored-path
+    /// introspection. Do NOT substitute this for `from_bytes` at the mutating
+    /// call-sites (`migrate_document`, `reindex_file`, `load_document`, `needs_reindex`)
+    /// — those rely on the `META_PATH` overwrite to record the file's current path.
+    ///
+    /// The device's `PeerId` is set as the Loro peer id before import so any
+    /// subsequent local ops attribute to this replica; imported ops keep their authors.
+    pub fn from_bytes_preserve_path(bytes: &[u8], author: PeerId) -> Result<Self> {
+        let doc = LoroDoc::new();
+        doc.set_peer_id(author.as_u64()).ok();
+        doc.import(bytes).map_err(|e| {
+            error!(
+                bytes_len = bytes.len(),
+                error = %e,
+                "loro_from_bytes_preserve_path FAILED"
+            );
+            DocumentError::Loro(e.to_string())
+        })?;
+
+        // Seed the local path cache from the document's own stored META_PATH. The
+        // empty fallback only applies to meta-less legacy docs, where stored_path()
+        // returns None — callers fall back to the doc's hash in that case.
+        let mut note = Self {
+            doc,
+            path: String::new(),
+        };
+        if let Some(stored) = note.stored_path() {
+            note.path = stored;
+        }
+        Ok(note)
+    }
+
     /// Get the document path (from local cache)
     pub fn path(&self) -> &str {
         &self.path
@@ -608,6 +649,26 @@ World"#;
             doc_a.version().iter().count(),
             2,
             "merged version vector should have one entry per device author"
+        );
+    }
+
+    /// Loading an orphaned `.loro` for read-only introspection must surface the
+    /// document's own stored path, not clobber it. `from_bytes` overwrites
+    /// `META_PATH` with its `path` arg (intentional for reindex/migration), so
+    /// the reconcile orphan-loader needs the preserve variant to recover the
+    /// real deleted path instead of an empty string.
+    #[test]
+    fn test_from_bytes_preserve_path_keeps_original_meta_path() {
+        // Build a doc at a known path, export it, then reload via the preserve
+        // loader and confirm the stored path round-trips.
+        let doc = NoteDocument::from_markdown("a/b.md", "# Content", test_author()).unwrap();
+        let snapshot = doc.export_snapshot();
+
+        let reloaded = NoteDocument::from_bytes_preserve_path(&snapshot, test_author()).unwrap();
+        assert_eq!(
+            reloaded.stored_path(),
+            Some("a/b.md".to_string()),
+            "preserve loader must not overwrite the document's stored META_PATH"
         );
     }
 }

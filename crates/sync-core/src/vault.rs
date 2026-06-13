@@ -695,8 +695,12 @@ impl<F: FileSystem> Vault<F> {
                 // This .loro has no matching markdown file - could be deleted or moved
                 let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
                 if let Ok(bytes) = self.fs.read(&sync_path).await {
-                    // Use from_bytes to preserve peer ID when loading orphaned docs
-                    if let Ok(doc) = NoteDocument::from_bytes("", &bytes, self.loro_author) {
+                    // Preserve the doc's stored META_PATH so move-matching and orphan
+                    // reporting see the real deleted path (passing "" to from_bytes
+                    // would clobber it). Peer ID is preserved either way.
+                    if let Ok(doc) =
+                        NoteDocument::from_bytes_preserve_path(&bytes, self.loro_author)
+                    {
                         orphaned_docs.push((hash.clone(), doc));
                     }
                 }
@@ -2250,6 +2254,40 @@ mod tests {
         let files = vault.list_files().await.unwrap();
         assert!(!files.contains(&"delete.md".to_string()));
         assert!(files.contains(&"keep.md".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_orphan_report_uses_real_path_not_empty() {
+        // When a markdown file is deleted offline, its orphaned `.loro` must be
+        // reported under the file's real path. The orphan-loader previously passed
+        // an empty path to `from_bytes`, which clobbered the doc's stored META_PATH
+        // to "" and surfaced empty `Orphaned .loro file (deleted?):` reports.
+        use std::sync::Arc;
+
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("notes/deleted.md", b"# Deleted Note")
+            .await
+            .unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Delete the markdown offline; the .loro orphan remains on disk.
+        fs.delete("notes/deleted.md").await.unwrap();
+
+        // Reload and reconcile — the orphan report must carry the real path.
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let report = vault.reconcile().await.unwrap();
+
+        assert!(
+            report.orphaned.contains(&"notes/deleted.md".to_string()),
+            "orphan report should contain the real path, got: {:?}",
+            report.orphaned
+        );
+        assert!(
+            !report.orphaned.contains(&String::new()),
+            "orphan report must not contain an empty path, got: {:?}",
+            report.orphaned
+        );
     }
 
     #[tokio::test]
