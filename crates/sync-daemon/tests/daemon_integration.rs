@@ -2326,6 +2326,100 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// Revocation propagates and WINS over re-add — the B1 enforcement end-to-end.
+    ///
+    /// A and B both start trusting a third peer C. On A, `remove_peer(C)` writes a
+    /// tombstone (no user-facing revoke command exists yet, so this stands in for
+    /// what one would do). The connected-path reconcile carries A's roster — which
+    /// includes the C tombstone — to B, whose `merge_roster` honors tombstone-
+    /// precedence: B stops trusting C.
+    ///
+    /// Then the negative-resurrection property: B's own reconcile pushes its roster
+    /// back to A, and A's C must STAY revoked. `merge_roster` never lets a (stale)
+    /// live row resurrect a tombstone, so A's `is_allowed(C)` can never flip back to
+    /// true — removal wins over re-add across the mesh.
+    ///
+    /// Seeds 99/100 for A/B; C = synthetic PeerId from seed 96.
+    #[tokio::test]
+    async fn allowlist_revocation_propagates_and_wins() -> anyhow::Result<()> {
+        let node_a = build_node(99).await?;
+        let node_b = build_node(100).await?;
+
+        let c_peer = PeerId::from_secret_bytes(super::common::seed(96));
+
+        connect_nodes(&node_a, &node_b).await?;
+        // Both members trust C (the shared roster before revocation).
+        node_a.allowlist.add_peer(c_peer, "peer-c").await?;
+        node_b.allowlist.add_peer(c_peer, "peer-c").await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        // Build A inline so its reconcile cadence is fast enough to carry the
+        // tombstone within `wait_until` (there's no revoke command to push promptly).
+        let a_allowlist = node_a.allowlist.clone();
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            a_allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-a".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.set_reconnect_interval(Duration::from_millis(100));
+        daemon_a.set_roster_reconcile_interval(Duration::from_millis(0));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Swarm forms; both still trust C at this point.
+        wait_until("swarm formed (B knows A)", || {
+            let allowlist = daemon_b.allowlist.clone();
+            async move { !allowlist.list_peers().await.unwrap_or_default().is_empty() }
+        })
+        .await;
+
+        // Revoke C on A — writes a tombstone that travels in the roster.
+        a_allowlist.remove_peer(&c_peer).await?;
+
+        // B honors the revocation: tombstone-precedence flips C to not-trusted.
+        wait_until("B no longer trusts C after revocation", || {
+            let allowlist = daemon_b.allowlist.clone();
+            async move { !allowlist.is_allowed(&c_peer).await.unwrap_or(true) }
+        })
+        .await;
+
+        // Negative-resurrection: B's roster pushes back to A, but a removed peer can
+        // never be resurrected by a stale live row — A's C stays revoked. This can
+        // never become true, so a single assertion (post-convergence) is sound.
+        // `a_allowlist` is the daemon's own handle (shared Arc), so this is A's view.
+        assert!(
+            !a_allowlist.is_allowed(&c_peer).await?,
+            "A's revocation of C must not be resurrected by B's roster push"
+        );
+
+        a_shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = a_loop.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
     /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
     /// `last_attempt_ms` values land on the same clock the supervisor reads.
     fn now_ms_test() -> u64 {
