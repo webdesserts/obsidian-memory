@@ -633,9 +633,16 @@ impl<F: FileSystem> Vault<F> {
         let mut modified = Vec::new();
 
         for (path, data) in updates {
-            // No mtime available in bulk sync - uses "remote wins" for divergent histories
-            if self.apply_single_update(&path, &data, None).await? {
-                modified.push(path);
+            // No mtime available in bulk sync - uses "remote wins" for divergent histories.
+            //
+            // Contain per-document failures: one corrupt entry must not abort the
+            // whole batch and drop every other (valid) document with it. There is no
+            // per-item retry path, so a partial set of applied paths is the correct
+            // outcome - the caller emits events only for the documents that landed.
+            match self.apply_single_update(&path, &data, None).await {
+                Ok(true) => modified.push(path),
+                Ok(false) => {}
+                Err(e) => warn!("apply_document_updates: skipping {}: {}", path, e),
             }
         }
 
@@ -927,6 +934,68 @@ mod tests {
             .unwrap();
         assert!(none.is_none(), "No more messages after SyncResponse");
         assert!(modified1.is_empty(), "Vault1 already had everything");
+    }
+
+    /// A corrupt document in a sync batch must not take down the whole batch.
+    /// Before the per-item containment fix, `apply_document_updates` propagated
+    /// the first error and dropped every other (valid) document with it.
+    #[tokio::test]
+    async fn test_apply_document_updates_continues_on_corrupt_entry() {
+        use std::sync::Arc;
+
+        let fs = Arc::new(InMemoryFs::new());
+        let vault = Vault::init(Arc::clone(&fs), test_author()).await.unwrap();
+
+        // A real snapshot for a path the receiver doesn't have yet -> lands as a
+        // new document.
+        let valid_doc =
+            NoteDocument::from_markdown("good.md", "# Good", test_author_2()).unwrap();
+        let valid_snapshot = valid_doc.export_snapshot().unwrap();
+
+        let mut document_updates = HashMap::new();
+        document_updates.insert("good.md".to_string(), valid_snapshot);
+        document_updates.insert("bad.md".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let response = SyncMessage::SyncResponse {
+            registry_updates: None,
+            document_updates,
+        };
+        let response_bytes = bincode::serialize(&response).unwrap();
+
+        // The corrupt entry must be skipped, not abort the batch.
+        let (followup, modified) = vault.process_sync_message(&response_bytes).await.unwrap();
+        assert!(followup.is_none(), "SyncResponse needs no follow-up message");
+
+        assert_eq!(
+            modified.len(),
+            1,
+            "only one document should be reported applied"
+        );
+        assert!(
+            modified.contains(&"good.md".to_string()),
+            "good.md must be in the applied list"
+        );
+
+        // The valid document landed and is readable.
+        let good = vault.get_document("good.md").await.unwrap();
+        assert!(good.to_markdown().contains("Good"));
+        assert!(
+            fs.exists("good.md").await.unwrap(),
+            "valid document markdown should be written to disk"
+        );
+
+        // The corrupt document was never written to disk. (get_document can't be
+        // used as the check here: it falls back to a fresh empty doc for unknown
+        // paths, so it always returns Ok.)
+        let bad_sync_path = vault.document_sync_path("bad.md");
+        assert!(
+            !fs.exists(&bad_sync_path).await.unwrap(),
+            "corrupt document must not be applied to disk"
+        );
+        assert!(
+            !fs.exists("bad.md").await.unwrap(),
+            "corrupt document markdown must not be written"
+        );
     }
 
     #[tokio::test]
