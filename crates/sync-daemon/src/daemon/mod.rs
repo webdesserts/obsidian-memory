@@ -444,9 +444,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///      bootstraps by EndpointId — mDNS or a prior direct address may reach
     ///      it on-LAN. `last_attempt_ms` is stamped now.
     ///    - **Not due (throttled):** EVICT the hint from the address-lookup
-    ///      (`remove_peer_relay`). This is the core of the fix — eviction is the
-    ///      only thing that stops iroh-gossip's HyParView from re-resolving and
-    ///      re-feeding the dead relay to iroh's relay actor.
+    ///      (`remove_peer_relay`) so iroh-gossip's HyParView stops re-resolving
+    ///      and re-feeding the dead relay to iroh's relay actor — UNLESS it is
+    ///      the only hint we have, in which case it is RETAINED (see the
+    ///      sole-hint rule below).
     /// 4. `rejoin_peers` with just the due hints. A successful re-dial surfaces
     ///    as a normal `NeighborUp` → `on_neighbor_up` → full sync.
     /// 5. Since step 1 already returned when connected, reaching here means zero
@@ -460,6 +461,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// removes the in-memory lookup entry, never the durable `PeerRelay` row — a
     /// genuinely off-LAN peer that returns is still reached on the slow cadence,
     /// and learn-on-exchange resets it the instant it reconnects.
+    ///
+    /// **Sole-hint rule (relay-reap fix):** while partitioned, a throttled hint
+    /// that is the ONLY one is never evicted. Throttling caps how often we DIAL
+    /// it, but its address must stay resident so a reaped non-home relay actor
+    /// can be respawned and the partition can heal without a process restart.
+    /// Evicting the only address is what caused the 12+ minute non-recovery this
+    /// rule exists to prevent. With two or more hints the throttled ones are
+    /// still evicted — a live alternative remains, so no lifeline is at risk.
     async fn on_reconnect_tick(&mut self) {
         // Step 1: connected — stay quiet and don't churn the swarm.
         if self.peer_registry.lock().await.alive_count() > 0 {
@@ -476,6 +485,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // EndpointIds dialed this tick, so we can attribute the (coarse) failure
         // after the attempt if no neighbor materializes.
         let mut due_ids: Vec<EndpointId> = Vec::new();
+
+        // When this is the only hint we have, it is the lookup's sole route to
+        // the peer — we never evict it while partitioned (see the throttled
+        // branch below). Step 1 already returned if connected, so reaching here
+        // means `alive_count == 0`.
+        let is_sole_hint = self.peer_relays.len() == 1;
 
         // Decide per hint, applying node calls (set/remove) and stamping the
         // in-memory `last_attempt_ms` for due hints as we go.
@@ -498,11 +513,31 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 hint.last_attempt_ms = Some(now);
                 bootstrap_ids.push(endpoint_id);
                 due_ids.push(endpoint_id);
-            } else {
-                // Throttled: evict from the lookup so nothing re-resolves the
-                // dead relay until the hint comes due again.
+            } else if !is_sole_hint {
+                // Throttled, and there is at least one OTHER hint — safe to evict
+                // this one from the lookup so nothing re-resolves the dead relay
+                // until it comes due again.
                 self.sync_node.remove_peer_relay(endpoint_id);
             }
+            // Throttled AND sole hint: deliberately RETAINED in the lookup.
+            //
+            // This is the relay-reap reconnect fix. We throttle the dial
+            // FREQUENCY (the `hint_attempt_due` gate above already does this),
+            // not the address PRESENCE — never evicting a partitioned peer's
+            // only lifeline. If we removed it, the next due tick would re-seed an
+            // address that had been gone, but more importantly a sole reaped
+            // relay actor would never be driven back to life between due windows.
+            //
+            // Tradeoff (intentional, and it diverges from `remove_peer_relay`'s
+            // own docstring warning): retaining the sole hint means a
+            // permanently-dead peer's address lingers in `MemoryLookup`, where
+            // iroh-gossip's HyParView maintenance re-resolves it on its own ~60s
+            // cadence — low-grade relay-actor activity that the general eviction
+            // path otherwise quiets between due windows. We accept that churn
+            // because the alternative (evicting the only address while
+            // partitioned) is what caused the 12+ minute non-recovery this fix
+            // exists to kill. `MAX_HINT_BACKOFF_MS` still bounds how often WE
+            // actively dial it, so retention does not reintroduce a hot dial loop.
         }
 
         if bootstrap_ids.is_empty() {
