@@ -159,8 +159,9 @@ impl SyncMetadata {
             tracing::info!("Running migration v0 → v1: generating VaultId");
             let meta = SyncMetadata::new();
 
-            let toml_str = toml::to_string(&meta)
-                .map_err(|e| VaultError::Other(format!("Failed to serialize metadata: {}", e)))?;
+            let toml_str = toml::to_string(&meta).map_err(|e| {
+                VaultError::MetadataSerialization(format!("Failed to serialize metadata: {}", e))
+            })?;
             fs.atomic_write(METADATA_FILE, toml_str.as_bytes()).await?;
 
             // Verify the write succeeded by re-reading. Does NOT protect against
@@ -182,8 +183,9 @@ impl SyncMetadata {
     /// Used both by the migration path and by VaultId adoption (`Vault::adopt_vault_id`)
     /// so the toml is serialized in exactly one place.
     pub async fn save<F: FileSystem>(&self, fs: &F) -> Result<()> {
-        let toml_str = toml::to_string(self)
-            .map_err(|e| VaultError::Other(format!("Failed to serialize metadata: {}", e)))?;
+        let toml_str = toml::to_string(self).map_err(|e| {
+            VaultError::MetadataSerialization(format!("Failed to serialize metadata: {}", e))
+        })?;
         fs.atomic_write(METADATA_FILE, toml_str.as_bytes()).await?;
         Ok(())
     }
@@ -209,8 +211,37 @@ pub enum VaultError {
     #[error("Corrupt registry: {0}")]
     CorruptRegistry(String),
 
-    #[error("Vault error: {0}")]
-    Other(String),
+    /// Failed to serialize vault metadata (metadata.toml) for persistence.
+    #[error("{0}")]
+    MetadataSerialization(String),
+
+    /// Failed to export the registry CRDT to bytes for persistence.
+    #[error("{0}")]
+    RegistryExport(String),
+
+    /// Failed to import registry bytes into the in-memory registry CRDT.
+    #[error("{0}")]
+    RegistryImport(String),
+
+    /// A Loro tree mutation (create/move/delete node or set node metadata) failed.
+    #[error("{0}")]
+    TreeOperation(String),
+
+    /// A rename was requested but its source path has no registry node.
+    #[error("{0}")]
+    RenameSourceMissing(String),
+
+    /// A rename was requested but its target path already has a registry node.
+    #[error("{0}")]
+    RenameTargetExists(String),
+
+    /// A sync path failed validation (traversal, absolute, non-markdown, etc.).
+    #[error("{0}")]
+    InvalidPath(String),
+
+    /// Failed to decode a Loro blob's metadata header.
+    #[error("{0}")]
+    BlobDecode(String),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -632,9 +663,9 @@ impl<F: FileSystem> Vault<F> {
         let _file_tree = registry.get_tree(REGISTRY_TREE);
 
         // Save initial registry
-        let registry_bytes = registry
-            .export(loro::ExportMode::Snapshot)
-            .map_err(|e| VaultError::Other(format!("Failed to export initial registry: {}", e)))?;
+        let registry_bytes = registry.export(loro::ExportMode::Snapshot).map_err(|e| {
+            VaultError::RegistryExport(format!("Failed to export initial registry: {}", e))
+        })?;
         fs.atomic_write(REGISTRY_FILE, &registry_bytes).await?;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -1236,9 +1267,9 @@ impl<F: FileSystem> Vault<F> {
     async fn reconcile_registry(&self) -> Result<()> {
         let registry_path = format!("{}/registry.loro", SYNC_DIR);
         if let Ok(data) = self.fs.read(&registry_path).await {
-            self.registry_mut()
-                .import(&data)
-                .map_err(|e| VaultError::Other(format!("Registry reconcile failed: {}", e)))?;
+            self.registry_mut().import(&data).map_err(|e| {
+                VaultError::RegistryImport(format!("Registry reconcile failed: {}", e))
+            })?;
             self.rebuild_path_cache();
             tracing::debug!("Reconciled registry before sync");
         }
@@ -1571,7 +1602,7 @@ impl<F: FileSystem> Vault<F> {
         let bytes = self
             .registry()
             .export(loro::ExportMode::Snapshot)
-            .map_err(|e| VaultError::Other(format!("Failed to export registry: {}", e)))?;
+            .map_err(|e| VaultError::RegistryExport(format!("Failed to export registry: {}", e)))?;
         self.fs.atomic_write(REGISTRY_FILE, &bytes).await?;
         Ok(())
     }
@@ -1908,7 +1939,7 @@ impl<F: FileSystem> Vault<F> {
                         continue;
                     }
                     tree.delete(node_id).map_err(|e| {
-                        VaultError::Other(format!(
+                        VaultError::TreeOperation(format!(
                             "Failed to tombstone duplicate node at '{}': {}",
                             group.path, e
                         ))
@@ -1927,7 +1958,7 @@ impl<F: FileSystem> Vault<F> {
                     continue;
                 }
                 tree.delete(relic.node).map_err(|e| {
-                    VaultError::Other(format!(
+                    VaultError::TreeOperation(format!(
                         "Failed to tombstone relic node at '{}': {}",
                         relic.path, e
                     ))
@@ -1957,47 +1988,55 @@ impl<F: FileSystem> Vault<F> {
     fn validate_sync_path(path: &str) -> Result<()> {
         // Empty path
         if path.is_empty() {
-            return Err(VaultError::Other("Empty path not allowed".into()));
+            return Err(VaultError::InvalidPath("Empty path not allowed".into()));
         }
         // Path traversal
         if path.contains("..") {
-            return Err(VaultError::Other("Path traversal not allowed".into()));
+            return Err(VaultError::InvalidPath("Path traversal not allowed".into()));
         }
         // Empty segments (a//b.md)
         if path.contains("//") {
-            return Err(VaultError::Other("Empty path segment not allowed".into()));
+            return Err(VaultError::InvalidPath(
+                "Empty path segment not allowed".into(),
+            ));
         }
         // Absolute paths (Unix)
         if path.starts_with('/') {
-            return Err(VaultError::Other("Absolute path not allowed".into()));
+            return Err(VaultError::InvalidPath("Absolute path not allowed".into()));
         }
         // Absolute paths (Windows - drive letter)
         if path.len() >= 2 && path.chars().nth(1) == Some(':') {
-            return Err(VaultError::Other(
+            return Err(VaultError::InvalidPath(
                 "Windows absolute path not allowed".into(),
             ));
         }
         // Backslash
         if path.contains('\\') {
-            return Err(VaultError::Other("Backslash in path not allowed".into()));
+            return Err(VaultError::InvalidPath(
+                "Backslash in path not allowed".into(),
+            ));
         }
         // Null bytes
         if path.contains('\0') {
-            return Err(VaultError::Other("Null byte in path not allowed".into()));
+            return Err(VaultError::InvalidPath(
+                "Null byte in path not allowed".into(),
+            ));
         }
         // Must be .md
         if !path.ends_with(".md") {
-            return Err(VaultError::Other("Only markdown files allowed".into()));
+            return Err(VaultError::InvalidPath(
+                "Only markdown files allowed".into(),
+            ));
         }
         // Control characters
         if path.chars().any(|c| c.is_control()) {
-            return Err(VaultError::Other(
+            return Err(VaultError::InvalidPath(
                 "Control character in path not allowed".into(),
             ));
         }
         // Path length limit (filesystem safety)
         if path.len() > 1024 {
-            return Err(VaultError::Other("Path too long".into()));
+            return Err(VaultError::InvalidPath("Path too long".into()));
         }
         Ok(())
     }
@@ -2033,20 +2072,20 @@ impl<F: FileSystem> Vault<F> {
         let tree = self.file_tree();
         let node_id = tree
             .create(parent_id)
-            .map_err(|e| VaultError::Other(format!("Failed to create file node: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to create file node: {}", e)))?;
 
         let meta = tree
             .get_meta(node_id)
-            .map_err(|e| VaultError::Other(format!("Failed to get file meta: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to get file meta: {}", e)))?;
         meta.insert(TREE_META_TYPE, "file")
-            .map_err(|e| VaultError::Other(format!("Failed to set file type: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to set file type: {}", e)))?;
         meta.insert(TREE_META_NAME, file_name[0])
-            .map_err(|e| VaultError::Other(format!("Failed to set file name: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to set file name: {}", e)))?;
         meta.insert(TREE_META_DOC_ID, simple_hash(path))
-            .map_err(|e| VaultError::Other(format!("Failed to set doc_id: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to set doc_id: {}", e)))?;
         // Store the full path so the node's path is recoverable after deletion.
         meta.insert(TREE_META_PATH, path)
-            .map_err(|e| VaultError::Other(format!("Failed to set path meta: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to set path meta: {}", e)))?;
 
         // Update cache
         self.path_to_node_mut().insert(path.to_string(), node_id);
@@ -2073,8 +2112,9 @@ impl<F: FileSystem> Vault<F> {
 
         if let Some(node_id) = self.find_node_by_path(path) {
             let tree = self.file_tree();
-            tree.delete(node_id)
-                .map_err(|e| VaultError::Other(format!("Failed to delete file node: {}", e)))?;
+            tree.delete(node_id).map_err(|e| {
+                VaultError::TreeOperation(format!("Failed to delete file node: {}", e))
+            })?;
 
             // Mark the path deleted synchronously so an inbound DocumentUpdate arriving
             // before the next registry sync doesn't resurrect it. rebuild_path_cache also
@@ -2174,7 +2214,7 @@ impl<F: FileSystem> Vault<F> {
 
                 return Ok(());
             }
-            return Err(VaultError::Other(format!(
+            return Err(VaultError::RenameSourceMissing(format!(
                 "Source file not found: {}",
                 old_path
             )));
@@ -2182,7 +2222,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Check target doesn't exist
         if self.find_node_by_path(new_path).is_some() {
-            return Err(VaultError::Other(format!(
+            return Err(VaultError::RenameTargetExists(format!(
                 "Target already exists: {}",
                 new_path
             )));
@@ -2201,21 +2241,21 @@ impl<F: FileSystem> Vault<F> {
 
         // Move node to new parent (Loro API is `mov`)
         tree.mov(node_id, new_parent)
-            .map_err(|e| VaultError::Other(format!("Failed to move file node: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to move file node: {}", e)))?;
 
         // Update name in metadata
         let meta = tree
             .get_meta(node_id)
-            .map_err(|e| VaultError::Other(format!("Failed to get file meta: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to get file meta: {}", e)))?;
         meta.insert(TREE_META_NAME, new_name[0])
-            .map_err(|e| VaultError::Other(format!("Failed to update file name: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to update file name: {}", e)))?;
         meta.insert(TREE_META_DOC_ID, simple_hash(new_path))
-            .map_err(|e| VaultError::Other(format!("Failed to update doc_id: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to update doc_id: {}", e)))?;
         // This main path moves the node via tree.mov() rather than register_file, so the
         // path meta must be updated explicitly to keep the deleted-path guard accurate if
         // the renamed node is later deleted.
         meta.insert(TREE_META_PATH, new_path)
-            .map_err(|e| VaultError::Other(format!("Failed to update path meta: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to update path meta: {}", e)))?;
 
         // Update caches
         self.path_to_node_mut().remove(old_path);
@@ -2294,17 +2334,17 @@ impl<F: FileSystem> Vault<F> {
         }
 
         // Create new folder node
-        let node_id = tree
-            .create(parent)
-            .map_err(|e| VaultError::Other(format!("Failed to create folder node: {}", e)))?;
+        let node_id = tree.create(parent).map_err(|e| {
+            VaultError::TreeOperation(format!("Failed to create folder node: {}", e))
+        })?;
 
         let meta = tree
             .get_meta(node_id)
-            .map_err(|e| VaultError::Other(format!("Failed to get folder meta: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to get folder meta: {}", e)))?;
         meta.insert(TREE_META_TYPE, "folder")
-            .map_err(|e| VaultError::Other(format!("Failed to set folder type: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to set folder type: {}", e)))?;
         meta.insert(TREE_META_NAME, name)
-            .map_err(|e| VaultError::Other(format!("Failed to set folder name: {}", e)))?;
+            .map_err(|e| VaultError::TreeOperation(format!("Failed to set folder name: {}", e)))?;
 
         Ok(TreeParentId::Node(node_id))
     }
@@ -2347,7 +2387,7 @@ impl<F: FileSystem> Vault<F> {
 
         let bytes = self.fs.read(&sync_path).await?;
         let meta = LoroDoc::decode_import_blob_meta(&bytes, false)
-            .map_err(|e| VaultError::Other(format!("Failed to decode blob meta: {}", e)))?;
+            .map_err(|e| VaultError::BlobDecode(format!("Failed to decode blob meta: {}", e)))?;
 
         Ok(Some(BlobMeta {
             change_count: meta.change_num,

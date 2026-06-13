@@ -573,7 +573,7 @@ impl<F: FileSystem> Vault<F> {
             .registry()
             .export(loro::ExportMode::snapshot())
             .map_err(|e| {
-                crate::vault::VaultError::Other(format!("Registry export failed: {}", e))
+                crate::vault::VaultError::RegistryExport(format!("Registry export failed: {}", e))
             })?;
         self.fs
             .write(
