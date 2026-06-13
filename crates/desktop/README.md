@@ -47,8 +47,12 @@ The vault path is read from `OBSIDIAN_MEMORY_VAULT` (no `--vault` flag).
 # 1. Build the frontend once (emits frontend/dist incl. the pairing windows)
 cd crates/desktop/frontend && npm install && npm run build
 
-# 2. Run the app (compiles the crate, starts the daemon + tray)
-cd crates/desktop && OBSIDIAN_MEMORY_VAULT=~/notes cargo run
+# 2. Build + sign the app — from the repo root. (Do NOT use `cargo run`: it
+#    launches the binary before it can be code-signed.)
+./scripts/build-desktop.sh
+
+# 3. Run the signed binary (starts the daemon + tray)
+OBSIDIAN_MEMORY_VAULT=~/notes ./target/debug/desktop
 ```
 
 On first run the tray icon appears in the menu bar. The app is dock-less by
@@ -62,6 +66,20 @@ in `frontend/`, then `cargo clean -p desktop` to force a re-embed, then `cargo r
 
 A packaged release `.app` (`tauri build`) isn't wired up for this layout yet —
 tracked as a follow-up.
+
+### Code signing (firewall persistence)
+
+`build-desktop.sh` signs the binary with the **`ObsidianMemory Dev Signing`**
+self-signed certificate. This matters on machines running the macOS Application
+Firewall (especially MDM/stealth setups): ad-hoc signing (`codesign -s -`)
+re-anchors the firewall's allow-rule on the binary's cdhash, which changes every
+build — so you get a fresh "allow incoming connections" prompt on every rebuild.
+Signing with a named cert anchors the rule on the cert instead, so a single Allow
+persists across all future rebuilds (proven on the MDM machine 2026-06-13).
+
+The cert lives in the team's 1Password **Develop** vault for fleet distribution;
+import it into your login keychain and set it to *Always Trust* for code signing,
+then `build-desktop.sh` signs with it automatically (see the team signing runbook).
 
 ## Architecture
 
