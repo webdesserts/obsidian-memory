@@ -307,14 +307,26 @@ impl NoteDocument {
         self.doc.state_frontiers()
     }
 
-    /// Export full snapshot
-    pub fn export_snapshot(&self) -> Vec<u8> {
-        self.doc.export(ExportMode::Snapshot).unwrap()
+    /// Export full snapshot.
+    ///
+    /// Returns `Result` rather than panicking: a loro export failure (e.g. an
+    /// internal encoding error) is surfaced to the caller so a single bad
+    /// document can't take down the daemon.
+    pub fn export_snapshot(&self) -> Result<Vec<u8>> {
+        self.doc
+            .export(ExportMode::Snapshot)
+            .map_err(|e| DocumentError::Loro(e.to_string()))
     }
 
-    /// Export updates since a version
-    pub fn export_updates(&self, from: &VersionVector) -> Vec<u8> {
-        self.doc.export(ExportMode::updates(from)).unwrap()
+    /// Export updates since a version.
+    ///
+    /// Returns `Result` rather than panicking: a loro export failure is
+    /// surfaced to the caller so a single bad document can't take down the
+    /// daemon.
+    pub fn export_updates(&self, from: &VersionVector) -> Result<Vec<u8>> {
+        self.doc
+            .export(ExportMode::updates(from))
+            .map_err(|e| DocumentError::Loro(e.to_string()))
     }
 
     /// Import data from bytes
@@ -571,7 +583,7 @@ World"#;
         let mut doc2 = NoteDocument::new("test.md", test_author());
 
         // Sync from doc1 to doc2
-        let snapshot = doc1.export_snapshot();
+        let snapshot = doc1.export_snapshot().unwrap();
         doc2.import(&snapshot).unwrap();
 
         assert_eq!(doc2.body().to_string(), "Hello");
@@ -622,7 +634,7 @@ World"#;
         // Device A creates the note, then device B starts from A's history but
         // authors new ops under its own PeerId (two devices sharing a vault).
         let doc_a = NoteDocument::from_markdown("note.md", "base", author_a).unwrap();
-        let base_snapshot = doc_a.export_snapshot();
+        let base_snapshot = doc_a.export_snapshot().unwrap();
         let mut doc_b = NoteDocument::from_bytes("note.md", &base_snapshot, author_b).unwrap();
 
         let base_vv = doc_a.version();
@@ -634,10 +646,10 @@ World"#;
         doc_b.commit();
 
         // Cross-import each other's updates since the shared base.
-        let updates_from_b = doc_b.export_updates(&base_vv);
+        let updates_from_b = doc_b.export_updates(&base_vv).unwrap();
         let mut doc_a = doc_a;
         doc_a.import(&updates_from_b).unwrap();
-        let updates_from_a = doc_a.export_updates(&base_vv);
+        let updates_from_a = doc_a.export_updates(&base_vv).unwrap();
         doc_b.import(&updates_from_a).unwrap();
 
         // Both replicas converge to identical content.
@@ -662,7 +674,7 @@ World"#;
         // Build a doc at a known path, export it, then reload via the preserve
         // loader and confirm the stored path round-trips.
         let doc = NoteDocument::from_markdown("a/b.md", "# Content", test_author()).unwrap();
-        let snapshot = doc.export_snapshot();
+        let snapshot = doc.export_snapshot().unwrap();
 
         let reloaded = NoteDocument::from_bytes_preserve_path(&snapshot, test_author()).unwrap();
         assert_eq!(

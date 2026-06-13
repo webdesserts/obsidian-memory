@@ -271,7 +271,7 @@ impl<F: FileSystem> Vault<F> {
         let doc = self.get_document(path).await?;
 
         // Export a snapshot (for now - could optimize to send incremental updates)
-        let snapshot = doc.export_snapshot();
+        let snapshot = doc.export_snapshot()?;
 
         // Get file modification time for "latest wins" conflict resolution
         let mtime = self.fs.stat(path).await.ok().map(|s| s.mtime_millis);
@@ -421,14 +421,14 @@ impl<F: FileSystem> Vault<F> {
             if let Some(their_version_bytes) = their_versions.get(&path) {
                 // They have it - send updates since their version
                 if let Ok(their_version) = loro::VersionVector::decode(their_version_bytes) {
-                    let updates = doc.export_updates(&their_version);
+                    let updates = doc.export_updates(&their_version)?;
                     if !updates.is_empty() {
                         document_updates.insert(path, updates);
                     }
                 }
             } else {
                 // They don't have it - send full snapshot
-                document_updates.insert(path, doc.export_snapshot());
+                document_updates.insert(path, doc.export_snapshot()?);
             }
         }
 
@@ -568,7 +568,9 @@ impl<F: FileSystem> Vault<F> {
         let registry_bytes = self
             .registry()
             .export(loro::ExportMode::snapshot())
-            .unwrap();
+            .map_err(|e| {
+                crate::vault::VaultError::Other(format!("Registry export failed: {}", e))
+            })?;
         self.fs
             .write(
                 &format!("{}/registry.loro", crate::vault::SYNC_DIR),
@@ -681,7 +683,7 @@ impl<F: FileSystem> Vault<F> {
 
             // Create temp doc FROM LOCAL STATE, then import remote to get merged version
             // This correctly handles incremental updates (not just full snapshots)
-            let mut temp_doc = NoteDocument::from_bytes(path, &doc.export_snapshot(), author)?;
+            let mut temp_doc = NoteDocument::from_bytes(path, &doc.export_snapshot()?, author)?;
             temp_doc.import(data)?;
             let merged_vv = temp_doc.version();
 
@@ -797,7 +799,7 @@ impl<F: FileSystem> Vault<F> {
             self.mark_synced(path);
 
             // Save to disk
-            let snapshot = doc.export_snapshot();
+            let snapshot = doc.export_snapshot()?;
             self.fs
                 .atomic_write(&sync_path, &snapshot)
                 .await
@@ -986,7 +988,7 @@ mod tests {
 
         // Create another document and import doc1's state
         let mut doc2 = NoteDocument::new("test.md", test_author_2());
-        doc2.import(&doc1.export_snapshot()).unwrap();
+        doc2.import(&doc1.export_snapshot().unwrap()).unwrap();
         let v2 = doc2.version().encode();
 
         // v2 should include v1 (it has all ops from doc1)
@@ -1618,7 +1620,7 @@ mod tests {
         // A document imported from another preserves the doc_id
         // Use different peer_id to avoid Loro merge conflicts with same-peer operations
         let mut doc3 = NoteDocument::new("test.md", test_author_2());
-        doc3.import(&doc1.export_snapshot()).unwrap();
+        doc3.import(&doc1.export_snapshot().unwrap()).unwrap();
 
         assert_eq!(
             doc3.doc_id(),

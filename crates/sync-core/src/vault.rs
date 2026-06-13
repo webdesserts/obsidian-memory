@@ -558,7 +558,9 @@ impl<F: FileSystem> Vault<F> {
         let _file_tree = registry.get_tree(REGISTRY_TREE);
 
         // Save initial registry
-        let registry_bytes = registry.export(loro::ExportMode::Snapshot).unwrap();
+        let registry_bytes = registry
+            .export(loro::ExportMode::Snapshot)
+            .map_err(|e| VaultError::Other(format!("Failed to export initial registry: {}", e)))?;
         fs.atomic_write(REGISTRY_FILE, &registry_bytes).await?;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -988,7 +990,7 @@ impl<F: FileSystem> Vault<F> {
         let doc = NoteDocument::from_bytes(new_path, &bytes, self.loro_author)?;
 
         // Save to new location
-        let snapshot = doc.export_snapshot();
+        let snapshot = doc.export_snapshot()?;
         self.fs.atomic_write(&new_sync_path, &snapshot).await?;
 
         // Delete old file
@@ -1066,7 +1068,7 @@ impl<F: FileSystem> Vault<F> {
 
         if body_changed || fm_changed {
             doc.commit();
-            let snapshot = doc.export_snapshot();
+            let snapshot = doc.export_snapshot()?;
             self.fs.atomic_write(&sync_path, &snapshot).await?;
             tracing::debug!("Re-indexed document via diff: {}", path);
         }
@@ -1146,7 +1148,7 @@ impl<F: FileSystem> Vault<F> {
 
         if body_changed || fm_changed {
             doc.commit();
-            let snapshot = doc.export_snapshot();
+            let snapshot = doc.export_snapshot()?;
             self.fs.atomic_write(&sync_path, &snapshot).await?;
         }
 
@@ -1417,7 +1419,7 @@ impl<F: FileSystem> Vault<F> {
 
             if body_changed || fm_changed {
                 existing_doc.commit();
-                let snapshot = existing_doc.export_snapshot();
+                let snapshot = existing_doc.export_snapshot()?;
                 self.documents_mut().insert(path.to_string(), existing_doc);
                 self.fs.atomic_write(&sync_path, &snapshot).await?;
                 tracing::debug!("Updated document via diff: {}", path);
@@ -1438,7 +1440,7 @@ impl<F: FileSystem> Vault<F> {
 
             if body_changed || fm_changed {
                 doc.commit();
-                let snapshot = doc.export_snapshot();
+                let snapshot = doc.export_snapshot()?;
                 self.fs.atomic_write(&sync_path, &snapshot).await?;
                 tracing::debug!("Updated cold-cache document via diff: {}", path);
             } else {
@@ -1451,7 +1453,7 @@ impl<F: FileSystem> Vault<F> {
 
         // Document doesn't exist anywhere - create new (this is the only time we need new peer ID)
         let new_doc = NoteDocument::from_markdown(path, &content, self.loro_author)?;
-        let snapshot = new_doc.export_snapshot();
+        let snapshot = new_doc.export_snapshot()?;
         self.fs.atomic_write(&sync_path, &snapshot).await?;
         self.documents_mut().insert(path.to_string(), new_doc);
 
@@ -1474,7 +1476,7 @@ impl<F: FileSystem> Vault<F> {
 
             // Save sync state
             let sync_path = self.document_sync_path(path);
-            let snapshot = doc.export_snapshot();
+            let snapshot = doc.export_snapshot()?;
             self.fs.atomic_write(&sync_path, &snapshot).await?;
         }
         Ok(())
@@ -2623,7 +2625,7 @@ mod tests {
             Some(""),
             "test setup must produce a doc with empty stored path"
         );
-        fs.write(&sync_path, &legacy.export_snapshot())
+        fs.write(&sync_path, &legacy.export_snapshot().unwrap())
             .await
             .unwrap();
 
