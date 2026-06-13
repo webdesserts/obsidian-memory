@@ -14,12 +14,18 @@ use std::time::Duration;
 
 use iroh::{EndpointId, SecretKey};
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
+use sync_core::fs::FileSystem;
 use sync_core::network::SyncNode;
 use sync_core::network::gossip::GossipEvent;
 use sync_core::network::streams::connect_and_sync_raw;
 use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
+use sync_daemon::daemon::Daemon;
+use sync_daemon::persistence::PeerRelay;
 use sync_daemon::relay::EmbeddedRelay;
+use sync_daemon::watcher::FileEvent;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 mod common;
 
@@ -380,6 +386,193 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
     gossip_a.event_rx.close();
     relay_a.shutdown().await;
     relay_b.shutdown().await;
+
+    Ok(())
+}
+
+/// Faithful repro: a running daemon re-establishes its gossip neighbor after the
+/// peer's relay flaps long enough for the non-home `ActiveRelayActor` to reap —
+/// WITHOUT a process restart.
+///
+/// This is the end-to-end scenario behind the relay-reap reconnect fix. The
+/// supervisor lives in daemon A; B's home relay (`relay_peer`) is the one that
+/// goes down. With the only A→B path being `relay_peer`, A's endpoint carries a
+/// non-home `ActiveRelayActor` for it, which iroh reaps after 60s of inactivity
+/// (the hardcoded `RELAY_INACTIVE_CLEANUP_TIME` — verified to have no env/config/
+/// builder override in iroh-1.0.0-rc.1, and `Endpoint::network_change` does NOT
+/// force-close non-home actors, so the reap cannot be forced faster). Once
+/// reaped, the OLD supervisor never respawned it and additionally evicted B's
+/// sole hint on throttled ticks → permanent partition until restart. The fix
+/// keeps the sole hint resident so the next due dial drives relay traffic that
+/// respawns the actor.
+///
+/// `#[ignore]`d because it idles past the 60s reap (≥65s wall time). Run manually:
+///
+/// ```text
+/// cargo test -p sync-daemon --test relay_integration -- --ignored \
+///     supervisor_heals_after_peer_relay_reap
+/// ```
+///
+/// CAVEAT (in-process faithfulness): `SyncNode::new` always enables mDNS, so two
+/// localhost nodes may discover each other's direct addresses and reconnect
+/// without the relay — masking the bug. The truly off-LAN property (both home
+/// relays unreachable to the dialer, relay the only path) is only guaranteed in
+/// the real charon ↔ umbra E2E. Treat this test as a best-effort local
+/// confirmation, not a hermetic gate; the fast logic tests in
+/// `daemon_integration.rs` are the deterministic regression guards.
+///
+/// Seeds 60/61 reserved.
+#[tokio::test]
+#[ignore = "idles past iroh's 60s RELAY_INACTIVE_CLEANUP_TIME reap (~65s+); run with --ignored"]
+async fn supervisor_heals_after_peer_relay_reap() -> anyhow::Result<()> {
+    use iroh::RelayUrl;
+
+    // Two disjoint home relays: R_a is A's home; R_peer is B's home (the flapper).
+    let relay_a = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_peer = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let url_a: RelayUrl = relay_a.relay_url().clone();
+    let url_peer: RelayUrl = relay_peer.relay_url().clone();
+
+    // Build full relay-aware nodes (home relay each), then allowlist both ways.
+    let node_a = common::build_node_with_relay(60, &url_a).await?;
+    let node_b = common::build_node_with_relay(61, &url_peer).await?;
+    node_a.allowlist.add_peer(node_b.node_id, "node-b").await?;
+    node_b.allowlist.add_peer(node_a.node_id, "node-a").await?;
+
+    let a_id = node_a.sync_node.node_id();
+    let b_id = node_b.sync_node.node_id();
+
+    // Seed relay hints both directions — the ONLY path each has to the other.
+    // No direct addresses (no `connect_nodes`): the relay must carry A↔B so a
+    // real reap-sensitive non-home actor exists.
+    node_a.sync_node.set_peer_relay(b_id, &url_peer);
+    node_b.sync_node.set_peer_relay(a_id, &url_a);
+
+    let vault_id: VaultId = "cafebabecafebabe".parse().unwrap();
+
+    // A subscribes with no bootstrap; B bootstraps off A's bare EndpointId.
+    let gossip_a = node_a.sync_node.join_vault_gossip(&vault_id, vec![]).await?;
+    let gossip_b = node_b
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![a_id])
+        .await?;
+
+    // Drive both as full Daemons so A's reconnect supervisor runs. Shrink A's
+    // tick so recovery lands inside the test's window once the relay returns.
+    let a_vault = node_a.vault.clone();
+    let a_fs = node_a.fs.clone();
+    let b_fs = node_b.fs.clone();
+    let b_vault = node_b.vault.clone();
+
+    let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+    let a_shutdown = CancellationToken::new();
+    let mut daemon_a = Daemon::new(
+        a_vault.clone(),
+        node_a.sync_node,
+        gossip_a,
+        a_file_rx,
+        None,
+        node_a.allowlist.clone(),
+        "device-a".to_string(),
+        None,
+        "/test-vault-reap-a".into(),
+        a_shutdown.clone(),
+    );
+    let mut a_hint = PeerRelay::new(b_id.to_string(), url_peer.to_string());
+    a_hint.last_success_ms = Some(0);
+    daemon_a.seed_peer_relays_snapshot(vec![a_hint]);
+    daemon_a.set_reconnect_interval(Duration::from_millis(500));
+
+    let (_b_file_tx, b_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+    let b_shutdown = CancellationToken::new();
+    let mut daemon_b = Daemon::new(
+        b_vault.clone(),
+        node_b.sync_node,
+        gossip_b,
+        b_file_rx,
+        None,
+        node_b.allowlist.clone(),
+        "device-b".to_string(),
+        None,
+        "/test-vault-reap-b".into(),
+        b_shutdown.clone(),
+    );
+
+    let a_loop = tokio::spawn(async move { daemon_a.run_loop().await });
+    let b_loop = tokio::spawn(async move { daemon_b.run_loop().await });
+
+    // Establish the swarm through the relays: A pulls a note B writes pre-flap.
+    b_fs
+        .write("notes/pre-flap.md", b"# Before the flap")
+        .await?;
+    {
+        let vault = b_vault.lock().await;
+        vault.on_file_changed("notes/pre-flap.md").await?;
+    }
+    common::wait_until(
+        "A pulls B's pre-flap note (swarm established via relay)",
+        Duration::from_secs(45),
+        || {
+            let fs = a_fs.clone();
+            async move { fs.read("notes/pre-flap.md").await.is_ok() }
+        },
+    )
+    .await;
+
+    // Flap B's relay and idle past the 60s reap — A's non-home actor for
+    // `relay_peer` goes idle and reaps. Capture the bind addr first so the
+    // replacement can advertise the identical URL.
+    let peer_bind: SocketAddr = format!(
+        "{}:{}",
+        url_peer.host_str().unwrap(),
+        url_peer.port().unwrap()
+    )
+    .parse()
+    .unwrap();
+    relay_peer.shutdown().await;
+    tokio::time::sleep(Duration::from_secs(70)).await;
+
+    // Bring the relay back advertising the SAME URL. Prefer reusing the original
+    // bind addr; fall back to a fresh bind that still advertises the same URL if
+    // the OS hasn't released the port yet (start failure → retry on :0).
+    let relay_peer = match EmbeddedRelay::start(peer_bind).await {
+        Ok(r) => r,
+        Err(_) => {
+            EmbeddedRelay::start_with_advertised_url(
+                "127.0.0.1:0".parse().unwrap(),
+                url_peer.as_str(),
+            )
+            .await?
+        }
+    };
+
+    // B writes a second note during/after the partition. Recovery is proven when
+    // A pulls it WITHOUT any restart — the supervisor respawned the reaped relay
+    // path on its own. On the OLD code this hangs (actor never respawns; sole
+    // hint was evicted on throttled ticks) → the repro.
+    b_fs
+        .write("notes/post-flap.md", b"# After the flap")
+        .await?;
+    {
+        let vault = b_vault.lock().await;
+        vault.on_file_changed("notes/post-flap.md").await?;
+    }
+    common::wait_until(
+        "A pulls B's post-flap note after the relay returns (heals without restart)",
+        Duration::from_secs(90),
+        || {
+            let fs = a_fs.clone();
+            async move { fs.read("notes/post-flap.md").await.is_ok() }
+        },
+    )
+    .await;
+
+    a_shutdown.cancel();
+    b_shutdown.cancel();
+    let _ = a_loop.await;
+    let _ = b_loop.await;
+    relay_a.shutdown().await;
+    relay_peer.shutdown().await;
 
     Ok(())
 }

@@ -1864,6 +1864,183 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// While partitioned with its SOLE peer-relay hint, the supervisor never
+    /// evicts that hint even on throttled ticks — the relay-reap reconnect fix.
+    ///
+    /// Bug being guarded: a non-home iroh `ActiveRelayActor` reaps after 60s of
+    /// inactivity; once reaped, the supervisor's re-bootstrap can't respawn it,
+    /// and the OLD behavior compounded this by `remove_peer_relay`-ing the only
+    /// hint on throttled ticks — starving the next due dial of the peer's
+    /// address so the partition never heals without a process restart. The fix
+    /// throttles the dial FREQUENCY (the existing `hint_attempt_due` gate), not
+    /// the address PRESENCE: a sole hint stays resident in the lookup while at
+    /// zero neighbors.
+    ///
+    /// To prove the supervisor loop actually ran (not a pass-by-luck dead loop),
+    /// the hint starts ABSENT from the lookup but DUE in the snapshot. The first
+    /// supervisor tick re-seeds it (`None` → `Some`, the positive liveness
+    /// signal) and stamps `last_attempt_ms`, throwing it into a 120s backoff so
+    /// every later tick sees it throttled. The OLD code would then remove it; the
+    /// fix retains it. Seed 89 reserved (90 only mints a valid peer EndpointId).
+    #[tokio::test]
+    async fn supervisor_retains_sole_hint_when_throttled() -> anyhow::Result<()> {
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(89).await?;
+        // 90 exists only to mint a valid, distinct peer EndpointId.
+        let node_peer = build_node(90).await?;
+        let peer_id = node_peer.sync_node.node_id();
+
+        // A clone of the lookup shares the backing store, so it observes the
+        // supervisor's mutations from outside the spawned event loop. The hint
+        // starts absent: the first due tick is what adds it.
+        let lookup = node_a.sync_node.peer_lookup.clone();
+        assert!(
+            lookup.get_endpoint_info(peer_id).is_none(),
+            "hint should start absent — the first supervisor tick adds it"
+        );
+
+        // A never-attempted hint is due immediately; the SOLE hint in the snapshot.
+        let sole_hint = PeerRelay::new(peer_id.to_string(), "http://example.com:3340/".to_string());
+
+        // A joins gossip with no bootstrap — it stays partitioned at zero
+        // neighbors, so the supervisor acts every tick.
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-sole-hint".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.seed_peer_relays_snapshot(vec![sole_hint]);
+        daemon_a.set_reconnect_interval(Duration::from_millis(50));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // Liveness: the first due tick re-seeds the hint into the lookup. This
+        // proves the supervisor loop is running before we assert retention.
+        wait_until("sole hint re-seeded by first due tick", || {
+            let lookup = lookup.clone();
+            async move { lookup.get_endpoint_info(peer_id).is_some() }
+        })
+        .await;
+
+        // The hint is now throttled (120s backoff). Let many throttled ticks fire
+        // — the OLD code removes the sole hint on the first of these; the fix
+        // keeps it. 750ms at a 50ms interval is ~15 ticks, far more than the one
+        // tick the old eviction needed.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert!(
+            lookup.get_endpoint_info(peer_id).is_some(),
+            "the sole peer-relay hint must remain in the lookup across throttled \
+             ticks — evicting it would strand the only address needed to heal the \
+             partition"
+        );
+
+        a_shutdown.cancel();
+        let _ = a_loop.await;
+
+        Ok(())
+    }
+
+    /// With TWO throttled hints and none due, BOTH are evicted — the sole-hint
+    /// retention guard fires only at exactly one hint.
+    ///
+    /// The relay-reap fix retains a hint only when it is the lookup's LAST
+    /// address (`peer_relays.len() == 1`). With two stale hints and no due
+    /// alternative, there is no single lifeline to protect: both are throttled,
+    /// both get evicted, and `bootstrap_ids` is empty so the tick early-returns
+    /// (nothing to dial until one comes due). This pins the boundary so a future
+    /// change can't silently widen the guard to "never evict while partitioned."
+    ///
+    /// Seeds 91 reserved (92/93 only mint valid peer EndpointIds).
+    #[tokio::test]
+    async fn supervisor_evicts_both_when_two_throttled_none_due() -> anyhow::Result<()> {
+        use iroh::RelayUrl;
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(91).await?;
+        // 92/93 exist only to mint two valid, distinct peer EndpointIds.
+        let node_x = build_node(92).await?;
+        let node_y = build_node(93).await?;
+        let x_id = node_x.sync_node.node_id();
+        let y_id = node_y.sync_node.node_id();
+        let relay_url: RelayUrl = "http://example.com:3340/".parse()?;
+
+        // Seed BOTH hints into A's lookup so eviction is observable as removal.
+        node_a.sync_node.set_peer_relay(x_id, &relay_url);
+        node_a.sync_node.set_peer_relay(y_id, &relay_url);
+
+        let lookup = node_a.sync_node.peer_lookup.clone();
+        assert!(lookup.get_endpoint_info(x_id).is_some());
+        assert!(lookup.get_endpoint_info(y_id).is_some());
+
+        // Both hints are throttled: recent attempt + failures puts each well
+        // inside its backoff window, and neither is due.
+        let now = now_ms_test();
+        let mut hint_x = PeerRelay::new(x_id.to_string(), "http://example.com:3340/".to_string());
+        hint_x.failure_count = 6;
+        hint_x.last_attempt_ms = Some(now);
+        let mut hint_y = PeerRelay::new(y_id.to_string(), "http://example.com:3340/".to_string());
+        hint_y.failure_count = 6;
+        hint_y.last_attempt_ms = Some(now);
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-two-throttled".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.seed_peer_relays_snapshot(vec![hint_x, hint_y]);
+        daemon_a.set_reconnect_interval(Duration::from_millis(50));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // With no due alternative to protect, both throttled hints are evicted.
+        wait_until("both throttled hints evicted from lookup", || {
+            let lookup = lookup.clone();
+            async move {
+                lookup.get_endpoint_info(x_id).is_none()
+                    && lookup.get_endpoint_info(y_id).is_none()
+            }
+        })
+        .await;
+
+        a_shutdown.cancel();
+        let _ = a_loop.await;
+
+        Ok(())
+    }
+
     /// A successful NeighborUp sync resets the peer's hint freshness — the
     /// learn-on-exchange behavior that makes stale-hint eviction safe.
     ///
