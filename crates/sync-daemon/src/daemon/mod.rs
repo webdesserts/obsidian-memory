@@ -32,7 +32,7 @@ use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::fs::FileSystem;
 use sync_core::network::{
     SyncNode,
-    gossip::{GossipEvent, VaultGossip},
+    gossip::{GossipEvent, GossipMessage, MAX_GOSSIP_MESSAGE_SIZE, VaultGossip},
     pairing::{InboundPairingExchange, PairingApproval, PairingEvent},
     streams::InboundSyncRequest,
 };
@@ -72,6 +72,14 @@ const MAX_HINT_BACKOFF_MS: u64 = 1_800_000;
 /// quiet noise within ~an hour of a peer going dark, high enough not to throttle
 /// a few-minute flaky outage.
 const STALE_FAILURE_THRESHOLD: u32 = 5;
+
+/// How often the connected-path allowlist reconcile re-pushes the membership
+/// roster to live neighbors. The reconnect supervisor wakes every
+/// [`RECONNECT_BASE_MS`] (5s), but the roster push is throttled to this slower
+/// cadence so a healthy mesh re-converges any drift (a missed `NeighborUp`, a
+/// restart) without a per-tick gossip broadcast. ~60s is responsive at the
+/// stated 3-machine scale and negligible fan-out.
+const ROSTER_RECONCILE_MS: u64 = 60_000;
 
 /// Per-hint exponential backoff window from a hint's consecutive failure count.
 ///
@@ -215,6 +223,18 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// from disk per tick) so the test harness — which uses a non-existent vault
     /// path — can seed it directly without writing `daemon.toml`.
     peer_relays: Vec<crate::persistence::PeerRelay>,
+
+    // ── allowlist convergence ───────────────────────────────────────────────
+    /// Wall-clock (`now_ms()`) of the last connected-path roster reconcile, or
+    /// `None` if one hasn't fired yet. Throttles the roster push inside
+    /// `on_reconnect_tick` to [`ROSTER_RECONCILE_MS`] so it doesn't broadcast on
+    /// every 5s supervisor wake.
+    last_roster_reconcile_ms: Option<u64>,
+    /// Reconcile throttle window (defaults to [`ROSTER_RECONCILE_MS`]). A field
+    /// rather than a const only so integration tests can shrink it to observe a
+    /// reconcile within `wait_until`'s budget — same test-seam rationale as
+    /// [`Daemon::set_reconnect_interval`].
+    roster_reconcile_interval_ms: u64,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -271,6 +291,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             exchange_learn_rx,
             reconnect_tick,
             peer_relays: Vec::new(),
+            last_roster_reconcile_ms: None,
+            roster_reconcile_interval_ms: ROSTER_RECONCILE_MS,
         }
     }
 
@@ -366,15 +388,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                             self.on_allowlist_update_received(from, peer).await;
                         }
                         GossipEvent::AllowlistRoster { from, peers } => {
-                            // The roster-merge handler (sender-trust gate + merge_roster)
-                            // and the NeighborUp/reconcile senders land in the next
-                            // cluster. Until then, log and drop so an early roster from
-                            // an upgraded peer is a safe no-op rather than a panic.
-                            debug!(
-                                from = %from,
-                                count = peers.len(),
-                                "Allowlist roster received (handler not wired yet — ignoring)"
-                            );
+                            self.on_allowlist_roster_received(from, peers).await;
                         }
                     }
                 }
@@ -482,7 +496,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// still evicted — a live alternative remains, so no lifeline is at risk.
     async fn on_reconnect_tick(&mut self) {
         // Step 1: connected — stay quiet and don't churn the swarm.
+        //
+        // The reconnect/dial logic below is the shipped, validated supervisor and
+        // is untouched. The ONLY addition on the connected path is a throttled
+        // allowlist-roster reconcile: re-converge any membership drift (a missed
+        // NeighborUp, a restart) on a slow cadence. It is gated behind its own
+        // timer so it fires ~once/ROSTER_RECONCILE_MS, not on every 5s wake, and
+        // it does not touch the dial/hint machinery — when connected we still
+        // return before reaching it.
         if self.peer_registry.lock().await.alive_count() > 0 {
+            self.maybe_reconcile_allowlist_roster().await;
             return;
         }
 
@@ -569,6 +592,37 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // returned when connected). Record the failure so the throttle ramps and
         // survives a restart.
         self.record_due_hint_failures(&due_ids, now).await;
+    }
+
+    /// Connected-path allowlist reconcile, throttled to `roster_reconcile_interval_ms`.
+    ///
+    /// Called from `on_reconnect_tick`'s connected branch. Re-pushes the
+    /// membership roster to live neighbors on a slow cadence so members that
+    /// drifted across a restart or a missed `NeighborUp` re-converge even with no
+    /// new pairings. Cheap: one small gossip broadcast at most once per window.
+    async fn maybe_reconcile_allowlist_roster(&mut self) {
+        let now = now_ms();
+        let due = match self.last_roster_reconcile_ms {
+            None => true,
+            Some(last) => now.saturating_sub(last) >= self.roster_reconcile_interval_ms,
+        };
+        if !due {
+            return;
+        }
+        self.last_roster_reconcile_ms = Some(now);
+        self.push_allowlist_roster().await;
+    }
+
+    /// Shrink the connected-path roster-reconcile throttle so integration tests
+    /// can observe a reconcile within `wait_until`'s budget.
+    ///
+    /// `pub` solely for integration-test access — same rationale as
+    /// [`Daemon::set_reconnect_interval`] (the test binary compiles this crate
+    /// without the `test` cfg, so a `#[cfg(test)]` gate would break it). This is a
+    /// SEAM on the daemon's own reconcile timer, not a widening of the allowlist
+    /// API. Do not call from production code paths.
+    pub fn set_roster_reconcile_interval(&mut self, period: std::time::Duration) {
+        self.roster_reconcile_interval_ms = period.as_millis() as u64;
     }
 
     /// Bump `failure_count` for each hint dialed-but-unconnected this tick.
@@ -957,6 +1011,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.exchange_learn_tx.clone(),
             SyncExchangeKind::NeighborUp,
         );
+
+        // Push our full membership roster to the swarm so the peer that just came
+        // up converges to it — the eventually-consistent fix for the one-shot
+        // lossy `AllowlistUpdate` delta (a peer offline at a pairing's broadcast
+        // instant would otherwise never learn the rest of the mesh). The newly
+        // joined peer is a current neighbor and will receive it; re-sending to
+        // peers that already have the entries is safe (merge_roster is idempotent).
+        self.push_allowlist_roster().await;
     }
 
     /// A peer left the gossip swarm.
@@ -1002,6 +1064,85 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.exchange_learn_tx.clone(),
             SyncExchangeKind::ChangePull { path },
         );
+    }
+
+    /// Broadcast our full membership roster to the gossip swarm.
+    ///
+    /// This is the eventually-consistent convergence path that replaces the
+    /// one-shot, lossy `AllowlistUpdate` delta: any peer that missed a pairing's
+    /// single broadcast learns the whole roster on the next NeighborUp/reconcile.
+    /// The receiver's `merge_roster` is a union with tombstone-precedence, so
+    /// re-sending to peers that already have the entries is safe and idempotent.
+    ///
+    /// Bounded fan-out (spec rule 4): a `GossipMessage::AllowlistRoster` rides the
+    /// same 1KB-capped `broadcast_message` path as every other gossip envelope.
+    /// We PRE-CHECK the encoded size against the cap rather than relying on the
+    /// `Err` from `broadcast_message` (a returned `Err` there is a BUG, not the
+    /// expected over-cap path). When the roster would exceed the cap we fall back
+    /// to chunked per-peer `AllowlistUpdate` deltas — the common 3-machine path
+    /// stays a single message and a large mesh degrades safely instead of erroring.
+    async fn push_allowlist_roster(&mut self) {
+        // Include tombstones — filtering to live-only breaks revocation
+        // propagation (a removed peer would never converge to "removed" elsewhere).
+        let roster = match self.allowlist.list_peers().await {
+            Ok(peers) => peers,
+            Err(e) => {
+                warn!("Failed to read allowlist for roster push: {}", e);
+                return;
+            }
+        };
+        if roster.is_empty() {
+            return;
+        }
+
+        // Pre-check the encoded envelope size against the gossip cap. Build the
+        // same `GossipMessage::AllowlistRoster` the broadcast will, so the size we
+        // measure matches what `broadcast_message` would frame.
+        let encoded_len = bincode::serialize(&GossipMessage::AllowlistRoster(roster.clone()))
+            .map(|b| b.len())
+            .unwrap_or(usize::MAX);
+
+        if encoded_len > MAX_GOSSIP_MESSAGE_SIZE {
+            warn!(
+                roster_len = roster.len(),
+                encoded_len,
+                cap = MAX_GOSSIP_MESSAGE_SIZE,
+                "Allowlist roster exceeds gossip size cap — falling back to per-peer deltas"
+            );
+            for peer in &roster {
+                if let Err(e) = self.vault_gossip.broadcast_allowlist_update(peer).await {
+                    warn!(peer_id = %peer.node_id, "Failed to broadcast allowlist delta: {}", e);
+                }
+            }
+            return;
+        }
+
+        if let Err(e) = self.vault_gossip.broadcast_allowlist_roster(&roster).await {
+            warn!("Failed to broadcast allowlist roster: {}", e);
+        }
+    }
+
+    /// Handle a full membership roster received via gossip from a mesh member.
+    ///
+    /// Same sender-trust gate as `on_allowlist_update_received` — we only merge a
+    /// roster from a peer already in our allowlist. `merge_roster` unions the
+    /// incoming entries with tombstone-precedence, so this both adds peers we were
+    /// missing and honors revocations a trusted member propagated.
+    async fn on_allowlist_roster_received(&self, from: iroh::EndpointId, peers: Vec<AllowedPeer>) {
+        let sender_id = PeerId::from_bytes(*from.as_bytes());
+        if !self.is_peer_allowed(&sender_id).await {
+            warn!(peer = %from, "Allowlist roster from non-allowlisted peer, ignoring");
+            return;
+        }
+
+        match self.allowlist.merge_roster(&peers).await {
+            Ok(()) => {
+                info!(from = %from, count = peers.len(), "Merged allowlist roster via gossip");
+            }
+            Err(e) => {
+                error!("Failed to merge allowlist roster from {}: {}", from, e);
+            }
+        }
     }
 
     /// Handle an allowlist update received via gossip from a mesh member.

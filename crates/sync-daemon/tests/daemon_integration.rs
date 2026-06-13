@@ -2163,6 +2163,169 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// CROWN JEWEL: a peer ABSENT at a pairing's broadcast instant converges to
+    /// the full mesh roster after it joins — the exact rhea↔umbra trust-
+    /// propagation bug.
+    ///
+    /// A already trusts a third peer C (the "umbra" A paired with earlier). B (the
+    /// "rhea") paired through A but never saw C — its allowlist holds only A. When
+    /// B late-joins the swarm, A's `NeighborUp` fires `push_allowlist_roster`,
+    /// which broadcasts A's full roster `{B, C}`. B is already trusted by A, so B
+    /// merges the roster and learns C with no direct B↔C pairing and no broadcast
+    /// at C's original pairing instant.
+    ///
+    /// The user-facing effect asserted is trust state — B can now sync with C
+    /// because C is in B's allowlist — not any internal call.
+    ///
+    /// Seeds 94/95 for A/B; C = synthetic PeerId from seed 96 (never a live node).
+    #[tokio::test]
+    async fn allowlist_roster_converges_on_late_join() -> anyhow::Result<()> {
+        let node_a = build_node(94).await?;
+        let node_b = build_node(95).await?;
+
+        // C is a synthetic third member A already knows — a roster entry, never a
+        // real node. Derived from a distinct seed so its PeerId can't collide.
+        let c_peer = PeerId::from_secret_bytes(super::common::seed(96));
+
+        // connect_nodes wires A↔B mutual trust → A's allowlist = {B}, B's = {A}.
+        connect_nodes(&node_a, &node_b).await?;
+        // Pre-seed C into A only: A's allowlist becomes {B, C}; B still has only A.
+        // (PeerId is Copy, so `c_peer` stays usable for the assert below.)
+        node_a.allowlist.add_peer(c_peer, "peer-c").await?;
+
+        // Sug2 (pin the causal chain): B does NOT know C before the roster push.
+        // Asserted before any daemon spawns, so B's allowlist is definitively {A}.
+        assert!(
+            !node_b.allowlist.is_allowed(&c_peer).await?,
+            "precondition: B must not know C until the roster push (else pass-by-luck)"
+        );
+
+        // A joins with empty bootstrap; B late-joins off A → NeighborUp fires on A.
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // B converges to the full roster {A, C} purely from joining the mesh.
+        wait_until("B's allowlist contains C after roster push", || {
+            let allowlist = daemon_b.allowlist.clone();
+            async move {
+                allowlist
+                    .list_peers()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|p| p.node_id == c_peer && !p.removed)
+            }
+        })
+        .await;
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
+    /// Connected-path periodic reconcile (convergence mechanism 2): a roster drift
+    /// that NeighborUp already missed self-heals on a reconcile tick.
+    ///
+    /// A and B form a live swarm and sync. THEN — after they are already connected,
+    /// so no NeighborUp will fire for it — C is added to A's allowlist directly.
+    /// The connected-path reconcile inside the supervisor tick re-pushes A's roster
+    /// on its throttled cadence; B picks up C without any new pairing or reconnect.
+    ///
+    /// The reconcile throttle is shrunk via `set_roster_reconcile_interval` (a seam
+    /// on the daemon's own timer) so the reconcile lands within `wait_until`.
+    ///
+    /// Seeds 97/98 for A/B; C = synthetic PeerId from seed 96.
+    #[tokio::test]
+    async fn allowlist_roster_reconciles_drift_while_connected() -> anyhow::Result<()> {
+        let node_a = build_node(97).await?;
+        let node_b = build_node(98).await?;
+
+        let c_peer = PeerId::from_secret_bytes(super::common::seed(96));
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        // Build A inline so we can shrink its reconcile cadence before run_loop.
+        let a_allowlist = node_a.allowlist.clone();
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            a_allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-a".into(),
+            a_shutdown.clone(),
+        );
+        // Fast tick + near-zero reconcile throttle so a reconcile fires promptly
+        // once a neighbor is live. (The crown-jewel NeighborUp push happens before
+        // C exists, so only the connected-path reconcile can carry C here.)
+        daemon_a.set_reconnect_interval(Duration::from_millis(100));
+        daemon_a.set_roster_reconcile_interval(Duration::from_millis(0));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Wait for the swarm to form (B learns A on NeighborUp; A's roster at this
+        // instant is just {B}, so B does not yet know C).
+        wait_until("B's allowlist contains A (swarm formed)", || {
+            let allowlist = daemon_b.allowlist.clone();
+            async move { !allowlist.list_peers().await.unwrap_or_default().is_empty() }
+        })
+        .await;
+
+        // Drift: add C to A AFTER connection — NeighborUp already fired and won't
+        // re-fire, so only the periodic reconcile can propagate this.
+        a_allowlist.add_peer(c_peer, "peer-c").await?;
+
+        // The connected-path reconcile re-pushes A's roster; B converges on C.
+        wait_until("B's allowlist contains C via reconcile", || {
+            let allowlist = daemon_b.allowlist.clone();
+            async move {
+                allowlist
+                    .list_peers()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|p| p.node_id == c_peer && !p.removed)
+            }
+        })
+        .await;
+
+        a_shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = a_loop.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
     /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
     /// `last_attempt_ms` values land on the same clock the supervisor reads.
     fn now_ms_test() -> u64 {
