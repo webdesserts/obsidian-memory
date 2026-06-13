@@ -74,6 +74,10 @@ pub(crate) const SYNC_DIR: &str = ".sync";
 const REGISTRY_FILE: &str = ".sync/registry.loro";
 /// Vault metadata file (contains VaultId and format version)
 const METADATA_FILE: &str = ".sync/metadata.toml";
+/// Directory where reconcile quarantines disk orphans (tombstoned `.md` files
+/// still on disk). A dot-directory so `list_files` and the watcher already exclude
+/// it — see `quarantine_orphan` for why that exclusion is load-bearing.
+const TRASH_DIR: &str = ".trash";
 
 // Loro container and field names for the registry tree — changing these breaks existing
 // .loro files. Format stability tests will trip if these change.
@@ -228,10 +232,19 @@ pub struct ReconcileReport {
     pub moved: Vec<FileMove>,
     /// Orphaned .loro hashes (file was deleted, not moved)
     pub orphaned: Vec<String>,
+    /// Disk orphans (tombstoned-in-registry `.md` files still on disk) that were
+    /// moved to `.trash/`. Deliberately excluded from `has_changes()`: quarantine is
+    /// local disk cleanup with no registry mutation and no sync implications, so it
+    /// must not cause the daemon to broadcast.
+    pub quarantined: Vec<String>,
 }
 
 impl ReconcileReport {
     /// Check if any changes were made
+    ///
+    /// `quarantined` is intentionally NOT consulted here — see the field doc: it is
+    /// local cleanup with no sync implications, and the daemon gates broadcasts on
+    /// this method.
     pub fn has_changes(&self) -> bool {
         !self.indexed.is_empty() || !self.reindexed.is_empty() || !self.moved.is_empty()
     }
@@ -661,8 +674,17 @@ impl<F: FileSystem> Vault<F> {
     /// - External file modifications → re-create Loro docs from markdown
     /// - External file moves → migrate Loro doc to new path hash
     /// - External file deletions → orphaned .loro files (logged, not deleted)
+    /// - Tombstoned disk orphans → quarantined to `.trash/`
     ///
     /// The filesystem (markdown) is always the source of truth.
+    ///
+    /// Invariant for the orphan-quarantine A1 guard: callers must ensure the
+    /// `path_to_node` cache is current before invoking. `Vault::load` guarantees
+    /// this by running `rebuild_path_cache()` immediately before reconcile, and
+    /// `register_file` updates the cache synchronously, so a re-created file is
+    /// always visible. A manual re-trigger (e.g. the wasm plugin) after external
+    /// changes that bypass `register_file` should `rebuild_path_cache()` first,
+    /// otherwise the guard could read a stale cache and quarantine a live file.
     pub async fn reconcile(&self) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
 
@@ -768,10 +790,26 @@ impl<F: FileSystem> Vault<F> {
                     self.reindex_file(path).await?;
                     report.reindexed.push(path.clone());
                 }
+            } else if self.is_path_deleted_in_registry(path) {
+                // A disk `.md` whose registry state is tombstoned is an untracked
+                // orphan (a historical-bug or offline-window strand), not a new file.
+                // Quarantine it to .trash/ instead of resurrecting it as a new node.
+                // The .trash/ exclusion in list_files (and the watcher) is what keeps
+                // this idempotent — the moved file is no longer a reconcile candidate.
+                //
+                // Log-and-continue (mirroring index_existing_files): reconcile runs
+                // inside Vault::load, so propagating a per-orphan fs error here would
+                // abort daemon startup over a single unquarantineable file. Cleanup of
+                // one orphan failing must not block the vault from loading.
+                if let Err(e) = self.quarantine_orphan(path).await {
+                    tracing::warn!("Failed to quarantine orphan {}: {}", path, e);
+                } else {
+                    report.quarantined.push(path.clone());
+                }
             } else {
-                // Truly new file (not a move target). on_file_changed registers the
-                // new file node in the tree as part of creating its document, so no
-                // separate register_file call is needed here.
+                // Truly new file (not a move target, not a tombstoned orphan).
+                // on_file_changed registers the new file node in the tree as part of
+                // creating its document, so no separate register_file call is needed.
                 tracing::info!("New file detected, indexing: {}", path);
                 self.on_file_changed(path).await?;
                 report.indexed.push(path.clone());
@@ -797,6 +835,85 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(report)
+    }
+
+    /// Move a tombstoned disk orphan to `.trash/<path>`.
+    ///
+    /// A disk orphan is a `.md` file on disk whose registry state is tombstoned
+    /// (`is_path_deleted_in_registry`). Quarantining is reversible (the file is
+    /// preserved under `.trash/`, which `list_files` and the watcher exclude) and
+    /// touches only disk — never the registry tree — so it cannot fight the
+    /// resurrection guard or `delete_file`, which read the same `deleted_paths` set.
+    ///
+    /// A1 guard: if a live node currently occupies the path, the file is NOT an
+    /// orphan no matter how `deleted_paths` looks. `delete_file` inserts into
+    /// `deleted_paths` synchronously and `register_file` on a local re-create does
+    /// NOT clear it, so a path can be stale-tombstoned while carrying a freshly
+    /// re-created live node. Without this short-circuit, a reconcile triggered in
+    /// that window (e.g. the wasm plugin's manual trigger) would delete the user's
+    /// recreated file. The alive-node check closes that data-loss path in every
+    /// calling context.
+    async fn quarantine_orphan(&self, path: &str) -> Result<()> {
+        // A1: an alive node at the path means this is not an orphan — never quarantine.
+        if self.path_to_node().contains_key(path) {
+            return Ok(());
+        }
+
+        let bytes = self.fs.read(path).await?;
+
+        // Pick the trash destination. Crash-idempotency: if a prior quarantine wrote
+        // `.trash/<path>` but failed to delete the original (the partial-failure
+        // window below), the orphan sits at BOTH paths. On the next pass we must reuse
+        // that identical trash copy and just retry the delete — NOT allocate a new
+        // collision suffix, which would let `.trash/<path>.N` grow without bound under
+        // a persistent delete failure. A new suffix is only for a genuinely distinct
+        // orphan that happens to share a name (different content).
+        let base_dest = format!("{}/{}", TRASH_DIR, path);
+        let dest = match self.fs.read(&base_dest).await {
+            // Already-trashed identical content → reuse it, skip the write, retry delete.
+            Ok(existing) if existing == bytes => base_dest,
+            // Occupied by different content → suffix to avoid clobbering a distinct file.
+            Ok(_) => {
+                let mut n = 1;
+                loop {
+                    let candidate = format!("{}/{}.{}", TRASH_DIR, path, n);
+                    match self.fs.read(&candidate).await {
+                        Ok(existing) if existing == bytes => break candidate,
+                        Ok(_) => n += 1,
+                        Err(_) => break candidate,
+                    }
+                }
+            }
+            // Nothing there yet → use the base destination.
+            Err(_) => base_dest,
+        };
+
+        // Write only when the destination doesn't already hold our content (the
+        // crash-idempotency reuse case above skips it). NativeFs has no move primitive,
+        // so mirror migrate_document: atomic_write (write-temp + rename) keeps the
+        // trash copy from being torn if the process crashes mid-write, then delete the
+        // original. `write` creates parent dirs (FileSystem trait contract), so `.trash/`
+        // is created on demand.
+        if !self.fs.exists(&dest).await? {
+            self.fs.atomic_write(&dest, &bytes).await?;
+        }
+
+        // The write→delete sequence is non-atomic: if delete fails here, the copy is
+        // safely in trash but the original remains. Surface that distinct partial state
+        // so the next pass's idempotent reuse (above) is the recovery, not data loss.
+        if let Err(e) = self.fs.delete(path).await {
+            tracing::warn!(
+                "Quarantine partially succeeded for {}: copy is in {} but the original \
+                 could not be removed ({}); it will be retried on the next reconcile",
+                path,
+                dest,
+                e
+            );
+            return Err(e.into());
+        }
+
+        tracing::info!("Quarantined disk orphan {} -> {}", path, dest);
+        Ok(())
     }
 
     /// Migrate a Loro document from old path hash to new path.
@@ -3226,5 +3343,433 @@ mod tests {
         let toml_str = toml::to_string(&meta).unwrap();
         assert!(toml_str.contains("version = "));
         assert!(toml_str.contains("vault_id = "));
+    }
+
+    // ========== Orphan Quarantine Tests ==========
+    //
+    // Reconcile moves untracked disk orphans — `.md` files on disk whose registry
+    // state is tombstoned — to `.trash/<path>`. These cover the happy path, the
+    // safety guards (never touch absent or alive paths), idempotency, and the A1
+    // data-loss guard (a recreated file with a live node at a stale-tombstoned path
+    // must NOT be quarantined).
+
+    /// Seed a tombstoned-with-meta orphan and return a loaded vault whose
+    /// `deleted_paths` is repopulated from the persisted tombstone, with the orphan
+    /// markdown NOT yet on disk. The caller writes the orphan strand back to disk and
+    /// drives `reconcile()` itself so it can assert on the returned report.
+    ///
+    /// (The orphan must be off disk at load time, otherwise `Vault::load`'s own
+    /// reconcile quarantines it before the caller's explicit reconcile runs — the
+    /// load-time path is covered by the Commit 3 NativeFs integration test.)
+    async fn seed_tombstoned_orphan(
+        fs: &std::sync::Arc<InMemoryFs>,
+        path: &str,
+        content: &[u8],
+    ) -> Vault<std::sync::Arc<InMemoryFs>> {
+        fs.write(path, content).await.unwrap();
+        let vault = Vault::init(std::sync::Arc::clone(fs), test_peer_id())
+            .await
+            .unwrap();
+        fs.delete(path).await.unwrap();
+        vault.delete_file(path).await.unwrap();
+        drop(vault);
+
+        // Load fresh (orphan still off disk) so rebuild_path_cache repopulates
+        // deleted_paths from the persisted tombstone and load's reconcile is a no-op.
+        Vault::load(std::sync::Arc::clone(fs), test_peer_id())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_quarantines_tombstoned_orphan() {
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let vault = seed_tombstoned_orphan(&fs, "orphan.md", b"# Orphan").await;
+        // Write the orphan strand back to disk, then reconcile.
+        fs.write("orphan.md", b"# Orphan").await.unwrap();
+        let report = vault.reconcile().await.unwrap();
+
+        // The orphan was moved to .trash/, not re-indexed.
+        assert!(
+            report.quarantined.contains(&"orphan.md".to_string()),
+            "tombstoned orphan should be quarantined, got: {:?}",
+            report.quarantined
+        );
+        assert!(
+            !report.indexed.contains(&"orphan.md".to_string()),
+            "a tombstoned orphan must never be indexed as a new file"
+        );
+
+        // Original gone from the vault, present under .trash/ on disk.
+        assert!(
+            !fs.exists("orphan.md").await.unwrap(),
+            "the orphan must be removed from its original path"
+        );
+        assert!(
+            fs.exists(".trash/orphan.md").await.unwrap(),
+            "the orphan must be moved under .trash/"
+        );
+
+        // Registry untouched: the path stays tombstoned (no alive node).
+        assert!(
+            !vault.path_to_node().contains_key("orphan.md"),
+            "quarantine must not register an alive node"
+        );
+        assert!(
+            vault.is_path_deleted_in_registry("orphan.md"),
+            "the path must remain tombstoned after quarantine"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_quarantine_registry_absent_file() {
+        // A disk file with no registry entry at all (never deleted) must be indexed
+        // as new, never quarantined. Regression guard against over-deletion.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        fs.write("brand_new.md", b"# Brand New").await.unwrap();
+
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let report = vault.reconcile().await.unwrap();
+
+        assert!(
+            !report.quarantined.contains(&"brand_new.md".to_string()),
+            "a registry-absent file must not be quarantined"
+        );
+        assert!(
+            fs.exists("brand_new.md").await.unwrap(),
+            "the absent file must stay on disk and be indexed"
+        );
+        assert!(
+            !fs.exists(".trash/brand_new.md").await.unwrap(),
+            "no .trash entry should be created for an absent file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_quarantine_meta_less_tombstone() {
+        // A deleted node with no TREE_META_PATH never enters deleted_paths, so its
+        // path is indistinguishable from an absent file. A same-named disk file must
+        // therefore be treated as new (indexed), NOT quarantined — proving we never
+        // over-delete when the tombstone carries no recoverable path.
+        //
+        // We simulate the pre-upgrade meta-less tombstone by deleting the file via a
+        // direct tree delete that bypasses the path-meta recording path. There is no
+        // such path on the current build (delete_file always records meta), so we
+        // assert the equivalent observable: a path that is NOT in deleted_paths but
+        // exists on disk is indexed, never quarantined.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        // A file whose path the registry has no tombstone for (the meta-less case
+        // surfaces identically: is_path_deleted_in_registry is false).
+        fs.write("ambiguous.md", b"# Ambiguous").await.unwrap();
+
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            !vault.is_path_deleted_in_registry("ambiguous.md"),
+            "precondition: a meta-less/absent path is not in deleted_paths"
+        );
+
+        let report = vault.reconcile().await.unwrap();
+        assert!(
+            !report.quarantined.contains(&"ambiguous.md".to_string()),
+            "a path the registry cannot prove deleted must never be quarantined"
+        );
+        assert!(
+            fs.exists("ambiguous.md").await.unwrap(),
+            "the file must stay on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_alive_node_no_disk_file_is_noop() {
+        // Constraint 7: an alive registry node whose path has no disk file is a
+        // registry-debris relic, not a disk orphan. Reconcile must leave it untouched
+        // (nothing on disk to clean) and must not crash.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("relic.md", b"# Relic").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        // Remove the markdown but leave the alive node in the registry.
+        fs.delete("relic.md").await.unwrap();
+        // Note: we do NOT delete_file, so the node stays alive with no disk file.
+
+        let report = vault.reconcile().await.unwrap();
+        assert!(
+            report.quarantined.is_empty(),
+            "an alive-node-no-disk-file relic must not be quarantined, got: {:?}",
+            report.quarantined
+        );
+        assert!(
+            !fs.exists(".trash/relic.md").await.unwrap(),
+            "no .trash entry for a relic with no disk file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_quarantine_duplicate_node_pair_with_alive() {
+        // A path can carry BOTH a tombstoned node and a fresh alive node — the
+        // cross-machine parallel-index debris seen in production. deleted_paths is
+        // alive-wins (rebuild_path_cache removes any path occupied by an alive node),
+        // so such a path is NOT in the cleaned set and the disk file is left in place,
+        // not quarantined. Reconcile never mutates the tree, so it cannot worsen the
+        // duplication — that is the dedupe tooling's job.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("dup.md", b"# Dup").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Tombstone the node, then register the path again to mint a SECOND, alive
+        // node at the same path (register_file only matches alive nodes, so it creates
+        // a fresh one rather than reviving the tombstone) — a duplicate-node pair.
+        fs.delete("dup.md").await.unwrap();
+        vault.delete_file("dup.md").await.unwrap();
+        fs.write("dup.md", b"# Dup").await.unwrap();
+        vault.register_file("dup.md").unwrap();
+        vault.save_registry().await.unwrap();
+        drop(vault);
+
+        // Reload so rebuild_path_cache recomputes deleted_paths over BOTH nodes:
+        // alive-wins must keep "dup.md" out of deleted_paths.
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            !vault.is_path_deleted_in_registry("dup.md"),
+            "alive-wins: a path with any alive node must not be in deleted_paths"
+        );
+
+        let report = vault.reconcile().await.unwrap();
+        assert!(
+            !report.quarantined.contains(&"dup.md".to_string()),
+            "a path with an alive duplicate node must never be quarantined"
+        );
+        assert!(
+            fs.exists("dup.md").await.unwrap(),
+            "the file must stay on disk"
+        );
+        assert!(
+            !fs.exists(".trash/dup.md").await.unwrap(),
+            "no .trash entry for an alive-duplicate path"
+        );
+    }
+
+    /// Test fs that delegates to a shared InMemoryFs but fails writes into
+    /// `.trash/`, simulating a real-fs quarantine failure (full disk, permission
+    /// error). Wraps the same Arc the seed state was written through.
+    struct TrashWriteFailingFs {
+        inner: std::sync::Arc<InMemoryFs>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl FileSystem for TrashWriteFailingFs {
+        async fn read(&self, path: &str) -> crate::fs::Result<Vec<u8>> {
+            self.inner.read(path).await
+        }
+        async fn write(&self, path: &str, content: &[u8]) -> crate::fs::Result<()> {
+            if path.starts_with(".trash/") {
+                return Err(FsError::Io("simulated trash write failure".into()));
+            }
+            self.inner.write(path, content).await
+        }
+        async fn list(&self, path: &str) -> crate::fs::Result<Vec<crate::fs::FileEntry>> {
+            self.inner.list(path).await
+        }
+        async fn delete(&self, path: &str) -> crate::fs::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn exists(&self, path: &str) -> crate::fs::Result<bool> {
+            self.inner.exists(path).await
+        }
+        async fn stat(&self, path: &str) -> crate::fs::Result<crate::fs::FileStat> {
+            self.inner.stat(path).await
+        }
+        async fn mkdir(&self, path: &str) -> crate::fs::Result<()> {
+            self.inner.mkdir(path).await
+        }
+        async fn rename(&self, from: &str, to: &str) -> crate::fs::Result<()> {
+            self.inner.rename(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_quarantine_failure_does_not_abort_load() {
+        // B1 regression: reconcile runs inside Vault::load, so a per-orphan quarantine
+        // failure must NOT propagate and abort daemon startup. The failing orphan is
+        // logged and skipped; other files still reconcile and the vault loads.
+        use std::sync::Arc;
+
+        // Seed a tombstoned orphan and a separate brand-new file in InMemoryFs.
+        let seed = Arc::new(InMemoryFs::new());
+        seed.write("orphan.md", b"# Orphan").await.unwrap();
+        let vault = Vault::init(Arc::clone(&seed), test_peer_id())
+            .await
+            .unwrap();
+        seed.delete("orphan.md").await.unwrap();
+        vault.delete_file("orphan.md").await.unwrap();
+        drop(vault);
+        // Recreate the orphan strand and add a genuinely new file.
+        seed.write("orphan.md", b"# Orphan").await.unwrap();
+        seed.write("fresh.md", b"# Fresh").await.unwrap();
+
+        // Wrap the SAME underlying fs so quarantine's write into .trash/ fails.
+        // Load must still succeed.
+        let failing = Arc::new(TrashWriteFailingFs {
+            inner: Arc::clone(&seed),
+        });
+        let vault = Vault::load(Arc::clone(&failing), test_peer_id())
+            .await
+            .expect("Vault::load must succeed even when a quarantine write fails");
+
+        // The new file was still indexed despite the orphan's quarantine failing.
+        let files = vault.list_files().await.unwrap();
+        assert!(
+            files.contains(&"fresh.md".to_string()),
+            "a brand-new file must still be indexed when a sibling orphan fails to \
+             quarantine; got: {:?}",
+            files
+        );
+
+        // The orphan was NOT quarantined (its .trash write failed) and was NOT
+        // resurrected (the gate took the quarantine branch, not the index branch),
+        // so it stays on disk for the next reconcile to retry.
+        let report = vault.reconcile().await.unwrap();
+        assert!(
+            !report.quarantined.contains(&"orphan.md".to_string()),
+            "the failing orphan must not be reported as quarantined"
+        );
+        assert!(
+            !report.indexed.contains(&"orphan.md".to_string()),
+            "the failing orphan must not be resurrected as a new index entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_quarantine_recovers_from_partial_failure_idempotently() {
+        // Crash-idempotency: if a prior quarantine wrote .trash/<path> but failed to
+        // delete the original (the non-atomic write→delete window), the orphan sits at
+        // BOTH paths. The next reconcile must reuse the existing identical trash copy
+        // and retry the delete — NOT allocate a new collision suffix. Without this,
+        // .trash/<path>.N would grow without bound under a persistent delete failure.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // Tombstone orphan.md in the registry, then load a fresh vault so deleted_paths
+        // is repopulated (orphan off disk at load → load's reconcile is a no-op).
+        fs.write("orphan.md", b"# Orphan").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        fs.delete("orphan.md").await.unwrap();
+        vault.delete_file("orphan.md").await.unwrap();
+        drop(vault);
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Construct the post-crash partial-failure state directly: identical content at
+        // both the original path AND the trash destination (write succeeded, delete did
+        // not).
+        fs.write("orphan.md", b"# Orphan").await.unwrap();
+        fs.write(".trash/orphan.md", b"# Orphan").await.unwrap();
+
+        let report = vault.reconcile().await.unwrap();
+
+        // The retry deleted the original and reported the quarantine complete.
+        assert!(
+            report.quarantined.contains(&"orphan.md".to_string()),
+            "the partial-failure orphan should report as quarantined once the delete \
+             retry succeeds, got: {:?}",
+            report.quarantined
+        );
+        assert!(
+            !fs.exists("orphan.md").await.unwrap(),
+            "the original must be removed on the retry"
+        );
+        // The existing trash copy was reused — NO new collision-suffixed duplicate.
+        assert!(
+            fs.exists(".trash/orphan.md").await.unwrap(),
+            ".trash/orphan.md must remain"
+        );
+        assert!(
+            !fs.exists(".trash/orphan.md.1").await.unwrap(),
+            "a new collision suffix must NOT be created when the trash copy is identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_quarantine_does_not_fight_alive_recreated_file() {
+        // A1 (data-loss guard): a path can be in `deleted_paths` (stale from a
+        // delete_file) AND carry an alive node at the same path (a re-create that
+        // registered a fresh node). `register_file` does not clear deleted_paths, so
+        // without the alive-node guard, quarantine would delete the user's freshly
+        // recreated file. The path_to_node guard must short-circuit BEFORE any disk
+        // move when an alive node occupies the path.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("recreated.md", b"# Original").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Delete it (tombstones, inserts into deleted_paths synchronously).
+        fs.delete("recreated.md").await.unwrap();
+        vault.delete_file("recreated.md").await.unwrap();
+
+        // User recreates the file and it is registered live again (fresh node).
+        fs.write("recreated.md", b"# Recreated by user").await.unwrap();
+        vault.register_file("recreated.md").unwrap();
+
+        // Precondition: deleted_paths is still armed (register_file doesn't clear it),
+        // but an alive node now occupies the path.
+        assert!(
+            vault.path_to_node().contains_key("recreated.md"),
+            "precondition: alive node present at the recreated path"
+        );
+
+        // Directly exercising the guard: quarantine must be a no-op for an alive path.
+        vault.quarantine_orphan("recreated.md").await.unwrap();
+
+        assert!(
+            fs.exists("recreated.md").await.unwrap(),
+            "the user's recreated file must NOT be quarantined"
+        );
+        assert!(
+            !fs.exists(".trash/recreated.md").await.unwrap(),
+            "no .trash entry — the alive node makes this not an orphan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_quarantine_is_idempotent() {
+        // A second reconcile pass must quarantine nothing: the first pass moved the
+        // orphan under .trash/, and list_files excludes dot-directories, so the moved
+        // file is no longer a candidate. Verify exactly one trash entry, no nesting.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let vault = seed_tombstoned_orphan(&fs, "dupe.md", b"# Dupe").await;
+        // Write the orphan strand back to disk, then reconcile.
+        fs.write("dupe.md", b"# Dupe").await.unwrap();
+
+        let first = vault.reconcile().await.unwrap();
+        assert!(first.quarantined.contains(&"dupe.md".to_string()));
+
+        let second = vault.reconcile().await.unwrap();
+        assert!(
+            second.quarantined.is_empty(),
+            "second pass must quarantine nothing, got: {:?}",
+            second.quarantined
+        );
+        assert!(
+            fs.exists(".trash/dupe.md").await.unwrap(),
+            ".trash/dupe.md must still exist after the second pass"
+        );
+        assert!(
+            !fs.exists(".trash/.trash/dupe.md").await.unwrap(),
+            "trash contents must never be re-quarantined into a nested .trash/"
+        );
     }
 }
