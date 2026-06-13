@@ -459,6 +459,10 @@ impl<F: FileSystem> Vault<F> {
 
     /// Apply registry updates from a sync response.
     ///
+    /// Errors here `?`-propagate (whole-batch-fatal): registry-delta corruption means we
+    /// can't trust any of the batch, whereas a single corrupt document is per-item-recoverable
+    /// — see `apply_document_updates`, which contains per-item to drop the bad one and keep the rest.
+    ///
     /// Imports the registry CRDT updates, then cleans up the filesystem for paths the
     /// registry vacated on this device:
     ///
@@ -842,6 +846,56 @@ mod tests {
         PeerId::from_bytes([2u8; 32])
     }
 
+    /// Build two in-memory vaults, seeding each with `(path, content)` files
+    /// before `Vault::init` indexes them. Vault A is authored by `test_author`,
+    /// vault B by `test_author_2` — the same construction the hand-rolled tests
+    /// use. For tests that add files after init (via `on_file_changed`) or need a
+    /// retained `Arc<InMemoryFs>` handle, construct manually and drive the
+    /// handshake with [`full_sync`].
+    async fn two_vaults(
+        files_a: &[(&str, &str)],
+        files_b: &[(&str, &str)],
+    ) -> (Vault<InMemoryFs>, Vault<InMemoryFs>) {
+        let fs_a = InMemoryFs::new();
+        let fs_b = InMemoryFs::new();
+
+        for (path, content) in files_a {
+            fs_a.write(path, content.as_bytes()).await.unwrap();
+        }
+        for (path, content) in files_b {
+            fs_b.write(path, content.as_bytes()).await.unwrap();
+        }
+
+        let vault_a = Vault::init(fs_a, test_author()).await.unwrap();
+        let vault_b = Vault::init(fs_b, test_author_2()).await.unwrap();
+        (vault_a, vault_b)
+    }
+
+    /// Drive the complete three-message sync handshake with `a` as the initiator
+    /// and return `(modified_a, modified_b)` — the paths each vault received.
+    ///
+    /// The exchange is: A sends a SyncRequest → B answers with a SyncExchange
+    /// (its response plus its own request) → A applies it and sends back a final
+    /// SyncResponse → B applies that and the handshake terminates. The protocol
+    /// always produces a final SyncResponse, so the `.unwrap()` chain is exact;
+    /// getting this order wrong is the latent "pass-by-luck" risk this helper
+    /// removes. Tests that assert on the intermediate messages keep the manual
+    /// form.
+    async fn full_sync<F: crate::fs::FileSystem>(
+        a: &Vault<F>,
+        b: &Vault<F>,
+    ) -> (Vec<String>, Vec<String>) {
+        let request = a.prepare_sync_request().await.unwrap();
+        let (exchange, _) = b.process_sync_message(&request).await.unwrap();
+        let (final_response, modified_a) =
+            a.process_sync_message(&exchange.unwrap()).await.unwrap();
+        let (_, modified_b) = b
+            .process_sync_message(&final_response.unwrap())
+            .await
+            .unwrap();
+        (modified_a, modified_b)
+    }
+
     #[tokio::test]
     async fn test_sync_between_vaults_symmetric() {
         // Create two vaults with different files
@@ -1015,15 +1069,7 @@ mod tests {
         vault1.on_file_changed("note.md").await.unwrap();
 
         // Full sync to get vault2 up to date
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Now vault1 makes a change
         vault1
@@ -1173,30 +1219,14 @@ mod tests {
         vault1.on_file_changed("note.md").await.unwrap();
 
         // Sync vault1 → vault2
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Simulate file watcher: vault2 calls on_file_changed after sync writes to disk.
         // This is the bug scenario - previously created new peer ID and duplicated content.
         vault2.on_file_changed("note.md").await.unwrap();
 
         // Sync vault2 → vault1 (this would cause duplication before the fix)
-        let request2 = vault1.prepare_sync_request().await.unwrap();
-        let (exchange2, _) = vault2.process_sync_message(&request2).await.unwrap();
-        let (final_resp2, _) = vault1
-            .process_sync_message(&exchange2.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp2 {
-            vault2.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault1, &vault2).await;
 
         // Verify content is exactly "Hello" (not "HelloHello" or duplicated)
         let doc = vault1.get_document("note.md").await.unwrap();
@@ -1218,30 +1248,14 @@ mod tests {
         vault1.on_file_changed("note.md").await.unwrap();
 
         // Sync to vault2
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Vault2 makes a local edit
         vault2.fs.write("note.md", b"Hello World").await.unwrap();
         vault2.on_file_changed("note.md").await.unwrap();
 
         // Sync back to vault1
-        let request2 = vault1.prepare_sync_request().await.unwrap();
-        let (exchange2, _) = vault2.process_sync_message(&request2).await.unwrap();
-        let (final_resp2, _) = vault1
-            .process_sync_message(&exchange2.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp2 {
-            vault2.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault1, &vault2).await;
 
         // Vault1 should have the updated content
         let doc = vault1.get_document("note.md").await.unwrap();
@@ -1306,15 +1320,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Simulate external modification on vault2 (plugin was off)
         fs2.write("note.md", b"Modified externally").await.unwrap();
@@ -1325,18 +1331,7 @@ mod tests {
             .unwrap();
 
         // Sync back to vault1
-        let request2 = vault1.prepare_sync_request().await.unwrap();
-        let (exchange2, _) = vault2_reloaded
-            .process_sync_message(&request2)
-            .await
-            .unwrap();
-        let (final_resp2, _) = vault1
-            .process_sync_message(&exchange2.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp2 {
-            vault2_reloaded.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault1, &vault2_reloaded).await;
 
         // Verify content is NOT duplicated
         let doc = vault1.get_document("note.md").await.unwrap();
@@ -1364,15 +1359,7 @@ mod tests {
         let vault2 = Vault::init(Arc::clone(&fs2), test_author_2())
             .await
             .unwrap();
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Clear vault2's in-memory cache (simulate cold cache)
         vault2.documents_mut().clear();
@@ -1382,15 +1369,7 @@ mod tests {
         vault2.on_file_changed("note.md").await.unwrap();
 
         // Sync back to vault1
-        let request2 = vault1.prepare_sync_request().await.unwrap();
-        let (exchange2, _) = vault2.process_sync_message(&request2).await.unwrap();
-        let (final_resp2, _) = vault1
-            .process_sync_message(&exchange2.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp2 {
-            vault2.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault1, &vault2).await;
 
         // Verify content is correct (not duplicated)
         let doc = vault1.get_document("note.md").await.unwrap();
@@ -1421,15 +1400,7 @@ mod tests {
         let vault2 = Vault::init(Arc::clone(&fs2), test_author_2())
             .await
             .unwrap();
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Simulate file rename on vault2 (plugin was off)
         let content = fs2.read("old_name.md").await.unwrap();
@@ -1480,16 +1451,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Sync vault1 → vault2
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _modified) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        // Sync the two vaults
+        full_sync(&vault2, &vault1).await;
 
         // Verify content is NOT interleaved
         let doc1 = vault1.get_document("note.md").await.unwrap();
@@ -1606,25 +1569,11 @@ mod tests {
     #[tokio::test]
     async fn test_sync_empty_file() {
         // Test that syncing empty files works correctly
-        let fs1 = InMemoryFs::new();
-        let fs2 = InMemoryFs::new();
-
         // Vault1 creates an empty file
-        fs1.write("empty.md", b"").await.unwrap();
-
-        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
-        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
+        let (vault1, vault2) = two_vaults(&[("empty.md", "")], &[]).await;
 
         // Sync to vault2
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, modified) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        let (modified, _) = full_sync(&vault2, &vault1).await;
 
         // Vault2 should have received the empty file
         assert!(modified.contains(&"empty.md".to_string()));
@@ -1635,27 +1584,12 @@ mod tests {
     #[tokio::test]
     async fn test_sync_frontmatter_only_file() {
         // Test that syncing files with only frontmatter (no body) works correctly
-        let fs1 = InMemoryFs::new();
-        let fs2 = InMemoryFs::new();
-
         // Vault1 creates a file with only frontmatter
-        fs1.write("meta.md", b"---\ntitle: Test\ntags:\n  - a\n  - b\n---\n")
-            .await
-            .unwrap();
-
-        let vault1 = Vault::init(fs1, test_author()).await.unwrap();
-        let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
+        let (vault1, vault2) =
+            two_vaults(&[("meta.md", "---\ntitle: Test\ntags:\n  - a\n  - b\n---\n")], &[]).await;
 
         // Sync to vault2
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, modified) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        let (modified, _) = full_sync(&vault2, &vault1).await;
 
         // Vault2 should have received the file
         assert!(modified.contains(&"meta.md".to_string()));
@@ -1715,15 +1649,7 @@ mod tests {
             .unwrap();
 
         // Initial sync - vault2 gets the file with vault1's doc_id
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
 
         // Both vaults should now have same doc_id
         let doc1 = vault1.get_document("note.md").await.unwrap();
@@ -1824,15 +1750,7 @@ mod tests {
         vault1.on_file_changed("note.md").await.unwrap();
         let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
         assert!(vault2.fs.exists("note.md").await.unwrap(), "setup: vault2 should have note.md");
 
         // Vault 2 deletes the file locally: remove from disk first (user action),
@@ -1880,15 +1798,7 @@ mod tests {
         vault1.on_file_changed("note.md").await.unwrap();
         let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
         assert!(vault2.fs.exists("note.md").await.unwrap(), "setup: both vaults should have note.md");
 
         // Both vaults delete note.md independently — both get tombstones.
@@ -1952,15 +1862,7 @@ mod tests {
         vault1.on_file_changed("nested/note.md").await.unwrap();
         let vault2 = Vault::init(fs2, test_author_2()).await.unwrap();
 
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
         assert!(vault2.fs.exists("note.md").await.unwrap());
         assert!(vault2.fs.exists("nested/note.md").await.unwrap());
 
@@ -2016,15 +1918,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
         assert!(fs2.exists("note.md").await.unwrap(), "setup: vault2 should have note.md");
 
         // Vault 2 deletes the file locally (disk delete, then registry tombstone).
@@ -2082,15 +1976,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request = vault2.prepare_sync_request().await.unwrap();
-        let (exchange, _) = vault1.process_sync_message(&request).await.unwrap();
-        let (final_resp, _) = vault2
-            .process_sync_message(&exchange.unwrap())
-            .await
-            .unwrap();
-        if let Some(resp) = final_resp {
-            vault1.process_sync_message(&resp).await.unwrap();
-        }
+        full_sync(&vault2, &vault1).await;
         assert!(fs2.exists("note.md").await.unwrap(), "setup: vault2 should have note.md");
 
         // Both vaults delete note.md independently — both persist a tombstone.
