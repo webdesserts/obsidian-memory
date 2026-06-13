@@ -103,10 +103,17 @@ mod tests {
         storage.add_peer(b, "device-b").await.unwrap();
         storage.remove_peer(&a).await.unwrap();
 
+        // Reload from disk: the revocation must survive, with A no longer trusted
+        // but kept as a tombstone (so the removal can propagate across the mesh).
         let storage2 = make_storage(&dir);
+        assert!(!storage2.is_allowed(&a).await.unwrap());
+        assert!(storage2.is_allowed(&b).await.unwrap());
+
         let peers = storage2.list_peers().await.unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].node_id, b);
+        assert_eq!(peers.len(), 2);
+        let tombstone = peers.iter().find(|p| p.node_id == a).unwrap();
+        assert!(tombstone.removed);
+        assert!(tombstone.removed_at.is_some());
     }
 
     #[tokio::test]

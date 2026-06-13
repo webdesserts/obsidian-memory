@@ -25,6 +25,12 @@ pub type Result<T> = std::result::Result<T, AllowlistError>;
 /// An authorized peer stored in the allowlist.
 ///
 /// Each entry represents a device that has been paired and is allowed to sync.
+///
+/// Removed peers are kept as **tombstones** (`removed = true`) rather than being
+/// dropped from storage. This is required for revocation to converge across the
+/// mesh: the roster is exchanged by union-merge, so a removal that simply dropped
+/// the row would be re-added by any peer that still held it. A tombstone travels
+/// in the roster and wins over a live re-add (see `merge_roster`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AllowedPeer {
     /// The peer's ed25519 public key (64-char hex).
@@ -35,23 +41,39 @@ pub struct AllowedPeer {
     pub paired_at: u64,
     /// When we last saw this peer online (Unix timestamp milliseconds), if ever.
     pub last_seen: Option<u64>,
+    /// Whether this peer has been revoked. A tombstoned entry is kept in storage
+    /// so the revocation propagates, but is never treated as trusted.
+    ///
+    /// `#[serde(default)]` keeps older `allowlist.json` files (written before
+    /// tombstones existed) loadable — a missing field deserializes to `false`,
+    /// i.e. a live peer.
+    #[serde(default)]
+    pub removed: bool,
+    /// When the peer was revoked (Unix timestamp milliseconds), if ever.
+    #[serde(default)]
+    pub removed_at: Option<u64>,
 }
 
 impl AllowedPeer {
     /// Create a new allowed peer entry with the current time as `paired_at`.
     pub fn new(node_id: PeerId, device_name: impl Into<String>) -> Self {
-        let paired_at = SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
         Self {
             node_id,
             device_name: device_name.into(),
-            paired_at,
+            paired_at: now_ms(),
             last_seen: None,
+            removed: false,
+            removed_at: None,
         }
     }
+}
+
+/// Current Unix time in milliseconds, or 0 if the clock is before the epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Abstracts loading and persisting the allowlist of authorized peers.
@@ -84,17 +106,29 @@ pub trait AllowlistStorage: Send + Sync {
         self.save_peers(&peers).await
     }
 
-    /// Remove a peer from the allowlist.
+    /// Revoke a peer by writing a tombstone.
+    ///
+    /// The entry stays in storage with `removed = true` (rather than being dropped)
+    /// so the revocation propagates across the mesh and wins over any peer that
+    /// still holds a live row (see `merge_roster`). If the peer is not present,
+    /// this is a no-op.
     async fn remove_peer(&self, node_id: &PeerId) -> Result<()> {
         let mut peers = self.list_peers().await?;
-        peers.retain(|p| &p.node_id != node_id);
-        self.save_peers(&peers).await
+        if let Some(peer) = peers.iter_mut().find(|p| &p.node_id == node_id) {
+            peer.removed = true;
+            peer.removed_at = Some(now_ms());
+            self.save_peers(&peers).await?;
+        }
+        Ok(())
     }
 
     /// Check whether a peer is authorized to connect.
+    ///
+    /// Tombstoned (revoked) entries are not trusted, even though they remain in
+    /// storage. This trait is the single source of truth for trust decisions.
     async fn is_allowed(&self, node_id: &PeerId) -> Result<bool> {
         let peers = self.list_peers().await?;
-        Ok(peers.iter().any(|p| &p.node_id == node_id))
+        Ok(peers.iter().any(|p| &p.node_id == node_id && !p.removed))
     }
 
     /// Update the last-seen timestamp for a peer.
@@ -137,17 +171,29 @@ pub trait AllowlistStorage {
         self.save_peers(&peers).await
     }
 
-    /// Remove a peer from the allowlist.
+    /// Revoke a peer by writing a tombstone.
+    ///
+    /// The entry stays in storage with `removed = true` (rather than being dropped)
+    /// so the revocation propagates across the mesh and wins over any peer that
+    /// still holds a live row (see `merge_roster`). If the peer is not present,
+    /// this is a no-op.
     async fn remove_peer(&self, node_id: &PeerId) -> Result<()> {
         let mut peers = self.list_peers().await?;
-        peers.retain(|p| &p.node_id != node_id);
-        self.save_peers(&peers).await
+        if let Some(peer) = peers.iter_mut().find(|p| &p.node_id == node_id) {
+            peer.removed = true;
+            peer.removed_at = Some(now_ms());
+            self.save_peers(&peers).await?;
+        }
+        Ok(())
     }
 
     /// Check whether a peer is authorized to connect.
+    ///
+    /// Tombstoned (revoked) entries are not trusted, even though they remain in
+    /// storage. This trait is the single source of truth for trust decisions.
     async fn is_allowed(&self, node_id: &PeerId) -> Result<bool> {
         let peers = self.list_peers().await?;
-        Ok(peers.iter().any(|p| &p.node_id == node_id))
+        Ok(peers.iter().any(|p| &p.node_id == node_id && !p.removed))
     }
 
     /// Update the last-seen timestamp for a peer.
@@ -265,9 +311,52 @@ mod tests {
         storage.add_peer(b, "device-b").await.unwrap();
         storage.remove_peer(&a).await.unwrap();
 
+        // A revoked peer is no longer trusted...
+        assert!(!storage.is_allowed(&a).await.unwrap());
+        assert!(storage.is_allowed(&b).await.unwrap());
+
+        // ...but stays in storage as a tombstone so the revocation can propagate.
         let peers = storage.list_peers().await.unwrap();
+        assert_eq!(peers.len(), 2);
+        let tombstone = peers.iter().find(|p| p.node_id == a).unwrap();
+        assert!(tombstone.removed);
+        assert!(tombstone.removed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_remove_peer_unknown_is_noop() {
+        let storage = InMemoryAllowlist::new();
+        let unknown = peer_a();
+
+        // Revoking a peer that was never added should not error or create a row.
+        storage.remove_peer(&unknown).await.unwrap();
+
+        let peers = storage.list_peers().await.unwrap();
+        assert!(peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_old_format_entry_loads_as_live() {
+        // An allowlist.json written before tombstones existed has no `removed`
+        // field. `#[serde(default)]` must load it as a LIVE (trusted) peer.
+        let json = r#"[{
+            "node_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "device_name": "legacy-device",
+            "paired_at": 1700000000000,
+            "last_seen": null
+        }]"#;
+
+        let peers: Vec<AllowedPeer> = serde_json::from_str(json).unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].node_id, b);
+        assert!(!peers[0].removed, "missing `removed` field must default to live");
+        assert_eq!(peers[0].removed_at, None);
+
+        let storage = InMemoryAllowlist::new();
+        storage.save_peers(&peers).await.unwrap();
+        assert!(
+            storage.is_allowed(&peers[0].node_id).await.unwrap(),
+            "a legacy entry must be trusted after load"
+        );
     }
 
     #[tokio::test]

@@ -786,8 +786,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// window where any device on the network can sync before pairing completes.
     /// Pair first with `memory sync pair`, then start the daemon.
     async fn is_peer_allowed(&self, peer_id: &PeerId) -> bool {
-        match self.allowlist.list_peers().await {
-            Ok(peers) => peers.iter().any(|p| &p.node_id == peer_id),
+        // Delegate to the trait `is_allowed` so the tombstone filter is the single
+        // source of truth — an inline `list_peers().any(...)` scan here would treat
+        // a revoked (tombstoned) peer as still trusted, bypassing revocation.
+        // Fail closed: any read error denies sync (matches the deny-on-error policy).
+        match self.allowlist.is_allowed(peer_id).await {
+            Ok(allowed) => allowed,
             Err(e) => {
                 error!("Failed to read allowlist, denying sync: {}", e);
                 false
