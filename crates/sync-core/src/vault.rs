@@ -403,6 +403,66 @@ impl SyncState {
     }
 }
 
+/// One path occupied by more than one alive file node — the cross-machine
+/// parallel-index debris the dedupe tool targets. Both nodes share the same
+/// `doc_id` (= path hash), so the document content is unaffected; the dedupe
+/// keeps `winner` alive and tombstones the rest.
+#[derive(Debug, Clone)]
+pub struct DuplicateGroup {
+    /// The shared path these alive nodes resolve to.
+    pub path: String,
+    /// The `doc_id` shared by every node in the group (= path hash, so the
+    /// duplicated nodes point at the same document content).
+    pub doc_id: String,
+    /// Every alive TreeID at `path` (always length >= 2).
+    pub alive_nodes: Vec<TreeID>,
+    /// The deterministic survivor: the lowest TreeID by (peer, counter). Every
+    /// machine computes the same winner from a converged registry, so the dedupe
+    /// is idempotent and convergent even if run on two machines independently.
+    pub winner: TreeID,
+}
+
+/// An alive file node with no backing data anywhere — a tombstone that never
+/// landed. Both the `.md` at its path AND the `.sync/documents/<doc_id>.loro`
+/// are absent, so it has nothing to lose if tombstoned. (If either exists it is
+/// a live node, not a relic, and is left untouched.)
+#[derive(Debug, Clone)]
+pub struct Relic {
+    /// The alive TreeID with no backing files.
+    pub node: TreeID,
+    /// The path the node resolves to (no `.md` exists there).
+    pub path: String,
+    /// The node's `doc_id` (no `.loro` exists for it either).
+    pub doc_id: String,
+}
+
+/// One path occupied by more than one alive FOLDER node. Surfaced for operator
+/// visibility only — folder dedupe is intentionally out of scope for v1 because
+/// `LoroTree::delete` is recursive and production children are split across the
+/// two folder nodes, so a naive tombstone is direct data loss. Listed, not handled.
+#[derive(Debug, Clone)]
+pub struct FolderDupGroup {
+    /// The shared path these alive folder nodes resolve to.
+    pub path: String,
+    /// Every alive folder TreeID at `path` (always length >= 2).
+    pub alive_nodes: Vec<TreeID>,
+}
+
+/// The result of a read-only registry-debris scan ([`Vault::find_registry_debris`]).
+///
+/// Classifies the loro-registry debris that accumulates from cross-machine
+/// parallel indexing and lost tombstones. Pure inspection — building it mutates
+/// nothing; the operator reviews it before any `--apply` pass acts on it.
+#[derive(Debug, Clone, Default)]
+pub struct DebrisReport {
+    /// Paths with more than one alive FILE node, each naming the deterministic winner.
+    pub duplicate_groups: Vec<DuplicateGroup>,
+    /// Alive file nodes with no `.md` and no `.loro` on disk.
+    pub relics: Vec<Relic>,
+    /// Paths with more than one alive FOLDER node — listed but NOT handled in v1.
+    pub folder_dups: Vec<FolderDupGroup>,
+}
+
 /// Manages a vault of documents.
 ///
 /// Uses interior mutability for core state to allow `&self` methods in WASM.
@@ -1677,6 +1737,108 @@ impl<F: FileSystem> Vault<F> {
     /// Find a node by path using the cache
     fn find_node_by_path(&self, path: &str) -> Option<TreeID> {
         self.path_to_node().get(path).copied()
+    }
+
+    /// Scan the registry for debris without mutating anything.
+    ///
+    /// Surfaces two classes of damage the cross-machine sync history leaves behind:
+    /// **duplicate alive pairs** (more than one alive file node resolving to the same
+    /// path — parallel-index debris) and **relics** (an alive file node whose `.md` and
+    /// `.loro` are both gone — a tombstone that never landed). Duplicate FOLDER groups
+    /// are listed separately but not classified for dedupe; folder handling is out of
+    /// scope for v1 (recursive `LoroTree::delete` + child-split makes it a riskier,
+    /// separate effort).
+    ///
+    /// For each duplicate group the report records the deterministic winner — the lowest
+    /// `TreeID` by `(peer, counter)` — so the same survivor is chosen on every machine
+    /// from a converged registry. This is read-only: the caller (an operator dry run)
+    /// reviews the report before any tombstoning happens under a separate `--apply` pass.
+    ///
+    /// Async because the relic gate consults `fs.exists` for the backing `.md`/`.loro`.
+    pub async fn find_registry_debris(&self) -> Result<DebrisReport> {
+        // Collect alive-node data while holding the tree borrow, then release it before
+        // the async fs probes below (never hold a registry guard across an await).
+        // Each file node carries its TreeID + doc_id; the grouping path is the map key.
+        let mut alive_files: HashMap<String, Vec<(TreeID, String)>> = HashMap::new();
+        let mut alive_folders: HashMap<String, Vec<TreeID>> = HashMap::new();
+
+        {
+            let tree = self.file_tree();
+            for node_id in tree.nodes() {
+                // A deleted (tombstoned) node is not debris — only alive nodes are.
+                if tree.is_node_deleted(&node_id).unwrap_or(true) {
+                    continue;
+                }
+                let Ok(meta) = tree.get_meta(node_id) else {
+                    continue;
+                };
+                let node_type = Self::tree_meta_string(&meta, TREE_META_TYPE);
+                let Some(path) = self.get_node_path(&node_id) else {
+                    continue;
+                };
+
+                match node_type.as_deref() {
+                    Some("file") => {
+                        let doc_id = Self::tree_meta_string(&meta, TREE_META_DOC_ID)
+                            .unwrap_or_else(|| simple_hash(&path));
+                        alive_files.entry(path).or_default().push((node_id, doc_id));
+                    }
+                    Some("folder") => {
+                        alive_folders.entry(path).or_default().push(node_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut report = DebrisReport::default();
+
+        // Folder duplicate groups: surfaced for visibility, never deduped in v1.
+        for (path, nodes) in alive_folders {
+            if nodes.len() > 1 {
+                report.folder_dups.push(FolderDupGroup {
+                    path,
+                    alive_nodes: nodes,
+                });
+            }
+        }
+
+        for (path, nodes) in alive_files {
+            if nodes.len() > 1 {
+                // Duplicate alive pair: the winner is the lowest TreeID (Ord on
+                // (peer, counter)), deterministic across machines.
+                let alive_nodes: Vec<TreeID> = nodes.iter().map(|(id, _)| *id).collect();
+                let winner = alive_nodes
+                    .iter()
+                    .copied()
+                    .min()
+                    .expect("group has at least two nodes");
+                // All nodes in the group share the same doc_id (= path hash).
+                let doc_id = nodes[0].1.clone();
+                report.duplicate_groups.push(DuplicateGroup {
+                    path,
+                    doc_id,
+                    alive_nodes,
+                    winner,
+                });
+            } else {
+                // A single alive node — a relic only if its .md AND .loro are both gone.
+                // If either exists it is a live node (perhaps just not scanned); skip it.
+                let (node_id, doc_id) = &nodes[0];
+                let md_exists = self.fs.exists(&path).await.unwrap_or(false);
+                let loro_path = self.document_sync_path(&path);
+                let loro_exists = self.fs.exists(&loro_path).await.unwrap_or(false);
+                if !md_exists && !loro_exists {
+                    report.relics.push(Relic {
+                        node: *node_id,
+                        path,
+                        doc_id: doc_id.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     /// Validate a sync path for security
@@ -3987,6 +4149,158 @@ mod tests {
         assert!(
             !fs.exists(".trash/.trash/dupe.md").await.unwrap(),
             "trash contents must never be re-quarantined into a nested .trash/"
+        );
+    }
+
+    // ========== Registry debris inspector (find_registry_debris) ==========
+
+    /// Build a vault holding TWO alive file nodes at one path — the cross-machine
+    /// parallel-index debris the dedupe tool targets. `register_file` short-circuits
+    /// on an existing alive node, so the pair can't be made by calling it twice on one
+    /// vault. Instead, two vaults register the path under DISTINCT peer ids
+    /// (`test_peer_id` vs `test_peer_id_2`), then one registry is exported and imported
+    /// into the other; after `rebuild_path_cache` the merged registry carries both alive
+    /// TreeIDs at the same path. Returns the loaded vault plus the two TreeIDs so callers
+    /// can assert on the deterministic (lowest-TreeID) winner.
+    async fn seed_duplicate_alive_pair(
+        fs: &std::sync::Arc<InMemoryFs>,
+        path: &str,
+        content: &[u8],
+    ) -> (Vault<std::sync::Arc<InMemoryFs>>, TreeID, TreeID) {
+        fs.write(path, content).await.unwrap();
+
+        // Vault A registers the path under peer A.
+        let vault_a = Vault::init(std::sync::Arc::clone(fs), test_peer_id())
+            .await
+            .unwrap();
+        let id_a = vault_a.register_file(path).unwrap();
+        vault_a.save_registry().await.unwrap();
+
+        // Vault B (a SEPARATE registry doc, peer B) registers the same path — yielding a
+        // second node with a different TreeID. A fresh InMemoryFs keeps B's .sync isolated
+        // from A's so the import below merges two independent registrations.
+        let fs_b = std::sync::Arc::new(InMemoryFs::new());
+        fs_b.write(path, content).await.unwrap();
+        let vault_b = Vault::init(std::sync::Arc::clone(&fs_b), test_peer_id_2())
+            .await
+            .unwrap();
+        let id_b = vault_b.register_file(path).unwrap();
+        assert_ne!(
+            id_a, id_b,
+            "the two registrations must mint distinct TreeIDs"
+        );
+
+        // Merge B's registry into A's, then rebuild A's cache over both nodes.
+        let b_snapshot = vault_b
+            .registry()
+            .export(loro::ExportMode::Snapshot)
+            .unwrap();
+        vault_a.registry_mut().import(&b_snapshot).unwrap();
+        vault_a.rebuild_path_cache();
+
+        (vault_a, id_a, id_b)
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_debris_flags_duplicate_alive_pair() {
+        // Two alive file nodes at one path is the prime debris class. The inspector must
+        // surface the group and name the deterministic winner: the lowest TreeID (Ord on
+        // (peer, counter)), so every machine resolves the same survivor from a converged
+        // registry. The loser is reported but nothing is mutated.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let (vault, id_a, id_b) = seed_duplicate_alive_pair(&fs, "dup.md", b"# Dup").await;
+        let expected_winner = std::cmp::min(id_a, id_b);
+
+        let report = vault.find_registry_debris().await.unwrap();
+
+        assert_eq!(
+            report.duplicate_groups.len(),
+            1,
+            "exactly one duplicate group expected, got: {:?}",
+            report.duplicate_groups
+        );
+        let group = &report.duplicate_groups[0];
+        assert_eq!(group.path, "dup.md");
+        assert_eq!(
+            group.alive_nodes.len(),
+            2,
+            "the group must list both alive TreeIDs"
+        );
+        assert!(group.alive_nodes.contains(&id_a));
+        assert!(group.alive_nodes.contains(&id_b));
+        assert_eq!(
+            group.winner, expected_winner,
+            "the winner must be the lowest TreeID (deterministic across machines)"
+        );
+        assert!(
+            report.relics.is_empty(),
+            "an alive duplicate pair is not a relic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_debris_flags_relic() {
+        // A relic is an alive file node whose .md AND .loro are both gone — a tombstone
+        // that never landed. The inspector flags it (so --apply can later tombstone it)
+        // but only when BOTH backing files are absent; otherwise it is a live node.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("relic.md", b"# Relic").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let relic_id = vault.register_file("relic.md").unwrap();
+        vault.save_registry().await.unwrap();
+
+        // Strip both backing files WITHOUT tombstoning the node — the node stays alive
+        // in the tree with nothing on disk, which is the relic signature.
+        fs.delete("relic.md").await.unwrap();
+        let loro_path = vault.document_sync_path("relic.md");
+        // The .loro may or may not have been written; delete is idempotent enough here.
+        let _ = fs.delete(&loro_path).await;
+
+        let report = vault.find_registry_debris().await.unwrap();
+
+        assert_eq!(
+            report.relics.len(),
+            1,
+            "the alive node with no .md and no .loro must be flagged as a relic, got: {:?}",
+            report.relics
+        );
+        let relic = &report.relics[0];
+        assert_eq!(relic.node, relic_id);
+        assert_eq!(relic.path, "relic.md");
+        assert!(
+            report.duplicate_groups.is_empty(),
+            "a single relic node is not a duplicate group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_debris_ignores_healthy_node() {
+        // A normal path — one alive node with its .md on disk — is neither a duplicate
+        // nor a relic. The inspector must report nothing for it, so an operator running
+        // a dry run on a clean vault sees an empty report.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("healthy.md", b"# Healthy").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        vault.register_file("healthy.md").unwrap();
+        vault.save_registry().await.unwrap();
+
+        let report = vault.find_registry_debris().await.unwrap();
+
+        assert!(
+            report.duplicate_groups.is_empty(),
+            "a single-alive-node path must not be a duplicate group, got: {:?}",
+            report.duplicate_groups
+        );
+        assert!(
+            report.relics.is_empty(),
+            "a node with its .md on disk must not be a relic, got: {:?}",
+            report.relics
         );
     }
 }

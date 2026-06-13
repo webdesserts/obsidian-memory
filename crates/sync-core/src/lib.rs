@@ -48,4 +48,8 @@ pub use pairing::{
 pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use peers::{PeerEntry, PeerRegistry, PeerState};
 pub use sync::SyncMessage;
-pub use vault::{SyncMetadata, Vault};
+pub use vault::{DebrisReport, DuplicateGroup, FolderDupGroup, Relic, SyncMetadata, Vault};
+
+// Re-export the loro TreeID so consumers of the registry-debris API (DebrisReport et al.)
+// can name node identities without taking a direct `loro` dependency.
+pub use loro::TreeID;
