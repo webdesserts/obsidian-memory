@@ -2141,9 +2141,21 @@ impl<F: FileSystem> Vault<F> {
 
             tracing::info!("Deleted file from tree: {}", path);
             Ok(true)
+        } else if self.is_path_deleted_in_registry(path) {
+            // A registry tombstone already covers this path, so this is a redundant
+            // watcher echo for a delete that already recorded its tombstone (e.g. the
+            // local watcher firing after delete_file already ran). The deletion has
+            // propagated; nothing is lost, so this is debug-level noise, not a warning.
+            tracing::debug!(
+                "delete_file: '{}' already tombstoned — redundant delete, no-op",
+                path
+            );
+            Ok(false)
         } else {
-            // The path carries the same diagnostic via the `false` return for daemon
-            // callers, but the warn stays for non-daemon callers that ignore the bool.
+            // Genuinely unknown path: no node at all (alive or tombstoned), so the
+            // deletion records no tombstone and won't propagate to peers. The `false`
+            // return carries this diagnostic for daemon callers, but the warn stays for
+            // non-daemon callers that ignore the bool.
             tracing::warn!(
                 "delete_file: no registry node for '{}' — no tombstone recorded",
                 path
