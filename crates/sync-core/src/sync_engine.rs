@@ -524,6 +524,21 @@ impl<F: FileSystem> Vault<F> {
         // path is not blocked — no separate record/clear bookkeeping is needed here.
         self.rebuild_path_cache();
 
+        // Alive-wins for the captured deleted set (the analogue of the move B1 exclusion
+        // below): deleted_paths was built from the PRE-import cache, which — under a
+        // duplicate-node pair, two alive twins at one path — may have held the now-tombstoned
+        // twin. rebuild_path_cache's alive-wins only repairs the registry guard set, not this
+        // already-captured local vec, so a path an alive twin still occupies must be dropped
+        // here or apply_registry_changes would physically delete a live file (Log.md /
+        // Working Memory.md data loss).
+        let deleted_paths: Vec<String> = {
+            let rebuilt_cache = self.path_to_node();
+            deleted_paths
+                .into_iter()
+                .filter(|p| !rebuilt_cache.contains_key(p.as_str()))
+                .collect()
+        };
+
         // Detect moves: an old path whose node (same TreeID) now lives at a different path.
         // This is orthogonal to the deleted-paths set above (which keys on tombstoned nodes);
         // a moved node stays alive, just under a new path.
@@ -2050,6 +2065,101 @@ mod tests {
         assert!(
             doc.to_markdown().contains("Brand new"),
             "reloaded vault2 must have the re-created content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_of_cached_loser_twin_keeps_alive_path() {
+        // Data-loss guard: when two ALIVE registry nodes occupy the same path
+        // (a duplicate-node pair — real production debris for Log.md / Working
+        // Memory.md, same FNV-1a doc_id from independent parallel indexing), a
+        // tombstone arriving for the node that happens to be in the path cache
+        // must NOT physically delete the .md file. The WINNER twin is still alive
+        // at that path, so the file must survive.
+        //
+        // apply_registry_updates collects deleted_paths from the pre-import cache,
+        // then rebuild_path_cache re-derives the alive-wins set. Without filtering
+        // the captured vec against the rebuilt cache, the path stays in the local
+        // vec (the cache held the tombstoned twin) and the file is deleted even
+        // though an alive twin still occupies the path.
+        use std::sync::Arc;
+
+        let recv_fs = Arc::new(InMemoryFs::new());
+        let donor_fs = Arc::new(InMemoryFs::new());
+
+        // Receiver registers note.md → twin R.
+        recv_fs.write("note.md", b"# Note").await.unwrap();
+        let recv = Vault::init(Arc::clone(&recv_fs), test_author())
+            .await
+            .unwrap();
+
+        // A separate vault registers the SAME path independently → twin D (a
+        // different TreeID, same path/doc_id). Importing donor's registry into the
+        // receiver leaves BOTH twins alive at note.md — the duplicate-node pair.
+        donor_fs.write("note.md", b"# Note").await.unwrap();
+        let donor = Vault::init(Arc::clone(&donor_fs), test_author_2())
+            .await
+            .unwrap();
+        let donor_registry = donor.registry().export(loro::ExportMode::Snapshot).unwrap();
+        recv.apply_registry_updates(&donor_registry).await.unwrap();
+
+        // Precondition: two alive file nodes, both resolving to note.md.
+        let alive_at_path: Vec<TreeID> = {
+            let tree = recv.file_tree();
+            tree.nodes()
+                .into_iter()
+                .filter(|id| !tree.is_node_deleted(id).unwrap_or(true))
+                .filter(|id| recv.get_node_path(id).as_deref() == Some("note.md"))
+                .collect()
+        };
+        assert_eq!(
+            alive_at_path.len(),
+            2,
+            "setup: note.md must have two alive twins (got {:?})",
+            alive_at_path
+        );
+
+        // Tombstone the twin that is CURRENTLY CACHED. The cache slot is won by
+        // whichever twin iterated last in rebuild_path_cache; the FxHashMap order
+        // is deterministic-per-run, so an uncontrolled fixture would pass by luck.
+        // Reading the cache and tombstoning that exact node deterministically drives
+        // the bug regardless of which twin won the slot.
+        let cached_id = *recv.path_to_node().get("note.md").unwrap();
+        let survivor_id = *alive_at_path
+            .iter()
+            .find(|id| **id != cached_id)
+            .expect("the non-cached twin survives the tombstone");
+
+        // Build the tombstone the production way: a peer forked from the receiver's
+        // current registry deletes the cached twin, then exports. Importing that op
+        // back merges a tombstone for exactly that node while the survivor stays alive.
+        let tombstone_bytes = {
+            let peer = loro::LoroDoc::new();
+            peer.import(&recv.registry().export(loro::ExportMode::Snapshot).unwrap())
+                .unwrap();
+            let peer_tree = peer.get_tree(crate::vault::REGISTRY_TREE);
+            peer_tree.delete(cached_id).unwrap();
+            peer.export(loro::ExportMode::Snapshot).unwrap()
+        };
+
+        recv.apply_registry_updates(&tombstone_bytes).await.unwrap();
+
+        // The survivor twin must still be alive, and the path must still resolve.
+        assert!(
+            !recv.file_tree().is_node_deleted(&survivor_id).unwrap_or(true),
+            "the non-cached twin must remain alive after its sibling is tombstoned"
+        );
+        assert!(
+            !recv.is_file_deleted("note.md"),
+            "note.md must still resolve to an alive node (alive wins)"
+        );
+
+        // The data-loss guard: the .md file must survive because an alive twin still
+        // occupies the path. Without the filter, the captured deleted_paths vec —
+        // built from the cache that held the tombstoned twin — physically deletes it.
+        assert!(
+            recv_fs.exists("note.md").await.unwrap(),
+            "note.md must NOT be physically deleted when an alive twin still occupies the path"
         );
     }
 }
