@@ -1,6 +1,7 @@
 // Prevents a console window from popping up on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_settings;
 mod commands;
 mod daemon_task;
 mod notification;
@@ -12,7 +13,8 @@ mod tray_status;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use app_settings::{AppSettings, resolve_vault_path};
 use daemon_task::DaemonHandle;
 use shutdown::ShutdownController;
 use sync_daemon::daemon::DaemonRunConfig;
@@ -334,63 +336,88 @@ mod tests {
 }
 
 fn main() -> Result<()> {
-    // Read the vault path from the environment — the only supported configuration
-    // surface in Phase 1. Phase 6 adds a vault-picker UI.
-    //
-    // A CLI --vault flag is deliberately avoided: `tauri-cli` does not forward
-    // trailing arguments to the bundled binary in `tauri dev` mode, which would
-    // silently ignore the flag in development.
-    let vault_path = match std::env::var("OBSIDIAN_MEMORY_VAULT") {
-        Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
-        _ => {
-            eprintln!("error: OBSIDIAN_MEMORY_VAULT is not set");
-            eprintln!("Set it to the path of your Obsidian vault, e.g.:");
-            eprintln!("  OBSIDIAN_MEMORY_VAULT=~/notes cargo tauri dev");
-            std::process::exit(1);
-        }
-    };
-
     memory_common::init_tracing(false, "desktop");
 
     info!("Starting Memory");
-    info!("Vault: {:?}", vault_path);
-
-    // Resolve the URL advertised to peers for this node's embedded relay.
-    //
-    // The env var `OBSIDIAN_MEMORY_RELAY_URL` takes precedence so stable-hostname
-    // machines (e.g. umbra) can advertise a public URL instead of the detected LAN
-    // IP. When unset, fall back to LAN IP detection. Log which source won.
-    let env_relay_url = std::env::var("OBSIDIAN_MEMORY_RELAY_URL").ok();
-    let detected_ip = detect_lan_ip();
-    let advertised_relay_url = resolve_advertised_relay_url(env_relay_url.clone(), detected_ip);
-
-    match &advertised_relay_url {
-        Some(url) if env_relay_url.as_deref().is_some_and(|v| !v.is_empty()) => {
-            info!("Relay will advertise URL from OBSIDIAN_MEMORY_RELAY_URL: {}", url);
-        }
-        Some(url) => {
-            info!("Relay will advertise LAN URL: {}", url);
-        }
-        None => {
-            warn!(
-                "LAN IP detection failed — relay will start but advertise 0.0.0.0:{}. \
-                 Peers on the LAN won't be able to reach the relay. \
-                 Check your network connection.",
-                RELAY_PORT
-            );
-        }
-    }
-
-    let daemon_config = DaemonRunConfig {
-        vault: vault_path,
-        identity_key: None,
-        health_listen: Some(format!("127.0.0.1:{}", HEALTH_PORT)),
-        relay_listen: Some(format!("0.0.0.0:{}", RELAY_PORT)),
-        advertised_relay_url,
-    };
 
     tauri::Builder::default()
+        // tauri-plugin-store must be registered before setup() so that
+        // app.store() is usable inside the setup hook.
+        .plugin(tauri_plugin_store::Builder::default().build())
         .setup(move |app| {
+            // --- Vault path resolution (amendment S2: daemon_config built here) ---
+            //
+            // Priority: OBSIDIAN_MEMORY_VAULT env var > stored path from
+            // app-settings.json. The env var is always written back to the store so
+            // that autostarted instances (which launch without shell env vars) find
+            // the vault at the same location (amendment B2).
+            //
+            // A CLI --vault flag is deliberately avoided: `tauri-cli` does not
+            // forward trailing arguments to the bundled binary in `tauri dev` mode,
+            // which would silently ignore the flag in development.
+            let mut settings = AppSettings::load(app.handle())?;
+            let env_vault = std::env::var("OBSIDIAN_MEMORY_VAULT").ok();
+            let vault_path = resolve_vault_path(
+                env_vault.as_deref(),
+                settings.vault_path().and_then(|p| p.to_str()),
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "OBSIDIAN_MEMORY_VAULT is not set and no vault path is stored.\n\
+                     Set it to the path of your Obsidian vault, e.g.:\n\
+                     \x20 OBSIDIAN_MEMORY_VAULT=~/notes cargo tauri dev"
+                )
+            })?;
+
+            info!("Vault: {:?}", vault_path);
+
+            // Unconditionally refresh the stored vault path whenever the env var is set
+            // (amendment B2). This keeps the stored path current if the user moves their
+            // vault and reruns with the updated env var, so a future autostarted launch
+            // (which has no env var) still finds the right location.
+            if env_vault.as_deref().is_some_and(|v| !v.is_empty()) {
+                settings.set_vault_path(vault_path.clone());
+                if let Err(e) = settings.save(app.handle()) {
+                    warn!("Failed to persist vault path to app settings: {e}");
+                }
+            }
+
+            // Resolve the URL advertised to peers for this node's embedded relay.
+            //
+            // The env var `OBSIDIAN_MEMORY_RELAY_URL` takes precedence so
+            // stable-hostname machines (e.g. umbra) can advertise a public URL
+            // instead of the detected LAN IP.
+            let env_relay_url = std::env::var("OBSIDIAN_MEMORY_RELAY_URL").ok();
+            let detected_ip = detect_lan_ip();
+            let advertised_relay_url =
+                resolve_advertised_relay_url(env_relay_url.clone(), detected_ip);
+
+            match &advertised_relay_url {
+                Some(url) if env_relay_url.as_deref().is_some_and(|v| !v.is_empty()) => {
+                    info!("Relay will advertise URL from OBSIDIAN_MEMORY_RELAY_URL: {}", url);
+                }
+                Some(url) => {
+                    info!("Relay will advertise LAN URL: {}", url);
+                }
+                None => {
+                    warn!(
+                        "LAN IP detection failed — relay will start but advertise 0.0.0.0:{}. \
+                         Peers on the LAN won't be able to reach the relay. \
+                         Check your network connection.",
+                        RELAY_PORT
+                    );
+                }
+            }
+
+            let daemon_config = DaemonRunConfig {
+                vault: vault_path,
+                identity_key: None,
+                health_listen: Some(format!("127.0.0.1:{}", HEALTH_PORT)),
+                relay_listen: Some(format!("0.0.0.0:{}", RELAY_PORT)),
+                advertised_relay_url,
+            };
+
+
             // Tray-only mode: suppress the dock icon so the app lives entirely
             // in the menu bar. `"windows": []` in tauri.conf.json removes the
             // main window; this call removes the Dock icon.

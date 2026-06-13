@@ -14,7 +14,9 @@ tauri-build = { version = "2", features = [] }
 sync-daemon = { path = "../sync-daemon" }
 memory-common = { path = "../memory-common" }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-store = "2"
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
