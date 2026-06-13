@@ -47,15 +47,47 @@ const HEALTH_PORT: u16 = 8082;
 
 /// Detect the machine's primary LAN IP address for advertising to peers.
 ///
-/// Returns `None` if detection fails (e.g. no network interface, VPN-only config).
-/// The relay still starts and binds to 0.0.0.0; it just won't advertise a reachable
-/// URL. A warning is logged once at startup.
+/// Enumerates every network interface and selects a routable address via
+/// [`select_advertise_ip`], rejecting loopback and link-local addresses and
+/// preferring an RFC1918 address on a real NIC. This avoids advertising an
+/// unroutable APIPA address that a macOS auto-created `bridge0` (iPhone-USB /
+/// hotspot) can otherwise win via the default-route lookup.
 ///
-/// On machines with multiple LAN interfaces (Wi-Fi + ethernet, VPN active), this
-/// picks the default route's interface — usually the right one. A manual override
-/// will be available in Phase 6 via a network-interface picker in the settings UI.
+/// Returns `None` if enumeration fails or no routable address exists (e.g. fully
+/// offline). The relay still starts and binds to 0.0.0.0; it just won't advertise a
+/// reachable URL. The chosen interface and address are logged at INFO; the no-address
+/// paths log a WARN. A manual override is available now via `OBSIDIAN_MEMORY_RELAY_URL`,
+/// and a network-interface picker is planned for the settings UI in Phase 6.
 fn detect_lan_ip() -> Option<std::net::IpAddr> {
-    local_ip_address::local_ip().ok()
+    match local_ip_address::list_afinet_netifas() {
+        Ok(ifaces) => {
+            let chosen = select_advertise_ip(&ifaces);
+            match &chosen {
+                Some(ip) => {
+                    let name = ifaces
+                        .iter()
+                        .find(|(_, a)| a == ip)
+                        .map(|(n, _)| n.as_str())
+                        .unwrap_or("?");
+                    info!(
+                        "Selected LAN address {ip} on interface '{name}' \
+                         (rejected link-local/loopback, preferred routable NIC)"
+                    );
+                }
+                None => warn!(
+                    "No routable LAN address found among {} interfaces; \
+                     relay will advertise 0.0.0.0. Candidates were: {:?}",
+                    ifaces.len(),
+                    ifaces
+                ),
+            }
+            chosen
+        }
+        Err(e) => {
+            warn!("Interface enumeration failed ({e}); relay won't advertise a reachable LAN URL");
+            None
+        }
+    }
 }
 
 /// Interface-name prefixes that identify a real physical NIC. Selection biases
