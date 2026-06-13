@@ -422,7 +422,6 @@ fn main() -> Result<()> {
                 advertised_relay_url,
             };
 
-
             // Tray-only mode: suppress the dock icon so the app lives entirely
             // in the menu bar. `"windows": []` in tauri.conf.json removes the
             // main window; this call removes the Dock icon.

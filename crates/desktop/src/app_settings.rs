@@ -85,6 +85,9 @@ impl AppSettings {
         self.vault_path.as_deref()
     }
 
+    // Read by a future settings panel (design steer #8); startup autostart truth
+    // comes from `autolaunch().is_enabled()`, so nothing reads this yet.
+    #[allow(dead_code)]
     pub fn autostart_enabled(&self) -> bool {
         self.autostart_enabled
     }

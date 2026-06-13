@@ -28,6 +28,9 @@ use tracing::{debug, warn};
 pub struct TrayMenuHandles {
     pub status_item: tauri::menu::MenuItem<tauri::Wry>,
     pub pair_item: tauri::menu::MenuItem<tauri::Wry>,
+    // Held for a future settings panel (design steer #8) to read/update the check
+    // state without rebuilding the menu; not consumed by the status driver yet.
+    #[allow(dead_code)]
     pub autostart_item: tauri::menu::CheckMenuItem<tauri::Wry>,
 }
 
