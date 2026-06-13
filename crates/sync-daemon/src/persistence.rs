@@ -88,12 +88,50 @@ impl IdentityKey {
 /// Unlike `relay_url` (this node's own relay — runtime state, discarded on
 /// load), peer relay entries survive restarts. They are updated on re-pairing
 /// with last-write-wins semantics.
+///
+/// ## Freshness fields
+///
+/// The reconnect supervisor uses `last_success_ms` / `failure_count` /
+/// `last_attempt_ms` to back off and EVICT a hint that keeps failing — a stale
+/// coffeeshop relay would otherwise be re-dialed forever. They are all
+/// `#[serde(default)]` so a `daemon.toml` written before this feature loads
+/// cleanly (absent fields → `None`/`0`). Wall-clock milliseconds (not
+/// monotonic `Instant`) because they persist across restarts and are compared
+/// to "now" on the next run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerRelay {
     /// The peer's iroh `EndpointId` as a 64-char lowercase hex string.
     pub endpoint_id: String,
     /// The peer's advertised relay URL (e.g. `http://umbra.computer:3340/`).
     pub relay_url: String,
+    /// Wall-clock ms of the last successful reach (exchange or fresh pair).
+    /// `None` = never reached.
+    #[serde(default)]
+    pub last_success_ms: Option<u64>,
+    /// Consecutive failed reconnect attempts since the last success. Reset to
+    /// `0` on success; drives the per-hint exponential backoff.
+    #[serde(default)]
+    pub failure_count: u32,
+    /// Wall-clock ms of the last reconnect ATTEMPT (re-add + re-dial), for
+    /// backoff windowing. `None` = never attempted (so the hint is due now).
+    #[serde(default)]
+    pub last_attempt_ms: Option<u64>,
+}
+
+impl PeerRelay {
+    /// Construct a fresh hint with no recorded attempt or success yet.
+    ///
+    /// Use this instead of a struct literal so the freshness fields stay an
+    /// implementation detail of one place.
+    pub fn new(endpoint_id: String, relay_url: String) -> Self {
+        Self {
+            endpoint_id,
+            relay_url,
+            last_success_ms: None,
+            failure_count: 0,
+            last_attempt_ms: None,
+        }
+    }
 }
 
 /// Daemon-specific configuration persisted in `.sync/daemon.toml`.
@@ -242,9 +280,14 @@ impl DaemonConfig {
 
     /// Record a peer's relay URL keyed by their `EndpointId`, then persist.
     ///
-    /// This is the write path for learned relay hints — called on pairing so
-    /// the daemon can reach this peer through their relay on future startups,
-    /// even when mDNS isn't available (off-LAN).
+    /// This is the write path for learned relay hints — called on pairing and
+    /// on learn-on-exchange so the daemon can reach this peer through their
+    /// relay on future startups, even when mDNS isn't available (off-LAN).
+    ///
+    /// **Freshness:** both callers mean "we just reached this peer," so this
+    /// stamps `last_success_ms = now_ms` and resets `failure_count = 0`,
+    /// un-throttling a hint the supervisor may have been backing off.
+    /// `last_attempt_ms` is preserved (it tracks dial attempts, not successes).
     ///
     /// **Dedup:** if an entry for `endpoint_id` already exists it is overwritten
     /// (last-write-wins), so re-pairing naturally updates a stale relay URL.
@@ -256,6 +299,7 @@ impl DaemonConfig {
         &mut self,
         endpoint_id: &str,
         relay_url: &str,
+        now_ms: u64,
         vault_path: &Path,
     ) -> Result<()> {
         // Skip self: our peer_id hex and the EndpointId hex share the same
@@ -271,14 +315,65 @@ impl DaemonConfig {
             .find(|r| r.endpoint_id == endpoint_id)
         {
             existing.relay_url = relay_url.to_string();
+            existing.last_success_ms = Some(now_ms);
+            existing.failure_count = 0;
         } else {
-            self.peer_relays.push(PeerRelay {
-                endpoint_id: endpoint_id.to_string(),
-                relay_url: relay_url.to_string(),
-            });
+            let mut entry = PeerRelay::new(endpoint_id.to_string(), relay_url.to_string());
+            entry.last_success_ms = Some(now_ms);
+            self.peer_relays.push(entry);
         }
 
         self.save(vault_path)
+    }
+
+    /// Stamp success on an EXISTING hint without changing its relay URL.
+    ///
+    /// Used by learn-on-exchange when the peer is reachable but no fresh relay
+    /// URL was observed (e.g. a LAN-direct connection has no active relay
+    /// path): we still reset freshness so the supervisor stops throttling, but
+    /// we don't invent a URL. No-op if no entry exists for `endpoint_id`.
+    pub fn mark_peer_relay_success(
+        &mut self,
+        endpoint_id: &str,
+        now_ms: u64,
+        vault_path: &Path,
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .peer_relays
+            .iter_mut()
+            .find(|r| r.endpoint_id == endpoint_id)
+        {
+            existing.last_success_ms = Some(now_ms);
+            existing.failure_count = 0;
+            self.save(vault_path)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Persist a failed reconnect attempt against an EXISTING hint.
+    ///
+    /// Increments `failure_count` and records `last_attempt_ms = now_ms` so the
+    /// supervisor's per-hint backoff survives a restart — the restart-reflood is
+    /// the user-visible symptom this whole feature kills. No-op if no entry
+    /// exists for `endpoint_id`.
+    pub fn record_hint_failure(
+        &mut self,
+        endpoint_id: &str,
+        now_ms: u64,
+        vault_path: &Path,
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .peer_relays
+            .iter_mut()
+            .find(|r| r.endpoint_id == endpoint_id)
+        {
+            existing.failure_count = existing.failure_count.saturating_add(1);
+            existing.last_attempt_ms = Some(now_ms);
+            self.save(vault_path)
+        } else {
+            Ok(())
+        }
     }
 
     /// Save the current config to `.sync/daemon.toml`.
@@ -608,7 +703,7 @@ incarnation = 3
         // from our own peer_id so self-skip doesn't apply).
         let peer_id_hex = "a".repeat(64);
         config
-            .upsert_peer_relay(&peer_id_hex, "http://umbra.computer:3340/", vault_path)
+            .upsert_peer_relay(&peer_id_hex, "http://umbra.computer:3340/", 1_000, vault_path)
             .unwrap();
 
         // Reload and verify the entry survives.
@@ -638,10 +733,10 @@ incarnation = 3
         let peer_id_hex = "b".repeat(64);
 
         config
-            .upsert_peer_relay(&peer_id_hex, "http://old-relay:3340/", vault_path)
+            .upsert_peer_relay(&peer_id_hex, "http://old-relay:3340/", 1_000, vault_path)
             .unwrap();
         config
-            .upsert_peer_relay(&peer_id_hex, "http://new-relay:3340/", vault_path)
+            .upsert_peer_relay(&peer_id_hex, "http://new-relay:3340/", 2_000, vault_path)
             .unwrap();
 
         // Should have exactly one entry with the updated URL.
@@ -684,6 +779,173 @@ incarnation = 3
         );
     }
 
+    /// A `peer_relays` entry written before the freshness fields existed loads
+    /// with those fields defaulted — proving the new `#[serde(default)]` fields
+    /// are a NON-breaking config change for an existing `daemon.toml`.
+    #[tokio::test]
+    async fn test_peer_relay_freshness_fields_default_for_old_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let sync_dir = vault_path.join(".sync");
+        fs::create_dir_all(&sync_dir).unwrap();
+
+        // A daemon.toml whose [[peer_relays]] entry has only the two original
+        // fields (endpoint_id, relay_url) — no freshness fields.
+        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
+        let peer_id = key.peer_id();
+        let peer_hex = "c".repeat(64);
+        fs::write(
+            sync_dir.join("daemon.toml"),
+            format!(
+                "peer_id = \"{peer_id}\"\n\n[[peer_relays]]\nendpoint_id = \"{peer_hex}\"\nrelay_url = \"http://umbra.computer:3340/\"\n"
+            ),
+        )
+        .unwrap();
+
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        assert_eq!(config.peer_relays.len(), 1);
+        let entry = &config.peer_relays[0];
+        assert_eq!(entry.endpoint_id, peer_hex);
+        assert_eq!(entry.relay_url, "http://umbra.computer:3340/");
+        // Freshness fields default cleanly for an entry that predates them.
+        assert_eq!(entry.last_success_ms, None);
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.last_attempt_ms, None);
+    }
+
+    /// The freshness fields survive a full save → load round-trip.
+    #[tokio::test]
+    async fn test_peer_relay_freshness_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        // Build an entry carrying every freshness field, then persist it.
+        let peer_hex = "d".repeat(64);
+        let mut entry = PeerRelay::new(peer_hex.clone(), "http://relay:3340/".to_string());
+        entry.last_success_ms = Some(123_456);
+        entry.failure_count = 4;
+        entry.last_attempt_ms = Some(789_000);
+        config.peer_relays.push(entry);
+        config.save(vault_path).unwrap();
+
+        let (loaded, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.peer_relays.len(), 1);
+        let loaded_entry = &loaded.peer_relays[0];
+        assert_eq!(loaded_entry.last_success_ms, Some(123_456));
+        assert_eq!(loaded_entry.failure_count, 4);
+        assert_eq!(loaded_entry.last_attempt_ms, Some(789_000));
+    }
+
+    /// `upsert_peer_relay` stamps `last_success_ms` and resets `failure_count`,
+    /// un-throttling a hint the supervisor had been backing off.
+    #[tokio::test]
+    async fn test_upsert_peer_relay_stamps_success_and_resets_failures() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        let peer_hex = "e".repeat(64);
+
+        // Seed a throttled entry directly (as if the supervisor had recorded
+        // several failures), then upsert it as a fresh success.
+        let mut throttled = PeerRelay::new(peer_hex.clone(), "http://old:3340/".to_string());
+        throttled.failure_count = 7;
+        throttled.last_attempt_ms = Some(500);
+        config.peer_relays.push(throttled);
+
+        config
+            .upsert_peer_relay(&peer_hex, "http://fresh:3340/", 9_000, vault_path)
+            .unwrap();
+
+        let entry = &config.peer_relays[0];
+        assert_eq!(entry.relay_url, "http://fresh:3340/");
+        assert_eq!(entry.last_success_ms, Some(9_000));
+        assert_eq!(entry.failure_count, 0, "success resets the failure count");
+        // last_attempt_ms tracks dial attempts, not successes — preserved.
+        assert_eq!(entry.last_attempt_ms, Some(500));
+    }
+
+    /// `mark_peer_relay_success` resets freshness on an existing entry without
+    /// changing its URL, and is a no-op when the entry is absent.
+    #[tokio::test]
+    async fn test_mark_peer_relay_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        let present = "a".repeat(64);
+        let absent = "b".repeat(64);
+
+        let mut entry = PeerRelay::new(present.clone(), "http://relay:3340/".to_string());
+        entry.failure_count = 3;
+        config.peer_relays.push(entry);
+
+        config
+            .mark_peer_relay_success(&present, 4_242, vault_path)
+            .unwrap();
+
+        let updated = &config.peer_relays[0];
+        assert_eq!(updated.last_success_ms, Some(4_242));
+        assert_eq!(updated.failure_count, 0);
+        // URL is left untouched — no fresh URL was supplied.
+        assert_eq!(updated.relay_url, "http://relay:3340/");
+
+        // Absent entry: no-op, no panic, no new entry appended.
+        config
+            .mark_peer_relay_success(&absent, 5_000, vault_path)
+            .unwrap();
+        assert_eq!(config.peer_relays.len(), 1);
+    }
+
+    /// `record_hint_failure` increments `failure_count` + stamps
+    /// `last_attempt_ms` on an existing entry, and is a no-op when absent.
+    #[tokio::test]
+    async fn test_record_hint_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        let present = "a".repeat(64);
+        let absent = "b".repeat(64);
+
+        config
+            .peer_relays
+            .push(PeerRelay::new(present.clone(), "http://relay:3340/".to_string()));
+
+        config.record_hint_failure(&present, 1_000, vault_path).unwrap();
+        config.record_hint_failure(&present, 2_000, vault_path).unwrap();
+
+        let entry = &config.peer_relays[0];
+        assert_eq!(entry.failure_count, 2);
+        assert_eq!(entry.last_attempt_ms, Some(2_000));
+        // A failure must not pretend the peer was reached.
+        assert_eq!(entry.last_success_ms, None);
+
+        // Absent entry: no-op, no new entry appended.
+        config.record_hint_failure(&absent, 3_000, vault_path).unwrap();
+        assert_eq!(config.peer_relays.len(), 1);
+    }
+
     /// `upsert_peer_relay` skips entries whose endpoint_id matches our own peer_id —
     /// seeding ourselves into the lookup would cause iroh to try to dial itself.
     #[tokio::test]
@@ -698,7 +960,7 @@ incarnation = 3
         // Use our own peer_id as the endpoint_id — should be silently skipped.
         let own_id = config.peer_id.to_string();
         config
-            .upsert_peer_relay(&own_id, "http://self-relay:3340/", vault_path)
+            .upsert_peer_relay(&own_id, "http://self-relay:3340/", 1_000, vault_path)
             .unwrap();
 
         assert!(

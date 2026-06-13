@@ -106,7 +106,8 @@ pub async fn persist_adopted_relay(
 
     match DaemonConfig::load_or_generate(vault_path, None).await {
         Ok((mut config, _identity)) => {
-            if let Err(e) = config.upsert_peer_relay(&responder_id_hex, &url_str, vault_path) {
+            let now = crate::daemon::now_ms();
+            if let Err(e) = config.upsert_peer_relay(&responder_id_hex, &url_str, now, vault_path) {
                 warn!("Failed to persist adopted relay URL: {}", e);
                 return;
             }

@@ -361,7 +361,7 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
         .expect("Failed to seed initial config");
     seed_config
         .peer_relays
-        .push(PeerRelay { endpoint_id: peer_relay_endpoint.clone(), relay_url: peer_relay_url.to_string() });
+        .push(PeerRelay::new(peer_relay_endpoint.clone(), peer_relay_url.to_string()));
     seed_config.save(&vault_path).expect("Failed to save seeded config");
 
     let config = DaemonRunConfig {

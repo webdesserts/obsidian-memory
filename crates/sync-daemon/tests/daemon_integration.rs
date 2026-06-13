@@ -1577,10 +1577,7 @@ mod daemon_integration {
         // only needs to parse — direct addresses from `connect_nodes` carry the
         // actual dial.
         let b_endpoint_hex = node_b.sync_node.node_id().to_string();
-        let b_hint = PeerRelay {
-            endpoint_id: b_endpoint_hex,
-            relay_url: "http://example.com:3340/".to_string(),
-        };
+        let b_hint = PeerRelay::new(b_endpoint_hex, "http://example.com:3340/".to_string());
 
         // A joins with no bootstrap; B joins with no bootstrap (NOT off A). They
         // share a topic but never dial each other — A is partitioned at zero
@@ -1667,10 +1664,10 @@ mod daemon_integration {
 
         connect_nodes(&node_a, &node_b).await?;
 
-        let b_hint = PeerRelay {
-            endpoint_id: node_b.sync_node.node_id().to_string(),
-            relay_url: "http://example.com:3340/".to_string(),
-        };
+        let b_hint = PeerRelay::new(
+            node_b.sync_node.node_id().to_string(),
+            "http://example.com:3340/".to_string(),
+        );
 
         // A and B form a normal swarm (B bootstraps off A).
         let gossip_a = node_a

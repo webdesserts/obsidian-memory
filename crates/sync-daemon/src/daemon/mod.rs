@@ -39,7 +39,7 @@ use sync_core::network::{
 use sync_core::pairing::{PairingChallenge, PairingSession};
 use sync_core::{PeerId, PeerRegistry, Vault};
 
-pub(super) fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -490,10 +490,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         {
             existing.relay_url = relay_url;
         } else {
-            self.peer_relays.push(crate::persistence::PeerRelay {
-                endpoint_id,
-                relay_url,
-            });
+            self.peer_relays
+                .push(crate::persistence::PeerRelay::new(endpoint_id, relay_url));
         }
     }
 
