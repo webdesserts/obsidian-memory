@@ -463,6 +463,20 @@ pub struct DebrisReport {
     pub folder_dups: Vec<FolderDupGroup>,
 }
 
+/// The outcome of an [`Vault::apply_dedupe`] pass — how much debris was tombstoned.
+///
+/// Counts only what the dedupe actually mutated: duplicate-group losers and relics.
+/// Folder dups are out of scope for v1 and never contribute here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DedupeStats {
+    /// How many duplicate groups had their losers tombstoned (one survivor kept each).
+    pub groups_deduped: usize,
+    /// Total loser nodes tombstoned across all duplicate groups (excludes each winner).
+    pub nodes_tombstoned: usize,
+    /// How many relic nodes were tombstoned.
+    pub relics_tombstoned: usize,
+}
+
 /// Manages a vault of documents.
 ///
 /// Uses interior mutability for core state to allow `&self` methods in WASM.
@@ -1839,6 +1853,104 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(report)
+    }
+
+    /// Tombstone the registry debris a prior [`Vault::find_registry_debris`] scan found.
+    ///
+    /// For each duplicate group, keeps `winner` alive and `tree.delete`s every other node
+    /// in `alive_nodes` (the losers); for each relic, `tree.delete`s the relic node. Folder
+    /// dups are NOT touched (v1 scope-out — `LoroTree::delete` is recursive and production
+    /// children are split across the two folder nodes, so a naive folder-tombstone is data
+    /// loss; the report surfaces them for visibility only).
+    ///
+    /// Both twins in a duplicate group share the same `doc_id` (= path hash), so tombstoning
+    /// the loser leaves the document content untouched — only one tree node remains alive.
+    /// The winner is never destroyed.
+    ///
+    /// The registry is persisted exactly ONCE at the end, so the whole pass is a single
+    /// `save_registry` write regardless of how many nodes it tombstones (at production scale
+    /// this is hundreds of nodes — one transaction, not one write per group). When this saved
+    /// registry later rides a `registry_updates` broadcast, the deleted-paths alive-guard in
+    /// `apply_registry_updates` protects every receiver: a duplicate path the winner still
+    /// occupies is never fs-cleaned, so peers keep their `.md`/`.loro` on disk.
+    ///
+    /// Relics are tombstoned unconditionally here — the report only classifies a node as a
+    /// relic when both its `.md` and `.loro` are already absent, so there is nothing on disk
+    /// to remove.
+    ///
+    /// Safe to re-run with a STALE (pre-dedupe) report: a node that is already tombstoned is
+    /// skipped rather than re-deleted. This matters because `LoroTree::delete` on an
+    /// already-deleted node returns `Err(TreeNodeDeletedOrNotExist)` — it does NOT no-op — so
+    /// without the skip a second pass over the same report would error. When nothing is left
+    /// to tombstone the pass returns early without writing the registry, so a converged
+    /// re-run is a true no-op (no spurious registry write, no cache rebuild).
+    pub async fn apply_dedupe(&self, report: &DebrisReport) -> Result<DedupeStats> {
+        let mut stats = DedupeStats::default();
+
+        {
+            // Hold the tree borrow for all tombstone ops, then drop it before save_registry
+            // (never hold a registry guard across the await below).
+            let tree = self.file_tree();
+
+            for group in &report.duplicate_groups {
+                let mut tombstoned_in_group = 0;
+                for &node_id in &group.alive_nodes {
+                    // Keep the deterministic survivor; tombstone every other twin. The winner
+                    // is the lowest TreeID, identical on every machine from a converged
+                    // registry, so two operators running --apply independently converge.
+                    if node_id == group.winner {
+                        continue;
+                    }
+                    // Already tombstoned (stale report re-run, or a peer's tombstone arrived
+                    // first): skip it. `tree.delete` errors on an already-deleted node, so this
+                    // guard is what keeps a re-run a clean no-op instead of a hard error.
+                    if tree.is_node_deleted(&node_id).unwrap_or(false) {
+                        continue;
+                    }
+                    tree.delete(node_id).map_err(|e| {
+                        VaultError::Other(format!(
+                            "Failed to tombstone duplicate node at '{}': {}",
+                            group.path, e
+                        ))
+                    })?;
+                    tombstoned_in_group += 1;
+                }
+                if tombstoned_in_group > 0 {
+                    stats.groups_deduped += 1;
+                    stats.nodes_tombstoned += tombstoned_in_group;
+                }
+            }
+
+            for relic in &report.relics {
+                // Same already-tombstoned skip as the loser loop above.
+                if tree.is_node_deleted(&relic.node).unwrap_or(false) {
+                    continue;
+                }
+                tree.delete(relic.node).map_err(|e| {
+                    VaultError::Other(format!(
+                        "Failed to tombstone relic node at '{}': {}",
+                        relic.path, e
+                    ))
+                })?;
+                stats.relics_tombstoned += 1;
+            }
+        }
+
+        // Nothing was tombstoned (clean vault, or a converged re-run that skipped every
+        // already-deleted node): skip the registry write + cache rebuild so the pass is a
+        // true no-op rather than a redundant snapshot write.
+        if stats == DedupeStats::default() {
+            return Ok(stats);
+        }
+
+        // Single transaction for the whole pass: persist all tombstones with one write.
+        self.save_registry().await?;
+
+        // The tombstoned losers/relics no longer resolve; rebuild the path cache so the
+        // survivors are the only nodes the cache points at.
+        self.rebuild_path_cache();
+
+        Ok(stats)
     }
 
     /// Validate a sync path for security
@@ -4301,6 +4413,208 @@ mod tests {
             report.relics.is_empty(),
             "a node with its .md on disk must not be a relic, got: {:?}",
             report.relics
+        );
+    }
+
+    // ========== Registry dedupe apply (apply_dedupe) ==========
+
+    #[tokio::test]
+    async fn test_apply_dedupe_keeps_winner_tombstones_loser_disk_untouched() {
+        // The core dedupe: a duplicate alive pair at one path collapses to the
+        // deterministic winner (lowest TreeID). The loser is tombstoned, the winner
+        // stays alive, and — crucially — the .md on disk is NOT touched, because both
+        // twins share the same doc_id and an alive winner still occupies the path.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let (vault, id_a, id_b) = seed_duplicate_alive_pair(&fs, "dup.md", b"# Dup").await;
+        let winner = std::cmp::min(id_a, id_b);
+        let loser = std::cmp::max(id_a, id_b);
+
+        let report = vault.find_registry_debris().await.unwrap();
+        let stats = vault.apply_dedupe(&report).await.unwrap();
+
+        assert_eq!(stats.groups_deduped, 1, "one group was deduped");
+        assert_eq!(stats.nodes_tombstoned, 1, "exactly the loser was tombstoned");
+        assert_eq!(stats.relics_tombstoned, 0, "no relics in this fixture");
+
+        let tree = vault.file_tree();
+        assert!(
+            !tree.is_node_deleted(&winner).unwrap_or(true),
+            "the winner (lowest TreeID) must remain alive"
+        );
+        assert!(
+            tree.is_node_deleted(&loser).unwrap_or(false),
+            "the loser (higher TreeID) must be tombstoned"
+        );
+        assert!(
+            fs.exists("dup.md").await.unwrap(),
+            "the .md on disk must be untouched — a tombstone is a tree-only mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_dedupe_winner_independent_of_import_order() {
+        // The winner is the lowest TreeID regardless of which registry was imported into
+        // which — running the pair construction in the opposite import order must tombstone
+        // the SAME node. This is what lets two operators run --apply on two machines and
+        // converge on the same survivor.
+        use std::sync::Arc;
+
+        // Order 1: B imported into A (the helper's default).
+        let fs1 = Arc::new(InMemoryFs::new());
+        let (vault1, id1_a, id1_b) = seed_duplicate_alive_pair(&fs1, "dup.md", b"# Dup").await;
+        let report1 = vault1.find_registry_debris().await.unwrap();
+        vault1.apply_dedupe(&report1).await.unwrap();
+        let surviving1 = {
+            let tree = vault1.file_tree();
+            [id1_a, id1_b]
+                .into_iter()
+                .find(|id| !tree.is_node_deleted(id).unwrap_or(true))
+                .expect("one twin survives")
+        };
+
+        // Order 2: build the pair by importing A into B (reverse direction). The minted
+        // TreeIDs come from the same two peers, so the min-TreeID winner is the same node;
+        // we assert the survivor's peer matches order 1's, proving order-independence.
+        let fs_a = Arc::new(InMemoryFs::new());
+        fs_a.write("dup.md", b"# Dup").await.unwrap();
+        let vault_a = Vault::init(Arc::clone(&fs_a), test_peer_id())
+            .await
+            .unwrap();
+        vault_a.register_file("dup.md").unwrap();
+        vault_a.save_registry().await.unwrap();
+
+        let fs_b = Arc::new(InMemoryFs::new());
+        fs_b.write("dup.md", b"# Dup").await.unwrap();
+        let vault_b = Vault::init(Arc::clone(&fs_b), test_peer_id_2())
+            .await
+            .unwrap();
+        vault_b.register_file("dup.md").unwrap();
+        // Reverse import: A's registry into B.
+        let a_snapshot = vault_a
+            .registry()
+            .export(loro::ExportMode::Snapshot)
+            .unwrap();
+        vault_b.registry_mut().import(&a_snapshot).unwrap();
+        vault_b.rebuild_path_cache();
+
+        let report2 = vault_b.find_registry_debris().await.unwrap();
+        vault_b.apply_dedupe(&report2).await.unwrap();
+        let surviving2 = {
+            let tree = vault_b.file_tree();
+            tree.nodes()
+                .into_iter()
+                .find(|id| {
+                    !tree.is_node_deleted(id).unwrap_or(true)
+                        && vault_b.get_node_path(id).as_deref() == Some("dup.md")
+                })
+                .expect("one twin survives")
+        };
+
+        assert_eq!(
+            surviving1.peer, surviving2.peer,
+            "the surviving (min-TreeID) node must be the same regardless of import order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_dedupe_tombstones_relic() {
+        // A relic (alive node, no .md, no .loro) is tombstoned under apply. Reusing the
+        // relic fixture: register, then strip both backing files without tombstoning.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("relic.md", b"# Relic").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let relic_id = vault.register_file("relic.md").unwrap();
+        vault.save_registry().await.unwrap();
+        fs.delete("relic.md").await.unwrap();
+        let loro_path = vault.document_sync_path("relic.md");
+        let _ = fs.delete(&loro_path).await;
+
+        let report = vault.find_registry_debris().await.unwrap();
+        let stats = vault.apply_dedupe(&report).await.unwrap();
+
+        assert_eq!(stats.relics_tombstoned, 1, "the relic must be tombstoned");
+        assert_eq!(stats.groups_deduped, 0, "no duplicate groups in this fixture");
+        assert!(
+            vault.file_tree().is_node_deleted(&relic_id).unwrap_or(false),
+            "the relic node must be tombstoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_dedupe_leaves_folder_dups_alive() {
+        // Folder dedupe is scoped out of v1 (recursive delete + split children = data loss).
+        // A duplicate FOLDER pair must be left fully alive by apply_dedupe — the report
+        // surfaces it for visibility only. Registering a nested path on two vaults then
+        // merging yields duplicate folder nodes for the parent dir alongside the file dup.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // A nested path: both vaults independently create a "dir" folder node, so the merge
+        // produces a folder duplicate group at "dir" in addition to the file dup.
+        let (vault, _, _) = seed_duplicate_alive_pair(&fs, "dir/dup.md", b"# Dup").await;
+
+        let report = vault.find_registry_debris().await.unwrap();
+        assert_eq!(
+            report.folder_dups.len(),
+            1,
+            "the nested-path fixture must surface one folder duplicate group, got: {:?}",
+            report.folder_dups
+        );
+        let folder_nodes = report.folder_dups[0].alive_nodes.clone();
+
+        vault.apply_dedupe(&report).await.unwrap();
+
+        // Every folder node in the group must still be alive — apply_dedupe never touches
+        // folder dups.
+        let tree = vault.file_tree();
+        for id in &folder_nodes {
+            assert!(
+                !tree.is_node_deleted(id).unwrap_or(true),
+                "folder node {:?} must remain alive — folder dedupe is out of scope for v1",
+                id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_dedupe_is_idempotent_with_stale_report() {
+        // Re-running the dedupe must be a graceful no-op even with a STALE report — the
+        // exact safety the live 445-node vault depends on, since an operator could re-run
+        // --apply against a report captured before the first pass. The original report's
+        // losers are already tombstoned the second time around; apply_dedupe must skip them
+        // (tree.delete on an already-deleted node ERRORS, so a naive re-run would fail) and
+        // return zero new tombstones rather than erroring or double-acting.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let (vault, _, _) = seed_duplicate_alive_pair(&fs, "dup.md", b"# Dup").await;
+        let report = vault.find_registry_debris().await.unwrap();
+        vault.apply_dedupe(&report).await.unwrap();
+
+        // A fresh scan must see a converged registry: the losers are tombstoned, so each
+        // path has exactly one alive node.
+        let report_after = vault.find_registry_debris().await.unwrap();
+        assert!(
+            report_after.duplicate_groups.is_empty(),
+            "after dedupe, no duplicate groups remain, got: {:?}",
+            report_after.duplicate_groups
+        );
+
+        // Re-apply the ORIGINAL (pre-dedupe, now stale) report: its losers are already
+        // tombstoned. This must NOT error and must tombstone nothing — the already-deleted
+        // skip-guard turns the stale re-run into a clean no-op.
+        let stats_stale = vault
+            .apply_dedupe(&report)
+            .await
+            .expect("re-applying a stale report must not error on already-tombstoned nodes");
+        assert_eq!(
+            stats_stale,
+            DedupeStats::default(),
+            "re-applying a stale report must tombstone nothing (losers already gone)"
         );
     }
 }

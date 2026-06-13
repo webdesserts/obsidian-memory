@@ -6,10 +6,11 @@
 //! (an alive file node whose `.md` and `.loro` are both gone — a tombstone that never
 //! landed). Both are resurrection landmines until cleaned.
 //!
-//! This binary is the read-only INSPECTOR. It acquires the same exclusive daemon lock
-//! the app uses (so it refuses to run while the app is up), loads the vault, and prints
-//! the debris it finds. It does NOT mutate the registry — a future `--apply` pass owns
-//! the tombstoning.
+//! This binary is the INSPECTOR (default) and the dedupe APPLY pass (`--apply`). It acquires
+//! the same exclusive daemon lock the app uses (so it refuses to run while the app is up),
+//! loads the vault, and prints the debris it finds. Without `--apply` it mutates nothing.
+//! With `--apply` it tombstones the duplicate-group losers and relics (folder dups are left
+//! alone — v1 scope-out) and persists the registry once.
 //!
 //! ## Runbook
 //!
@@ -18,8 +19,8 @@
 //! 3. Dry-run inspect:
 //!    `cargo run -p sync-daemon --example registry_maintenance -- --vault <vault>`
 //! 4. Review the reported duplicate groups, relics, and (unhandled) folder dups.
-//!
-//! Mutation (`--apply`) is a separate, later step — not yet implemented here.
+//! 5. Apply: re-run with `--apply` appended.
+//! 6. Restart the app; verify mesh-wide convergence (re-run the inspector on each machine).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,14 +32,14 @@ use sync_daemon::persistence::DaemonConfig;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let Some(vault_path) = parse_vault_arg() else {
+    let Some(args) = parse_args() else {
         eprintln!(
-            "usage: cargo run -p sync-daemon --example registry_maintenance -- --vault <path>"
+            "usage: cargo run -p sync-daemon --example registry_maintenance -- --vault <path> [--apply]"
         );
         return ExitCode::FAILURE;
     };
 
-    match run(vault_path).await {
+    match run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -47,30 +48,44 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Hand-parse `--vault <path>`. clap is a sync-daemon dep, but a single positional flag
-/// doesn't justify a derive struct here — a future `--apply` commit can graduate this to
-/// clap if the surface grows.
-fn parse_vault_arg() -> Option<PathBuf> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--vault" {
-            return args.next().map(PathBuf::from);
-        }
-    }
-    None
+struct Args {
+    vault_path: PathBuf,
+    /// When true, tombstone the debris after printing the report; otherwise dry-run.
+    apply: bool,
 }
 
-async fn run(vault_path: PathBuf) -> Result<(), String> {
+/// Hand-parse `--vault <path>` and the optional `--apply` flag. clap is a sync-daemon dep,
+/// but two flags don't justify a derive struct here.
+fn parse_args() -> Option<Args> {
+    let mut vault_path = None;
+    let mut apply = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--vault" => vault_path = args.next().map(PathBuf::from),
+            "--apply" => apply = true,
+            _ => {}
+        }
+    }
+    Some(Args {
+        vault_path: vault_path?,
+        apply,
+    })
+}
+
+async fn run(args: Args) -> Result<(), String> {
+    let Args { vault_path, apply } = args;
+
     // Acquire the daemon lock FIRST — this is the concurrent-writer guard. If the app or
-    // daemon is running it holds this lock, and we must not read a registry it is actively
-    // mutating. Fail fast with a clear instruction.
+    // daemon is running it holds this lock, and we must not read (let alone mutate) a
+    // registry it is actively mutating. Fail fast with a clear instruction.
     let _lock = DaemonLock::acquire(&vault_path).map_err(|e| {
         format!("{e}. Stop the desktop app / daemon on this machine first, then retry.")
     })?;
 
     let fs = NativeFs::new(vault_path.clone());
-    // `cfg` (the DaemonConfig) is unused — we only need the identity to author the Loro
-    // ops as this device's PeerId, matching the daemon's startup load.
+    // The DaemonConfig is unused — we only need the identity to author the Loro ops as this
+    // device's PeerId, matching the daemon's startup load.
     let (_, identity) = DaemonConfig::load_or_generate(&vault_path, None)
         .await
         .map_err(|e| format!("failed to load daemon identity: {e}"))?;
@@ -86,6 +101,55 @@ async fn run(vault_path: PathBuf) -> Result<(), String> {
         .map_err(|e| format!("registry scan failed: {e}"))?;
 
     print_report(&report);
+
+    if apply {
+        apply_dedupe(&vault, &report, &vault_path).await?;
+    }
+
+    Ok(())
+}
+
+/// Print the scale warning, run the dedupe, and print the resulting stats.
+///
+/// The pre-call line states the planned blast radius (summed loser count across all groups,
+/// each keeping one winner) and the safety preconditions; the post-call line reports the
+/// ACTUAL counts from the returned [`DedupeStats`]. Keeping the "Tombstoned N…" claim to
+/// after the call means a mid-way failure never leaves a misleading "we tombstoned N" on
+/// screen — the error surfaces instead.
+async fn apply_dedupe(
+    vault: &Vault<NativeFs>,
+    report: &sync_core::DebrisReport,
+    vault_path: &std::path::Path,
+) -> Result<(), String> {
+    let planned_losers: usize = report
+        .duplicate_groups
+        .iter()
+        .map(|g| g.alive_nodes.len().saturating_sub(1))
+        .sum();
+
+    println!("\n=== APPLY ===");
+    println!(
+        "Applying dedupe to {}: tombstoning up to {} loser node(s) across {} group(s) + {} relic(s).",
+        vault_path.display(),
+        planned_losers,
+        report.duplicate_groups.len(),
+        report.relics.len()
+    );
+    println!(
+        "This mutates the registry. The app must be stopped and .sync backed up. \
+         Folder dups ({}) are NOT touched (v1 scope-out).",
+        report.folder_dups.len()
+    );
+
+    let stats = vault
+        .apply_dedupe(report)
+        .await
+        .map_err(|e| format!("dedupe apply failed: {e}"))?;
+
+    println!(
+        "\nTombstoned {} loser node(s) across {} group(s) + {} relic(s).",
+        stats.nodes_tombstoned, stats.groups_deduped, stats.relics_tombstoned
+    );
     Ok(())
 }
 
@@ -93,7 +157,9 @@ async fn run(vault_path: PathBuf) -> Result<(), String> {
 /// doc_id / path / parent. Every node the report surfaces is alive (deleted nodes are not
 /// debris), so state is always `alive`; name and parent are derived from the resolved path.
 fn print_report(report: &sync_core::DebrisReport) {
-    println!("=== Registry debris (DRY RUN — no mutations) ===\n");
+    // The report is printed before any mutation. Whether this run mutates is decided by
+    // the caller — the APPLY section (only with --apply) prints the scale warning + stats.
+    println!("=== Registry debris scan ===\n");
 
     println!("Duplicate alive groups: {}", report.duplicate_groups.len());
     for group in &report.duplicate_groups {
