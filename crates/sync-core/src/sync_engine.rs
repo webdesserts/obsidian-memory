@@ -2119,4 +2119,157 @@ mod tests {
             "note.md must NOT be physically deleted when an alive twin still occupies the path"
         );
     }
+
+    /// Which twin vault B has in its path cache when A's dedupe tombstone arrives.
+    ///
+    /// The deleted-paths alive-guard (`fc3a27e`) only matters when B has cached the LOSER:
+    /// that is the ordering where the tombstone lands on the cached node and the path would
+    /// (without the guard) enter the local deleted_paths vec and delete a still-occupied
+    /// file. Testing the winner-cached case too proves the dedupe is safe in both orderings,
+    /// and guards against a fixture that passes only by FxHashMap luck.
+    #[derive(Clone, Copy, Debug)]
+    enum CachedTwin {
+        Winner,
+        Loser,
+    }
+
+    /// Cross-peer dedupe-broadcast safety, parameterized on which twin B has cached.
+    ///
+    /// The scenario, built the production way:
+    /// 1. Vault A holds a duplicate alive pair at `note.md` (two peers registered the path
+    ///    independently, then one registry was imported into A).
+    /// 2. A runs `find_registry_debris` + `apply_dedupe`, tombstoning the deterministic
+    ///    LOSER (the higher TreeID) and keeping the winner.
+    /// 3. Vault B ALSO holds both twins alive (it imported A's pre-dedupe registry) and has
+    ///    the `.md` on disk. B's cache is arranged to hold `cached` (winner or loser).
+    /// 4. B imports A's post-dedupe registry via the real `apply_registry_updates` path.
+    ///
+    /// Asserts B's `.md` survives, the winner is alive, the loser is tombstoned, and no fs
+    /// deletion fired — proving the alive-guard protects the file when a dedup tombstone
+    /// arrives at a path an alive winner still occupies.
+    async fn cross_peer_dedupe_keeps_file(cached: CachedTwin) {
+        use std::sync::Arc;
+
+        // --- Build vault A with a duplicate alive pair at note.md (two peers). ---
+        let fs_a = Arc::new(InMemoryFs::new());
+        fs_a.write("note.md", b"# Note").await.unwrap();
+        let vault_a = Vault::init(Arc::clone(&fs_a), test_author())
+            .await
+            .unwrap();
+
+        let fs_other = Arc::new(InMemoryFs::new());
+        fs_other.write("note.md", b"# Note").await.unwrap();
+        let vault_other = Vault::init(Arc::clone(&fs_other), test_author_2())
+            .await
+            .unwrap();
+        // Merge the other peer's registry into A → both twins alive at note.md.
+        let other_snapshot = vault_other
+            .registry()
+            .export(loro::ExportMode::Snapshot)
+            .unwrap();
+        vault_a
+            .apply_registry_updates(&other_snapshot)
+            .await
+            .unwrap();
+
+        // Identify the two twins and the deterministic winner/loser from the report.
+        let report = vault_a.find_registry_debris().await.unwrap();
+        assert_eq!(
+            report.duplicate_groups.len(),
+            1,
+            "vault A must see exactly one duplicate group at note.md"
+        );
+        let group = &report.duplicate_groups[0];
+        let winner = group.winner;
+        let loser = *group
+            .alive_nodes
+            .iter()
+            .find(|id| **id != winner)
+            .expect("the group has a loser twin");
+        assert_eq!(winner, std::cmp::min(winner, loser), "winner is the min TreeID");
+
+        // --- Build vault B holding BOTH twins alive, with note.md on disk. ---
+        // B imports A's PRE-dedupe registry, so B's two twins have the SAME TreeIDs A's do —
+        // which is what makes A's later tombstone op (keyed on the loser's TreeID) land on a
+        // node B actually has.
+        let fs_b = Arc::new(InMemoryFs::new());
+        fs_b.write("note.md", b"# Note").await.unwrap();
+        let vault_b = Vault::init(Arc::clone(&fs_b), test_author())
+            .await
+            .unwrap();
+        let a_pre_dedupe = vault_a
+            .registry()
+            .export(loro::ExportMode::Snapshot)
+            .unwrap();
+        vault_b.apply_registry_updates(&a_pre_dedupe).await.unwrap();
+        assert!(
+            fs_b.exists("note.md").await.unwrap(),
+            "setup: note.md must be on B's disk before the dedupe tombstone arrives"
+        );
+
+        // Control which twin B has cached. rebuild_path_cache resolves the path to whichever
+        // twin iterated last (FxHashMap order is deterministic-per-run), so an uncontrolled
+        // fixture would only exercise one ordering by luck. Force the cache slot explicitly.
+        let target = match cached {
+            CachedTwin::Winner => winner,
+            CachedTwin::Loser => loser,
+        };
+        vault_b
+            .path_to_node_mut()
+            .insert("note.md".to_string(), target);
+        assert_eq!(
+            *vault_b.path_to_node().get("note.md").unwrap(),
+            target,
+            "setup: B's cache must hold the {cached:?} twin"
+        );
+
+        // --- A runs the dedupe, then B imports A's post-dedupe registry. ---
+        let stats = vault_a.apply_dedupe(&report).await.unwrap();
+        assert_eq!(
+            stats.nodes_tombstoned, 1,
+            "A's dedupe tombstones exactly the loser"
+        );
+        let a_post_dedupe = vault_a
+            .registry()
+            .export(loro::ExportMode::Snapshot)
+            .unwrap();
+        vault_b.apply_registry_updates(&a_post_dedupe).await.unwrap();
+
+        // The winner stays alive, the loser is tombstoned, and — the load-bearing assertion —
+        // B's .md survives because the winner still occupies the path. Without the alive-guard,
+        // the Loser-cached ordering would have routed note.md into the local deleted_paths vec
+        // and physically deleted a file that a live node still backs.
+        assert!(
+            !vault_b.file_tree().is_node_deleted(&winner).unwrap_or(true),
+            "the winner twin must remain alive on B ({cached:?} cached)"
+        );
+        assert!(
+            vault_b.file_tree().is_node_deleted(&loser).unwrap_or(false),
+            "the loser twin must be tombstoned on B ({cached:?} cached)"
+        );
+        assert!(
+            !vault_b.is_file_deleted("note.md"),
+            "note.md must still resolve to the alive winner on B ({cached:?} cached)"
+        );
+        assert!(
+            fs_b.exists("note.md").await.unwrap(),
+            "note.md must NOT be physically deleted on B when an alive winner occupies the path ({cached:?} cached)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cross_peer_dedupe_keeps_file_winner_cached() {
+        // B cached the WINNER pre-import: the tombstone lands on the non-cached loser. The
+        // file is safe here even without the alive-guard, but proving it keeps the dedupe
+        // honest across both FxHashMap orderings.
+        cross_peer_dedupe_keeps_file(CachedTwin::Winner).await;
+    }
+
+    #[tokio::test]
+    async fn test_cross_peer_dedupe_keeps_file_loser_cached() {
+        // B cached the LOSER pre-import: the tombstone lands on the cached node, which is the
+        // exact case the deleted-paths alive-guard exists for. Only this ordering exercises
+        // the fix; without it B would lose note.md.
+        cross_peer_dedupe_keeps_file(CachedTwin::Loser).await;
+    }
 }
