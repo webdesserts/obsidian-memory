@@ -206,6 +206,9 @@ pub enum VaultError {
     #[error("Corrupt metadata: {0}")]
     CorruptMetadata(String),
 
+    #[error("Corrupt registry: {0}")]
+    CorruptRegistry(String),
+
     #[error("Vault error: {0}")]
     Other(String),
 }
@@ -619,7 +622,13 @@ impl<F: FileSystem> Vault<F> {
             let doc = LoroDoc::new();
             // Author new registry ops under the device peer id before import
             doc.set_peer_id(author.as_u64()).ok();
-            doc.import(&bytes).ok();
+            // HARD-FAIL on a corrupt registry rather than swallowing the error.
+            // Falling back to an empty registry would re-index every file with fresh
+            // doc_ids → mass divergence from peers → "latest wins" content clobber.
+            // The desktop and daemon startup paths both surface this Err as a clean
+            // logged exit, which is the safe outcome. (See audit / hardening Item 3.)
+            doc.import(&bytes)
+                .map_err(|e| VaultError::CorruptRegistry(e.to_string()))?;
             doc
         } else {
             let doc = LoroDoc::new();
@@ -741,7 +750,13 @@ impl<F: FileSystem> Vault<F> {
         // Try to match orphaned .loro files to new markdown files by content
         for (old_hash, orphaned_doc) in &orphaned_docs {
             let orphaned_content_hash = orphaned_doc.content_hash();
-            let old_path = orphaned_doc.stored_path().unwrap_or_default();
+            // A legacy orphan with META_PATH="" yields Some("") here, which
+            // unwrap_or_default would not catch — fall back to the hash so the move
+            // log and report.moved.from carry a meaningful identifier, not "".
+            let old_path = orphaned_doc
+                .stored_path()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| old_hash.clone());
 
             for new_path in &new_files {
                 if matched_new_files.contains(new_path) {
@@ -773,52 +788,44 @@ impl<F: FileSystem> Vault<F> {
             }
         }
 
-        // Process remaining markdown files
+        // Process remaining markdown files.
+        //
+        // Each file is reconciled in isolation via `reconcile_one_file` and a
+        // per-file error never aborts the whole pass. reconcile runs inside
+        // Vault::load, so propagating a per-file fs error here would abort daemon
+        // startup over a single file (e.g. one race-deleted between the directory
+        // scan and this loop) — log-and-continue, mirroring `index_existing_files`
+        // and the orphan-quarantine branch. NotFound (a vanished file) is benign and
+        // debug-logged; other errors warn.
         for path in &md_files {
             if matched_new_files.contains(path) {
                 // Already handled as a move target
                 continue;
             }
 
-            let hash = simple_hash(path);
-            let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
-
-            if loro_hashes.contains(&hash) {
-                // Both exist - check if markdown was modified externally
-                if self.needs_reindex(path, &sync_path).await? {
-                    tracing::info!("File modified externally, re-indexing: {}", path);
-                    self.reindex_file(path).await?;
-                    report.reindexed.push(path.clone());
+            match self
+                .reconcile_one_file(path, &loro_hashes, &mut report)
+                .await
+            {
+                Ok(()) => {}
+                Err(VaultError::Fs(FsError::NotFound(_))) => {
+                    tracing::debug!("Skipping race-deleted file during reconcile: {}", path);
                 }
-            } else if self.is_path_deleted_in_registry(path) {
-                // A disk `.md` whose registry state is tombstoned is an untracked
-                // orphan (a historical-bug or offline-window strand), not a new file.
-                // Quarantine it to .trash/ instead of resurrecting it as a new node.
-                // The .trash/ exclusion in list_files (and the watcher) is what keeps
-                // this idempotent — the moved file is no longer a reconcile candidate.
-                //
-                // Log-and-continue (mirroring index_existing_files): reconcile runs
-                // inside Vault::load, so propagating a per-orphan fs error here would
-                // abort daemon startup over a single unquarantineable file. Cleanup of
-                // one orphan failing must not block the vault from loading.
-                if let Err(e) = self.quarantine_orphan(path).await {
-                    tracing::warn!("Failed to quarantine orphan {}: {}", path, e);
-                } else {
-                    report.quarantined.push(path.clone());
+                Err(e) => {
+                    tracing::warn!("Failed to reconcile {}: {}", path, e);
                 }
-            } else {
-                // Truly new file (not a move target, not a tombstoned orphan).
-                // on_file_changed registers the new file node in the tree as part of
-                // creating its document, so no separate register_file call is needed.
-                tracing::info!("New file detected, indexing: {}", path);
-                self.on_file_changed(path).await?;
-                report.indexed.push(path.clone());
             }
         }
 
         // Report orphaned .loro files that weren't matched to moves
         for (hash, doc) in &orphaned_docs {
-            let old_path = doc.stored_path().unwrap_or_else(|| hash.clone());
+            // Legacy orphans persisted before `5fd4a63` may carry META_PATH="", so
+            // stored_path() returns Some("") and won't fall back on its own. Filter
+            // the empty string so the warning + report carry the hash, not "".
+            let old_path = doc
+                .stored_path()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| hash.clone());
             let was_moved = report.moved.iter().any(|m| m.from == old_path);
             if !was_moved {
                 tracing::warn!("Orphaned .loro file (deleted?): {}", old_path);
@@ -835,6 +842,57 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(report)
+    }
+
+    /// Reconcile a single markdown file against its Loro state, recording the
+    /// outcome in `report`.
+    ///
+    /// Extracted from `reconcile`'s per-file loop so the caller can apply one
+    /// log-and-continue handler around every branch (a file race-deleted mid-scan
+    /// must not abort `Vault::load`). The quarantine branch keeps its own inner
+    /// log-and-continue so a quarantine failure surfaces its specific message and
+    /// is never mistaken for a generic reconcile error by the caller.
+    async fn reconcile_one_file(
+        &self,
+        path: &str,
+        loro_hashes: &std::collections::HashSet<String>,
+        report: &mut ReconcileReport,
+    ) -> Result<()> {
+        let hash = simple_hash(path);
+        let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
+
+        if loro_hashes.contains(&hash) {
+            // Both exist - check if markdown was modified externally
+            if self.needs_reindex(path, &sync_path).await? {
+                tracing::info!("File modified externally, re-indexing: {}", path);
+                self.reindex_file(path).await?;
+                report.reindexed.push(path.to_string());
+            }
+        } else if self.is_path_deleted_in_registry(path) {
+            // A disk `.md` whose registry state is tombstoned is an untracked
+            // orphan (a historical-bug or offline-window strand), not a new file.
+            // Quarantine it to .trash/ instead of resurrecting it as a new node.
+            // The .trash/ exclusion in list_files (and the watcher) is what keeps
+            // this idempotent — the moved file is no longer a reconcile candidate.
+            //
+            // Inner log-and-continue (mirroring index_existing_files): cleanup of
+            // one orphan failing must not block the vault from loading, and its
+            // specific failure message is more useful than the caller's generic one.
+            if let Err(e) = self.quarantine_orphan(path).await {
+                tracing::warn!("Failed to quarantine orphan {}: {}", path, e);
+            } else {
+                report.quarantined.push(path.to_string());
+            }
+        } else {
+            // Truly new file (not a move target, not a tombstoned orphan).
+            // on_file_changed registers the new file node in the tree as part of
+            // creating its document, so no separate register_file call is needed.
+            tracing::info!("New file detected, indexing: {}", path);
+            self.on_file_changed(path).await?;
+            report.indexed.push(path.to_string());
+        }
+
+        Ok(())
     }
 
     /// Move a tombstoned disk orphan to `.trash/<path>`.
@@ -2480,6 +2538,113 @@ mod tests {
         assert!(files.contains(&"knowledge/note.md".to_string()));
     }
 
+    #[tokio::test]
+    async fn test_reconcile_skips_race_deleted_file() {
+        // A markdown file deleted between list_files() and the per-file reconcile
+        // body (a race window during startup scan) must NOT abort Vault::load. The
+        // surviving files reconcile normally; the vanished one is skipped.
+        use std::sync::Arc;
+
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("keep.md", b"# Keep").await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // A brand-new file appears (no .loro yet). The wrapping filesystem lets
+        // list_files() still enumerate it but returns FsError::NotFound when reconcile
+        // reads it to index — exactly the race where a file vanishes between the
+        // directory scan and the per-file body.
+        fs.write("racy.md", b"# Racy").await.unwrap();
+        let race_fs = Arc::new(VanishOnReadFs::new(Arc::clone(&fs), "racy.md"));
+
+        // Before the fix: NotFound propagates through reconcile → Vault::load → Err.
+        // After: the file is skipped (debug-logged), load succeeds, survivor present.
+        let vault = Vault::load(race_fs, test_peer_id())
+            .await
+            .expect("Vault::load must survive a race-deleted file during reconcile");
+
+        let files = vault.list_files().await.unwrap();
+        assert!(
+            files.contains(&"keep.md".to_string()),
+            "surviving file should still reconcile, got: {:?}",
+            files
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_with_corrupt_registry_returns_error() {
+        // A corrupt registry.loro must HARD-FAIL the load rather than silently
+        // falling back to an empty registry. An empty registry re-indexes every file
+        // with fresh doc_ids → mass divergence from peers → latest-wins content
+        // clobber. Failing loud is the only safe behavior. (See Item 3 / audit.)
+        use std::sync::Arc;
+
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("note.md", b"# Note").await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Corrupt the persisted registry.
+        fs.write(REGISTRY_FILE, b"not a valid loro snapshot")
+            .await
+            .unwrap();
+
+        let result = Vault::load(Arc::clone(&fs), test_peer_id()).await;
+        assert!(
+            matches!(result, Err(VaultError::CorruptRegistry(_))),
+            "corrupt registry must fail with CorruptRegistry, got: {:?}",
+            result.map(|_| "Ok(vault)")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_orphan_warning_uses_hash_for_empty_path() {
+        // A legacy orphan .loro persisted with META_PATH="" (written by the
+        // pre-5fd4a63 orphan loader that passed "" to from_bytes) must be reported
+        // under its hash, not an empty string. stored_path() returns Some("") for
+        // such docs, so the unwrap_or fallbacks don't fire — a defensive
+        // empty-string filter is what keeps the warning/report meaningful.
+        use std::sync::Arc;
+
+        let fs = Arc::new(InMemoryFs::new());
+
+        fs.write("legacy.md", b"# Legacy").await.unwrap();
+        let _vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Rewrite the file's .loro so its stored META_PATH is "" — exactly the state
+        // a pre-fix orphan loader left on disk. from_bytes("", ...) overwrites
+        // META_PATH with the empty string.
+        let hash = simple_hash("legacy.md");
+        let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
+        let bytes = fs.read(&sync_path).await.unwrap();
+        let legacy = NoteDocument::from_bytes("", &bytes, test_peer_id()).unwrap();
+        assert_eq!(
+            legacy.stored_path().as_deref(),
+            Some(""),
+            "test setup must produce a doc with empty stored path"
+        );
+        fs.write(&sync_path, &legacy.export_snapshot())
+            .await
+            .unwrap();
+
+        // Delete the markdown so the .loro becomes an orphan on reconcile.
+        fs.delete("legacy.md").await.unwrap();
+
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let report = vault.reconcile().await.unwrap();
+
+        assert!(
+            !report.orphaned.contains(&String::new()),
+            "orphan report must not carry an empty path, got: {:?}",
+            report.orphaned
+        );
+        assert!(
+            report.orphaned.contains(&hash),
+            "orphan report should fall back to the hash for an empty stored path, got: {:?}",
+            report.orphaned
+        );
+    }
+
     // ========== Tree Operation Tests ==========
 
     // ========== Registry Persistence Tests ==========
@@ -3558,6 +3723,56 @@ mod tests {
             !fs.exists(".trash/dup.md").await.unwrap(),
             "no .trash entry for an alive-duplicate path"
         );
+    }
+
+    /// Test fs that delegates to a shared InMemoryFs but returns
+    /// `FsError::NotFound` when reading a specific armed path, simulating a file
+    /// that was deleted after `list_files()` enumerated it but before the per-file
+    /// reconcile body read it (the startup-scan race).
+    struct VanishOnReadFs {
+        inner: std::sync::Arc<InMemoryFs>,
+        vanish_path: String,
+    }
+
+    impl VanishOnReadFs {
+        fn new(inner: std::sync::Arc<InMemoryFs>, vanish_path: &str) -> Self {
+            Self {
+                inner,
+                vanish_path: vanish_path.to_string(),
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl FileSystem for VanishOnReadFs {
+        async fn read(&self, path: &str) -> crate::fs::Result<Vec<u8>> {
+            if path == self.vanish_path {
+                return Err(FsError::NotFound(path.to_string()));
+            }
+            self.inner.read(path).await
+        }
+        async fn write(&self, path: &str, content: &[u8]) -> crate::fs::Result<()> {
+            self.inner.write(path, content).await
+        }
+        async fn list(&self, path: &str) -> crate::fs::Result<Vec<crate::fs::FileEntry>> {
+            self.inner.list(path).await
+        }
+        async fn delete(&self, path: &str) -> crate::fs::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn exists(&self, path: &str) -> crate::fs::Result<bool> {
+            self.inner.exists(path).await
+        }
+        async fn stat(&self, path: &str) -> crate::fs::Result<crate::fs::FileStat> {
+            self.inner.stat(path).await
+        }
+        async fn mkdir(&self, path: &str) -> crate::fs::Result<()> {
+            self.inner.mkdir(path).await
+        }
+        async fn rename(&self, from: &str, to: &str) -> crate::fs::Result<()> {
+            self.inner.rename(from, to).await
+        }
     }
 
     /// Test fs that delegates to a shared InMemoryFs but fails writes into
