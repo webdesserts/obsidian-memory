@@ -365,6 +365,17 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                         GossipEvent::AllowlistUpdate { from, peer } => {
                             self.on_allowlist_update_received(from, peer).await;
                         }
+                        GossipEvent::AllowlistRoster { from, peers } => {
+                            // The roster-merge handler (sender-trust gate + merge_roster)
+                            // and the NeighborUp/reconcile senders land in the next
+                            // cluster. Until then, log and drop so an early roster from
+                            // an upgraded peer is a safe no-op rather than a panic.
+                            debug!(
+                                from = %from,
+                                count = peers.len(),
+                                "Allowlist roster received (handler not wired yet — ignoring)"
+                            );
+                        }
                     }
                 }
 

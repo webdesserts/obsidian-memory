@@ -438,6 +438,43 @@ mod network_integration {
         );
         assert_eq!(received.1.device_name, "new-device");
 
+        // B also broadcasts a full membership roster (the convergence path used on
+        // reconnect/reconcile). A receives it as an AllowlistRoster event, carrying
+        // every entry including a tombstone, so revocations propagate too.
+        let mut tombstoned = AllowedPeer::new(PeerId::from_bytes([0x99u8; 32]), "revoked");
+        tombstoned.removed = true;
+        tombstoned.removed_at = Some(1_700_000_000_000);
+        let roster = vec![new_peer.clone(), tombstoned.clone()];
+        gossip_b.broadcast_allowlist_roster(&roster).await?;
+
+        let received_roster = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match gossip_a.event_rx.recv().await {
+                    Some(GossipEvent::AllowlistRoster { from, peers }) => break (from, peers),
+                    Some(_) => continue,
+                    None => panic!("gossip_a event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for A to receive AllowlistRoster");
+
+        assert_eq!(
+            received_roster.0, node_b_id,
+            "AllowlistRoster.from should be B's id"
+        );
+        assert_eq!(received_roster.1.len(), 2, "roster should carry both entries");
+        let received_tombstone = received_roster
+            .1
+            .iter()
+            .find(|p| p.node_id == tombstoned.node_id)
+            .expect("roster should include the tombstoned peer");
+        assert!(
+            received_tombstone.removed,
+            "tombstone flag must survive the round-trip so revocations propagate"
+        );
+        assert_eq!(received_tombstone.removed_at, Some(1_700_000_000_000));
+
         Ok(())
     }
 

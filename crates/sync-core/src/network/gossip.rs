@@ -56,6 +56,11 @@ pub enum GossipMessage {
     ChangeNotification(ChangeNotification),
     /// A peer was added to the allowlist — receiving peers should add them locally.
     AllowlistUpdate(AllowedPeer),
+    /// The sender's full membership roster (live peers + tombstones) — receiving
+    /// peers merge it by union with tombstone-precedence to converge on one
+    /// allowlist. Sent on reconnect/reconcile so trust propagates even to peers
+    /// that were offline at a pairing's single-shot `AllowlistUpdate` broadcast.
+    AllowlistRoster(Vec<AllowedPeer>),
 }
 
 /// Events produced by the gossip subscription loop.
@@ -72,6 +77,12 @@ pub enum GossipEvent {
     },
     /// A peer was added to the allowlist by a trusted mesh member.
     AllowlistUpdate { from: EndpointId, peer: AllowedPeer },
+    /// A full membership roster received from a trusted mesh member, to be
+    /// merged into the local allowlist by union with tombstone-precedence.
+    AllowlistRoster {
+        from: EndpointId,
+        peers: Vec<AllowedPeer>,
+    },
 }
 
 /// Handle for a vault-scoped gossip subscription.
@@ -129,6 +140,13 @@ impl VaultGossip {
                                     peer,
                                 }
                             }
+                            Ok(GossipMessage::AllowlistRoster(peers)) => {
+                                debug!(count = peers.len(), from = %msg.delivered_from, "Allowlist roster received");
+                                GossipEvent::AllowlistRoster {
+                                    from: msg.delivered_from,
+                                    peers,
+                                }
+                            }
                             Err(e) => {
                                 warn!(
                                     "Failed to deserialize gossip message from {}: {}",
@@ -176,6 +194,18 @@ impl VaultGossip {
     /// allowlist if the sender is trusted.
     pub async fn broadcast_allowlist_update(&mut self, peer: &AllowedPeer) -> Result<()> {
         let msg = GossipMessage::AllowlistUpdate(peer.clone());
+        self.broadcast_message(&msg).await
+    }
+
+    /// Broadcast the full membership roster to all vault peers.
+    ///
+    /// Used by the reconnect/reconcile convergence path so a peer that missed a
+    /// pairing's single-shot `AllowlistUpdate` still learns the whole roster.
+    /// Goes through `broadcast_message`, so it inherits the 1KB size cap — the
+    /// caller is responsible for the pre-check and per-peer-delta fallback when a
+    /// large roster would exceed it (see the daemon's `push_allowlist_roster`).
+    pub async fn broadcast_allowlist_roster(&mut self, peers: &[AllowedPeer]) -> Result<()> {
+        let msg = GossipMessage::AllowlistRoster(peers.to_vec());
         self.broadcast_message(&msg).await
     }
 
