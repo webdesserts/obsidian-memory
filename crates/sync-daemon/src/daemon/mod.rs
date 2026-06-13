@@ -51,18 +51,53 @@ pub(crate) fn now_ms() -> u64 {
 /// blip self-resolve before the supervisor acts.
 const RECONNECT_BASE_MS: u64 = 5_000;
 
-/// Steady-state partition retry ceiling. With 2× growth from the 5s base, a
-/// peer offline for hours costs one re-seed + one `rejoin_peers` per minute —
-/// negligible CPU and one log line/minute — while still reconnecting within a
-/// minute once the peer returns (vs the pre-supervisor "never").
-const RECONNECT_CAP_MS: u64 = 60_000;
-
-/// Advance the reconnect backoff: double, saturating at the cap.
+/// Base interval for a fresh/briefly-unreachable hint's reconnect attempts.
 ///
-/// The supervisor resets to [`RECONNECT_BASE_MS`] whenever it observes a live
-/// neighbor; this only grows the interval while partitioned.
-fn next_reconnect_backoff(current: u64) -> u64 {
-    current.saturating_mul(2).min(RECONNECT_CAP_MS)
+/// `60s` matches the old global reconnect ceiling, so a healthy hint retries on
+/// the same cadence the supervisor used before per-hint backoff existed — no
+/// behavior change for the common transient-drop case.
+const HINT_BACKOFF_BASE_MS: u64 = 60_000;
+
+/// Shift ceiling for the per-hint backoff. `60s << 5 ≈ 32 min`, which bounds
+/// growth and keeps the shift well clear of overflow.
+const HINT_BACKOFF_CEIL: u32 = 5;
+
+/// Maximum per-hint backoff. A dead hint is re-added + dialed roughly twice an
+/// hour — frequent enough to catch a returning peer, rare enough that the
+/// failed-dial burst is negligible noise (vs the continuous loop we're fixing).
+const MAX_HINT_BACKOFF_MS: u64 = 1_800_000;
+
+/// Consecutive failed attempts after which a hint is considered "stale": it
+/// gets the max-backoff cadence and the one-shot eviction log. Low enough to
+/// quiet noise within ~an hour of a peer going dark, high enough not to throttle
+/// a few-minute flaky outage.
+const STALE_FAILURE_THRESHOLD: u32 = 5;
+
+/// Per-hint exponential backoff window from a hint's consecutive failure count.
+///
+/// `HINT_BACKOFF_BASE_MS << min(failure_count, HINT_BACKOFF_CEIL)`, saturating
+/// at [`MAX_HINT_BACKOFF_MS`]. Throttles a dead hint's attempt cadence WITHOUT
+/// abandoning it — even the stalest hint is re-dialed once per returned window.
+fn per_hint_backoff(failure_count: u32) -> u64 {
+    let shift = failure_count.min(HINT_BACKOFF_CEIL);
+    (HINT_BACKOFF_BASE_MS << shift).min(MAX_HINT_BACKOFF_MS)
+}
+
+/// Whether a hint is due for another reconnect attempt at `now_ms`.
+///
+/// A never-attempted hint (`last_attempt_ms == None`) is due immediately — we
+/// have never tried it, so there is nothing to back off from. For an
+/// already-attempted hint the elapsed math uses `saturating_sub` so a backward
+/// clock jump (a `last_attempt_ms` in the future) yields `0` elapsed — the hint
+/// reads not-yet-due for one window, then becomes due again, never permanently
+/// wedged.
+fn hint_attempt_due(hint: &crate::persistence::PeerRelay, now_ms: u64) -> bool {
+    match hint.last_attempt_ms {
+        None => true,
+        Some(last_attempt) => {
+            now_ms.saturating_sub(last_attempt) >= per_hint_backoff(hint.failure_count)
+        }
+    }
 }
 
 /// Configuration for running the sync daemon.
@@ -147,15 +182,11 @@ pub struct Daemon<FS: FileSystem, AL> {
     initiator_outcome_rx: mpsc::UnboundedReceiver<InitiatorPairOutcome>,
 
     // ── reconnect supervisor ────────────────────────────────────────────────
-    /// Steady wake cadence for the reconnect supervisor. Backoff decides whether
-    /// a given wake actually attempts a re-dial (see `next_attempt_at_ms`).
+    /// Steady wake cadence for the reconnect supervisor. Per-hint backoff
+    /// (tracked on each `PeerRelay`'s freshness fields) decides whether a given
+    /// hint actually attempts a re-dial on a wake — there is no longer a single
+    /// global backoff gate.
     reconnect_tick: tokio::time::Interval,
-    /// Current reconnect backoff in ms. Starts at [`RECONNECT_BASE_MS`], doubles
-    /// (capped at [`RECONNECT_CAP_MS`]) on each partitioned attempt, resets on the
-    /// tick that observes a live neighbor.
-    reconnect_backoff_ms: u64,
-    /// Earliest wall-clock ms for the next reconnect attempt. `0` = attempt now.
-    next_attempt_at_ms: u64,
     /// In-memory snapshot of persisted peer relay hints, the supervisor's source
     /// of truth for who to re-dial. Populated at startup from `DaemonConfig` and
     /// updated when pairing learns a peer's relay. Held in memory (not reloaded
@@ -214,8 +245,6 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             initiator_outcome_tx,
             initiator_outcome_rx,
             reconnect_tick,
-            reconnect_backoff_ms: RECONNECT_BASE_MS,
-            next_attempt_at_ms: 0,
             peer_relays: Vec::new(),
         }
     }
@@ -371,29 +400,40 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
-    /// Reconnect supervisor: heal a partition by re-seeding relay hints and
-    /// re-bootstrapping gossip, without a process restart.
+    /// Reconnect supervisor: heal a partition by re-dialing peer relay hints,
+    /// without a process restart — now with per-hint backoff and eviction.
     ///
-    /// Runs on a steady tick; backoff (tracked in `reconnect_backoff_ms` /
-    /// `next_attempt_at_ms`) decides whether a given wake actually attempts a
-    /// re-dial. The state machine:
+    /// Runs on a steady tick. There is no single global backoff gate: each hint
+    /// carries its own freshness (`failure_count` / `last_attempt_ms`) and is
+    /// throttled independently. The state machine:
     ///
-    /// 1. A live neighbor → connected. Reset backoff and return (no log spam).
+    /// 1. A live neighbor → connected. Return (no log spam, no churn).
     /// 2. No known peer relays → nothing to chase (unpaired or hint-less). Return.
-    /// 3. Not yet due (`now_ms() < next_attempt_at_ms`) → return.
-    /// 4. Attempt: overwrite each peer's relay hint (`set_peer_relay`, clearing
-    ///    any stale URL) and call `rejoin_peers` with the peer EndpointIds. A
-    ///    successful re-dial surfaces as a normal `NeighborUp` → `on_neighbor_up`
-    ///    → full sync, exactly like a fresh start. Then grow the backoff.
+    /// 3. For each hint, `hint_attempt_due` decides:
+    ///    - **Due:** re-seed its relay (`set_peer_relay`) and re-bootstrap gossip
+    ///      toward its EndpointId. An unparseable URL skips the seed but STILL
+    ///      bootstraps by EndpointId — mDNS or a prior direct address may reach
+    ///      it on-LAN. `last_attempt_ms` is stamped now.
+    ///    - **Not due (throttled):** EVICT the hint from the address-lookup
+    ///      (`remove_peer_relay`). This is the core of the fix — eviction is the
+    ///      only thing that stops iroh-gossip's HyParView from re-resolving and
+    ///      re-feeding the dead relay to iroh's relay actor.
+    /// 4. `rejoin_peers` with just the due hints. A successful re-dial surfaces
+    ///    as a normal `NeighborUp` → `on_neighbor_up` → full sync.
+    /// 5. Since step 1 already returned when connected, reaching here means zero
+    ///    neighbors — so every hint dialed this tick failed. Bump `failure_count`
+    ///    (in memory + persisted, so the throttle survives a restart) and emit
+    ///    the one-shot eviction log when a hint first crosses the stale threshold.
     ///
-    /// Backoff resets on the tick that observes a live neighbor (step 1), not in
-    /// `on_neighbor_up`, keeping the supervisor state machine self-contained; the
-    /// one-tick reset lag is harmless.
+    /// **Last-hint guarantee:** a due hint is ALWAYS re-added regardless of how
+    /// high its `failure_count` is (the per-hint backoff caps, so even the
+    /// stalest hint comes due within [`MAX_HINT_BACKOFF_MS`]). Eviction only ever
+    /// removes the in-memory lookup entry, never the durable `PeerRelay` row — a
+    /// genuinely off-LAN peer that returns is still reached on the slow cadence,
+    /// and learn-on-exchange resets it the instant it reconnects.
     async fn on_reconnect_tick(&mut self) {
-        // Step 1: connected — reset and stay quiet.
+        // Step 1: connected — stay quiet and don't churn the swarm.
         if self.peer_registry.lock().await.alive_count() > 0 {
-            self.reconnect_backoff_ms = RECONNECT_BASE_MS;
-            self.next_attempt_at_ms = 0;
             return;
         }
 
@@ -402,26 +442,38 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         }
 
-        // Step 3: not yet due.
-        if now_ms() < self.next_attempt_at_ms {
-            return;
-        }
-
-        // Step 4: re-seed every known hint (overwrite stale relays) and collect
-        // the peer EndpointIds to re-bootstrap gossip toward.
+        let now = now_ms();
         let mut bootstrap_ids: Vec<EndpointId> = Vec::new();
-        for peer_relay in &self.peer_relays {
-            let Ok(endpoint_id) = peer_relay.endpoint_id.parse::<EndpointId>() else {
+        // EndpointIds dialed this tick, so we can attribute the (coarse) failure
+        // after the attempt if no neighbor materializes.
+        let mut due_ids: Vec<EndpointId> = Vec::new();
+
+        // Decide per hint, applying node calls (set/remove) and stamping the
+        // in-memory `last_attempt_ms` for due hints as we go.
+        for hint in self.peer_relays.iter_mut() {
+            let Ok(endpoint_id) = hint.endpoint_id.parse::<EndpointId>() else {
                 // Malformed snapshot entry — skip silently; startup already warned
                 // about this entry at load time.
                 continue;
             };
-            if let Ok(relay_url) = peer_relay.relay_url.parse::<iroh::RelayUrl>() {
-                self.sync_node.set_peer_relay(endpoint_id, &relay_url);
+
+            if hint_attempt_due(hint, now) {
+                // Re-add the hint and dial it. Re-add is UNCONDITIONAL of
+                // failure_count — the last-hint guarantee that a returning
+                // off-LAN peer is never stranded.
+                if let Ok(relay_url) = hint.relay_url.parse::<iroh::RelayUrl>() {
+                    self.sync_node.set_peer_relay(endpoint_id, &relay_url);
+                }
+                // Even with an unparseable URL, still bootstrap by EndpointId —
+                // mDNS or a prior direct address may reach the peer on-LAN.
+                hint.last_attempt_ms = Some(now);
+                bootstrap_ids.push(endpoint_id);
+                due_ids.push(endpoint_id);
+            } else {
+                // Throttled: evict from the lookup so nothing re-resolves the
+                // dead relay until the hint comes due again.
+                self.sync_node.remove_peer_relay(endpoint_id);
             }
-            // Even if the relay URL is unparseable, still try to re-bootstrap by
-            // EndpointId — mDNS or a previously-seeded direct address may resolve.
-            bootstrap_ids.push(endpoint_id);
         }
 
         if bootstrap_ids.is_empty() {
@@ -434,14 +486,63 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         } else {
             info!(
                 hints = attempt_count,
-                backoff_ms = self.reconnect_backoff_ms,
-                "Reconnect attempt: re-seeded hints, re-bootstrapping gossip"
+                "Reconnect attempt: re-seeded due hints, re-bootstrapping gossip"
             );
         }
 
-        // Grow backoff and schedule the next attempt.
-        self.reconnect_backoff_ms = next_reconnect_backoff(self.reconnect_backoff_ms);
-        self.next_attempt_at_ms = now_ms() + self.reconnect_backoff_ms;
+        // Step 5: every due hint failed to yield a neighbor this tick (step 1
+        // returned when connected). Record the failure so the throttle ramps and
+        // survives a restart.
+        self.record_due_hint_failures(&due_ids, now).await;
+    }
+
+    /// Bump `failure_count` for each hint dialed-but-unconnected this tick.
+    ///
+    /// Updates the in-memory snapshot (drives the next tick's throttle) and
+    /// persists to `daemon.toml` (so the throttle survives a restart — the
+    /// restart-reflood is the symptom this feature kills). Persistence is a
+    /// load → mutate → save against disk, mirroring `pair_shared::persist_adopted_relay`,
+    /// done at most once per backoff window per hint (cheap). Emits the one-shot
+    /// eviction log when a hint first crosses [`STALE_FAILURE_THRESHOLD`].
+    async fn record_due_hint_failures(&mut self, due_ids: &[EndpointId], now: u64) {
+        if due_ids.is_empty() {
+            return;
+        }
+
+        let due_hex: Vec<String> = due_ids.iter().map(|id| id.to_string()).collect();
+
+        // In-memory bump + one-shot stale-transition log.
+        for hint in self.peer_relays.iter_mut() {
+            if due_hex.contains(&hint.endpoint_id) {
+                hint.failure_count = hint.failure_count.saturating_add(1);
+                if hint.failure_count == STALE_FAILURE_THRESHOLD {
+                    info!(
+                        endpoint_id = %hint.endpoint_id,
+                        failure_count = hint.failure_count,
+                        backoff_ms = MAX_HINT_BACKOFF_MS,
+                        "Peer relay hint stale — evicting from lookup, retrying slowly"
+                    );
+                }
+            }
+        }
+
+        // Persist the throttle. The daemon doesn't hold a live DaemonConfig, so
+        // load → record_hint_failure (which saves) → done, per due hint.
+        match crate::persistence::DaemonConfig::load_or_generate(&self.vault_path, None).await {
+            Ok((mut config, _identity)) => {
+                for hex in &due_hex {
+                    if let Err(e) = config.record_hint_failure(hex, now, &self.vault_path) {
+                        warn!("Failed to persist reconnect hint failure: {e}");
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                // Non-fatal: the in-memory throttle still works this session; only
+                // the across-restart persistence is lost.
+                warn!("Failed to load daemon config to persist hint failure: {e}");
+            }
+        }
     }
 
     /// Shrink the reconnect-supervisor tick interval so integration tests can
@@ -966,31 +1067,93 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
 #[cfg(test)]
 mod backoff_tests {
-    use super::{RECONNECT_BASE_MS, RECONNECT_CAP_MS, next_reconnect_backoff};
+    use super::{
+        HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, hint_attempt_due, per_hint_backoff,
+    };
+    use crate::persistence::PeerRelay;
 
-    /// Backoff doubles from the base, saturates at the cap, and never overflows.
+    // A failure count comfortably past the shift ceiling, to prove the clamp.
+    const STALE_OR_MORE: u32 = 10;
+
+    /// Build a synthetic hint carrying just the freshness state the pure
+    /// functions read (the endpoint_id/relay_url are irrelevant here).
+    fn hint(failure_count: u32, last_attempt_ms: Option<u64>) -> PeerRelay {
+        let mut h = PeerRelay::new("x".repeat(64), "http://relay:3340/".to_string());
+        h.failure_count = failure_count;
+        h.last_attempt_ms = last_attempt_ms;
+        h
+    }
+
+    /// Per-hint backoff doubles per failure, saturates at the cap, never overflows.
     #[test]
-    fn reconnect_backoff_grows_and_caps() {
-        // Doubling from the base.
-        assert_eq!(
-            next_reconnect_backoff(RECONNECT_BASE_MS),
-            RECONNECT_BASE_MS * 2
-        );
+    fn per_hint_backoff_grows_and_caps() {
+        // Zero failures → the base interval.
+        assert_eq!(per_hint_backoff(0), HINT_BACKOFF_BASE_MS);
+        // Each failure doubles the window.
+        assert_eq!(per_hint_backoff(1), HINT_BACKOFF_BASE_MS * 2);
+        assert_eq!(per_hint_backoff(2), HINT_BACKOFF_BASE_MS * 4);
 
-        // Climbs toward the cap, then saturates there.
-        let mut cur = RECONNECT_BASE_MS;
-        for _ in 0..20 {
-            cur = next_reconnect_backoff(cur);
-            assert!(cur <= RECONNECT_CAP_MS, "backoff must never exceed the cap");
+        // Climbs to and saturates at the cap; a huge failure count cannot
+        // overflow the shift (it's clamped to the ceiling) nor exceed the cap.
+        assert_eq!(per_hint_backoff(STALE_OR_MORE), MAX_HINT_BACKOFF_MS);
+        assert_eq!(per_hint_backoff(u32::MAX), MAX_HINT_BACKOFF_MS);
+        for fc in 0..50 {
+            assert!(
+                per_hint_backoff(fc) <= MAX_HINT_BACKOFF_MS,
+                "backoff must never exceed the cap"
+            );
         }
-        assert_eq!(cur, RECONNECT_CAP_MS, "backoff should reach the cap");
-        assert_eq!(
-            next_reconnect_backoff(RECONNECT_CAP_MS),
-            RECONNECT_CAP_MS,
-            "backoff at the cap stays at the cap"
-        );
+    }
 
-        // Saturating multiply guards against overflow near u64::MAX.
-        assert_eq!(next_reconnect_backoff(u64::MAX), RECONNECT_CAP_MS);
+    /// A never-attempted hint is due immediately.
+    #[test]
+    fn never_attempted_hint_is_due() {
+        assert!(hint_attempt_due(&hint(0, None), 0));
+        assert!(hint_attempt_due(&hint(9, None), 5_000_000));
+    }
+
+    /// A fresh hint (no failures) is due on the base cadence: not due before the
+    /// base window elapses, due once it does.
+    #[test]
+    fn fresh_hint_due_on_base_cadence() {
+        let h = hint(0, Some(1_000));
+        // Just before the base window: not due.
+        assert!(!hint_attempt_due(&h, 1_000 + HINT_BACKOFF_BASE_MS - 1));
+        // Exactly at the window: due.
+        assert!(hint_attempt_due(&h, 1_000 + HINT_BACKOFF_BASE_MS));
+    }
+
+    /// A throttled hint stays not-due inside its (longer) window and becomes due
+    /// after it — the failure_count widens the window.
+    #[test]
+    fn throttled_hint_respects_wider_window() {
+        let h = hint(2, Some(10_000));
+        let window = per_hint_backoff(2);
+        assert!(!hint_attempt_due(&h, 10_000 + window - 1));
+        assert!(hint_attempt_due(&h, 10_000 + window));
+    }
+
+    /// Last-hint guarantee: even the stalest hint comes due within the capped
+    /// window, so a returning off-LAN peer is never permanently abandoned.
+    #[test]
+    fn stalest_hint_eventually_due() {
+        let h = hint(u32::MAX, Some(0));
+        // One nanosecond before the cap elapses: still throttled.
+        assert!(!hint_attempt_due(&h, MAX_HINT_BACKOFF_MS - 1));
+        // At the cap: due again — re-added and dialed.
+        assert!(hint_attempt_due(&h, MAX_HINT_BACKOFF_MS));
+    }
+
+    /// Clock-backward tolerance: a `last_attempt_ms` in the future (clock jumped
+    /// back) yields `0` elapsed via saturating_sub, so the hint simply reads
+    /// not-yet-due rather than panicking or wedging. It comes due again once the
+    /// clock catches up — self-recovering within the re-add window.
+    #[test]
+    fn clock_backward_does_not_panic_or_wedge() {
+        let h = hint(0, Some(1_000_000));
+        // "Now" is before the recorded attempt — not due, no panic.
+        assert!(!hint_attempt_due(&h, 0));
+        // Once the clock advances past attempt + window, it's due again.
+        assert!(hint_attempt_due(&h, 1_000_000 + HINT_BACKOFF_BASE_MS));
     }
 }

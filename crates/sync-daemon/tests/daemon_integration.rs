@@ -1761,4 +1761,115 @@ mod daemon_integration {
 
         Ok(())
     }
+
+    /// The supervisor evicts a THROTTLED hint from the address-lookup but leaves
+    /// a DUE hint present — the core of the stale-hint fix.
+    ///
+    /// While partitioned (zero neighbors), `on_reconnect_tick` decides per hint:
+    /// a hint inside its backoff window (recent attempt + failures) is removed
+    /// from `MemoryLookup` so iroh-gossip can't re-resolve and re-feed the dead
+    /// relay; a hint that's due is re-seeded and dialed. We seed two hints into
+    /// A's `peer_lookup` up front, run the supervisor with no peer to connect to,
+    /// and assert: the throttled one is gone, the due one remains.
+    ///
+    /// Uses no embedded relay (immune to the live-app `test_sync_through_embedded_relay`
+    /// interference). Seeds 84/85/86 reserved (85/86 only supply valid EndpointIds).
+    #[tokio::test]
+    async fn supervisor_evicts_throttled_hint_keeps_due() -> anyhow::Result<()> {
+        use iroh::RelayUrl;
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(84).await?;
+        // 85/86 exist only to mint two valid, distinct peer EndpointIds.
+        let node_throttled = build_node(85).await?;
+        let node_due = build_node(86).await?;
+
+        let throttled_id = node_throttled.sync_node.node_id();
+        let due_id = node_due.sync_node.node_id();
+        let relay_url: RelayUrl = "http://example.com:3340/".parse()?;
+
+        // Seed BOTH hints into A's lookup so eviction is observable as a removal.
+        node_a.sync_node.set_peer_relay(throttled_id, &relay_url);
+        node_a.sync_node.set_peer_relay(due_id, &relay_url);
+
+        // A clone of the lookup shares the same backing store, so it observes the
+        // supervisor's mutations from outside the spawned event loop.
+        let lookup = node_a.sync_node.peer_lookup.clone();
+        assert!(
+            lookup.get_endpoint_info(throttled_id).is_some(),
+            "throttled hint should start present in the lookup"
+        );
+        assert!(
+            lookup.get_endpoint_info(due_id).is_some(),
+            "due hint should start present in the lookup"
+        );
+
+        // Snapshot: the throttled hint has failures and a just-now attempt, so it
+        // is well inside its backoff window (not due). The due hint has never been
+        // attempted, so it is due immediately.
+        let now = now_ms_test();
+        let mut throttled_hint =
+            PeerRelay::new(throttled_id.to_string(), "http://example.com:3340/".to_string());
+        throttled_hint.failure_count = 6;
+        throttled_hint.last_attempt_ms = Some(now);
+        let due_hint =
+            PeerRelay::new(due_id.to_string(), "http://example.com:3340/".to_string());
+
+        // A joins gossip with no bootstrap — it stays partitioned at zero
+        // neighbors, so the supervisor acts every tick.
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            // A non-existent vault path: persisting hint failures will fail
+            // gracefully (logged, non-fatal), but the in-memory eviction — what
+            // this test asserts — still runs.
+            "/test-vault-evict".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.seed_peer_relays_snapshot(vec![throttled_hint, due_hint]);
+        daemon_a.set_reconnect_interval(Duration::from_millis(100));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // The supervisor evicts the throttled hint while keeping the due one.
+        wait_until("throttled hint evicted from lookup", || {
+            let lookup = lookup.clone();
+            async move { lookup.get_endpoint_info(throttled_id).is_none() }
+        })
+        .await;
+
+        assert!(
+            lookup.get_endpoint_info(due_id).is_some(),
+            "due hint must remain in the lookup (re-seeded each due tick)"
+        );
+
+        a_shutdown.cancel();
+        let _ = a_loop.await;
+
+        Ok(())
+    }
+
+    /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
+    /// `last_attempt_ms` values land on the same clock the supervisor reads.
+    fn now_ms_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }

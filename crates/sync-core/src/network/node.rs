@@ -323,6 +323,32 @@ impl SyncNode {
         self.peer_lookup.set_endpoint_info(addr);
     }
 
+    /// Evict a peer's relay hint from the address-lookup service (native only).
+    ///
+    /// Removing the entry from `peer_lookup` (`MemoryLookup`) is the only lever
+    /// that stops a dead hint from being re-dialed: merely declining to re-seed
+    /// it is insufficient because iroh-gossip's HyParView maintenance ALSO
+    /// re-resolves whatever sits in the lookup on its own ~60s cadence, which
+    /// re-feeds iroh's relay actor. With the entry gone, no re-resolution source
+    /// can revive the relay, and iroh reaps the idle `ActiveRelayActor` within
+    /// ~60s — that is what actually quiets the "No route to host" warn loop.
+    ///
+    /// The reconnect supervisor calls this to throttle a stale hint, then
+    /// re-adds it via `set_peer_relay` on a slow cadence so a genuinely off-LAN
+    /// peer that returns is still reached. Removing an absent key is a harmless
+    /// no-op.
+    #[cfg(feature = "native")]
+    pub fn remove_peer_relay(&self, endpoint_id: EndpointId) {
+        if endpoint_id == self.node_id() {
+            tracing::warn!(
+                "remove_peer_relay called with our own EndpointId — ignoring for \
+                 consistency with add/set_peer_relay (we never seed ourselves)"
+            );
+            return;
+        }
+        self.peer_lookup.remove_endpoint_info(endpoint_id);
+    }
+
     /// Derive a deterministic gossip TopicId from a VaultId.
     ///
     /// Each vault gets its own gossip topic, scoped to peers who share that vault.
