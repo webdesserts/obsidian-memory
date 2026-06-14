@@ -85,7 +85,9 @@ async fn pair_inner(
     // Collect meshes for up to 10 seconds, deduplicating by vault_id.
     let mut meshes: HashMap<String, DiscoveredMesh> = HashMap::new();
 
-    let deadline = tokio::time::sleep(Duration::from_secs(DISCOVERY_TIMEOUT_SECS));
+    let deadline = tokio::time::sleep(sync_core::time_scale::scaled(Duration::from_secs(
+        DISCOVERY_TIMEOUT_SECS,
+    )));
     futures::pin_mut!(discovery_stream);
     futures::pin_mut!(deadline);
 

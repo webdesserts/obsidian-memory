@@ -210,6 +210,23 @@ async fn startup_inner(
         "Failed to acquire daemon lock — is another daemon already running on this vault?",
     )?;
 
+    // Seed the process-global test-time-scale from the env var, once, before any
+    // scaled duration is constructed below. Unset → never seeded → scale stays
+    // 1.0 → production timing is unchanged. This is the ONLY place the env var is
+    // read; the desktop app and WASM plugin never seed it.
+    if let Ok(raw) = std::env::var("OBSIDIAN_MEMORY_TIME_SCALE") {
+        match raw.parse::<f64>() {
+            Ok(scale) if sync_core::time_scale::set_time_scale(scale) => {
+                info!(
+                    scale,
+                    "OBSIDIAN_MEMORY_TIME_SCALE active — durations scaled (test mode)"
+                );
+            }
+            Ok(_) => {}
+            Err(_) => warn!(raw = %raw, "Ignoring unparseable OBSIDIAN_MEMORY_TIME_SCALE"),
+        }
+    }
+
     info!("Starting sync daemon");
     info!("Vault path: {:?}", config.vault);
 

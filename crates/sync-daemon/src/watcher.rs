@@ -62,7 +62,7 @@ impl FileWatcher {
 
         // Create debouncer with callback (notify-debouncer-mini 0.6 API)
         let mut debouncer = new_debouncer(
-            Duration::from_millis(200),
+            sync_core::time_scale::scaled(Duration::from_millis(200)),
             move |result: Result<Vec<DebouncedEvent>, notify::Error>| {
                 match result {
                     Ok(events) => {

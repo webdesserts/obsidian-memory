@@ -37,6 +37,7 @@ use sync_core::network::{
     streams::InboundSyncRequest,
 };
 use sync_core::pairing::{PairingChallenge, PairingSession};
+use sync_core::time_scale::{scaled, scaled_ms};
 use sync_core::{PeerId, PeerRegistry, Vault};
 
 pub(crate) fn now_ms() -> u64 {
@@ -88,7 +89,10 @@ const ROSTER_RECONCILE_MS: u64 = 60_000;
 /// abandoning it — even the stalest hint is re-dialed once per returned window.
 fn per_hint_backoff(failure_count: u32) -> u64 {
     let shift = failure_count.min(HINT_BACKOFF_CEIL);
-    (HINT_BACKOFF_BASE_MS << shift).min(MAX_HINT_BACKOFF_MS)
+    // Scale both the per-failure window and the ceiling so the test-time-scale
+    // shrinks the backoff cadence consistently (D4/D5). At scale 1.0 (prod) both
+    // calls return their input unchanged.
+    scaled_ms(HINT_BACKOFF_BASE_MS << shift).min(scaled_ms(MAX_HINT_BACKOFF_MS))
 }
 
 /// Whether a hint is due for another reconnect attempt at `now_ms`.
@@ -263,8 +267,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // The reconnect supervisor wakes on a steady cadence; backoff (tracked in
         // the fields below) gates whether a wake actually re-dials. `Delay` skips
         // missed ticks rather than bursting to catch up after a slow turn.
-        let mut reconnect_tick =
-            tokio::time::interval(std::time::Duration::from_millis(RECONNECT_BASE_MS));
+        let mut reconnect_tick = tokio::time::interval(scaled(std::time::Duration::from_millis(
+            RECONNECT_BASE_MS,
+        )));
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         Self {
@@ -292,7 +297,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             reconnect_tick,
             peer_relays: Vec::new(),
             last_roster_reconcile_ms: None,
-            roster_reconcile_interval_ms: ROSTER_RECONCILE_MS,
+            roster_reconcile_interval_ms: scaled_ms(ROSTER_RECONCILE_MS),
         }
     }
 

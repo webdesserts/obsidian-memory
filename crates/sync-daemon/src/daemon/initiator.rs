@@ -128,8 +128,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             use futures::StreamExt;
             use sync_core::network::discovery::mesh_from_discovery_event;
 
-            let deadline = tokio::time::sleep(std::time::Duration::from_secs(
-                INITIATOR_DISCOVERY_TIMEOUT_SECS,
+            let deadline = tokio::time::sleep(sync_core::time_scale::scaled(
+                std::time::Duration::from_secs(INITIATOR_DISCOVERY_TIMEOUT_SECS),
             ));
             futures::pin_mut!(stream);
             futures::pin_mut!(deadline);
