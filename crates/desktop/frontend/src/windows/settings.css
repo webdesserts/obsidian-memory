@@ -1,0 +1,23 @@
+/* Tailwind + webdesserts/ui token pipeline for the settings window.
+ *
+ * Mirrors ui/dev/main.css: pull in Tailwind, then ui's semantic token layer and
+ * the neapolitan preset that resolves those tokens to concrete colors. The
+ * @source globs tell Tailwind to scan ui's component source (so the classes the
+ * Button/TextInput components emit are generated) and this window's own source.
+ *
+ * These paths resolve relative to THIS file (src/windows/), so they're six hops
+ * up to the sibling `ui` checkout — deeper than the Vite alias (which resolves
+ * from the frontend root). We rely on --font-sans's built-in fallback chain
+ * instead of vendoring the Switzer woff2.
+ */
+@import "tailwindcss";
+@import "../../../../../../ui/src/tokens/semantic.css";
+@import "../../../../../../ui/src/tokens/presets/neapolitan.css";
+
+@source "../../../../../../ui/src";
+@source ".";
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+}
