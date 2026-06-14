@@ -32,6 +32,7 @@ pub mod peer_id;
 pub mod peers;
 pub mod sync;
 pub mod sync_engine;
+pub mod time_scale;
 pub mod vault;
 
 #[cfg(not(target_arch = "wasm32"))]
