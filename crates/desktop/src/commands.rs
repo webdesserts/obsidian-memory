@@ -7,6 +7,8 @@
 //! The daemon-side implementations of `StartDiscovery` and `SubmitCode` live in
 //! `crates/sync-daemon/src/daemon.rs` (commit 4).
 
+use std::path::Path;
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{mpsc, oneshot};
@@ -15,6 +17,7 @@ use tracing::warn;
 use sync_daemon::pair_api::DaemonCommand;
 
 use crate::ControlState;
+use crate::app_settings::AppSettings;
 
 /// Send a oneshot `DaemonCommand` and await its reply.
 ///
@@ -154,4 +157,137 @@ pub async fn cancel_pair_discovery(control: State<'_, ControlState>) -> Result<(
 #[tauri::command]
 pub async fn reject_inbound_pair(control: State<'_, ControlState>) -> Result<(), String> {
     dispatch(&control, |reply| DaemonCommand::RejectInbound { reply }).await
+}
+
+/// Current persisted app settings, sent to the settings panel on mount.
+///
+/// Both fields use the panel's own naming: an empty string means "not set" on the
+/// JS side, which is how the panel renders blank inputs. Absent stored values are
+/// serialized as empty strings rather than `null` so the panel can bind them
+/// directly to text inputs without null-coalescing.
+#[derive(Serialize)]
+pub struct SettingsPayload {
+    pub relay_url: String,
+    pub vault_path: String,
+}
+
+/// Validate a relay URL per decision D3: empty (cleared) is allowed, otherwise it
+/// must start with `http://` or `https://`. No network call is made — this is a
+/// cheap shape check to catch typos like a bare hostname or `ftp://`.
+///
+/// Returns `Ok(())` if valid, or an error message suitable for display in the panel.
+fn validate_relay_url(relay_url: &str) -> Result<(), String> {
+    if relay_url.is_empty()
+        || relay_url.starts_with("http://")
+        || relay_url.starts_with("https://")
+    {
+        Ok(())
+    } else {
+        Err("Relay URL must start with http:// or https://".to_string())
+    }
+}
+
+/// Validate a vault path per decision D4: it must be non-empty and point at an
+/// existing directory. The `is_dir` check is a cheap typo guard so a mistyped path
+/// is caught at save time rather than silently failing on the next launch.
+///
+/// Returns `Ok(())` if valid, or an error message suitable for display in the panel.
+fn validate_vault_path(vault_path: &str) -> Result<(), String> {
+    if vault_path.is_empty() {
+        return Err("Vault folder is required".to_string());
+    }
+    if !Path::new(vault_path).is_dir() {
+        return Err(format!("Vault folder does not exist: {vault_path}"));
+    }
+    Ok(())
+}
+
+/// Return the current persisted app settings for the settings panel.
+///
+/// Absent values come back as empty strings (see [`SettingsPayload`]).
+#[tauri::command]
+pub fn get_settings(app: AppHandle) -> Result<SettingsPayload, String> {
+    let settings = AppSettings::load(&app).map_err(|e| e.to_string())?;
+    Ok(SettingsPayload {
+        relay_url: settings.relay_url().unwrap_or_default().to_string(),
+        vault_path: settings
+            .vault_path()
+            .and_then(|p| p.to_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// Validate and persist the settings entered in the panel.
+///
+/// Validates both fields up front (D3 relay-URL shape, D4 vault-folder existence)
+/// and returns the first error without writing anything, so a rejected save leaves
+/// the stored settings untouched. On success, loads the current settings, sets both
+/// fields, and saves once — a single atomic store flush rather than two partial
+/// writes. Both fields take effect on the next app launch (see the restart notice
+/// in the panel); the running daemon is not reconfigured mid-session.
+#[tauri::command]
+pub fn save_settings(app: AppHandle, relay_url: String, vault_path: String) -> Result<(), String> {
+    validate_relay_url(&relay_url)?;
+    validate_vault_path(&vault_path)?;
+
+    let mut settings = AppSettings::load(&app).map_err(|e| e.to_string())?;
+    settings.set_relay_url(Some(relay_url));
+    settings.set_vault_path(vault_path.into());
+    settings.save(&app).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_url_empty_is_allowed() {
+        // Clearing the relay field is valid — it falls back to the detected LAN IP.
+        assert!(validate_relay_url("").is_ok());
+    }
+
+    #[test]
+    fn relay_url_http_and_https_allowed() {
+        assert!(validate_relay_url("http://192.168.1.10:3340/").is_ok());
+        assert!(validate_relay_url("https://umbra.computer/").is_ok());
+    }
+
+    #[test]
+    fn relay_url_rejects_bare_host_and_other_schemes() {
+        assert!(validate_relay_url("umbra.computer").is_err());
+        assert!(validate_relay_url("ftp://umbra.computer/").is_err());
+    }
+
+    #[test]
+    fn vault_path_empty_is_rejected() {
+        assert!(validate_vault_path("").is_err());
+    }
+
+    #[test]
+    fn vault_path_nonexistent_is_rejected() {
+        assert!(validate_vault_path("/no/such/vault/path/exists").is_err());
+    }
+
+    #[test]
+    fn vault_path_existing_directory_is_accepted() {
+        // A directory that reliably exists across machines; proves the is_dir guard
+        // accepts a real folder rather than rejecting everything.
+        let tmp = std::env::temp_dir();
+        assert!(
+            validate_vault_path(tmp.to_str().unwrap()).is_ok(),
+            "temp dir {tmp:?} should validate as an existing directory"
+        );
+    }
+
+    #[test]
+    fn vault_path_existing_file_is_rejected() {
+        // A file is not a directory — is_dir must reject it (the vault must be a folder).
+        let mut file = std::env::temp_dir();
+        file.push("obsidian-memory-validate-vault-test-file");
+        std::fs::write(&file, b"x").unwrap();
+        let result = validate_vault_path(file.to_str().unwrap());
+        let _ = std::fs::remove_file(&file);
+        assert!(result.is_err());
+    }
 }

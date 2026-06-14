@@ -125,8 +125,6 @@ impl AppSettings {
     /// a blank value. (The vault path relies on `resolve_vault_path` to filter empty
     /// strings at read time; the relay URL is read directly via `relay_url()`, so the
     /// guard lives at the write boundary instead.)
-    // Consumed by the `save_settings` command (next commit); no caller yet.
-    #[allow(dead_code)]
     pub fn set_relay_url(&mut self, url: Option<String>) {
         self.relay_url = url.filter(|s| !s.is_empty());
     }

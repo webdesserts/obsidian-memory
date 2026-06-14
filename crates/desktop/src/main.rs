@@ -7,6 +7,7 @@ mod daemon_task;
 mod notification;
 mod pair_events;
 mod pair_window;
+mod settings_window;
 mod shutdown;
 mod tray_status;
 
@@ -542,7 +543,9 @@ fn main() -> Result<()> {
                 .id("pair")
                 .build(app)?;
 
-            // Menu order: [status, sep, autostart, sep, pair, sep, quit]
+            let settings_item = MenuItemBuilder::new("Settings…").id("settings").build(app)?;
+
+            // Menu order (D1): [status, sep, autostart, sep, pair, sep, settings…, sep, quit]
             let menu = MenuBuilder::new(app)
                 .items(&[
                     &status_item,
@@ -550,6 +553,8 @@ fn main() -> Result<()> {
                     &autostart_item,
                     &PredefinedMenuItem::separator(app)?,
                     &pair_item,
+                    &PredefinedMenuItem::separator(app)?,
+                    &settings_item,
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItemBuilder::new("Quit").id("quit").build(app)?,
                 ])
@@ -580,6 +585,9 @@ fn main() -> Result<()> {
                         if let Err(e) = pair_window::open_initiator(&app_for_events) {
                             warn!("Failed to open pair initiator window: {}", e);
                         }
+                    }
+                    "settings" => {
+                        settings_window::open(&app_for_events);
                     }
                     "toggle-autostart" => {
                         let app = app_for_events.clone();
@@ -661,12 +669,15 @@ fn main() -> Result<()> {
             Ok(())
         })
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::start_pair_discovery,
             commands::request_pairing,
             commands::submit_pair_code,
             commands::cancel_pair_discovery,
             commands::reject_inbound_pair,
+            commands::get_settings,
+            commands::save_settings,
         ])
         .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri application error: {e}"))?
