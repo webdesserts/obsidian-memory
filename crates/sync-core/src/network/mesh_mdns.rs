@@ -569,7 +569,7 @@ impl MeshMdns {
                         // always reads a fresh deadline when it wakes from notified().
                         {
                             let mut guard = fast_until.lock().unwrap();
-                            *guard = Some(Instant::now() + FAST_PHASE_DURATION);
+                            *guard = Some(Instant::now() + crate::time_scale::scaled(FAST_PHASE_DURATION));
                         }
                         requery_wake.notify_one();
 
@@ -589,9 +589,9 @@ impl MeshMdns {
                                         let guard = fast_until_task.lock().unwrap();
                                         match *guard {
                                             Some(deadline) if Instant::now() < deadline => {
-                                                FAST_REQUERY_INTERVAL
+                                                crate::time_scale::scaled(FAST_REQUERY_INTERVAL)
                                             }
-                                            _ => SLOW_REQUERY_INTERVAL,
+                                            _ => crate::time_scale::scaled(SLOW_REQUERY_INTERVAL),
                                         }
                                     };
 

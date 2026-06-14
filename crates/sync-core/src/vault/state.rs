@@ -314,7 +314,7 @@ impl SyncState {
         let mut paths = self.synced_paths.lock().unwrap();
         if let Some(timestamp) = paths.remove(path) {
             // Check if flag is still valid (not expired)
-            if timestamp.elapsed() < FLAG_TTL {
+            if timestamp.elapsed() < crate::time_scale::scaled(FLAG_TTL) {
                 return true;
             }
             // Flag expired - log for diagnostics
@@ -333,7 +333,7 @@ impl SyncState {
     pub fn is_synced(&self, path: &str) -> bool {
         let paths = self.synced_paths.lock().unwrap();
         if let Some(timestamp) = paths.get(path) {
-            return timestamp.elapsed() < FLAG_TTL;
+            return timestamp.elapsed() < crate::time_scale::scaled(FLAG_TTL);
         }
         false
     }
@@ -343,7 +343,7 @@ impl SyncState {
     #[allow(dead_code)]
     pub fn cleanup_expired(&self) {
         let mut paths = self.synced_paths.lock().unwrap();
-        paths.retain(|_, timestamp| timestamp.elapsed() < FLAG_TTL);
+        paths.retain(|_, timestamp| timestamp.elapsed() < crate::time_scale::scaled(FLAG_TTL));
     }
 
     /// Take all paths pending reconciliation (called before sync import).

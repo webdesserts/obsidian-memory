@@ -302,7 +302,7 @@ impl ProtocolHandler for PairingStreamHandler {
         // Wait for the client to close so they can finish reading.
         tokio::select! {
             _ = connection.closed() => {}
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            _ = tokio::time::sleep(crate::time_scale::scaled(std::time::Duration::from_secs(30))) => {
                 debug!("Closing idle pairing connection after 30s");
                 connection.close(0u32.into(), b"timeout");
             }

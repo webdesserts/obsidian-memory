@@ -141,7 +141,7 @@ impl ProtocolHandler for SyncStreamHandler {
         // on a peer that crashes after receiving its response.
         tokio::select! {
             _ = connection.closed() => {}
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            _ = tokio::time::sleep(crate::time_scale::scaled(std::time::Duration::from_secs(30))) => {
                 debug!("Closing idle inbound connection after 30s timeout");
                 connection.close(0u32.into(), b"timeout");
             }
