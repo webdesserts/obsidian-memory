@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "paths": {
+      // Mirror the vite.config.ts / vitest.config.ts alias so tsc resolves
+      // @webdesserts/ui from source (four hops up to the sibling ui checkout).
+      "@webdesserts/ui": ["../../../../ui/src/index.ts"]
+    }
+  },
+  // The settings window (panel + entry) and its browser test are the real,
+  // contract-bearing code: SettingsPanel mirrors the Rust SettingsPayload and
+  // the camelCased invoke args, and the test pins that contract. src/main.tsx
+  // is an empty Phase-1 placeholder and is intentionally out of scope. The
+  // vite/vitest configs use Node globals (__dirname, "path") and would require
+  // @types/node to check — left out, matching the ui repo's convention.
+  "include": ["src/windows", "tests"]
+}
