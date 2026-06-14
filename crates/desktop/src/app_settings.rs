@@ -19,6 +19,9 @@ const STORE_PATH: &str = "app-settings.json";
 /// JSON key for the stored vault path.
 const KEY_VAULT_PATH: &str = "vault_path";
 
+/// JSON key for the stored relay URL.
+const KEY_RELAY_URL: &str = "relay_url";
+
 /// JSON key for the stored autostart-enabled flag.
 const KEY_AUTOSTART_ENABLED: &str = "autostart_enabled";
 
@@ -26,9 +29,10 @@ const KEY_AUTOSTART_ENABLED: &str = "autostart_enabled";
 ///
 /// Loaded from and saved to the `tauri-plugin-store` JSON file at startup and
 /// whenever a value changes. All fields have safe defaults (no vault path, no
-/// autostart).
+/// relay URL, no autostart).
 pub struct AppSettings {
     vault_path: Option<PathBuf>,
+    relay_url: Option<String>,
     autostart_enabled: bool,
 }
 
@@ -47,6 +51,13 @@ impl AppSettings {
             .get(KEY_VAULT_PATH)
             .and_then(|v| v.as_str().map(PathBuf::from));
 
+        // Treat a stored empty string as absent so a corrupted/blank write never
+        // surfaces as `Some("")` to the relay-URL resolution path.
+        let relay_url = store
+            .get(KEY_RELAY_URL)
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .filter(|s| !s.is_empty());
+
         let autostart_enabled = store
             .get(KEY_AUTOSTART_ENABLED)
             .and_then(|v| v.as_bool())
@@ -54,6 +65,7 @@ impl AppSettings {
 
         Ok(AppSettings {
             vault_path,
+            relay_url,
             autostart_enabled,
         })
     }
@@ -74,6 +86,12 @@ impl AppSettings {
             store.delete(KEY_VAULT_PATH);
         }
 
+        if let Some(url) = &self.relay_url {
+            store.set(KEY_RELAY_URL, json!(url));
+        } else {
+            store.delete(KEY_RELAY_URL);
+        }
+
         store.set(KEY_AUTOSTART_ENABLED, json!(self.autostart_enabled));
 
         store
@@ -85,6 +103,10 @@ impl AppSettings {
         self.vault_path.as_deref()
     }
 
+    pub fn relay_url(&self) -> Option<&str> {
+        self.relay_url.as_deref()
+    }
+
     // Read by a future settings panel (design steer #8); startup autostart truth
     // comes from `autolaunch().is_enabled()`, so nothing reads this yet.
     #[allow(dead_code)]
@@ -94,6 +116,19 @@ impl AppSettings {
 
     pub fn set_vault_path(&mut self, path: PathBuf) {
         self.vault_path = Some(path);
+    }
+
+    /// Set the relay URL, normalizing an empty string to `None`.
+    ///
+    /// Unlike `set_vault_path`, this collapses empty→`None` here so that clearing
+    /// the field in the settings panel deletes the stored key rather than persisting
+    /// a blank value. (The vault path relies on `resolve_vault_path` to filter empty
+    /// strings at read time; the relay URL is read directly via `relay_url()`, so the
+    /// guard lives at the write boundary instead.)
+    // Consumed by the `save_settings` command (next commit); no caller yet.
+    #[allow(dead_code)]
+    pub fn set_relay_url(&mut self, url: Option<String>) {
+        self.relay_url = url.filter(|s| !s.is_empty());
     }
 
     pub fn set_autostart_enabled(&mut self, enabled: bool) {
@@ -172,5 +207,48 @@ mod tests {
     fn empty_stored_path_treated_as_absent() {
         // A stored empty string (e.g. corrupted write) must not produce a blank path.
         assert_eq!(resolve_vault_path(None, Some("")), None);
+    }
+
+    /// Build an `AppSettings` with all fields at their defaults, for exercising the
+    /// relay-URL setter/getter without a Tauri `AppHandle`. The store-backed
+    /// `load`/`save` paths require a running Tauri runtime, so the empty→None guard
+    /// (the only non-trivial behavior over a plain mirror of `vault_path`) is pinned
+    /// here at the in-memory boundary instead.
+    fn default_settings() -> AppSettings {
+        AppSettings {
+            vault_path: None,
+            relay_url: None,
+            autostart_enabled: false,
+        }
+    }
+
+    #[test]
+    fn relay_url_absent_by_default() {
+        assert_eq!(default_settings().relay_url(), None);
+    }
+
+    #[test]
+    fn relay_url_round_trips_through_setter() {
+        let mut settings = default_settings();
+        settings.set_relay_url(Some("https://umbra.computer/".to_string()));
+        assert_eq!(settings.relay_url(), Some("https://umbra.computer/"));
+    }
+
+    #[test]
+    fn set_relay_url_none_clears_value() {
+        let mut settings = default_settings();
+        settings.set_relay_url(Some("https://umbra.computer/".to_string()));
+        settings.set_relay_url(None);
+        assert_eq!(settings.relay_url(), None);
+    }
+
+    #[test]
+    fn set_relay_url_empty_string_normalizes_to_none() {
+        // Clearing the field in the settings panel sends an empty string; it must
+        // collapse to None so `save` deletes the key rather than persisting a blank
+        // URL that the relay-resolution path would then read back as `Some("")`.
+        let mut settings = default_settings();
+        settings.set_relay_url(Some(String::new()));
+        assert_eq!(settings.relay_url(), None);
     }
 }

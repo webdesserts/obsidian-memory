@@ -192,6 +192,23 @@ fn resolve_advertised_relay_url(
     detected.map(|ip| format!("http://{}:{}/", ip, RELAY_PORT))
 }
 
+/// Pick the explicitly-configured relay URL, preferring the env var over the
+/// stored value.
+///
+/// The env var (`OBSIDIAN_MEMORY_RELAY_URL`) is an override that always wins; the
+/// stored value (set via the settings panel) is the fallback used by autostarted
+/// instances that launch without shell env vars. Both inputs are expected to be
+/// already empty-filtered by the caller. The result feeds the first argument of
+/// [`resolve_advertised_relay_url`], so a detected LAN IP still backstops both.
+///
+/// Extracted as a pure function so the precedence is testable without launching Tauri.
+fn resolve_configured_relay_url(
+    env_relay_url: Option<String>,
+    stored_relay_url: Option<String>,
+) -> Option<String> {
+    env_relay_url.or(stored_relay_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +351,42 @@ mod tests {
     fn none_when_no_env_and_no_detected_ip() {
         assert_eq!(resolve_advertised_relay_url(None, None), None);
     }
+
+    #[test]
+    fn configured_relay_env_wins_over_stored() {
+        assert_eq!(
+            resolve_configured_relay_url(
+                Some("http://umbra.computer:3340/".to_string()),
+                Some("http://stored.example/".to_string()),
+            ),
+            Some("http://umbra.computer:3340/".to_string()),
+        );
+    }
+
+    #[test]
+    fn configured_relay_stored_used_when_no_env() {
+        assert_eq!(
+            resolve_configured_relay_url(None, Some("http://stored.example/".to_string())),
+            Some("http://stored.example/".to_string()),
+        );
+    }
+
+    #[test]
+    fn configured_relay_none_when_neither_set() {
+        assert_eq!(resolve_configured_relay_url(None, None), None);
+    }
+
+    #[test]
+    fn stored_relay_url_wins_over_detected_ip() {
+        // Mirrors `env_override_wins_over_detected_ip`: a relay URL configured via the
+        // settings panel (stored, no env override) must beat the detected LAN IP.
+        let stored = resolve_configured_relay_url(None, Some("http://stored.example/".to_string()));
+        let detected = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+        assert_eq!(
+            resolve_advertised_relay_url(stored, detected),
+            Some("http://stored.example/".to_string()),
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -389,17 +442,27 @@ fn main() -> Result<()> {
 
             // Resolve the URL advertised to peers for this node's embedded relay.
             //
-            // The env var `OBSIDIAN_MEMORY_RELAY_URL` takes precedence so
-            // stable-hostname machines (e.g. umbra) can advertise a public URL
-            // instead of the detected LAN IP.
-            let env_relay_url = std::env::var("OBSIDIAN_MEMORY_RELAY_URL").ok();
+            // Priority: OBSIDIAN_MEMORY_RELAY_URL env var > relay URL stored in
+            // app-settings.json (set via the settings panel) > detected LAN IP. The
+            // env var takes precedence so stable-hostname machines (e.g. umbra) can
+            // advertise a public URL; the stored value lets autostarted instances —
+            // which launch without shell env vars — still advertise the configured URL.
+            let env_relay_url = std::env::var("OBSIDIAN_MEMORY_RELAY_URL")
+                .ok()
+                .filter(|v| !v.is_empty());
+            let stored_relay_url = settings.relay_url().map(String::from);
+            let configured_relay_url =
+                resolve_configured_relay_url(env_relay_url.clone(), stored_relay_url.clone());
             let detected_ip = detect_lan_ip();
             let advertised_relay_url =
-                resolve_advertised_relay_url(env_relay_url.clone(), detected_ip);
+                resolve_advertised_relay_url(configured_relay_url, detected_ip);
 
             match &advertised_relay_url {
-                Some(url) if env_relay_url.as_deref().is_some_and(|v| !v.is_empty()) => {
+                Some(url) if env_relay_url.is_some() => {
                     info!("Relay will advertise URL from OBSIDIAN_MEMORY_RELAY_URL: {}", url);
+                }
+                Some(url) if stored_relay_url.is_some() => {
+                    info!("Relay will advertise URL from stored settings: {}", url);
                 }
                 Some(url) => {
                     info!("Relay will advertise LAN URL: {}", url);
