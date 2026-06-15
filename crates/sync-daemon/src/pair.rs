@@ -234,6 +234,9 @@ async fn pair_inner(
         &vault_path,
         peer_endpoint_id,
         &result.relay_urls,
+        // The CLI pairing flow runs no relay of its own (SyncNode created with
+        // no relay above), so there is no advertised relay_url to preserve.
+        None,
         &sync_node,
     )
     .await;

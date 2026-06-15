@@ -278,11 +278,14 @@ impl DaemonConfig {
         self.save(vault_path)
     }
 
-    /// Record a peer's relay URL keyed by their `EndpointId`, then persist.
+    /// Record a peer's relay URL keyed by their `EndpointId` (in memory).
     ///
     /// This is the write path for learned relay hints — called on pairing and
     /// on learn-on-exchange so the daemon can reach this peer through their
     /// relay on future startups, even when mDNS isn't available (off-LAN).
+    ///
+    /// Mutates the in-memory config only; the caller persists (via
+    /// [`persist_config_change`], which applies the `relay_url` clobber-guard).
     ///
     /// **Freshness:** both callers mean "we just reached this peer," so this
     /// stamps `last_success_ms = now_ms` and resets `failure_count = 0`,
@@ -295,17 +298,11 @@ impl DaemonConfig {
     /// **Self-skip:** if `endpoint_id` matches `self.peer_id` (our own identity)
     /// the call is a no-op — seeding ourselves into the lookup would cause iroh
     /// to try to dial itself.
-    pub fn upsert_peer_relay(
-        &mut self,
-        endpoint_id: &str,
-        relay_url: &str,
-        now_ms: u64,
-        vault_path: &Path,
-    ) -> Result<()> {
+    pub fn upsert_peer_relay(&mut self, endpoint_id: &str, relay_url: &str, now_ms: u64) {
         // Skip self: our peer_id hex and the EndpointId hex share the same
         // underlying ed25519 public key bytes.
         if self.peer_id.to_string() == endpoint_id {
-            return Ok(());
+            return;
         }
 
         // Replace in-place if endpoint_id already present, else append.
@@ -322,22 +319,18 @@ impl DaemonConfig {
             entry.last_success_ms = Some(now_ms);
             self.peer_relays.push(entry);
         }
-
-        self.save(vault_path)
     }
 
-    /// Stamp success on an EXISTING hint without changing its relay URL.
+    /// Stamp success on an EXISTING hint without changing its relay URL (in memory).
     ///
     /// Used by learn-on-exchange when the peer is reachable but no fresh relay
     /// URL was observed (e.g. a LAN-direct connection has no active relay
     /// path): we still reset freshness so the supervisor stops throttling, but
     /// we don't invent a URL. No-op if no entry exists for `endpoint_id`.
-    pub fn mark_peer_relay_success(
-        &mut self,
-        endpoint_id: &str,
-        now_ms: u64,
-        vault_path: &Path,
-    ) -> Result<()> {
+    ///
+    /// Mutates the in-memory config only; the caller persists (via
+    /// [`persist_config_change`]).
+    pub fn mark_peer_relay_success(&mut self, endpoint_id: &str, now_ms: u64) {
         if let Some(existing) = self
             .peer_relays
             .iter_mut()
@@ -345,24 +338,19 @@ impl DaemonConfig {
         {
             existing.last_success_ms = Some(now_ms);
             existing.failure_count = 0;
-            self.save(vault_path)
-        } else {
-            Ok(())
         }
     }
 
-    /// Persist a failed reconnect attempt against an EXISTING hint.
+    /// Record a failed reconnect attempt against an EXISTING hint (in memory).
     ///
     /// Increments `failure_count` and records `last_attempt_ms = now_ms` so the
     /// supervisor's per-hint backoff survives a restart — the restart-reflood is
     /// the user-visible symptom this whole feature kills. No-op if no entry
     /// exists for `endpoint_id`.
-    pub fn record_hint_failure(
-        &mut self,
-        endpoint_id: &str,
-        now_ms: u64,
-        vault_path: &Path,
-    ) -> Result<()> {
+    ///
+    /// Mutates the in-memory config only; the caller persists (via
+    /// [`persist_config_change`]).
+    pub fn record_hint_failure(&mut self, endpoint_id: &str, now_ms: u64) {
         if let Some(existing) = self
             .peer_relays
             .iter_mut()
@@ -370,9 +358,6 @@ impl DaemonConfig {
         {
             existing.failure_count = existing.failure_count.saturating_add(1);
             existing.last_attempt_ms = Some(now_ms);
-            self.save(vault_path)
-        } else {
-            Ok(())
         }
     }
 
@@ -386,6 +371,38 @@ impl DaemonConfig {
         fs::write(&config_path, contents)?;
         Ok(())
     }
+}
+
+/// Load the on-disk config, mutate it, and persist — with the `relay_url`
+/// clobber-guard always applied.
+///
+/// The daemon does not hold a long-lived `DaemonConfig` in memory, so every
+/// peer-relay write is a load → mutate → save round-trip against `daemon.toml`.
+/// All such writes share one hazard: [`DaemonConfig::load_or_generate`] returns
+/// `relay_url = None` (the daemon's own advertised relay is runtime state, not
+/// persisted), so a naive save would DROP the advertised URL out of the file.
+/// This helper re-stamps `relay_url` before running `mutate`, guaranteeing no
+/// caller can forget the guard — which is exactly the bug `persist_adopted_relay`
+/// shipped with (it omitted the re-stamp and clobbered the URL on pairing).
+///
+/// `relay_url` is the daemon's currently-advertised relay URL to preserve
+/// (`self.relay_url.clone()` for an active daemon; `None` for flows with no
+/// running relay, e.g. CLI pairing).
+///
+/// `mutate` performs the in-memory change (e.g. [`DaemonConfig::upsert_peer_relay`]).
+/// A single `save` follows, so the persisted file reflects the mutation plus the
+/// preserved `relay_url`.
+pub async fn persist_config_change(
+    vault_path: &Path,
+    relay_url: Option<String>,
+    mutate: impl FnOnce(&mut DaemonConfig),
+) -> Result<()> {
+    let (mut config, _identity) = DaemonConfig::load_or_generate(vault_path, None).await?;
+    // Clobber-guard: load_or_generate discarded the daemon's own relay_url as
+    // runtime state — restore it so the save below doesn't drop it from disk.
+    config.relay_url = relay_url;
+    mutate(&mut config);
+    config.save(vault_path)
 }
 
 /// Raw deserialization type for migration — accepts optional `incarnation`,
@@ -702,9 +719,8 @@ incarnation = 3
         // Seed a peer relay entry using a plausible endpoint_id (64 hex chars, different
         // from our own peer_id so self-skip doesn't apply).
         let peer_id_hex = "a".repeat(64);
-        config
-            .upsert_peer_relay(&peer_id_hex, "http://umbra.computer:3340/", 1_000, vault_path)
-            .unwrap();
+        config.upsert_peer_relay(&peer_id_hex, "http://umbra.computer:3340/", 1_000);
+        config.save(vault_path).unwrap();
 
         // Reload and verify the entry survives.
         let (loaded, _) = DaemonConfig::load_or_generate(vault_path, None)
@@ -732,12 +748,9 @@ incarnation = 3
 
         let peer_id_hex = "b".repeat(64);
 
-        config
-            .upsert_peer_relay(&peer_id_hex, "http://old-relay:3340/", 1_000, vault_path)
-            .unwrap();
-        config
-            .upsert_peer_relay(&peer_id_hex, "http://new-relay:3340/", 2_000, vault_path)
-            .unwrap();
+        config.upsert_peer_relay(&peer_id_hex, "http://old-relay:3340/", 1_000);
+        config.upsert_peer_relay(&peer_id_hex, "http://new-relay:3340/", 2_000);
+        config.save(vault_path).unwrap();
 
         // Should have exactly one entry with the updated URL.
         assert_eq!(config.peer_relays.len(), 1);
@@ -867,9 +880,7 @@ incarnation = 3
         throttled.last_attempt_ms = Some(500);
         config.peer_relays.push(throttled);
 
-        config
-            .upsert_peer_relay(&peer_hex, "http://fresh:3340/", 9_000, vault_path)
-            .unwrap();
+        config.upsert_peer_relay(&peer_hex, "http://fresh:3340/", 9_000);
 
         let entry = &config.peer_relays[0];
         assert_eq!(entry.relay_url, "http://fresh:3340/");
@@ -897,9 +908,7 @@ incarnation = 3
         entry.failure_count = 3;
         config.peer_relays.push(entry);
 
-        config
-            .mark_peer_relay_success(&present, 4_242, vault_path)
-            .unwrap();
+        config.mark_peer_relay_success(&present, 4_242);
 
         let updated = &config.peer_relays[0];
         assert_eq!(updated.last_success_ms, Some(4_242));
@@ -908,9 +917,7 @@ incarnation = 3
         assert_eq!(updated.relay_url, "http://relay:3340/");
 
         // Absent entry: no-op, no panic, no new entry appended.
-        config
-            .mark_peer_relay_success(&absent, 5_000, vault_path)
-            .unwrap();
+        config.mark_peer_relay_success(&absent, 5_000);
         assert_eq!(config.peer_relays.len(), 1);
     }
 
@@ -932,8 +939,8 @@ incarnation = 3
             .peer_relays
             .push(PeerRelay::new(present.clone(), "http://relay:3340/".to_string()));
 
-        config.record_hint_failure(&present, 1_000, vault_path).unwrap();
-        config.record_hint_failure(&present, 2_000, vault_path).unwrap();
+        config.record_hint_failure(&present, 1_000);
+        config.record_hint_failure(&present, 2_000);
 
         let entry = &config.peer_relays[0];
         assert_eq!(entry.failure_count, 2);
@@ -942,7 +949,7 @@ incarnation = 3
         assert_eq!(entry.last_success_ms, None);
 
         // Absent entry: no-op, no new entry appended.
-        config.record_hint_failure(&absent, 3_000, vault_path).unwrap();
+        config.record_hint_failure(&absent, 3_000);
         assert_eq!(config.peer_relays.len(), 1);
     }
 
@@ -959,9 +966,7 @@ incarnation = 3
 
         // Use our own peer_id as the endpoint_id — should be silently skipped.
         let own_id = config.peer_id.to_string();
-        config
-            .upsert_peer_relay(&own_id, "http://self-relay:3340/", 1_000, vault_path)
-            .unwrap();
+        config.upsert_peer_relay(&own_id, "http://self-relay:3340/", 1_000);
 
         assert!(
             config.peer_relays.is_empty(),
@@ -997,5 +1002,91 @@ incarnation = 3
             reloaded.relay_url.is_none(),
             "relay_url must be discarded on load (runtime state)"
         );
+    }
+
+    // ==================== persist_config_change tests ====================
+
+    /// The clobber-guard at the heart of `persist_config_change`: a peer-relay
+    /// write must persist its mutation AND keep the daemon's advertised
+    /// `relay_url` in `daemon.toml`. Without the guard, `load_or_generate`'s
+    /// discard of `relay_url` would silently drop the advertised URL on every
+    /// hint write.
+    #[tokio::test]
+    async fn test_persist_config_change_preserves_relay_url_and_mutation() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        // Seed the daemon's identity (so subsequent loads are stable).
+        let _ = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        let peer_hex = "a".repeat(64);
+
+        // Persist a hint write while the daemon is advertising a relay URL.
+        persist_config_change(
+            vault_path,
+            Some("http://umbra.computer:3340/".to_string()),
+            |config| config.upsert_peer_relay(&peer_hex, "http://peer-relay:3340/", 1_000),
+        )
+        .await
+        .unwrap();
+
+        // The advertised relay_url must be written to disk alongside the hint.
+        let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
+        assert!(
+            contents.contains("relay_url = \"http://umbra.computer:3340/\""),
+            "the advertised relay_url must survive a hint write, not be clobbered"
+        );
+
+        // Re-read through the config layer: the hint persisted. (relay_url itself
+        // is runtime state and is intentionally discarded on load — its presence
+        // ON DISK above is what proves the guard worked.)
+        let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.peer_relays.len(), 1);
+        assert_eq!(reloaded.peer_relays[0].endpoint_id, peer_hex);
+        assert_eq!(
+            reloaded.peer_relays[0].relay_url,
+            "http://peer-relay:3340/"
+        );
+    }
+
+    /// Passing `relay_url = None` (a flow with no running relay, e.g. CLI
+    /// pairing) persists the mutation and writes no top-level relay_url — the
+    /// helper does not invent one. This is the byte-identical behavior for
+    /// relay-less flows.
+    #[tokio::test]
+    async fn test_persist_config_change_no_relay_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let _ = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        let peer_hex = "b".repeat(64);
+
+        persist_config_change(vault_path, None, |config| {
+            config.upsert_peer_relay(&peer_hex, "http://peer-relay:3340/", 2_000)
+        })
+        .await
+        .unwrap();
+
+        let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
+        // Parse the TOML rather than substring-match: the `[[peer_relays]]`
+        // entry legitimately carries its OWN `relay_url`, so we must check the
+        // top-level table specifically for the absent daemon URL.
+        let parsed: toml::Value = toml::from_str(&contents).unwrap();
+        assert!(
+            parsed.get("relay_url").is_none(),
+            "no top-level relay_url should be written when the daemon has none to advertise"
+        );
+
+        let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.peer_relays.len(), 1);
     }
 }

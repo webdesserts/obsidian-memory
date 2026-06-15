@@ -17,7 +17,6 @@ use sync_core::peer_id::{PeerId, VaultId};
 use tracing::warn;
 
 use crate::native_fs::NativeFs;
-use crate::persistence::DaemonConfig;
 
 /// Write the mesh roster into the local allowlist after a successful pair.
 ///
@@ -92,10 +91,17 @@ pub async fn adopt_vault_id_on_disk(vault_path: &Path, new_id: VaultId) -> anyho
 /// Loading `DaemonConfig::load_or_generate` on a fresh vault generates the
 /// device keypair as a side effect; that is acceptable — a device pairing in
 /// needs an identity anyway.
+///
+/// `self_relay_url` is this device's own advertised relay URL, if it is running
+/// one. It is threaded through to the persist helper's clobber-guard so that
+/// adopting the responder's relay does NOT drop our own advertised `relay_url`
+/// from `daemon.toml`. The CLI pairing flow has no running relay and passes
+/// `None`; the live-daemon initiator flow passes its advertised URL.
 pub async fn persist_adopted_relay(
     vault_path: &Path,
     responder_id: EndpointId,
     relay_urls: &[String],
+    self_relay_url: Option<String>,
     sync_node: &SyncNode,
 ) {
     let Some(url_str) = relay_urls.iter().find(|u| !u.is_empty()).cloned() else {
@@ -103,22 +109,15 @@ pub async fn persist_adopted_relay(
     };
 
     let responder_id_hex = responder_id.to_string();
+    let now = crate::daemon::now_ms();
 
-    match DaemonConfig::load_or_generate(vault_path, None).await {
-        Ok((mut config, _identity)) => {
-            let now = crate::daemon::now_ms();
-            if let Err(e) = config.upsert_peer_relay(&responder_id_hex, &url_str, now, vault_path) {
-                warn!("Failed to persist adopted relay URL: {}", e);
-                return;
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Failed to load daemon config to persist adopted relay URL: {}",
-                e
-            );
-            return;
-        }
+    if let Err(e) = crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
+        config.upsert_peer_relay(&responder_id_hex, &url_str, now)
+    })
+    .await
+    {
+        warn!("Failed to persist adopted relay URL: {}", e);
+        return;
     }
 
     // Seed the live lookup so gossip can route to the responder through their
@@ -220,5 +219,80 @@ mod tests {
             2,
             "re-running the pair must not duplicate self or the mesh member"
         );
+    }
+
+    /// Regression: adopting a pairing relay must NOT clobber the daemon's own
+    /// advertised `relay_url` out of `daemon.toml`.
+    ///
+    /// `persist_adopted_relay` does a load → mutate → save round-trip, and
+    /// `load_or_generate` deliberately drops `relay_url` (runtime state). Before
+    /// the fix, the function never re-stamped it, so an active daemon (running
+    /// its own relay) that paired in would silently lose its advertised URL.
+    /// Threading `self_relay_url` through to the persist helper's clobber-guard
+    /// is the fix; this proves the URL survives the adopt-write.
+    #[tokio::test]
+    async fn persist_adopted_relay_preserves_own_relay_url() {
+        use crate::persistence::DaemonConfig;
+        use iroh::SecretKey;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let vault_dir = TempDir::new().unwrap();
+        let vault_path = vault_dir.path();
+
+        // Simulate our daemon having started its own relay: write our advertised
+        // URL to daemon.toml (this is what set_relay_url does on relay start).
+        let own_relay_url = "http://my-own-relay:3340/".to_string();
+        let (mut config, identity) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+        config
+            .set_relay_url(Some(own_relay_url.clone()), vault_path)
+            .unwrap();
+
+        // Build a minimal SyncNode (no relay) just so the live-lookup seed step
+        // of persist_adopted_relay has something to call. Use our persisted
+        // identity so node_id() matches the config's peer_id.
+        let allowlist = Arc::new(InMemoryAllowlist::new());
+        let sync_node = SyncNode::new(identity.secret_key_bytes(), None, allowlist)
+            .await
+            .expect("failed to build SyncNode for test");
+
+        // The responder is a DIFFERENT device, so its EndpointId won't trip the
+        // self-skip in upsert_peer_relay.
+        let responder_secret = SecretKey::from_bytes(&[7u8; 32]);
+        let responder_id = responder_secret.public();
+        let responder_relay = "http://responder-relay:3340/".to_string();
+
+        persist_adopted_relay(
+            vault_path,
+            responder_id,
+            &[responder_relay.clone()],
+            Some(own_relay_url.clone()),
+            &sync_node,
+        )
+        .await;
+
+        let contents = std::fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
+
+        // The fix: our own advertised relay_url must survive the adopt-write.
+        assert!(
+            contents.contains(&format!("relay_url = \"{own_relay_url}\"")),
+            "the daemon's own relay_url must NOT be clobbered when adopting a \
+             pairing relay; daemon.toml was:\n{contents}"
+        );
+
+        // And the responder's relay was actually persisted as a peer hint.
+        let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+        let hint = reloaded
+            .peer_relays
+            .iter()
+            .find(|r| r.endpoint_id == responder_id.to_string())
+            .expect("responder's relay should be persisted to peer_relays");
+        assert_eq!(hint.relay_url, responder_relay);
+
+        sync_node.shutdown().await.ok();
     }
 }

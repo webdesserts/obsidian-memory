@@ -661,25 +661,22 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         // Persist the throttle. The daemon doesn't hold a live DaemonConfig, so
-        // load → record_hint_failure (which saves) → done, per due hint.
-        match crate::persistence::DaemonConfig::load_or_generate(&self.vault_path, None).await {
-            Ok((mut config, _identity)) => {
-                // `load_or_generate` discards `relay_url` (runtime state); restore
-                // the daemon's advertised URL so saving the hint change doesn't
-                // clobber it out of daemon.toml.
-                config.relay_url = self.relay_url.clone();
+        // this is a load → mutate → save round-trip; `persist_config_change`
+        // applies the `relay_url` clobber-guard for us.
+        let persist = crate::persistence::persist_config_change(
+            &self.vault_path,
+            self.relay_url.clone(),
+            |config| {
                 for hex in &due_hex {
-                    if let Err(e) = config.record_hint_failure(hex, now, &self.vault_path) {
-                        warn!("Failed to persist reconnect hint failure: {e}");
-                        break;
-                    }
+                    config.record_hint_failure(hex, now);
                 }
-            }
-            Err(e) => {
-                // Non-fatal: the in-memory throttle still works this session; only
-                // the across-restart persistence is lost.
-                warn!("Failed to load daemon config to persist hint failure: {e}");
-            }
+            },
+        )
+        .await;
+        if let Err(e) = persist {
+            // Non-fatal: the in-memory throttle still works this session; only
+            // the across-restart persistence is lost.
+            warn!("Failed to persist reconnect hint failures: {e}");
         }
     }
 
@@ -723,28 +720,21 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.peer_relays.push(entry);
         }
 
-        // (2) Persist. Load → mutate → save, mirroring the failure-persist path.
-        match crate::persistence::DaemonConfig::load_or_generate(&self.vault_path, None).await {
-            Ok((mut config, _identity)) => {
-                // Preserve the daemon's advertised relay_url, which `load_or_generate`
-                // discards as runtime state — saving the hint must not clobber it.
-                config.relay_url = self.relay_url.clone();
-                let result = match learned.relay_url {
-                    Some(ref url) => config.upsert_peer_relay(
-                        &endpoint_hex,
-                        &url.to_string(),
-                        now,
-                        &self.vault_path,
-                    ),
-                    None => config.mark_peer_relay_success(&endpoint_hex, now, &self.vault_path),
-                };
-                if let Err(e) = result {
-                    warn!("Failed to persist learned peer relay: {e}");
-                }
-            }
-            Err(e) => {
-                warn!("Failed to load daemon config to persist learned peer relay: {e}");
-            }
+        // (2) Persist. Load → mutate → save via the shared helper, which applies
+        // the `relay_url` clobber-guard. Upsert when a URL was learned (stamps
+        // success), else just mark success without inventing a URL.
+        let learned_url = learned.relay_url.as_ref().map(|u| u.to_string());
+        let persist = crate::persistence::persist_config_change(
+            &self.vault_path,
+            self.relay_url.clone(),
+            |config| match learned_url {
+                Some(ref url) => config.upsert_peer_relay(&endpoint_hex, url, now),
+                None => config.mark_peer_relay_success(&endpoint_hex, now),
+            },
+        )
+        .await;
+        if let Err(e) = persist {
+            warn!("Failed to persist learned peer relay: {e}");
         }
 
         // (3) Live re-seed so the next dial uses the fresh hint.

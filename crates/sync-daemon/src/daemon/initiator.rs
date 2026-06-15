@@ -401,6 +401,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             &self.vault_path,
             responder_endpoint_id,
             &result.relay_urls,
+            self.relay_url.clone(),
             &self.sync_node,
         )
         .await;
