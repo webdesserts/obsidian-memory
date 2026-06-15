@@ -361,6 +361,26 @@ impl DaemonConfig {
         }
     }
 
+    /// Clear the reconnect backoff on EVERY hint (in memory) after a network
+    /// change — `failure_count → 0` and `last_attempt_ms → None`. Both make
+    /// `hint_attempt_due` return `true`, so the next supervisor tick re-dials
+    /// every hint immediately on the new network instead of waiting out a stale
+    /// 30-min backoff from the old one.
+    ///
+    /// Deliberately does NOT touch `last_success_ms`: a network change means "we
+    /// might be able to reach peers again," not "we reached them" — fabricating a
+    /// success would be a lie. (This is why the handler can't route through
+    /// `upsert_peer_relay`/`mark_peer_relay_success`, which both stamp success.)
+    ///
+    /// Mutates the in-memory config only; the caller persists (via
+    /// [`persist_config_change`], which applies the `relay_url` clobber-guard).
+    pub fn reset_hint_backoff(&mut self) {
+        for hint in self.peer_relays.iter_mut() {
+            hint.failure_count = 0;
+            hint.last_attempt_ms = None;
+        }
+    }
+
     /// Save the current config to `.sync/daemon.toml`.
     pub fn save(&self, vault_path: &Path) -> Result<()> {
         let config_path = vault_path.join(DAEMON_CONFIG_FILE);
@@ -951,6 +971,58 @@ incarnation = 3
         // Absent entry: no-op, no new entry appended.
         config.record_hint_failure(&absent, 3_000);
         assert_eq!(config.peer_relays.len(), 1);
+    }
+
+    /// `reset_hint_backoff` bulk-clears the throttle on every hint
+    /// (`failure_count → 0`, `last_attempt_ms → None`) but must NOT touch
+    /// `last_success_ms` — a network change means "we might reach peers again,"
+    /// not "we reached them," so fabricating a success would be a lie.
+    #[tokio::test]
+    async fn test_reset_hint_backoff_clears_throttle_preserves_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        // Two throttled hints, each with a recorded success in the past.
+        let mut a = PeerRelay::new("a".repeat(64), "http://relay-a:3340/".to_string());
+        a.failure_count = 6;
+        a.last_attempt_ms = Some(2_000);
+        a.last_success_ms = Some(1_000);
+        let mut b = PeerRelay::new("b".repeat(64), "http://relay-b:3340/".to_string());
+        b.failure_count = 3;
+        b.last_attempt_ms = Some(5_000);
+        b.last_success_ms = Some(4_000);
+        config.peer_relays.push(a);
+        config.peer_relays.push(b);
+
+        config.reset_hint_backoff();
+
+        for entry in &config.peer_relays {
+            assert_eq!(entry.failure_count, 0, "throttle counter must be cleared");
+            assert_eq!(
+                entry.last_attempt_ms, None,
+                "last attempt must be cleared so the hint is immediately due"
+            );
+        }
+        // The reset un-throttles; it does not pretend the peer was reached.
+        assert_eq!(config.peer_relays[0].last_success_ms, Some(1_000));
+        assert_eq!(config.peer_relays[1].last_success_ms, Some(4_000));
+
+        // Persisting the reset and reloading proves it survives a restart-mid-flap.
+        config.save(vault_path).unwrap();
+        let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.peer_relays.len(), 2);
+        for entry in &reloaded.peer_relays {
+            assert_eq!(entry.failure_count, 0);
+            assert_eq!(entry.last_attempt_ms, None);
+        }
+        assert_eq!(reloaded.peer_relays[0].last_success_ms, Some(1_000));
+        assert_eq!(reloaded.peer_relays[1].last_success_ms, Some(4_000));
     }
 
     /// `upsert_peer_relay` skips entries whose endpoint_id matches our own peer_id —

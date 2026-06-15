@@ -165,6 +165,13 @@ pub struct Daemon<FS: FileSystem, AL> {
     file_event_rx: mpsc::UnboundedReceiver<FileEvent>,
     /// Optional mDNS discovery channel. `None` in tests (and on WASM builds).
     discovery_rx: Option<mpsc::Receiver<sync_core::network::discovery::DiscoveredMesh>>,
+    /// Network-change signal. Each `()` means iroh observed an `EndpointAddr`
+    /// change (relay/direct-address delta ⇒ network conditions changed). Drained
+    /// in the run_loop select; the handler resets every hint's backoff so the
+    /// next supervisor tick re-dials on the new network — the fix for "every net
+    /// change needs a restart." `None` in tests that don't exercise reconnect,
+    /// and on any build where `watch_addr` isn't wired.
+    net_change_rx: Option<mpsc::Receiver<()>>,
     /// Tracks liveness state of all peers observed in the gossip swarm.
     ///
     /// Wrapped in `Arc<Mutex<...>>` so spawned tasks (QUIC sync exchanges) can
@@ -278,6 +285,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             vault_gossip,
             file_event_rx,
             discovery_rx,
+            // Wired post-construction by the startup `watch_addr` task (or by
+            // tests via `set_net_change_rx`); `None` means net-change reconnect
+            // is inert, exactly like an unwired `discovery_rx`.
+            net_change_rx: None,
             peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
             allowlist,
             active_pairing: None,
@@ -428,6 +439,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                         peers = mesh.online_count,
                         "mDNS: discovered mesh on LAN"
                     );
+                }
+
+                Some(()) = async {
+                    match self.net_change_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    self.on_network_change().await;
                 }
 
                 Some(cmd) = async {
@@ -680,6 +700,54 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
+    /// A network change occurred (wifi switch, hotspot, new LAN). Reset every
+    /// peer-relay hint's backoff so the next supervisor tick re-dials immediately
+    /// on the new network — the fix for "every net change needs a restart."
+    ///
+    /// Purely additive: the supervisor's dial/evict/sole-hint logic
+    /// (`on_reconnect_tick`) is untouched; we only un-throttle the hints by
+    /// zeroing `failure_count`/`last_attempt_ms`, which flips `hint_attempt_due`
+    /// to `true` for every hint so they all re-dial on the next wake.
+    async fn on_network_change(&mut self) {
+        if self.peer_relays.is_empty() {
+            return; // unpaired / hint-less — nothing to re-dial.
+        }
+        info!(
+            hints = self.peer_relays.len(),
+            "Network change detected — resetting reconnect backoff"
+        );
+
+        // (1) In-memory snapshot (the supervisor's source of truth).
+        for hint in self.peer_relays.iter_mut() {
+            hint.failure_count = 0;
+            hint.last_attempt_ms = None;
+        }
+
+        // (2) Persist so a restart mid-flap doesn't resurrect the stale throttle.
+        self.persist_backoff_reset().await;
+    }
+
+    /// Persist the network-change backoff reset to `daemon.toml`.
+    ///
+    /// Reuses [`persist_config_change`], which owns the `relay_url` clobber-guard
+    /// (`load_or_generate` returns `relay_url = None`, so the helper re-stamps the
+    /// daemon's advertised URL before saving) — so this can't drop the relay URL
+    /// out of disk. We pass [`DaemonConfig::reset_hint_backoff`] as the mutation:
+    /// NOT `mark_peer_relay_success`, which would lie about reaching the peer.
+    async fn persist_backoff_reset(&self) {
+        let persist = crate::persistence::persist_config_change(
+            &self.vault_path,
+            self.relay_url.clone(),
+            |config| config.reset_hint_backoff(),
+        )
+        .await;
+        if let Err(e) = persist {
+            // Non-fatal: the in-memory reset already un-throttled the hints this
+            // session; only the across-restart persistence is lost.
+            warn!("Failed to persist reconnect backoff reset: {e}");
+        }
+    }
+
     /// Refresh a peer's hint after a successful background sync exchange.
     ///
     /// This is what makes stale-hint eviction safe: a reachable peer's hint is
@@ -757,6 +825,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.reconnect_tick = tick;
+    }
+
+    /// Wire the network-change signal that resets reconnect backoff.
+    ///
+    /// Production passes a receiver fed by `endpoint.watch_addr()` (see
+    /// `startup.rs`); tests pass a receiver whose sender they hold, so `send(())`
+    /// simulates a net change with no real network. `pub` for integration-test
+    /// access — same seam rationale as [`Daemon::set_reconnect_interval`]
+    /// (integration-test binaries compile this crate without the `test` cfg, so a
+    /// `#[cfg(test)]` gate would break them). Not a public production API.
+    pub fn set_net_change_rx(&mut self, rx: mpsc::Receiver<()>) {
+        self.net_change_rx = Some(rx);
     }
 
     /// Populate the in-memory peer-relay snapshot the supervisor re-dials from.

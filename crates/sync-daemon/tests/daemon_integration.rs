@@ -2041,6 +2041,126 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// A network change re-dials a throttled peer and heals the partition without
+    /// a restart — the fix for "every wifi switch needs an app restart."
+    ///
+    /// The reconnect supervisor's per-hint backoff pins a long-unreachable peer at
+    /// the 30-min max, and nothing reset it on a network change. Now iroh's
+    /// `watch_addr` net-change signal (injected here through the same channel the
+    /// startup task feeds) resets the backoff so the hint becomes due and the next
+    /// supervisor tick re-dials.
+    ///
+    /// Mirrors `supervisor_rebootstraps_after_zero_neighbors` — A and B share a
+    /// topic but neither bootstraps off the other, so A is partitioned at zero
+    /// neighbors and the ONLY route to B is A's supervisor re-dialing its hint.
+    /// The single difference: B's hint starts THROTTLED (failure_count 6, recent
+    /// attempt ⇒ ~30-min backoff), so the supervisor will NOT dial it on its own
+    /// within the test budget. The net change is therefore the SOLE cause of the
+    /// reconnect, and A pulling B's note (a durable observable, not a transient
+    /// lookup-presence flicker) is the fix's proof. FAILS on pre-fix code: without
+    /// the handler, `net_tx.send` goes nowhere, the hint stays throttled, and A
+    /// never pulls.
+    ///
+    /// Seed 101 reserved (102 mints B's EndpointId via the supplier node).
+    #[tokio::test]
+    async fn net_change_redials_throttled_peer_and_heals_partition() -> anyhow::Result<()> {
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(101).await?; // partitioned peer that re-dials
+        let node_b = build_node(102).await?; // supplier — answers A's pull after reconnect
+
+        // Direct-address wiring so A's re-dial reaches B once the hint is due.
+        // (Direct addresses live in a separate resolver, so they survive the
+        // supervisor evicting the throttled hint from `peer_lookup`.)
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Seed a note into B's vault so A's pull proves the partition healed.
+        node_b
+            .fs
+            .write("notes/after-net-change.md", b"# Delivered after net change")
+            .await?;
+        {
+            let vault = node_b.vault.lock().await;
+            vault.on_file_changed("notes/after-net-change.md").await?;
+        }
+
+        // B's hint, THROTTLED: a recent attempt plus a high failure count puts it
+        // well inside its ~30-min backoff window (>> the 10s wait budget), so the
+        // supervisor will not re-dial it until the net change resets the throttle.
+        // The relay URL only needs to parse — `connect_nodes` carries the dial.
+        let b_endpoint_hex = node_b.sync_node.node_id().to_string();
+        let mut b_hint = PeerRelay::new(b_endpoint_hex, "http://example.com:3340/".to_string());
+        b_hint.failure_count = 6;
+        b_hint.last_attempt_ms = Some(now_ms_test());
+
+        // Both join with NO bootstrap — they never dial each other, so A stays
+        // partitioned at zero neighbors (the production failure shape).
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+
+        let a_vault = node_a.vault.clone();
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        // The net-change channel the production startup task feeds; here a test
+        // holds the sender so `send(())` simulates a wifi switch with no real net.
+        let (net_tx, net_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let mut daemon_a = Daemon::new(
+            a_vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-netchange".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.set_net_change_rx(net_rx);
+        daemon_a.seed_peer_relays_snapshot(vec![b_hint]);
+        daemon_a.set_reconnect_interval(Duration::from_millis(50));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+        // B just needs to be alive to answer A's sync pull.
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Fire the network change. (The throttled hint guarantees A has not yet
+        // re-dialed B — its backoff is ~30 min, far beyond the wait budget — so
+        // the reconnect below is caused by this signal, not by an early tick.)
+        net_tx.send(()).await.unwrap();
+
+        // The fix's proof: the net-change reset makes B's hint due, the next
+        // supervisor tick re-dials B, NeighborUp fires, and A pulls B's note.
+        wait_until("A pulled notes/after-net-change.md after the net change", || {
+            let vault = a_vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/after-net-change.md".to_string())
+            }
+        })
+        .await;
+
+        a_shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = a_loop.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
     /// A successful NeighborUp sync resets the peer's hint freshness — the
     /// learn-on-exchange behavior that makes stale-hint eviction safe.
     ///
