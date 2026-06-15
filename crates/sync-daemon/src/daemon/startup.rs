@@ -459,6 +459,34 @@ async fn startup_inner(
     // re-seeds and re-bootstraps gossip from this snapshot without a restart.
     daemon.seed_peer_relays_snapshot(daemon_config.peer_relays.clone());
 
+    // Network-change detection: iroh's watch_addr fires when the endpoint's relay
+    // or direct addresses change (i.e. the network changed). Forward each change
+    // as a () so the run_loop can reset reconnect backoff and re-dial without a
+    // restart. The endpoint is read here, after Daemon::new took ownership of
+    // sync_node, but before daemon is moved into StartupBundle.
+    {
+        use futures::StreamExt;
+        use iroh::Watcher;
+        // Capacity 1: a single wifi switch emits several address changes; they
+        // coalesce into one backoff reset (resetting twice is a no-op).
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+        // stream_updates_only (not stream) skips the current address, so we react
+        // only to real changes — no spurious reset at startup.
+        let mut addr_stream = daemon.sync_node.endpoint.watch_addr().stream_updates_only();
+        tokio::spawn(async move {
+            while addr_stream.next().await.is_some() {
+                // try_send: if a reset is already queued, dropping the extra change
+                // is correct — the handler re-dials ALL hints regardless of how
+                // many changes fired. A closed channel (receiver gone, i.e. daemon
+                // shut down) ends the task.
+                if tx.try_send(()).is_err() && tx.is_closed() {
+                    break;
+                }
+            }
+        });
+        daemon.set_net_change_rx(rx);
+    }
+
     Ok(StartupBundle {
         daemon,
         embedded_relay,
