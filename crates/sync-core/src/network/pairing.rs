@@ -506,7 +506,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .relay_mode(RelayMode::Disabled)
             .bind()

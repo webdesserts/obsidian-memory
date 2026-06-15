@@ -150,7 +150,7 @@ impl SyncNode {
             None => RelayMode::Disabled,
         };
 
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .relay_mode(relay_mode)
             .bind()
@@ -249,7 +249,7 @@ impl SyncNode {
             None => RelayMode::Disabled,
         };
 
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .relay_mode(relay_mode)
             .bind()
