@@ -13,7 +13,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
-    "clsx": "^2",
+    "@webdesserts/ui": "github:webdesserts/ui#7db5e0461bad452a67940b27cb6fd879723a08cd",
     "motion": "^12",
     "react": "^19",
     "react-dom": "^19"

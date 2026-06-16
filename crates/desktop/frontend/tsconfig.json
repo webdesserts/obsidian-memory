@@ -9,12 +9,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "noEmit": true,
-    "paths": {
-      // Mirror the vite.config.ts / vitest.config.ts alias so tsc resolves
-      // @webdesserts/ui from source (four hops up to the sibling ui checkout).
-      "@webdesserts/ui": ["../../../../ui/src/index.ts"]
-    }
+    "noEmit": true
   },
   // The settings window (panel + entry) and its browser test are the real,
   // contract-bearing code: SettingsPanel mirrors the Rust SettingsPayload and

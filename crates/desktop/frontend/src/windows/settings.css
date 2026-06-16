@@ -1,20 +1,27 @@
 /* Tailwind + webdesserts/ui token pipeline for the settings window.
  *
- * Mirrors ui/dev/main.css: pull in Tailwind, then ui's semantic token layer and
- * the neapolitan preset that resolves those tokens to concrete colors. The
- * @source globs tell Tailwind to scan ui's component source (so the classes the
- * Button/TextInput components emit are generated) and this window's own source.
+ * Mirrors ui's documented consumer setup: pull in Tailwind, then ui's semantic
+ * token layer and the neapolitan preset that resolves those tokens to concrete
+ * colors. ui is consumed as an installed package, so the token @imports use the
+ * package subpath exports and the @source points at the package's built dist
+ * (the classes the Button/TextInput components emit live there).
  *
- * These paths resolve relative to THIS file (src/windows/), so they're six hops
- * up to the sibling `ui` checkout — deeper than the Vite alias (which resolves
- * from the frontend root). We rely on --font-sans's built-in fallback chain
- * instead of vendoring the Switzer woff2.
+ *   @import "@webdesserts/ui/tokens";
+ *   @import "@webdesserts/ui/presets/neapolitan.css";
+ *   @source "../../node_modules/@webdesserts/ui/dist";
+ *
+ * The @source path is relative to THIS file (src/windows/): two hops up
+ * (windows → src → frontend root) reaches node_modules. A wrong hop count
+ * resolves above the frontend root and silently drops every component class
+ * with no build error, so don't adjust it without re-checking the emitted CSS.
+ * We rely on --font-sans's built-in fallback chain instead of vendoring the
+ * Switzer woff2.
  */
 @import "tailwindcss";
-@import "../../../../../../ui/src/tokens/semantic.css";
-@import "../../../../../../ui/src/tokens/presets/neapolitan.css";
+@import "@webdesserts/ui/tokens";
+@import "@webdesserts/ui/presets/neapolitan.css";
 
-@source "../../../../../../ui/src";
+@source "../../node_modules/@webdesserts/ui/dist";
 @source ".";
 
 body {
