@@ -81,6 +81,67 @@ The cert lives in the team's 1Password **Develop** vault for fleet distribution;
 import it into your login keychain and set it to *Always Trust* for code signing,
 then `build-desktop.sh` signs with it automatically (see the team signing runbook).
 
+## Frontend / ui dependency
+
+The settings panel uses [`@webdesserts/ui`](https://github.com/webdesserts/ui)
+for its components and design tokens. It's consumed as a **SHA-pinned git
+dependency on the built package**, not a source alias:
+
+```json
+"@webdesserts/ui": "github:webdesserts/ui#<full-sha>"
+```
+
+`npm install` clones that ref, runs ui's `prepare` script to build `dist`, and
+installs the package into `node_modules/@webdesserts/ui`. The frontend resolves
+ui through the package's `exports` map — JS from `dist`, CSS tokens from the
+`@webdesserts/ui/tokens` and `@webdesserts/ui/presets/*` subpaths, and the
+Tailwind `@source` scans `node_modules/@webdesserts/ui/dist` for the component
+classes. No sibling `~/code/webdesserts/ui` checkout is required to build.
+
+**Bumping the ui version:** edit the pinned `<full-sha>` in
+`frontend/package.json`, then `npm install` to refresh the lockfile. Pin the
+full SHA (not a branch name) so builds are reproducible.
+
+### Local ui co-development (HMR)
+
+The pinned package is rebuilt only on `npm install`, so editing ui source has no
+effect on the frontend until you re-install. For active co-development, `npm
+link` a local ui checkout and run a `tsc --watch` so `dist` rebuilds on every ui
+source edit:
+
+```bash
+# In the ui checkout — register the package and keep dist fresh:
+cd ~/code/webdesserts/ui
+npm link
+npx tsc -p tsconfig.build.json --watch   # ui's `build` is plain tsc (no watch)
+
+# In the frontend — link the local checkout, then run the dev server:
+cd crates/desktop/frontend
+npm link @webdesserts/ui
+npm run dev
+```
+
+The frontend's `@source "../../node_modules/@webdesserts/ui/dist"` follows the
+symlink to the live-rebuilt `dist`, so token and class changes flow through once
+`tsc --watch` re-emits.
+
+**Tradeoff vs. the old source alias:** the source alias gave zero-build instant
+HMR (edit ui source → frontend hot-reloads). The package model trades that for
+reproducibility: `npm link` + `tsc --watch` restores HMR, but a ui source edit
+reflects only after tsc re-emits `dist` (sub-second, not literally instant), and
+you have to keep the watch process running. For frontend work that doesn't touch
+ui, no link is needed — the pinned package just works.
+
+**To return to the pinned package:** `npm unlink @webdesserts/ui` then `npm
+install` (restores the git-dep from `package.json`).
+
+> **Footgun — gitignored `dist`:** ui's `dist` is gitignored, so the git ref
+> commit contains no built output; the install rebuilds it via `prepare`. This
+> is also why a stale `npm link` or a sibling checkout on the wrong branch can
+> mask the real package — if a build behaves unexpectedly, confirm
+> `node_modules/@webdesserts/ui` is a real directory (the git install), not a
+> leftover symlink.
+
 ## Architecture
 
 The crate is laid out so each module owns one concern:
