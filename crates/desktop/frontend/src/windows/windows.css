@@ -35,7 +35,7 @@ body {
  * Token names follow the neapolitan preset: --dot-grid-* not --dot-*. */
 @utility window-backdrop {
   background-image:
-    radial-gradient(ellipse at center, transparent clamp(50%, 30vw + 30vh, 80%), rgba(0, 0, 0, 0.2) 100%),
+    radial-gradient(ellipse at center, transparent clamp(60%, 40vw + 40vh, 90%), rgba(0, 0, 0, 0.07) 100%),
     linear-gradient(to top right, lch(54 47 0 / 0.1), lch(54 47 0 / 0) 70%),
     linear-gradient(to top left, lch(54 30 210 / 0.1), lch(54 30 210 / 0) 70%),
     radial-gradient(circle, var(--dot-grid-color) var(--dot-grid-size), transparent var(--dot-grid-size));
