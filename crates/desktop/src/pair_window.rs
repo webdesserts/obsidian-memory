@@ -117,7 +117,7 @@ pub fn open_responder(app: &AppHandle, device_name: &str, code: &str, expires_at
         }
 
         let query = format!(
-            "windows/pair-responder.html?device={}&code={}&expires={}",
+            "pair-responder.html?device={}&code={}&expires={}",
             percent_encode(&device_name),
             percent_encode(&code),
             expires_at_ms,

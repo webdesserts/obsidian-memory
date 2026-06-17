@@ -15,6 +15,7 @@ export default defineConfig({
         index: path.resolve(__dirname, "index.html"),
         settings: path.resolve(__dirname, "settings.html"),
         pairInitiator: path.resolve(__dirname, "pair-initiator.html"),
+        pairResponder: path.resolve(__dirname, "pair-responder.html"),
       },
     },
   },
