@@ -29,3 +29,15 @@ body {
   margin: 0;
   font-family: var(--font-sans);
 }
+
+/* Four-layer window background: vignette → warm tint → cool tint → dots.
+ * Replaces the ui `dot-grid` utility (which only covers the dots layer).
+ * Token names follow the neapolitan preset: --dot-grid-* not --dot-*. */
+@utility window-backdrop {
+  background-image:
+    radial-gradient(ellipse at center, transparent clamp(50%, 30vw + 30vh, 80%), rgba(0, 0, 0, 0.2) 100%),
+    linear-gradient(to top right, lch(54 47 0 / 0.1), lch(54 47 0 / 0) 70%),
+    linear-gradient(to top left, lch(54 30 210 / 0.1), lch(54 30 210 / 0) 70%),
+    radial-gradient(circle, var(--dot-grid-color) var(--dot-grid-size), transparent var(--dot-grid-size));
+  background-size: 100% 100%, 100% 100%, 100% 100%, var(--dot-grid-spacing) var(--dot-grid-spacing);
+}

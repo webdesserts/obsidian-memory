@@ -154,7 +154,7 @@ export function PairInitiator() {
   const pairDisabled = !isCompleteCode(code) || pairing;
 
   return (
-    <main data-tauri-drag-region className="dot-grid flex h-screen flex-col gap-4 bg-surface-base px-6 pb-6 pt-8 text-text-primary">
+    <main data-tauri-drag-region className="window-backdrop flex h-screen flex-col gap-4 bg-surface-base px-6 pb-6 pt-8 text-text-primary">
       <h1 className="text-lg font-medium">Pair with nearby device</h1>
       <p className="text-sm text-text-secondary">{scanStatus}</p>
 
