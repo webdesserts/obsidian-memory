@@ -68,4 +68,6 @@ tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tempfile.workspace = true
 anyhow.workspace = true
 bytes = "1"
+# For the `relay_probe` example: surface iroh's own relay-client logs via RUST_LOG.
+tracing-subscriber.workspace = true
 
