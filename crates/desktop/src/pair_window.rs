@@ -45,7 +45,7 @@ pub fn open_initiator(app: &AppHandle) -> tauri::Result<()> {
             .title("Pair with nearby device")
             .inner_size(420.0, 360.0)
             .resizable(false)
-            .title_bar_style(TitleBarStyle::Transparent)
+            .title_bar_style(TitleBarStyle::Overlay)
             .build();
 
         let window = match build_result {
@@ -129,7 +129,7 @@ pub fn open_responder(app: &AppHandle, device_name: &str, code: &str, expires_at
             .inner_size(420.0, 280.0)
             .resizable(false)
             .always_on_top(true)
-            .title_bar_style(TitleBarStyle::Transparent)
+            .title_bar_style(TitleBarStyle::Overlay)
             .build();
 
         let window = match build_result {

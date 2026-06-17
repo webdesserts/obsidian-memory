@@ -34,7 +34,7 @@ pub fn open(app: &AppHandle) {
             .title("Memory Settings")
             .inner_size(480.0, 360.0)
             .resizable(false)
-            .title_bar_style(TitleBarStyle::Transparent)
+            .title_bar_style(TitleBarStyle::Overlay)
             .build();
 
         if let Err(e) = build_result {

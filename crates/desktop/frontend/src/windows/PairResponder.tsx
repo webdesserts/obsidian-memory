@@ -118,7 +118,7 @@ export function PairResponder() {
   }
 
   return (
-    <main className="dot-grid flex h-screen flex-col items-center gap-2 bg-surface-base px-6 pb-6 pt-8 text-center text-text-primary">
+    <main data-tauri-drag-region className="dot-grid flex h-screen flex-col items-center gap-2 bg-surface-base px-6 pb-6 pt-8 text-center text-text-primary">
       <p className="text-sm text-text-secondary">
         Pair request from <span className="font-semibold text-text-primary">{init.device}</span>
       </p>
