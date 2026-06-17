@@ -142,6 +142,41 @@ impl SyncNode {
         extra_relay: Option<&RelayUrl>,
         allowlist: Arc<A>,
     ) -> Result<Self> {
+        Self::build(secret_key_bytes, extra_relay, allowlist, false).await
+    }
+
+    /// Create a SyncNode whose endpoint has **no IP transports** — relay-only.
+    ///
+    /// Identical to [`SyncNode::new`] except the iroh endpoint is built with
+    /// `clear_ip_transports()`, so it cannot open any direct/loopback QUIC path
+    /// and can only reach peers through a relay. This reproduces the off-LAN /
+    /// behind-NAT condition where the relay is the sole route — the topology that
+    /// in-process localhost tests otherwise can't force, because two loopback
+    /// nodes would discover each other's direct addresses and bypass the relay.
+    ///
+    /// Test-only (behind the `test-util` feature); never used in production.
+    #[cfg(all(feature = "native", feature = "test-util"))]
+    pub async fn new_relay_only<A: AllowlistStorage + std::fmt::Debug + 'static>(
+        secret_key_bytes: [u8; 32],
+        extra_relay: Option<&RelayUrl>,
+        allowlist: Arc<A>,
+    ) -> Result<Self> {
+        Self::build(secret_key_bytes, extra_relay, allowlist, true).await
+    }
+
+    /// Shared constructor body for [`SyncNode::new`] and (test-only)
+    /// [`SyncNode::new_relay_only`].
+    ///
+    /// `relay_only` strips IP transports from the endpoint so the only routing
+    /// path is a relay. The production callers always pass `false`; only the
+    /// `test-util` relay-only constructor passes `true`.
+    #[cfg(feature = "native")]
+    async fn build<A: AllowlistStorage + std::fmt::Debug + 'static>(
+        secret_key_bytes: [u8; 32],
+        extra_relay: Option<&RelayUrl>,
+        allowlist: Arc<A>,
+        relay_only: bool,
+    ) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
@@ -150,9 +185,17 @@ impl SyncNode {
             None => RelayMode::Disabled,
         };
 
-        let endpoint = Endpoint::builder(presets::Minimal)
+        let builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
-            .relay_mode(relay_mode)
+            .relay_mode(relay_mode);
+        // Relay-only: drop every IP transport so no direct/loopback path exists —
+        // the endpoint must route through a relay (the off-LAN/NAT condition).
+        let builder = if relay_only {
+            builder.clear_ip_transports()
+        } else {
+            builder
+        };
+        let endpoint = builder
             .bind()
             .await
             .context("Failed to create iroh endpoint")?;

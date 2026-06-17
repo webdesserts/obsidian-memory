@@ -61,4 +61,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
 bincode.workspace = true
 anyhow.workspace = true
-sync-core = { path = "../sync-core", features = ["native"] }
+# `test-util` exposes SyncNode::new_relay_only for the off-LAN/NAT repro tests.
+# Cargo unifies this with the production [dependencies] entry above, so it only
+# affects test builds — plain `cargo build` keeps sync-core at `native` only.
+sync-core = { path = "../sync-core", features = ["native", "test-util"] }

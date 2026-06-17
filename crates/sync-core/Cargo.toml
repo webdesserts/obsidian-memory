@@ -10,6 +10,12 @@ default = ["native"]
 # iroh/default enables direct socket binding and portmapper — not available in WASM.
 # The network module itself (gossip, streams, node) compiles for both native and WASM.
 native = ["iroh/default", "dep:mdns-sd", "tokio/rt", "tokio/macros"]
+# Test-only surface: exposes constructors that simulate constrained network
+# conditions (e.g. relay-only endpoints with no IP transports) so downstream
+# integration-test crates can reproduce off-LAN/NAT topologies. Never enabled
+# in production builds. `#[cfg(test)]` would not cross the crate boundary into
+# sync-daemon's integration tests, so this is a feature instead.
+test-util = []
 
 [dependencies]
 loro.workspace = true

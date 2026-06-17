@@ -576,3 +576,323 @@ async fn supervisor_heals_after_peer_relay_reap() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── H3': off-LAN bootstrap re-dial gap ──────────────────────────────────────
+//
+// These two tests isolate the "laptop never connects to umbra off-LAN" failure
+// (see [[Reviews/Off-LAN Relay-Dial Regression]], H3'). Both use truly
+// relay-only nodes (`build_relay_only_node` → `clear_ip_transports()`), so the
+// relay is the ONLY route — exactly rhea's coffeeshop condition, which the
+// IP-retaining relay tests above cannot force.
+//
+// CONTROL proves the relay-only + MemoryLookup-hint path connects when the hint
+// is present from the start. REPRO proves that once the FIRST bootstrap dial
+// fails (hint absent at dial time), the peer is never re-dialed even after the
+// hint becomes present and the supervisor keeps re-Joining — because gossip
+// leaves the peer in `Pending { queue: non-empty }` and only re-dials a peer
+// whose queue is empty (`iroh-gossip` `net.rs:696`).
+
+/// CONTROL: a relay-only node reaches a relay-only peer when the peer's relay
+/// hint is seeded into its `peer_lookup` BEFORE bootstrap.
+///
+/// This is the verdict-A happy path in isolation: with IP transports stripped
+/// from both endpoints, the relay is the only possible route, and the only way
+/// A learns B's relay is the `add_peer_relay` hint (B's relay is NOT in A's
+/// `RelayMap`). If A still NeighborUps B, the relay-only + hint-only mechanism
+/// works — so a failure to connect in the REPRO below is attributable to the
+/// re-dial gap, not to a broken off-LAN simulation.
+///
+/// If THIS test fails, the harness/off-LAN sim is wrong (e.g. relay-only nodes
+/// can't home on the in-process embedded relay) — investigate that before
+/// trusting the REPRO.
+///
+/// Seeds 106/107 reserved.
+#[tokio::test]
+async fn relay_only_control_connects_with_seeded_hint() -> anyhow::Result<()> {
+    // One relay both nodes home on; A reaches B only by resolving B's relay
+    // from its peer_lookup hint.
+    let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_url = relay.relay_url().clone();
+
+    // Relay-only nodes: no IP transports, so neither can fall back to a direct
+    // loopback path — the relay is genuinely the sole route (off-LAN/NAT sim).
+    let node_a = common::build_relay_only_node(106, &relay_url).await?;
+    let node_b = common::build_relay_only_node(107, &relay_url).await?;
+
+    node_a.allowlist.add_peer(node_b.node_id, "node-b").await?;
+    node_b.allowlist.add_peer(node_a.node_id, "node-a").await?;
+
+    let a_id = node_a.sync_node.node_id();
+    let b_id = node_b.sync_node.node_id();
+
+    // Ensure both endpoints have actually connected to their home relay before
+    // we test routing — a relay-only node that hasn't homed yet is unreachable
+    // through the relay, which would confound the result.
+    node_a.sync_node.endpoint.online().await;
+    node_b.sync_node.endpoint.online().await;
+
+    // Seed B's relay hint into A's lookup BEFORE bootstrap — the persisted-hint
+    // path (mirrors rhea's daemon.toml peer_relays). B's relay is NOT in A's
+    // RelayMap, so this hint is the only thing that resolves B for A.
+    node_a.sync_node.add_peer_relay(b_id, &relay_url);
+
+    let vault_id: VaultId = "cafebabe0beef106".parse().unwrap();
+
+    // B subscribes with no bootstrap; A bootstraps off B's bare EndpointId. The
+    // seeded hint provides A's relay path to B.
+    let mut gossip_b = node_b
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![])
+        .await?;
+    let mut gossip_a = node_a
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![b_id])
+        .await?;
+
+    // A NeighborUps B through the relay — proves the relay-only + hint-only path.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match gossip_a.event_rx.recv().await {
+                Some(GossipEvent::NeighborUp(id)) => {
+                    assert_eq!(id, b_id, "A's neighbor should be B");
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("gossip_a event channel closed before NeighborUp"),
+            }
+        }
+    })
+    .await
+    .expect("CONTROL: relay-only node failed to NeighborUp via seeded hint — \
+             the off-LAN sim itself is broken; fix this before trusting the repro");
+
+    gossip_a.event_rx.close();
+    gossip_b.event_rx.close();
+    let _ = a_id; // retained for symmetry with the repro below
+    relay.shutdown().await;
+    Ok(())
+}
+
+/// REPRO (H3'): after a relay-only node's FIRST gossip bootstrap dial to a peer
+/// fails, the peer is never re-dialed — even once its relay hint is present and
+/// the reconnect supervisor re-Joins every tick — so the peer stays permanently
+/// unreachable.
+///
+/// Setup mirrors the CONTROL (relay-only A + B, relay the sole route), with one
+/// change that breaks the first dial: A bootstraps off B's bare `EndpointId`
+/// while B's relay hint is ABSENT from A's `peer_lookup`, so the first
+/// `connect(B)` has no path to resolve. The hint is then added (as rhea's
+/// daemon.toml already holds it), and A's supervisor re-Joins B every tick. On
+/// healthy code A would reconnect once the hint is resolvable; on current code
+/// it never does, no matter how many times the supervisor re-Joins.
+///
+/// MECHANISM — `net.rs:696` is the proximate suppressor (proven against iroh
+/// source AND by the trace this test emits with `--nocapture`):
+///   * The first `Command::Join` puts B into `PeerState::Pending { queue: [Join] }`
+///     and fires exactly one `queue_dial(B)` (`net.rs:694-700`).
+///   * That single dial parks inside `Endpoint::connect` → `resolve_remote`,
+///     waiting for an address. The resolve phase has NO timeout (`endpoint.rs`
+///     connect doc: "This has no timeout"), and adding the hint 15s later does
+///     not wake the already-in-flight resolve. So within the window the dial
+///     neither succeeds nor fails — B's `queue` is never drained and stays
+///     non-empty. (This refines the diagnosis note's framing: the queue is
+///     non-empty because the first dial is STILL PENDING, not because a *failed*
+///     dial left it behind — but the suppressor is identical.)
+///   * Every later `rejoin_peers`→`Command::Join` re-emits `SendMessage(B, Join)`,
+///     which finds B `Pending` with a non-empty queue → the `queue.is_empty()`
+///     guard (`net.rs:696`) is false → `queue_dial` is NEVER called again.
+///
+/// Observed in the emitted trace: `re-bootstrapping gossip` ~60×, `start to
+/// dial peer=<B>` exactly 1×, `NeighborUp` 0×. The supervisor re-Joins B dozens
+/// of times; gossip dials it once and never again.
+///
+/// ASSERTION SHAPE: we assert the CORRECT behavior (A pulls a note B wrote —
+/// the durable observable used by the other supervisor tests), so this test is
+/// RED on current code (the pull times out and `wait_until` panics) and turns
+/// GREEN when the bootstrap re-dial fix lands. It is `#[ignore]`d so the suite
+/// stays green until then. The CONTROL test above proves the relay-only +
+/// seeded-hint path DOES connect, so this RED is attributable to the re-dial
+/// gap, not a broken off-LAN simulation.
+///
+/// Run manually (the emitted log IS the proof of the mechanism):
+///
+/// ```text
+/// cargo test -p sync-daemon --test relay_integration -- --ignored --nocapture \
+///     relay_only_bootstrap_first_dial_failure_is_never_retried
+/// ```
+///
+/// Seeds 108/109 reserved.
+#[tokio::test]
+#[ignore = "RED: H3' repro — un-ignore when the bootstrap re-dial fix lands"]
+async fn relay_only_bootstrap_first_dial_failure_is_never_retried() -> anyhow::Result<()> {
+    use sync_core::fs::FileSystem;
+
+    // The emitted gossip-dial + supervisor trace is the proof of the mechanism;
+    // `try_init` is a no-op if the test binary already installed a subscriber.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("iroh_gossip::net=debug,sync_daemon=info")
+        .with_test_writer()
+        .try_init();
+
+    let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_url = relay.relay_url().clone();
+
+    // Relay-only nodes (no IP transports) — the relay is the sole route.
+    let node_a = common::build_relay_only_node(108, &relay_url).await?;
+    let node_b = common::build_relay_only_node(109, &relay_url).await?;
+
+    node_a.allowlist.add_peer(node_b.node_id, "node-b").await?;
+    node_b.allowlist.add_peer(node_a.node_id, "node-a").await?;
+
+    let a_id = node_a.sync_node.node_id();
+    let b_id = node_b.sync_node.node_id();
+
+    // Both endpoints home on the relay before any routing is attempted.
+    node_a.sync_node.endpoint.online().await;
+    node_b.sync_node.endpoint.online().await;
+
+    // Seed a note into B's vault so A pulling it proves the partition healed —
+    // the same durable observable the other supervisor tests assert on.
+    node_b
+        .fs
+        .write("notes/after-bootstrap-redial.md", b"# Delivered after re-dial")
+        .await?;
+    {
+        let vault = node_b.vault.lock().await;
+        vault.on_file_changed("notes/after-bootstrap-redial.md").await?;
+    }
+
+    let vault_id: VaultId = "cafebabe0beef108".parse().unwrap();
+
+    // CRUX: A bootstraps off B's bare id while B's hint is ABSENT from A's
+    // lookup. The first connect(B) has no path to resolve, so the dial parks in
+    // `resolve_remote` and never drains B's gossip queue — leaving B `Pending`
+    // with a non-empty queue (the H3' precondition that suppresses all re-dials).
+    let gossip_b = node_b
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![])
+        .await?;
+    let gossip_a = node_a
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![b_id])
+        .await?;
+
+    // Let the first bootstrap dial run to completion and FAIL before the hint
+    // exists. With an empty lookup the dial resolves no path to B and fails
+    // after iroh's connect timeout (~10s); we wait past it so B is left
+    // `Pending` with a non-empty queue BEFORE any hint is present. This delay is
+    // the deterministic gate for the "first dial fails" precondition — the
+    // architect's "seed the hint late" trigger from the diagnosis note.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    // The hint becomes present right after the failed first dial — exactly the
+    // rhea state (umbra's hint resident in daemon.toml). On healthy code a
+    // subsequent re-dial would now resolve B and connect.
+    node_a.sync_node.add_peer_relay(b_id, &relay_url);
+
+    // Drive A as a real Daemon so its reconnect supervisor re-Joins B. The
+    // net-change channel lets us reset A's hint backoff repeatedly (below) so
+    // the supervisor stays un-throttled and re-Joins B on EVERY tick — the
+    // "supervisor keeps re-joining" condition. On healthy code one of those
+    // re-Joins would re-dial B; on current code none do.
+    let a_vault = node_a.vault.clone();
+    let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+    let a_shutdown = CancellationToken::new();
+    let (net_tx, net_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut daemon_a = Daemon::new(
+        a_vault.clone(),
+        node_a.sync_node,
+        gossip_a,
+        a_file_rx,
+        None,
+        node_a.allowlist.clone(),
+        "device-a".to_string(),
+        None,
+        "/test-vault-bootstrap-redial".into(),
+        a_shutdown.clone(),
+    );
+    daemon_a.set_net_change_rx(net_rx);
+    let b_hint = PeerRelay::new(b_id.to_string(), relay_url.to_string());
+    daemon_a.seed_peer_relays_snapshot(vec![b_hint]);
+    daemon_a.set_reconnect_interval(Duration::from_millis(200));
+
+    let a_loop = tokio::spawn(async move {
+        daemon_a.run_loop().await;
+    });
+
+    // Keep A's hint perpetually due by firing a network-change signal every
+    // 500ms — each one resets the hint's backoff so the supervisor re-Joins B
+    // every tick instead of backing off after the first failure. This makes the
+    // premise unambiguous: B is re-Joined many times over the wait window, and
+    // gossip still never re-dials it.
+    let net_shutdown = CancellationToken::new();
+    let net_pump = {
+        let net_shutdown = net_shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = net_shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if net_tx.send(()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // B just needs to stay alive to answer A's pull once A connects.
+    let b_vault = node_b.vault.clone();
+    let b_fs = node_b.fs.clone();
+    let b_allowlist = node_b.allowlist.clone();
+    let (_b_file_tx, b_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+    let b_shutdown = CancellationToken::new();
+    let mut daemon_b = Daemon::new(
+        b_vault.clone(),
+        node_b.sync_node,
+        gossip_b,
+        b_file_rx,
+        None,
+        b_allowlist,
+        "device-b".to_string(),
+        None,
+        "/test-vault-bootstrap-redial-b".into(),
+        b_shutdown.clone(),
+    );
+    let b_loop = tokio::spawn(async move {
+        daemon_b.run_loop().await;
+    });
+
+    // PROOF: on healthy code the supervisor re-dials B (hint now present) and A
+    // pulls B's note. On current code the first-dial failure left B Pending with
+    // a non-empty queue, so no re-dial ever fires — this wait TIMES OUT and the
+    // test is RED. The fix turns it GREEN.
+    common::wait_until(
+        "A pulls B's note after the first bootstrap dial failed (H3' re-dial)",
+        Duration::from_secs(30),
+        || {
+            let vault = a_vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/after-bootstrap-redial.md".to_string())
+            }
+        },
+    )
+    .await;
+
+    net_shutdown.cancel();
+    a_shutdown.cancel();
+    b_shutdown.cancel();
+    let _ = net_pump.await;
+    let _ = a_loop.await;
+    let _ = b_loop.await;
+    let _ = (a_id, b_fs, b_vault); // retained for clarity/symmetry
+    relay.shutdown().await;
+    Ok(())
+}

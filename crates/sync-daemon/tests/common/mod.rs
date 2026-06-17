@@ -65,6 +65,36 @@ pub async fn build_node_with_relay(seed_byte: u8, relay_url: &RelayUrl) -> anyho
     })
 }
 
+/// Build a [`RelayNode`] whose home relay is `relay_url` and whose endpoint has
+/// **no IP transports** — relay is the only routing path.
+///
+/// Identical to [`build_node_with_relay`] except it uses
+/// [`SyncNode::new_relay_only`], reproducing the off-LAN / behind-NAT condition:
+/// two such loopback nodes cannot fall back to direct addresses, so the relay is
+/// genuinely the only way they reach each other. Without this, in-process
+/// localhost nodes discover each other's direct addresses and bypass the relay,
+/// masking relay-path bugs.
+#[allow(dead_code)] // see RelayNode — per-binary common compilation
+pub async fn build_relay_only_node(seed_byte: u8, relay_url: &RelayUrl) -> anyhow::Result<RelayNode> {
+    let fs = Arc::new(InMemoryFs::new());
+    let author = PeerId::from_secret_bytes(seed(seed_byte));
+    let vault = Vault::init(fs.clone(), author).await?;
+    let vault = Arc::new(Mutex::new(vault));
+
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let sync_node =
+        SyncNode::new_relay_only(seed(seed_byte), Some(relay_url), allowlist.clone()).await?;
+    let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
+
+    Ok(RelayNode {
+        vault,
+        fs,
+        allowlist,
+        sync_node,
+        node_id,
+    })
+}
+
 /// Poll `predicate` until it returns true or `deadline` elapses, panicking on
 /// timeout. Checks every 100ms.
 ///
