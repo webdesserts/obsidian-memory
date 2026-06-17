@@ -6,7 +6,7 @@
 //! when `WebviewWindowBuilder::build()` is called from a worker thread.
 
 use sync_daemon::pair_api::DaemonCommand;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::sync::oneshot;
 use tracing::warn;
 
@@ -45,6 +45,7 @@ pub fn open_initiator(app: &AppHandle) -> tauri::Result<()> {
             .title("Pair with nearby device")
             .inner_size(420.0, 360.0)
             .resizable(false)
+            .title_bar_style(TitleBarStyle::Transparent)
             .build();
 
         let window = match build_result {
@@ -128,6 +129,7 @@ pub fn open_responder(app: &AppHandle, device_name: &str, code: &str, expires_at
             .inner_size(420.0, 280.0)
             .resizable(false)
             .always_on_top(true)
+            .title_bar_style(TitleBarStyle::Transparent)
             .build();
 
         let window = match build_result {

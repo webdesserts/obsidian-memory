@@ -22,3 +22,6 @@ crates/desktop/node_modules/
 crates/desktop/frontend/node_modules/
 crates/desktop/frontend/dist/
 crates/desktop/gen/
+
+# Vitest screenshot scratch output (actual/diff images written on snapshot update/failure)
+crates/desktop/frontend/.vitest-attachments/

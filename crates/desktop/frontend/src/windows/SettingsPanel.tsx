@@ -85,7 +85,7 @@ export function SettingsPanel() {
   }
 
   return (
-    <main className="flex h-screen flex-col gap-5 bg-surface-base p-6 text-text-primary">
+    <main className="dot-grid flex h-screen flex-col gap-5 bg-surface-base px-6 pb-6 pt-8 text-text-primary">
       <h1 className="text-lg font-medium">Memory Settings</h1>
 
       <div className="flex flex-1 flex-col gap-5">

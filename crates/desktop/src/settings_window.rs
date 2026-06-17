@@ -5,7 +5,7 @@
 //! that occurs when `WebviewWindowBuilder::build()` is called from a worker thread
 //! (same constraint as the pairing windows).
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager, TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
 use tracing::warn;
 
 /// Label assigned to the settings window. Used by the `settings-window` capability.
@@ -34,6 +34,7 @@ pub fn open(app: &AppHandle) {
             .title("Memory Settings")
             .inner_size(480.0, 360.0)
             .resizable(false)
+            .title_bar_style(TitleBarStyle::Transparent)
             .build();
 
         if let Err(e) = build_result {
