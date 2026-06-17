@@ -40,7 +40,7 @@ pub fn open_initiator(app: &AppHandle) -> tauri::Result<()> {
             return;
         }
 
-        let url = WebviewUrl::App("windows/pair-initiator.html".into());
+        let url = WebviewUrl::App("pair-initiator.html".into());
         let build_result = WebviewWindowBuilder::new(&app, INITIATOR_LABEL, url)
             .title("Pair with nearby device")
             .inner_size(420.0, 360.0)

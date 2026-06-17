@@ -4,7 +4,7 @@
  * real window. Mirrors webdesserts/ui's tests/test-wrapper.tsx.
  */
 
-import "../src/windows/settings.css";
+import "../src/windows/windows.css";
 
 export function TestWrapper({ children }: { children: React.ReactNode }) {
   return (

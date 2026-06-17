@@ -8,12 +8,13 @@ export default defineConfig({
   build: {
     outDir: "dist",
     rollupOptions: {
-      // Multi-page build: the existing index entry plus the bundled React
-      // settings window. The vanilla pair windows live in public/ and are
-      // copied verbatim, so they don't need an entry here.
+      // Multi-page build: the tray index entry plus each bundled React window.
+      // The pair windows are React entries (migrated from the old vanilla
+      // public/windows/ HTML), so they get their own rollup inputs here.
       input: {
         index: path.resolve(__dirname, "index.html"),
         settings: path.resolve(__dirname, "settings.html"),
+        pairInitiator: path.resolve(__dirname, "pair-initiator.html"),
       },
     },
   },
