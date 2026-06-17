@@ -31,6 +31,11 @@ pub mod streams;
 pub use node::{SYNC_ALPN, SyncNode};
 mod node;
 
+/// The gossip protocol ALPN, re-exported so downstream crates (e.g. the daemon's
+/// reconnect supervisor) can open gossip-bound connections without taking a
+/// direct dependency on `iroh-gossip`.
+pub use iroh_gossip::net::GOSSIP_ALPN;
+
 // Discovery and pairing are native-only — they depend on iroh::protocol::ProtocolHandler
 // and tokio::time::timeout which are unavailable in WASM.
 #[cfg(feature = "native")]

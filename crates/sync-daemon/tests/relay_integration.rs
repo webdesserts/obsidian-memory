@@ -673,61 +673,45 @@ async fn relay_only_control_connects_with_seeded_hint() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// REPRO (H3'): after a relay-only node's FIRST gossip bootstrap dial to a peer
-/// fails, the peer is never re-dialed — even once its relay hint is present and
-/// the reconnect supervisor re-Joins every tick — so the peer stays permanently
-/// unreachable.
+/// The reconnect supervisor recovers a relay-only peer whose FIRST gossip
+/// bootstrap dial parked, once the peer's relay hint is present (H3' fix).
 ///
-/// Setup mirrors the CONTROL (relay-only A + B, relay the sole route), with one
-/// change that breaks the first dial: A bootstraps off B's bare `EndpointId`
-/// while B's relay hint is ABSENT from A's `peer_lookup`, so the first
-/// `connect(B)` has no path to resolve. The hint is then added (as rhea's
-/// daemon.toml already holds it), and A's supervisor re-Joins B every tick. On
-/// healthy code A would reconnect once the hint is resolvable; on current code
-/// it never does, no matter how many times the supervisor re-Joins.
+/// This is the green regression guard for the off-LAN "never connects to umbra"
+/// bug. Setup mirrors the CONTROL (relay-only A + B, relay the sole route) but
+/// breaks the first dial: A bootstraps off B's bare `EndpointId` while B's relay
+/// hint is ABSENT, so gossip's bare-id dial parks in iroh's address resolution
+/// (no path, no timeout) and leaves B `Pending` with a non-empty queue. Gossip's
+/// own `net.rs:696` `queue.is_empty()` guard then suppresses every later re-dial,
+/// so gossip alone can never recover B — even though the supervisor re-Joins it
+/// every ~200ms tick (kept due by the net-change pump).
 ///
-/// MECHANISM — `net.rs:696` is the proximate suppressor (proven against iroh
-/// source AND by the trace this test emits with `--nocapture`):
-///   * The first `Command::Join` puts B into `PeerState::Pending { queue: [Join] }`
-///     and fires exactly one `queue_dial(B)` (`net.rs:694-700`).
-///   * That single dial parks inside `Endpoint::connect` → `resolve_remote`,
-///     waiting for an address. The resolve phase has NO timeout (`endpoint.rs`
-///     connect doc: "This has no timeout"), and adding the hint 15s later does
-///     not wake the already-in-flight resolve. So within the window the dial
-///     neither succeeds nor fails — B's `queue` is never drained and stays
-///     non-empty. (This refines the diagnosis note's framing: the queue is
-///     non-empty because the first dial is STILL PENDING, not because a *failed*
-///     dial left it behind — but the suppressor is identical.)
-///   * Every later `rejoin_peers`→`Command::Join` re-emits `SendMessage(B, Join)`,
-///     which finds B `Pending` with a non-empty queue → the `queue.is_empty()`
-///     guard (`net.rs:696`) is false → `queue_dial` is NEVER called again.
+/// The fix makes the supervisor establish the connection itself: for each due
+/// hint it spawns a relay-carrying `endpoint.connect(EndpointAddr::with_relay_url,
+/// GOSSIP_ALPN)` (an `App` path resolves immediately — no park, independent of
+/// gossip's stuck Dialer) and hands the connection to `gossip.handle_connection`,
+/// which adopts it like an inbound accept: `accept_conn` drains the queued Join →
+/// B Active → handshake → NeighborUp → full sync. We assert the durable
+/// observable the other supervisor tests use — A pulls a note B wrote.
 ///
-/// Observed in the emitted trace: `re-bootstrapping gossip` ~60×, `start to
-/// dial peer=<B>` exactly 1×, `NeighborUp` 0×. The supervisor re-Joins B dozens
-/// of times; gossip dials it once and never again.
+/// BEFORE the fix this test was RED (the pull timed out; gossip dialed B exactly
+/// once and never again despite ~60 re-Joins, observable as `start to dial
+/// peer=<B>` ×1 / `NeighborUp` ×0 in the emitted trace). The CONTROL test above
+/// proves the relay-only + seeded-hint path connects, so this test isolates the
+/// supervisor's recovery of an already-parked peer, not the off-LAN sim.
 ///
-/// ASSERTION SHAPE: we assert the CORRECT behavior (A pulls a note B wrote —
-/// the durable observable used by the other supervisor tests), so this test is
-/// RED on current code (the pull times out and `wait_until` panics) and turns
-/// GREEN when the bootstrap re-dial fix lands. It is `#[ignore]`d so the suite
-/// stays green until then. The CONTROL test above proves the relay-only +
-/// seeded-hint path DOES connect, so this RED is attributable to the re-dial
-/// gap, not a broken off-LAN simulation.
-///
-/// Run manually (the emitted log IS the proof of the mechanism):
+/// Run with `--nocapture` to see the supervisor-connect + adoption trace:
 ///
 /// ```text
-/// cargo test -p sync-daemon --test relay_integration -- --ignored --nocapture \
-///     relay_only_bootstrap_first_dial_failure_is_never_retried
+/// cargo test -p sync-daemon --test relay_integration -- --nocapture \
+///     supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial
 /// ```
 ///
 /// Seeds 108/109 reserved.
 #[tokio::test]
-#[ignore = "RED: H3' repro — un-ignore when the bootstrap re-dial fix lands"]
-async fn relay_only_bootstrap_first_dial_failure_is_never_retried() -> anyhow::Result<()> {
+async fn supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial() -> anyhow::Result<()> {
     use sync_core::fs::FileSystem;
 
-    // The emitted gossip-dial + supervisor trace is the proof of the mechanism;
+    // The emitted gossip-dial + supervisor trace documents the recovery path;
     // `try_init` is a no-op if the test binary already installed a subscriber.
     let _ = tracing_subscriber::fmt()
         .with_env_filter("iroh_gossip::net=debug,sync_daemon=info")
@@ -864,12 +848,12 @@ async fn relay_only_bootstrap_first_dial_failure_is_never_retried() -> anyhow::R
         daemon_b.run_loop().await;
     });
 
-    // PROOF: on healthy code the supervisor re-dials B (hint now present) and A
-    // pulls B's note. On current code the first-dial failure left B Pending with
-    // a non-empty queue, so no re-dial ever fires — this wait TIMES OUT and the
-    // test is RED. The fix turns it GREEN.
+    // PROOF: the supervisor's relay-carrying connect (hint now present) bypasses
+    // gossip's parked bare-id dial, establishes the relay path, and hands the
+    // connection to gossip → the queued Join drains → NeighborUp → A pulls B's
+    // note. Before the fix B stayed Pending and this wait timed out.
     common::wait_until(
-        "A pulls B's note after the first bootstrap dial failed (H3' re-dial)",
+        "A pulls B's note after the supervisor recovers the parked bootstrap peer",
         Duration::from_secs(30),
         || {
             let vault = a_vault.clone();

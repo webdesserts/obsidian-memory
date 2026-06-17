@@ -224,6 +224,19 @@ impl VaultGossip {
             .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
     }
 
+    /// A cloneable handle that can re-join peers from a spawned task.
+    ///
+    /// `VaultGossip` itself is not `Clone` (it owns the event receiver and the
+    /// pump task), but the reconnect supervisor's bootstrap-connect runs in a
+    /// spawned task that must re-queue a Join just before adopting the connection.
+    /// This hands out a lightweight clone of the underlying gossip sender for that
+    /// purpose without exposing the receiver.
+    pub fn rejoin_handle(&self) -> GossipRejoinHandle {
+        GossipRejoinHandle {
+            sender: self.sender.clone(),
+        }
+    }
+
     /// Serialize and broadcast a [`GossipMessage`] envelope.
     async fn broadcast_message(&mut self, msg: &GossipMessage) -> Result<()> {
         let bytes: Bytes = bincode::serialize(msg)?.into();
@@ -236,5 +249,25 @@ impl VaultGossip {
         }
         self.sender.broadcast(bytes).await?;
         Ok(())
+    }
+}
+
+/// A cloneable handle for re-joining gossip peers from a spawned task.
+///
+/// Obtained via [`VaultGossip::rejoin_handle`]. Carries only a clone of the
+/// gossip sender, so it can be moved into a `tokio::spawn`ed task (the reconnect
+/// supervisor's bootstrap-connect) where the non-`Clone` `VaultGossip` cannot go.
+#[derive(Clone)]
+pub struct GossipRejoinHandle {
+    sender: GossipSender,
+}
+
+impl GossipRejoinHandle {
+    /// Re-join the given peers — see [`VaultGossip::rejoin_peers`].
+    pub async fn rejoin_peers(&self, peers: Vec<EndpointId>) -> Result<()> {
+        self.sender
+            .join_peers(peers)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
     }
 }

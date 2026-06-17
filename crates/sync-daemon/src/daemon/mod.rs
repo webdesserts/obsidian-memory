@@ -20,7 +20,8 @@ use crate::pair_api::{
     ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary,
 };
 use crate::watcher::{FileEvent, FileEventKind};
-use iroh::EndpointId;
+use iroh::{EndpointAddr, EndpointId};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -31,7 +32,7 @@ use tracing::{debug, error, info, warn};
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::fs::FileSystem;
 use sync_core::network::{
-    SyncNode,
+    GOSSIP_ALPN, SyncNode,
     gossip::{GossipEvent, GossipMessage, MAX_GOSSIP_MESSAGE_SIZE, VaultGossip},
     pairing::{InboundPairingExchange, PairingApproval, PairingEvent},
     streams::InboundSyncRequest,
@@ -284,6 +285,20 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// from disk per tick) so the test harness — which uses a non-existent vault
     /// path — can seed it directly without writing `daemon.toml`.
     peer_relays: Vec<crate::persistence::PeerRelay>,
+    /// EndpointIds with a supervisor-issued bootstrap connect currently in flight.
+    ///
+    /// When a peer's first gossip bootstrap dial parks (relay-only, off-LAN), the
+    /// supervisor establishes the connection itself and hands it to gossip (see
+    /// `on_reconnect_tick`). Those connects are spawned tasks that can take up to
+    /// the QUIC handshake timeout to fail, while the supervisor keeps ticking
+    /// every ~200ms after a net change — so without a guard the same peer would
+    /// accumulate dozens of concurrent connects. An id is inserted before its
+    /// task spawns and removed when the task finishes; a tick skips any id already
+    /// present. Shared `Arc<tokio::sync::Mutex<…>>` because the removal happens
+    /// inside the spawned task, which can't borrow `&mut self`. The async mutex
+    /// (not `std`) is required: nothing holds the guard across an `.await` today,
+    /// but it lives behind the same shared-handle pattern as `peer_registry`.
+    bootstrap_connect_inflight: Arc<Mutex<HashSet<EndpointId>>>,
 
     // ── allowlist convergence ───────────────────────────────────────────────
     /// Wall-clock (`now_ms()`) of the last connected-path roster reconcile, or
@@ -357,6 +372,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             exchange_learn_rx,
             reconnect_tick,
             peer_relays: Vec::new(),
+            bootstrap_connect_inflight: Arc::new(Mutex::new(HashSet::new())),
             last_roster_reconcile_ms: None,
             roster_reconcile_interval_ms: scaled_ms(ROSTER_RECONCILE_MS),
         }
@@ -605,6 +621,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // EndpointIds dialed this tick, so we can attribute the (coarse) failure
         // after the attempt if no neighbor materializes.
         let mut due_ids: Vec<EndpointId> = Vec::new();
+        // Due hints whose relay URL parses, paired with that URL. Drives the
+        // supervisor-issued relay-carrying connect below — the recovery for peers
+        // whose bare-id gossip dial parked and can never be re-dialed by gossip.
+        let mut due_relay_targets: Vec<(EndpointId, iroh::RelayUrl)> = Vec::new();
 
         // When this is the only hint we have, it is the lookup's sole route to
         // the peer — we never evict it while partitioned (see the throttled
@@ -638,6 +658,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 // off-LAN peer is never stranded.
                 if let Ok(relay_url) = hint.relay_url.parse::<iroh::RelayUrl>() {
                     self.sync_node.set_peer_relay(endpoint_id, &relay_url);
+                    // Also drive a supervisor-issued connect for this hint (below):
+                    // gossip's bare-id Dialer can park forever and is then never
+                    // re-dialed, so we establish the relay-carrying connection
+                    // ourselves and hand it to gossip.
+                    due_relay_targets.push((endpoint_id, relay_url));
                 }
                 // Even with an unparseable URL, still bootstrap by EndpointId —
                 // mDNS or a prior direct address may reach the peer on-LAN.
@@ -705,10 +730,88 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             );
         }
 
+        // Supervisor-issued relay-carrying connect for each due hint.
+        //
+        // The `rejoin_peers` above re-queues a Join, but gossip dials a bootstrap
+        // peer by BARE EndpointId, and that dial can park forever in iroh's
+        // address resolution (relay-only, off-LAN — no path ever resolves, no
+        // timeout). Once parked, the peer sits `Pending` with a non-empty queue
+        // and gossip's `queue.is_empty()` guard suppresses every later re-dial, so
+        // the peer is unreachable until restart. We break that by establishing the
+        // connection ourselves with the relay attached (an `EndpointAddr` carrying
+        // the relay resolves immediately — no park) and handing it to gossip, which
+        // adopts it exactly as it adopts an inbound accept: `accept_conn` drains the
+        // queued Join, flips the peer Active, and the handshake yields NeighborUp.
+        // This is independent of gossip's parked Dialer, so it also recovers a peer
+        // that is ALREADY stuck.
+        for (endpoint_id, relay_url) in due_relay_targets {
+            self.spawn_bootstrap_connect(endpoint_id, relay_url);
+        }
+
         // Step 5: every due hint failed to yield a neighbor this tick (step 1
         // returned when connected). Record the failure so the throttle ramps and
         // survives a restart.
         self.record_due_hint_failures(&due_ids, now).await;
+    }
+
+    /// Establish a relay-carrying connection to a due peer and hand it to gossip,
+    /// recovering peers whose bare-id gossip bootstrap dial parked (see
+    /// `on_reconnect_tick`).
+    ///
+    /// Spawned, not awaited inline: `endpoint.connect` can take up to the QUIC
+    /// handshake timeout to fail when the relay is unreachable, and blocking the
+    /// daemon's single event loop that long would stall sync handling and the
+    /// net-change channel. The in-flight `HashSet` guard is load-bearing: the
+    /// supervisor ticks every ~200ms after a network change, so without it the
+    /// same peer would accumulate dozens of concurrent connects. We skip a peer
+    /// whose connect is already in flight, insert before spawning, and remove when
+    /// the task finishes (both success and failure).
+    fn spawn_bootstrap_connect(&self, endpoint_id: EndpointId, relay_url: iroh::RelayUrl) {
+        let endpoint = self.sync_node.endpoint.clone();
+        let gossip = self.sync_node.gossip.clone();
+        let rejoin = self.vault_gossip.rejoin_handle();
+        let inflight = self.bootstrap_connect_inflight.clone();
+
+        tokio::spawn(async move {
+            // Skip if a connect to this peer is already in flight; otherwise claim
+            // the slot. Holding the lock across the insert keeps the check-and-set
+            // atomic against concurrent ticks.
+            {
+                let mut set = inflight.lock().await;
+                if !set.insert(endpoint_id) {
+                    return;
+                }
+            }
+
+            // Re-queue a Join so a fresh Join is present in gossip's proto queue
+            // for `accept_conn` to drain on adoption (deterministic ordering — the
+            // queued Join is what initiates the handshake from our side once the
+            // connection is adopted).
+            if let Err(e) = rejoin.rejoin_peers(vec![endpoint_id]).await {
+                debug!(peer = %endpoint_id, "bootstrap re-join before connect failed: {e}");
+            }
+
+            // The relay-carrying addr is inserted as an `App` path before address
+            // lookup runs, so the connect resolves immediately and cannot park.
+            let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url);
+            match endpoint.connect(addr, GOSSIP_ALPN).await {
+                Ok(conn) => {
+                    // Adopt the connection into gossip: drains the queued Join →
+                    // peer Active → handshake → NeighborUp.
+                    if let Err(e) = gossip.handle_connection(conn).await {
+                        debug!(peer = %endpoint_id, "gossip rejected supervisor bootstrap connection: {e}");
+                    }
+                }
+                Err(e) => {
+                    // A real, fast failure now (vs the parked bare-id dial) — the
+                    // relay is genuinely unreachable this attempt. The next due
+                    // tick retries.
+                    debug!(peer = %endpoint_id, "supervisor bootstrap connect failed: {e}");
+                }
+            }
+
+            inflight.lock().await.remove(&endpoint_id);
+        });
     }
 
     /// Connected-path allowlist reconcile, throttled to `roster_reconcile_interval_ms`.
