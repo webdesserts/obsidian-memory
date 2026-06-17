@@ -112,6 +112,56 @@ fn hint_attempt_due(hint: &crate::persistence::PeerRelay, now_ms: u64) -> bool {
     }
 }
 
+/// Whether a peer-relay URL is reachable from OFF the local network.
+///
+/// A public/domain relay or a globally-routable IP (e.g. `https://umbra.computer/`)
+/// is an off-LAN lifeline. A private/link-local/loopback IP relay
+/// (`http://192.168.x:3340`, `10/8`, `172.16/12`, `169.254/16`, `fc00::/7`,
+/// `fe80::/10`) is LAN-only — useless once the laptop leaves that LAN.
+///
+/// An unparseable URL is treated as NOT off-LAN-reachable: it cannot be dialed
+/// via relay, so it can never be the lifeline we protect from eviction.
+///
+/// This classification is ONLY consulted for the eviction decision — never in
+/// the dial path (verdict A: an https domain relay and an http-ip relay take
+/// the identical dial path; no special-casing there).
+///
+/// `RelayUrl` derefs to `url::Url`, so we read `host_str()` and try to parse it
+/// as an `IpAddr`: a domain host fails the parse and is therefore off-LAN —
+/// exactly the semantics we want — while an IP host is classified by the std
+/// reachability methods (mirroring the house pattern in
+/// `crates/desktop/src/main.rs`'s `score_candidate`). IPv6 link-local
+/// (`fe80::/10`) and unique-local (`fc00::/7`) are matched bit-wise because the
+/// corresponding `Ipv6Addr` helpers are unstable on this toolchain.
+fn relay_is_offlan_reachable(relay_url: &str) -> bool {
+    let Ok(parsed) = relay_url.parse::<iroh::RelayUrl>() else {
+        return false; // unparseable → not a dial-able relay lifeline.
+    };
+    let Some(host) = parsed.host_str() else {
+        return false; // no host → not reachable.
+    };
+    // `host_str()` returns IPv6 hosts in bracketed notation (`[fe80::1]`), which
+    // fails `IpAddr` parsing — strip the brackets so the IP path classifies them
+    // instead of falling through to the domain branch.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        // A domain host (e.g. `umbra.computer`) doesn't parse as an IP — it is a
+        // genuine off-LAN route.
+        return true;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local() || v4.is_loopback()),
+        std::net::IpAddr::V6(v6) => {
+            let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            !(v6.is_loopback() || is_link_local || is_unique_local)
+        }
+    }
+}
+
 /// Configuration for running the sync daemon.
 pub struct DaemonRunConfig {
     pub vault: PathBuf,
@@ -496,8 +546,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///    - **Not due (throttled):** EVICT the hint from the address-lookup
     ///      (`remove_peer_relay`) so iroh-gossip's HyParView stops re-resolving
     ///      and re-feeding the dead relay to iroh's relay actor — UNLESS it is
-    ///      the only hint we have, in which case it is RETAINED (see the
-    ///      sole-hint rule below).
+    ///      the only hint we have OR the only off-LAN-reachable hint, in which
+    ///      case it is RETAINED (see the sole-hint / off-LAN-lifeline rule below).
     /// 4. `rejoin_peers` with just the due hints. A successful re-dial surfaces
     ///    as a normal `NeighborUp` → `on_neighbor_up` → full sync.
     /// 5. Since step 1 already returned when connected, reaching here means zero
@@ -512,13 +562,24 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// genuinely off-LAN peer that returns is still reached on the slow cadence,
     /// and learn-on-exchange resets it the instant it reconnects.
     ///
-    /// **Sole-hint rule (relay-reap fix):** while partitioned, a throttled hint
-    /// that is the ONLY one is never evicted. Throttling caps how often we DIAL
-    /// it, but its address must stay resident so a reaped non-home relay actor
-    /// can be respawned and the partition can heal without a process restart.
-    /// Evicting the only address is what caused the 12+ minute non-recovery this
-    /// rule exists to prevent. With two or more hints the throttled ones are
-    /// still evicted — a live alternative remains, so no lifeline is at risk.
+    /// **Sole-hint / off-LAN-lifeline rule (relay-reap fix):** while partitioned,
+    /// a throttled hint is never evicted if it is the ONLY hint we have OR the
+    /// ONLY off-LAN-reachable one (a public/domain relay, classified by
+    /// [`relay_is_offlan_reachable`]). Throttling caps how often we DIAL it, but
+    /// its address must stay resident so a reaped non-home relay actor can be
+    /// respawned and the partition can heal without a process restart. Evicting
+    /// the only address is what caused the 12+ minute non-recovery this rule
+    /// exists to prevent; the off-LAN generalization additionally keeps a laptop's
+    /// public-relay lifeline resident when its other hints are dead LAN-IP relays
+    /// (the n0-DNS-removal regression). A throttled hint is still evicted when a
+    /// real alternative remains — another hint when LAN-only protection applies,
+    /// or another off-LAN route.
+    ///
+    /// **Net-change interaction:** [`on_network_change`] un-throttles every hint
+    /// (flipping it back to *due*) so the next tick re-seeds rather than evicts.
+    /// Together with this off-LAN-lifeline retention, the public-relay lifeline
+    /// survives a network switch from both sides: it is never evicted while
+    /// throttled, and a net change re-dials it immediately on the new network.
     async fn on_reconnect_tick(&mut self) {
         // Step 1: connected — stay quiet and don't churn the swarm.
         //
@@ -551,6 +612,17 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // means `alive_count == 0`.
         let is_sole_hint = self.peer_relays.len() == 1;
 
+        // How many hints are reachable from OFF the local network (a public/domain
+        // relay or a globally-routable IP). When exactly one is, that hint is the
+        // last off-LAN lifeline and must not be evicted while throttled — LAN-only
+        // hints are no alternative once the laptop leaves the LAN. See the
+        // throttled branch below.
+        let offlan_reachable_count = self
+            .peer_relays
+            .iter()
+            .filter(|h| relay_is_offlan_reachable(&h.relay_url))
+            .count();
+
         // Decide per hint, applying node calls (set/remove) and stamping the
         // in-memory `last_attempt_ms` for due hints as we go.
         for hint in self.peer_relays.iter_mut() {
@@ -572,31 +644,51 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 hint.last_attempt_ms = Some(now);
                 bootstrap_ids.push(endpoint_id);
                 due_ids.push(endpoint_id);
-            } else if !is_sole_hint {
-                // Throttled, and there is at least one OTHER hint — safe to evict
-                // this one from the lookup so nothing re-resolves the dead relay
-                // until it comes due again.
-                self.sync_node.remove_peer_relay(endpoint_id);
+            } else {
+                // Throttled. Evict from the lookup UNLESS this hint is a lifeline
+                // we must never drop while partitioned:
+                //   - the only hint we have at all (sole-hint rule), OR
+                //   - the only OFF-LAN-reachable hint — its loss strands us
+                //     off-LAN even though LAN-only alternatives remain, because
+                //     those LAN-only hints cannot be dialed off-LAN.
+                // The off-LAN rule is a strict SUPERSET of the sole-hint rule: a
+                // sole LAN-only hint is still retained by `is_sole_hint` (it is
+                // the only address we have, useful or not), so this never regresses
+                // the original protection.
+                let is_sole_offlan_lifeline =
+                    relay_is_offlan_reachable(&hint.relay_url) && offlan_reachable_count == 1;
+                if !is_sole_hint && !is_sole_offlan_lifeline {
+                    // A live alternative remains (another hint, or another off-LAN
+                    // route) — safe to evict this one so nothing re-resolves the
+                    // dead relay until it comes due again.
+                    self.sync_node.remove_peer_relay(endpoint_id);
+                }
+                // Otherwise RETAINED in the lookup — the relay-reap reconnect fix,
+                // generalized to the off-LAN lifeline.
+                //
+                // We throttle the dial FREQUENCY (the `hint_attempt_due` gate
+                // above already does this), not the address PRESENCE — never
+                // evicting a partitioned peer's only lifeline. If we removed it,
+                // the next due tick would re-seed an address that had been gone,
+                // but more importantly a sole reaped relay actor would never be
+                // driven back to life between due windows. The off-LAN case adds:
+                // a laptop that paired with both a public-relay peer and a LAN-IP
+                // peer must keep the public hint resident, because off-LAN the
+                // LAN-IP hint is a dead end and the public one is the only route
+                // home (this is the n0-DNS-removal regression — n0's parallel DNS
+                // resolver used to mask this eviction window).
+                //
+                // Tradeoff (intentional, and it diverges from `remove_peer_relay`'s
+                // own docstring warning): retaining such a hint means a
+                // permanently-dead peer's address lingers in `MemoryLookup`, where
+                // iroh-gossip's HyParView maintenance re-resolves it on its own ~60s
+                // cadence — low-grade relay-actor activity that the general eviction
+                // path otherwise quiets between due windows. We accept that churn
+                // because the alternative (evicting the only off-LAN address while
+                // partitioned) is what caused the 12+ minute non-recovery this fix
+                // exists to kill. `MAX_HINT_BACKOFF_MS` still bounds how often WE
+                // actively dial it, so retention does not reintroduce a hot dial loop.
             }
-            // Throttled AND sole hint: deliberately RETAINED in the lookup.
-            //
-            // This is the relay-reap reconnect fix. We throttle the dial
-            // FREQUENCY (the `hint_attempt_due` gate above already does this),
-            // not the address PRESENCE — never evicting a partitioned peer's
-            // only lifeline. If we removed it, the next due tick would re-seed an
-            // address that had been gone, but more importantly a sole reaped
-            // relay actor would never be driven back to life between due windows.
-            //
-            // Tradeoff (intentional, and it diverges from `remove_peer_relay`'s
-            // own docstring warning): retaining the sole hint means a
-            // permanently-dead peer's address lingers in `MemoryLookup`, where
-            // iroh-gossip's HyParView maintenance re-resolves it on its own ~60s
-            // cadence — low-grade relay-actor activity that the general eviction
-            // path otherwise quiets between due windows. We accept that churn
-            // because the alternative (evicting the only address while
-            // partitioned) is what caused the 12+ minute non-recovery this fix
-            // exists to kill. `MAX_HINT_BACKOFF_MS` still bounds how often WE
-            // actively dial it, so retention does not reintroduce a hot dial loop.
         }
 
         if bootstrap_ids.is_empty() {
@@ -708,6 +800,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// (`on_reconnect_tick`) is untouched; we only un-throttle the hints by
     /// zeroing `failure_count`/`last_attempt_ms`, which flips `hint_attempt_due`
     /// to `true` for every hint so they all re-dial on the next wake.
+    ///
+    /// This pairs with `on_reconnect_tick`'s off-LAN-lifeline retention to protect
+    /// the public-relay lifeline across a network switch: retention keeps it
+    /// resident in the lookup even if a reconnect tick races ahead of this reset,
+    /// and this reset re-dials it immediately on the new network.
     async fn on_network_change(&mut self) {
         if self.peer_relays.is_empty() {
             return; // unpaired / hint-less — nothing to re-dial.
@@ -1528,5 +1625,47 @@ mod backoff_tests {
         assert!(!hint_attempt_due(&h, 0));
         // Once the clock advances past attempt + window, it's due again.
         assert!(hint_attempt_due(&h, 1_000_000 + HINT_BACKOFF_BASE_MS));
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::relay_is_offlan_reachable;
+
+    /// A public/domain relay or globally-routable IP is an off-LAN lifeline:
+    /// these are the genuine routes home when the laptop leaves its LAN.
+    #[test]
+    fn public_and_domain_relays_are_offlan_reachable() {
+        assert!(relay_is_offlan_reachable("https://umbra.computer/"));
+        assert!(relay_is_offlan_reachable("http://example.com:3340/"));
+        // A globally-routable IPv6 (Cloudflare) — not loopback/link/unique-local.
+        assert!(relay_is_offlan_reachable("http://[2606:4700::1]:3340/"));
+    }
+
+    /// Private/link-local/loopback IPv4 relays are LAN-only — useless off-LAN.
+    #[test]
+    fn private_link_local_and_loopback_ipv4_are_lan_only() {
+        assert!(!relay_is_offlan_reachable("http://192.168.68.52:3340/")); // 192.168/16
+        assert!(!relay_is_offlan_reachable("http://10.0.0.5:3340/")); // 10/8
+        assert!(!relay_is_offlan_reachable("http://172.16.0.1:3340/")); // 172.16/12
+        assert!(!relay_is_offlan_reachable("http://169.254.1.1:3340/")); // 169.254/16 link-local
+        assert!(!relay_is_offlan_reachable("http://127.0.0.1:3340/")); // loopback
+    }
+
+    /// IPv6 link-local (`fe80::/10`), unique-local (`fc00::/7`), and loopback are
+    /// LAN-only, matched bit-wise since the std helpers are unstable.
+    #[test]
+    fn link_local_and_unique_local_ipv6_are_lan_only() {
+        assert!(!relay_is_offlan_reachable("http://[fe80::1]:3340/")); // link-local
+        assert!(!relay_is_offlan_reachable("http://[fc00::1]:3340/")); // unique-local
+        assert!(!relay_is_offlan_reachable("http://[::1]:3340/")); // loopback
+    }
+
+    /// An unparseable / garbage URL can't be dialed as a relay, so it is never
+    /// the lifeline we protect from eviction — classified NOT off-LAN-reachable.
+    #[test]
+    fn unparseable_url_is_not_offlan_reachable() {
+        assert!(!relay_is_offlan_reachable("not a url"));
+        assert!(!relay_is_offlan_reachable(""));
     }
 }

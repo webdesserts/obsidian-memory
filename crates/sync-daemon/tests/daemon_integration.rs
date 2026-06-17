@@ -1847,6 +1847,10 @@ mod daemon_integration {
         });
 
         // The supervisor evicts the throttled hint while keeping the due one.
+        // Both hints are `example.com` domains (off-LAN-reachable), so the
+        // throttled one is evicted because a *due* alternative exists
+        // (offlan_reachable_count == 2 ⇒ it is NOT the sole off-LAN lifeline) —
+        // the eviction is driven by the due alternative, not by URL class.
         wait_until("throttled hint evicted from lookup", || {
             let lookup = lookup.clone();
             async move { lookup.get_endpoint_info(throttled_id).is_none() }
@@ -1957,15 +1961,21 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// With TWO throttled hints and none due, BOTH are evicted — the sole-hint
-    /// retention guard fires only at exactly one hint.
+    /// With TWO throttled hints and none due, BOTH are evicted — the retention
+    /// guard fires only when a hint is the sole hint OR the sole off-LAN lifeline.
     ///
-    /// The relay-reap fix retains a hint only when it is the lookup's LAST
-    /// address (`peer_relays.len() == 1`). With two stale hints and no due
-    /// alternative, there is no single lifeline to protect: both are throttled,
-    /// both get evicted, and `bootstrap_ids` is empty so the tick early-returns
-    /// (nothing to dial until one comes due). This pins the boundary so a future
-    /// change can't silently widen the guard to "never evict while partitioned."
+    /// The relay-reap fix retains a hint only when it is the lookup's LAST address
+    /// (`peer_relays.len() == 1`) or the LAST off-LAN-reachable one. Both hints
+    /// here are LAN-IP relays (`192.168.68.52` and `10.0.0.5`), so neither is
+    /// off-LAN-reachable: `offlan_reachable_count == 0`, the off-LAN-lifeline guard
+    /// never applies, and the `is_sole_hint` guard is also false (len == 2). With
+    /// no single lifeline to protect, both are throttled, both get evicted, and
+    /// `bootstrap_ids` is empty so the tick early-returns (nothing to dial until
+    /// one comes due). This pins the boundary so a future change can't silently
+    /// widen the guard to "never evict while partitioned." The URLs are LAN-IPs
+    /// (not domains) on purpose — a domain would be off-LAN-reachable and, as the
+    /// sole such hint, would be RETAINED, which is the opposite of what this
+    /// boundary test asserts.
     ///
     /// Seeds 91 reserved (92/93 only mint valid peer EndpointIds).
     #[tokio::test]
@@ -1979,11 +1989,15 @@ mod daemon_integration {
         let node_y = build_node(93).await?;
         let x_id = node_x.sync_node.node_id();
         let y_id = node_y.sync_node.node_id();
-        let relay_url: RelayUrl = "http://example.com:3340/".parse()?;
+        // Distinct LAN-IP relays: both LAN-only, so neither is the off-LAN
+        // lifeline the new rule protects. (The seeds only need to parse; the
+        // classification reads the snapshot strings below.)
+        let x_relay_url: RelayUrl = "http://192.168.68.52:3340/".parse()?;
+        let y_relay_url: RelayUrl = "http://10.0.0.5:3340/".parse()?;
 
         // Seed BOTH hints into A's lookup so eviction is observable as removal.
-        node_a.sync_node.set_peer_relay(x_id, &relay_url);
-        node_a.sync_node.set_peer_relay(y_id, &relay_url);
+        node_a.sync_node.set_peer_relay(x_id, &x_relay_url);
+        node_a.sync_node.set_peer_relay(y_id, &y_relay_url);
 
         let lookup = node_a.sync_node.peer_lookup.clone();
         assert!(lookup.get_endpoint_info(x_id).is_some());
@@ -1992,10 +2006,10 @@ mod daemon_integration {
         // Both hints are throttled: recent attempt + failures puts each well
         // inside its backoff window, and neither is due.
         let now = now_ms_test();
-        let mut hint_x = PeerRelay::new(x_id.to_string(), "http://example.com:3340/".to_string());
+        let mut hint_x = PeerRelay::new(x_id.to_string(), "http://192.168.68.52:3340/".to_string());
         hint_x.failure_count = 6;
         hint_x.last_attempt_ms = Some(now);
-        let mut hint_y = PeerRelay::new(y_id.to_string(), "http://example.com:3340/".to_string());
+        let mut hint_y = PeerRelay::new(y_id.to_string(), "http://10.0.0.5:3340/".to_string());
         hint_y.failure_count = 6;
         hint_y.last_attempt_ms = Some(now);
 
@@ -2034,6 +2048,130 @@ mod daemon_integration {
             }
         })
         .await;
+
+        a_shutdown.cancel();
+        let _ = a_loop.await;
+
+        Ok(())
+    }
+
+    /// With two throttled hints — a domain lifeline and a dead LAN-IP relay — the
+    /// supervisor RETAINS the domain hint (the sole off-LAN-reachable route) and
+    /// evicts the LAN-IP one. This is the off-LAN regression guard.
+    ///
+    /// The coffeeshop bug: a laptop that paired with both umbra (public
+    /// `umbra.computer` relay) and charon (a `192.168.x` LAN-IP relay) holds two
+    /// hints. Off-LAN, charon's LAN-IP relay is unreachable, so umbra's domain
+    /// hint is the ONLY real route — yet the old `is_sole_hint` guard (count == 1)
+    /// evicted it the moment it was throttled, because a second hint existed. With
+    /// n0 DNS removed (commit `2b51540`) there was no longer a parallel resolver
+    /// to mask the gap, so off-LAN reconnect silently broke. The fix generalizes
+    /// the retention guard from "sole hint" to "sole off-LAN-reachable hint": a
+    /// LAN-only alternative is no alternative off-LAN.
+    ///
+    /// The LAN-IP eviction is the positive liveness proof that the supervisor loop
+    /// actually ran (not a pass-by-luck dead loop) — we wait for that removal,
+    /// THEN assert the domain hint is still resident. Both hints are throttled
+    /// (failure_count 6 + just-now attempt ⇒ well inside backoff), so neither is
+    /// due; only the classification decides which is kept.
+    ///
+    /// FAILS on pre-fix code: the old branch evicts any throttled non-sole hint,
+    /// so the domain lifeline would be removed alongside the LAN-IP one.
+    ///
+    /// Seed 103 reserved (104/105 only mint valid peer EndpointIds).
+    #[tokio::test]
+    async fn supervisor_retains_throttled_offlan_lifeline_over_lan_hint() -> anyhow::Result<()> {
+        use iroh::RelayUrl;
+        use sync_daemon::persistence::PeerRelay;
+
+        let node_a = build_node(103).await?;
+        // 104/105 exist only to mint two valid, distinct peer EndpointIds.
+        let node_lifeline = build_node(104).await?;
+        let node_lan = build_node(105).await?;
+
+        let lifeline_id = node_lifeline.sync_node.node_id();
+        let lan_id = node_lan.sync_node.node_id();
+        // The seeded URL only needs to parse; the classification reads the
+        // snapshot `PeerRelay.relay_url` string, so the domain-vs-IP distinction
+        // is carried by the snapshot strings below, not by these seeds.
+        let lifeline_relay_url: RelayUrl = "http://example.com:3340/".parse()?;
+        let lan_relay_url: RelayUrl = "http://192.168.68.52:3340/".parse()?;
+
+        // Seed BOTH hints into A's lookup so eviction is observable as a removal.
+        node_a
+            .sync_node
+            .set_peer_relay(lifeline_id, &lifeline_relay_url);
+        node_a.sync_node.set_peer_relay(lan_id, &lan_relay_url);
+
+        let lookup = node_a.sync_node.peer_lookup.clone();
+        assert!(
+            lookup.get_endpoint_info(lifeline_id).is_some(),
+            "domain lifeline hint should start present in the lookup"
+        );
+        assert!(
+            lookup.get_endpoint_info(lan_id).is_some(),
+            "LAN-IP hint should start present in the lookup"
+        );
+
+        // Both hints are throttled: failures + just-now attempt puts each well
+        // inside its backoff window, so neither is due. The domain hint
+        // (`example.com`) is off-LAN-reachable; the `192.168.68.52` hint is
+        // LAN-only.
+        let now = now_ms_test();
+        let mut lifeline_hint = PeerRelay::new(
+            lifeline_id.to_string(),
+            "http://example.com:3340/".to_string(),
+        );
+        lifeline_hint.failure_count = 6;
+        lifeline_hint.last_attempt_ms = Some(now);
+        let mut lan_hint =
+            PeerRelay::new(lan_id.to_string(), "http://192.168.68.52:3340/".to_string());
+        lan_hint.failure_count = 6;
+        lan_hint.last_attempt_ms = Some(now);
+
+        // A joins gossip with no bootstrap — it stays partitioned at zero
+        // neighbors, so the supervisor acts every tick.
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+
+        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let a_shutdown = CancellationToken::new();
+        let mut daemon_a = Daemon::new(
+            node_a.vault.clone(),
+            node_a.sync_node,
+            gossip_a,
+            a_file_rx,
+            None,
+            node_a.allowlist.clone(),
+            "device-a".to_string(),
+            None,
+            "/test-vault-offlan-lifeline".into(),
+            a_shutdown.clone(),
+        );
+        daemon_a.seed_peer_relays_snapshot(vec![lifeline_hint, lan_hint]);
+        daemon_a.set_reconnect_interval(Duration::from_millis(50));
+
+        let a_loop = tokio::spawn(async move {
+            daemon_a.run_loop().await;
+        });
+
+        // The LAN-IP hint is evicted — the liveness proof the supervisor ran.
+        wait_until("LAN-IP hint evicted from lookup", || {
+            let lookup = lookup.clone();
+            async move { lookup.get_endpoint_info(lan_id).is_none() }
+        })
+        .await;
+
+        // The domain lifeline is the sole off-LAN-reachable hint, so it is
+        // RETAINED across throttled ticks even though a (LAN-only) alternative
+        // exists. This is the off-LAN regression the fix closes.
+        assert!(
+            lookup.get_endpoint_info(lifeline_id).is_some(),
+            "off-LAN domain lifeline must be retained when it is the only \
+             off-LAN-reachable hint, even with a LAN-only alternative present"
+        );
 
         a_shutdown.cancel();
         let _ = a_loop.await;
