@@ -185,6 +185,14 @@ impl SyncNode {
             None => RelayMode::Disabled,
         };
 
+        // `presets::Minimal`, NOT `presets::N0` — deliberate and load-bearing.
+        // Minimal registers NO address lookup: no n0 DNS, no pkarr publish/resolve,
+        // no `DnsAddressLookup`, no n0 relay pool. "Zero reliance on n0/corporate
+        // infra" is the project's founding principle (see the [[Iroh]] note).
+        // Discovery is fully self-hosted: mDNS (LAN) + persisted peer_relays hints
+        // (cold path) + gossip's own EndpointAddr propagation (warm path, below).
+        // Do NOT switch to `presets::N0` or add `DnsAddressLookup` to "fix" a
+        // connectivity bug — that re-adds the n0 dependency we intentionally cut.
         let builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .relay_mode(relay_mode);
@@ -236,6 +244,13 @@ impl SyncNode {
         // resolve off-LAN peers through hints seeded from persisted peer_relays.
         // Registration failure is non-fatal — we warn and continue without hints,
         // mirroring the mDNS registration pattern above.
+        //
+        // This is the COLD-path backstop. Gossip already shares addresses warmly
+        // (see `join_vault_gossip`), but that book is soft-state (~300s TTL) and is
+        // useless to a node that's been silent past the TTL, cold-started, or fully
+        // partitioned (no neighbor to learn from). These PERSISTED hints are what a
+        // returning off-LAN peer dials to re-enter the mesh. iroh won't persist or
+        // seed learned relays across restarts — that gap is exactly why we do.
         let peer_lookup = MemoryLookup::with_provenance("peer_relays");
         match endpoint.address_lookup() {
             Ok(lookup) => {
@@ -370,11 +385,14 @@ impl SyncNode {
     ///
     /// Removing the entry from `peer_lookup` (`MemoryLookup`) is the only lever
     /// that stops a dead hint from being re-dialed: merely declining to re-seed
-    /// it is insufficient because iroh-gossip's HyParView maintenance ALSO
-    /// re-resolves whatever sits in the lookup on its own ~60s cadence, which
-    /// re-feeds iroh's relay actor. With the entry gone, no re-resolution source
-    /// can revive the relay, and iroh reaps the idle `ActiveRelayActor` within
-    /// ~60s — that is what actually quiets the "No route to host" warn loop.
+    /// it is insufficient because while the entry is present it keeps getting
+    /// re-resolved and re-fed to iroh's relay actor — the gossip Dialer consults
+    /// the lookup whenever the state machine emits a dial (RequestJoin / active-
+    /// view repair), and iroh's relay-actor / address-lookup machinery churns on
+    /// a ~60s cadence (this is iroh's own machinery, NOT a HyParView timer). With
+    /// the entry gone, no re-resolution source can revive the relay, and iroh
+    /// reaps the idle `ActiveRelayActor` within ~60s — that is what actually
+    /// quiets the "No route to host" warn loop.
     ///
     /// The reconnect supervisor calls this to throttle a stale hint, then
     /// re-adds it via `set_peer_relay` on a slow cadence so a genuinely off-LAN
@@ -418,6 +436,19 @@ impl SyncNode {
     ///
     /// `bootstrap_nodes` should be the `EndpointId`s of known peers for that vault.
     /// At least one bootstrap node is needed to join the gossip swarm.
+    ///
+    /// We pass bare `EndpointId`s and attach NO peer data — yet iroh-gossip still
+    /// auto-publishes THIS node's own `EndpointAddr` (relay + direct IPs) as
+    /// membership peer-data, ships it on join/shuffle, and decodes peers' addresses
+    /// into a gossip-owned `AddressLookup` on the endpoint. So gossip IS our warm
+    /// address-sharing channel, for free: a connected peer that switches networks
+    /// re-announces its new address automatically (driven by iroh's `watch_addr`).
+    /// Don't conclude "we have no warm address sharing" — we do. Source trace:
+    /// [[Reviews/Gossip Address Propagation]].
+    ///
+    /// The catch (why the persisted `peer_lookup` hints still exist): gossip's book
+    /// is soft-state (~300s TTL) and can't cross a full partition or cold-start.
+    /// That COLD path is owned by the relay hints + the reconnect supervisor.
     pub async fn join_vault_gossip(
         &self,
         vault_id: &VaultId,

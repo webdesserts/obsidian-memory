@@ -548,6 +548,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// Reconnect supervisor: heal a partition by re-dialing peer relay hints,
     /// without a process restart — now with per-hint backoff and eviction.
     ///
+    /// Why this exists (it is NOT reinventing iroh): iroh-gossip does not re-dial
+    /// bootstrap peers once a node's active AND passive views both empty — a total
+    /// partition leaves no internal mechanism that dials anything; only an
+    /// app-issued `Join` re-injects bootstrap peers. iroh also keepalives live
+    /// connections but never re-dials a DROPPED peer, so re-dial cadence is entirely
+    /// app policy. This supervisor is that policy. See [[iroh vs Hand-Rolled
+    /// Connectivity]] (KEEP verdict) before assuming it's redundant.
+    ///
     /// Runs on a steady tick. There is no single global backoff gate: each hint
     /// carries its own freshness (`failure_count` / `last_attempt_ms`) and is
     /// throttled independently. The state machine:

@@ -464,6 +464,13 @@ async fn startup_inner(
     // as a () so the run_loop can reset reconnect backoff and re-dial without a
     // restart. The endpoint is read here, after Daemon::new took ownership of
     // sync_node, but before daemon is moved into StartupBundle.
+    //
+    // We are only ONE consumer of this signal. iroh consumes the same change
+    // internally to rebind sockets, re-home its relay, and re-publish our updated
+    // EndpointAddr over gossip (the warm re-announce — see `join_vault_gossip`). So
+    // do NOT add manual address re-advertising on net change; iroh already does it.
+    // Our job is the one thing iroh can't: re-inject gossip bootstrap (reset backoff
+    // → the supervisor re-dials), since a partition empties gossip's peer views.
     {
         use futures::StreamExt;
         use iroh::Watcher;
