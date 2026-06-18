@@ -1090,7 +1090,12 @@ async fn supervisor_recovers_offlan_peer_from_cross_product_seed() -> anyhow::Re
 /// relays it has learned (and fail over across them). This test pins the foundation:
 /// a multi-relay `RelayMap` actually homes the endpoint (it doesn't panic or refuse),
 /// and the selected home is a MEMBER of the configured set — proving the set is the
-/// home-candidate list, not just a single passthrough.
+/// home-candidate list.
+///
+/// SCOPE: this asserts home-relay SELECTION only — that the endpoint picks a home
+/// from the set. It does NOT exercise end-to-end forwarding through that relay (no
+/// second peer connects). `test_sync_through_embedded_relay` is the forwarding guard:
+/// it routes a real sync between two peers via an embedded relay.
 ///
 /// Seeds 120 reserved.
 #[tokio::test]

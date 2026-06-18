@@ -309,8 +309,10 @@ impl SyncNode {
     ///
     /// `relays` — the set of relay URLs this node homes on. The endpoint builds a
     /// custom `RelayMap` from them and homes on the lowest-latency reachable one,
-    /// failing over across the set. Pass `&[]` for no relay (direct QUIC only). The
-    /// plugin should pass the daemon's relay URL for reliable connectivity.
+    /// failing over across the set. It's a SET, not a single optional URL: a server
+    /// passes its own public relay (so it homes on itself), a laptop passes the
+    /// known public relays it learned at pairing, and `&[]` means no relay at all
+    /// (LAN-direct QUIC only).
     #[cfg(not(feature = "native"))]
     pub async fn new(secret_key_bytes: [u8; 32], relays: &[RelayUrl]) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);

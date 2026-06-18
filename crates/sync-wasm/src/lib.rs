@@ -710,10 +710,12 @@ mod wasm_impl {
     impl WasmSyncNode {
         /// Create a new iroh sync node from a 32-byte ed25519 secret key.
         ///
-        /// `relay_url` — if provided, the node routes through that relay URL for peers
-        /// that cannot be reached directly. Pass the daemon's embedded relay URL
-        /// (from `DaemonStatus.relayUrl`) for reliable LAN and internet connectivity.
-        /// If omitted, the node uses direct QUIC only.
+        /// `relay_url` — OPTIONAL, and server-only. `DaemonStatus.relayUrl` is
+        /// populated only when the local daemon runs an embedded relay, i.e. it's a
+        /// self-hosted SERVER; pass that URL so the plugin homes on its own relay.
+        /// A laptop's daemon advertises no relay — pass `None`, and the node uses
+        /// direct QUIC only (off-LAN reach comes from the daemon homing on the
+        /// known public relays, not from this single hint).
         #[wasm_bindgen]
         pub async fn create(
             secret_key: &[u8],
