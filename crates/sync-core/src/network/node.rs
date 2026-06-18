@@ -129,9 +129,11 @@ impl SyncNode {
     /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
     /// The endpoint binds to a random available port.
     ///
-    /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
-    /// only this relay URL. If `None`, the endpoint uses direct QUIC only (no relay).
-    /// Pass the daemon's embedded relay URL so peers can route through it.
+    /// `relays` — the set of relay URLs this node homes on. The endpoint builds a
+    /// custom `RelayMap` from them and homes on the lowest-latency reachable one,
+    /// failing over across the set. Pass `&[]` for no relay (direct QUIC only). A
+    /// server passes its own public relay (`&[own_url]`); a laptop passes the public
+    /// relays it has learned, so it can reach off-LAN peers and fail over.
     ///
     /// `allowlist` — on native builds, gossip connections are pre-screened using this
     /// allowlist before the gossip protocol runs. Non-allowlisted peers are rejected
@@ -139,10 +141,10 @@ impl SyncNode {
     #[cfg(feature = "native")]
     pub async fn new<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        extra_relay: Option<&RelayUrl>,
+        relays: &[RelayUrl],
         allowlist: Arc<A>,
     ) -> Result<Self> {
-        Self::build(secret_key_bytes, extra_relay, allowlist, false).await
+        Self::build(secret_key_bytes, relays, allowlist, false).await
     }
 
     /// Create a SyncNode whose endpoint has **no IP transports** — relay-only.
@@ -158,10 +160,10 @@ impl SyncNode {
     #[cfg(all(feature = "native", feature = "test-util"))]
     pub async fn new_relay_only<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        extra_relay: Option<&RelayUrl>,
+        relays: &[RelayUrl],
         allowlist: Arc<A>,
     ) -> Result<Self> {
-        Self::build(secret_key_bytes, extra_relay, allowlist, true).await
+        Self::build(secret_key_bytes, relays, allowlist, true).await
     }
 
     /// Shared constructor body for [`SyncNode::new`] and (test-only)
@@ -173,16 +175,26 @@ impl SyncNode {
     #[cfg(feature = "native")]
     async fn build<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        extra_relay: Option<&RelayUrl>,
+        relays: &[RelayUrl],
         allowlist: Arc<A>,
         relay_only: bool,
     ) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-        let relay_mode = match extra_relay {
-            Some(url) => RelayMode::Custom(RelayMap::from_iter([url.clone()])),
-            None => RelayMode::Disabled,
+        let relay_mode = if relays.is_empty() {
+            // `RelayMode::Disabled` disables ONLY the relay transport. `peer_lookup`
+            // (`MemoryLookup`) and mDNS stay registered on the endpoint's
+            // `address_lookup()` chain, so LAN-direct sync still works with no relay
+            // — a laptop with no known public relays is reachable on the LAN. Do NOT
+            // add an "if disabled, skip the lookup" shortcut: that would break the
+            // LAN-direct path this preserves.
+            RelayMode::Disabled
+        } else {
+            // Home on this SET of relays: iroh selects the lowest-latency reachable
+            // one and fails over across the rest (net-report only probes RelayMap
+            // members, so the set IS the home/failover candidate list).
+            RelayMode::Custom(RelayMap::from_iter(relays.iter().cloned()))
         };
 
         // `presets::Minimal`, NOT `presets::N0` — deliberate and load-bearing.
@@ -294,17 +306,22 @@ impl SyncNode {
     /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
     /// The endpoint binds to a random available port.
     ///
-    /// `extra_relay` — if provided, the endpoint uses a custom `RelayMap` containing
-    /// only this relay URL. If `None`, the endpoint uses direct QUIC only (no relay).
-    /// The plugin should always pass the daemon's relay URL for reliable connectivity.
+    /// `relays` — the set of relay URLs this node homes on. The endpoint builds a
+    /// custom `RelayMap` from them and homes on the lowest-latency reachable one,
+    /// failing over across the set. Pass `&[]` for no relay (direct QUIC only). The
+    /// plugin should pass the daemon's relay URL for reliable connectivity.
     #[cfg(not(feature = "native"))]
-    pub async fn new(secret_key_bytes: [u8; 32], extra_relay: Option<&RelayUrl>) -> Result<Self> {
+    pub async fn new(secret_key_bytes: [u8; 32], relays: &[RelayUrl]) -> Result<Self> {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-        let relay_mode = match extra_relay {
-            Some(url) => RelayMode::Custom(RelayMap::from_iter([url.clone()])),
-            None => RelayMode::Disabled,
+        // Kept in lockstep with the native `build()` RelayMode logic above:
+        // empty slice → `Disabled` (relay transport off; mDNS/peer_lookup remain),
+        // otherwise home on the SET with failover.
+        let relay_mode = if relays.is_empty() {
+            RelayMode::Disabled
+        } else {
+            RelayMode::Custom(RelayMap::from_iter(relays.iter().cloned()))
         };
 
         let endpoint = Endpoint::builder(presets::Minimal)

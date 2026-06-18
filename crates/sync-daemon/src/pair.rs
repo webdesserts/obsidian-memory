@@ -51,7 +51,7 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
     let pairing_allowlist = Arc::new(InMemoryAllowlist::new());
 
     // Create a minimal SyncNode (no relay needed for LAN pairing).
-    let sync_node = SyncNode::new(secret_key_bytes, None, pairing_allowlist)
+    let sync_node = SyncNode::new(secret_key_bytes, &[], pairing_allowlist)
         .await
         .context("Failed to create iroh SyncNode")?;
 

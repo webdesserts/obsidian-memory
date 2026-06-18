@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{EndpointId, SecretKey};
+use iroh::{EndpointId, RelayUrl, SecretKey, Watcher};
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
 use sync_core::fs::FileSystem;
 use sync_core::network::SyncNode;
@@ -50,8 +50,8 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 
     // Create two nodes that only know about the relay — no direct address
     // exchange. They can only reach each other by routing through the relay.
-    let node_a = SyncNode::new(common::seed(101), Some(&relay_url), allowlist_a.clone()).await?;
-    let node_b = SyncNode::new(common::seed(102), Some(&relay_url), allowlist_b.clone()).await?;
+    let node_a = SyncNode::new(common::seed(101), std::slice::from_ref(&relay_url), allowlist_a.clone()).await?;
+    let node_b = SyncNode::new(common::seed(102), std::slice::from_ref(&relay_url), allowlist_b.clone()).await?;
 
     // Pre-populate each allowlist with the other node's PeerId so gossip is accepted.
     let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
@@ -153,7 +153,7 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(10), None, allowlist).await?;
+    let node = SyncNode::new(common::seed(10), &[], allowlist).await?;
 
     // Use a second node's id as the "peer" and a standalone relay URL.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -199,7 +199,7 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(30), None, allowlist).await?;
+    let node = SyncNode::new(common::seed(30), &[], allowlist).await?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let relay = EmbeddedRelay::start(bind_addr).await?;
@@ -227,7 +227,7 @@ async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_empty_peer_relays_leaves_lookup_empty() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(20), None, allowlist).await?;
+    let node = SyncNode::new(common::seed(20), &[], allowlist).await?;
 
     // A deterministic peer id derived from a key seed (distinct from the node's own seed).
     let peer_secret = SecretKey::from_bytes(&[99u8; 32]);
@@ -278,8 +278,8 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
     // Node A: home relay = R_a (url_a is in its RelayMap).
     // Node B: home relay = R_b (url_b is in its RelayMap).
     // Neither node has the other's relay in its own RelayMap.
-    let node_a = SyncNode::new(common::seed(51), Some(&url_a), allowlist_a.clone()).await?;
-    let node_b = SyncNode::new(common::seed(52), Some(&url_b), allowlist_b.clone()).await?;
+    let node_a = SyncNode::new(common::seed(51), std::slice::from_ref(&url_a), allowlist_a.clone()).await?;
+    let node_b = SyncNode::new(common::seed(52), std::slice::from_ref(&url_b), allowlist_b.clone()).await?;
 
     let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
     let peer_b = PeerId::from_bytes(*node_b.node_id().as_bytes());
@@ -878,5 +878,124 @@ async fn supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial() -> an
     let _ = b_loop.await;
     let _ = (a_id, b_fs, b_vault); // retained for clarity/symmetry
     relay.shutdown().await;
+    Ok(())
+}
+
+/// A node built with a SET of relays (`&[relay_a, relay_b]`) homes on ONE of them.
+///
+/// This is the Tier-2 wire fix: `SyncNode::new` now takes a relay slice and builds
+/// `RelayMode::Custom(RelayMap::from_iter(set))`, so a laptop can home on the public
+/// relays it has learned (and fail over across them). This test pins the foundation:
+/// a multi-relay `RelayMap` actually homes the endpoint (it doesn't panic or refuse),
+/// and the selected home is a MEMBER of the configured set — proving the set is the
+/// home-candidate list, not just a single passthrough.
+///
+/// Seeds 120 reserved.
+#[tokio::test]
+async fn relay_map_homes_on_one_of_a_set() -> anyhow::Result<()> {
+    // Two independent relays; the node's RelayMap contains BOTH.
+    let relay_a = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_b = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let url_a: RelayUrl = relay_a.relay_url().clone();
+    let url_b: RelayUrl = relay_b.relay_url().clone();
+
+    // Relay-only so the endpoint MUST select a relay home (no IP transport can mask
+    // the relay-home selection we're testing).
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node =
+        SyncNode::new_relay_only(common::seed(120), &[url_a.clone(), url_b.clone()], allowlist)
+            .await?;
+
+    // `online()` returns once at least one home relay is connected — so the endpoint
+    // has finished selecting a home from the RelayMap.
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
+        .await
+        .expect("relay-only node with a 2-relay RelayMap failed to home on any relay");
+
+    // The connected home must be one of the two relays we configured.
+    let statuses = node.endpoint.home_relay_status().get();
+    let homed: Vec<RelayUrl> = statuses
+        .iter()
+        .filter(|s| s.is_connected())
+        .map(|s| s.url().clone())
+        .collect();
+    assert!(
+        !homed.is_empty(),
+        "online() returned but no home relay is connected"
+    );
+    assert!(
+        homed.iter().all(|u| *u == url_a || *u == url_b),
+        "home relay {homed:?} is not a member of the configured set {{{url_a}, {url_b}}}"
+    );
+
+    relay_a.shutdown().await;
+    relay_b.shutdown().await;
+    Ok(())
+}
+
+/// A node fails over to another relay in its set when its current home dies.
+///
+/// IGNORED: failover is net-report-paced — the endpoint only re-homes after a
+/// net-report cycle observes the dead relay, which is wall-clock-timed and flaky
+/// in-process. The failover MECHANISM is source-verified (net-report probes every
+/// RelayMap member and re-selects the lowest-latency reachable one; see
+/// [[Reviews/iroh Relay Conventions]] Q2), so a fragile wall-clock test here is
+/// worse than none. Kept as executable documentation of the intended behavior;
+/// run manually with `--ignored` when validating an iroh upgrade.
+///
+/// Seeds 121 reserved.
+#[tokio::test]
+#[ignore = "net-report-paced failover is timing-fragile in-process; mechanism is source-verified"]
+async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
+    let relay_a = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_b = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let url_a: RelayUrl = relay_a.relay_url().clone();
+    let url_b: RelayUrl = relay_b.relay_url().clone();
+
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node =
+        SyncNode::new_relay_only(common::seed(121), &[url_a.clone(), url_b.clone()], allowlist)
+            .await?;
+
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
+        .await
+        .expect("node failed to home on any relay");
+
+    // Kill whichever relay the node homed on; it must migrate to the survivor.
+    let homed_on_a = node
+        .endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .any(|s| s.is_connected() && *s.url() == url_a);
+    let survivor = if homed_on_a {
+        relay_a.shutdown().await;
+        url_b.clone()
+    } else {
+        relay_b.shutdown().await;
+        url_a.clone()
+    };
+
+    // Wait (bounded) for the home to migrate to the surviving relay.
+    let migrated = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let connected_survivor = node
+                .endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|s| s.is_connected() && *s.url() == survivor);
+            if connected_survivor {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(
+        migrated.is_ok(),
+        "home relay did not fail over to the surviving relay {survivor} within the wait"
+    );
+
     Ok(())
 }

@@ -304,7 +304,15 @@ async fn startup_inner(
     let secret_key_bytes = identity_key.secret_key_bytes();
     let allowlist = Arc::new(FileAllowlistStorage::new(&config.vault));
 
-    let sync_node = SyncNode::new(secret_key_bytes, relay_url.as_ref(), allowlist.clone())
+    // The set of relays this node homes on. Today: the server's own embedded relay
+    // (`Some`) as a one-element set, or empty on a laptop (no relay → `Disabled`).
+    // C5 replaces this with the laptop's learned public-relay set so a laptop homes
+    // on public relays it can reach off-LAN.
+    let home_relays: &[iroh::RelayUrl] = relay_url
+        .as_ref()
+        .map(std::slice::from_ref)
+        .unwrap_or(&[]);
+    let sync_node = SyncNode::new(secret_key_bytes, home_relays, allowlist.clone())
         .await
         .context("Failed to create iroh SyncNode")?;
 

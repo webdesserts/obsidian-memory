@@ -728,7 +728,10 @@ mod wasm_impl {
                 .transpose()
                 .map_err(|e| JsError::new(&format!("Invalid relay URL: {e}")))?;
 
-            let node = sync_core::network::SyncNode::new(key_bytes, relay.as_ref())
+            // `SyncNode::new` now takes a relay SET. The WASM plugin still wires a
+            // single relay (or none), so pass it as a one-element slice (or `&[]`).
+            let relays: &[iroh::RelayUrl] = relay.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
+            let node = sync_core::network::SyncNode::new(key_bytes, relays)
                 .await
                 .map_err(|e| JsError::new(&format!("Failed to create sync node: {e}")))?;
 

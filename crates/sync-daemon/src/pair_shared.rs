@@ -254,7 +254,7 @@ mod tests {
         // of persist_adopted_relay has something to call. Use our persisted
         // identity so node_id() matches the config's peer_id.
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let sync_node = SyncNode::new(identity.secret_key_bytes(), None, allowlist)
+        let sync_node = SyncNode::new(identity.secret_key_bytes(), &[], allowlist)
             .await
             .expect("failed to build SyncNode for test");
 

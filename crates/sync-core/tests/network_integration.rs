@@ -67,7 +67,7 @@ mod network_integration {
         secret_key_bytes: [u8; 32],
         allowlist: std::sync::Arc<A>,
     ) -> anyhow::Result<SyncNode> {
-        let node = SyncNode::new(secret_key_bytes, None, allowlist).await?;
+        let node = SyncNode::new(secret_key_bytes, &[], allowlist).await?;
         // Add MemoryLookup for direct in-process connectivity without relay.
         let memory_lookup = MemoryLookup::new();
         node.endpoint.address_lookup()?.add(memory_lookup);

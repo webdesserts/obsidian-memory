@@ -53,7 +53,8 @@ pub async fn build_node_with_relay(seed_byte: u8, relay_url: &RelayUrl) -> anyho
     let vault = Arc::new(Mutex::new(vault));
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let sync_node = SyncNode::new(seed(seed_byte), Some(relay_url), allowlist.clone()).await?;
+    let sync_node =
+        SyncNode::new(seed(seed_byte), std::slice::from_ref(relay_url), allowlist.clone()).await?;
     let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
 
     Ok(RelayNode {
@@ -83,7 +84,8 @@ pub async fn build_relay_only_node(seed_byte: u8, relay_url: &RelayUrl) -> anyho
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
     let sync_node =
-        SyncNode::new_relay_only(seed(seed_byte), Some(relay_url), allowlist.clone()).await?;
+        SyncNode::new_relay_only(seed(seed_byte), std::slice::from_ref(relay_url), allowlist.clone())
+            .await?;
     let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
 
     Ok(RelayNode {

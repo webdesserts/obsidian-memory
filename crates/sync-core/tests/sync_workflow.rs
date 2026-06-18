@@ -80,7 +80,7 @@ mod sync_workflow {
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let mut sync_node = SyncNode::new(seed(seed_byte), None, allowlist.clone()).await?;
+        let mut sync_node = SyncNode::new(seed(seed_byte), &[], allowlist.clone()).await?;
 
         // Add MemoryLookup for direct in-process connectivity without a relay.
         let memory_lookup = MemoryLookup::new();

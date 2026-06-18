@@ -79,7 +79,7 @@ mod daemon_integration {
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let sync_node = SyncNode::new(super::common::seed(seed_byte), None, allowlist.clone()).await?;
+        let sync_node = SyncNode::new(super::common::seed(seed_byte), &[], allowlist.clone()).await?;
 
         let memory_lookup = MemoryLookup::new();
         sync_node.endpoint.address_lookup()?.add(memory_lookup);
