@@ -26,7 +26,7 @@ use crate::native_fs::NativeFs;
 use crate::pair_api::{
     DaemonControl, DaemonStatus, PAIRING_BROADCAST_CAPACITY,
 };
-use crate::persistence::DaemonConfig;
+use crate::persistence::{DaemonConfig, PeerRelay};
 use crate::relay::EmbeddedRelay;
 use crate::watcher::FileWatcher;
 
@@ -299,59 +299,125 @@ async fn startup_inner(
         if let Err(e) = daemon_config.set_relay_url(Some(url.to_string()), &config.vault) {
             warn!("Failed to persist relay URL to daemon.toml: {}", e);
         }
+
+        // A SERVER's own relay belongs in `known_public_relays` too: that set is
+        // "all public relays this node knows," and this node IS one of them. Without
+        // this, a server only ever learns OTHERS' relays (via pairing-adopt), so its
+        // own set stays empty → its cross-product `(allowlist × known_public_relays)`
+        // is empty → its reconnect supervisor sits idle with no dial targets after a
+        // restart. Seeding the own relay gives e.g. umbra a `(laptops) × {umbra}`
+        // cross-product so it can re-dial laptops through its own relay (bidirectional
+        // recovery). `add_known_public_relay`'s off-LAN-reachable guard keeps a
+        // loopback-bound relay out (correctly — it's no use as a dial target), and it
+        // dedups, so this is a no-op once the public domain is already present.
+        daemon_config.add_known_public_relay(&url.to_string());
+        if let Err(e) = daemon_config.save(&config.vault) {
+            warn!("Failed to persist own relay into known_public_relays: {}", e);
+        }
     }
 
     let secret_key_bytes = identity_key.secret_key_bytes();
     let allowlist = Arc::new(FileAllowlistStorage::new(&config.vault));
 
-    // The set of relays this node homes on. Today: the server's own embedded relay
-    // (`Some`) as a one-element set, or empty on a laptop (no relay → `Disabled`).
-    // C5 replaces this with the laptop's learned public-relay set so a laptop homes
-    // on public relays it can reach off-LAN.
-    let home_relays: &[iroh::RelayUrl] = relay_url
-        .as_ref()
-        .map(std::slice::from_ref)
-        .unwrap_or(&[]);
-    let sync_node = SyncNode::new(secret_key_bytes, home_relays, allowlist.clone())
+    // Parse the persisted public-relay set once — it feeds BOTH wires below:
+    // this node's RelayMap (a laptop's home/failover) and, crossed with the
+    // allowlist, the live peer_lookup + supervisor snapshot. Malformed entries
+    // are skipped with a warning rather than failing startup.
+    let public_relays: Vec<RelayUrl> = daemon_config
+        .known_public_relays
+        .iter()
+        .filter_map(|url| match url.parse::<RelayUrl>() {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!(relay_url = %url, "Skipping known public relay — invalid URL: {e}");
+                None
+            }
+        })
+        .collect();
+
+    // The set of relays this node homes on (its `RelayMap`).
+    //
+    // A SERVER (embedded relay running → `relay_url.is_some()`) homes on its OWN
+    // public relay: it IS a relay, so it must be present in its own RelayMap to be
+    // reachable. This is independent of `known_public_relays` — a server with an
+    // empty public set still homes on its own relay (a server whose RelayMap ended
+    // up `Disabled` would be unreachable, breaking the whole mesh).
+    //
+    // A LAPTOP (no embedded relay) homes on the learned `known_public_relays` set,
+    // so it homes on a public relay it can reach off-LAN (and fails over across the
+    // set). An empty set → `RelayMode::Disabled` (LAN-only — the never-met-a-server
+    // edge).
+    let home_relays: Vec<RelayUrl> = match relay_url.as_ref() {
+        Some(own) => vec![own.clone()],
+        None => public_relays.clone(),
+    };
+    let sync_node = SyncNode::new(secret_key_bytes, &home_relays, allowlist.clone())
         .await
         .context("Failed to create iroh SyncNode")?;
 
     info!(node_id = %sync_node.node_id(), "Iroh node started");
 
-    // Seed the address-lookup service with known peer relay hints so gossip
-    // bootstrap can reach off-LAN peers through their relay without waiting
-    // for re-pairing. Each entry was recorded via upsert_peer_relay at
-    // pairing time. Malformed entries are skipped with a warning.
-    let seeded_count = {
-        let mut count = 0usize;
-        for peer_relay in &daemon_config.peer_relays {
-            let endpoint_id = match peer_relay.endpoint_id.parse::<EndpointId>() {
+    // Seed the live peer_lookup + the supervisor's working snapshot from the
+    // CROSS-PRODUCT `(allowlist peers) × (known_public_relays)`. There is no
+    // persisted per-peer relay hint anymore: to reach a paired peer off-LAN we try
+    // its EndpointId through each known public relay (a peer registered on a public
+    // relay is reached by dialing it through that relay). On-LAN peers are still
+    // found live by mDNS, so they need no hint here.
+    //
+    // Two-wires separation: `known_public_relays` → this node's RelayMap (above);
+    // `(allowlist × known_public_relays)` → peer_lookup + supervisor snapshot (here).
+    //
+    // SECURITY: the EndpointIds come from the ALLOWLIST (the trust anchor); the
+    // relay URLs are untrusted transport hints. A relay never contributes or
+    // changes an EndpointId — it is only ever paired with already-trusted IDs.
+    // `connect(EndpointAddr::new(id).with_relay_url(url))` TLS-verifies `id`
+    // regardless of `url`, so a hostile relay is DoS/metadata only, never
+    // impersonation.
+    //
+    // Built HERE (before `bootstrap_ids` moves into `join_vault_gossip` and the
+    // `allowlist` Arc moves into `Daemon::new`) so the same cross-product feeds
+    // both wires, computed once. The resulting `Vec<PeerRelay>` is handed to
+    // `seed_peer_relays_snapshot` after `Daemon::new`.
+    let own_endpoint_id = sync_node.node_id();
+    let supervisor_seed: Vec<PeerRelay> = {
+        let allowlist_peers = match allowlist.list_peers().await {
+            Ok(peers) => peers,
+            Err(e) => {
+                warn!("Failed to read allowlist for peer-relay seed: {}", e);
+                vec![]
+            }
+        };
+        let mut seed = Vec::new();
+        for peer in &allowlist_peers {
+            let endpoint_id = match EndpointId::from_bytes(peer.node_id.as_bytes()) {
                 Ok(id) => id,
                 Err(e) => {
-                    warn!(
-                        endpoint_id = %peer_relay.endpoint_id,
-                        "Skipping peer relay hint — invalid endpoint_id: {e}"
-                    );
+                    warn!("Skipping invalid allowlist peer for peer-relay seed: {e}");
                     continue;
                 }
             };
-            let relay_url_parsed = match peer_relay.relay_url.parse::<RelayUrl>() {
-                Ok(url) => url,
-                Err(e) => {
-                    warn!(
-                        relay_url = %peer_relay.relay_url,
-                        "Skipping peer relay hint — invalid relay URL: {e}"
-                    );
-                    continue;
-                }
-            };
-            sync_node.add_peer_relay(endpoint_id, &relay_url_parsed);
-            count += 1;
+            // Skip self: the first-pair bootstrap adds this node to its OWN
+            // allowlist, but seeding ourselves would make the supervisor (and
+            // gossip bootstrap) try to dial this node through a relay — iroh
+            // rejects self-directed relay paths. Mirrors `add_peer_relay`'s and
+            // `upsert_peer_relay`'s self-skip; the old persisted-`peer_relays` seed
+            // never contained self because `upsert_peer_relay` filtered it.
+            if endpoint_id == own_endpoint_id {
+                continue;
+            }
+            let endpoint_hex = peer.node_id.to_string();
+            for relay in &public_relays {
+                sync_node.add_peer_relay(endpoint_id, relay);
+                seed.push(PeerRelay::new(endpoint_hex.clone(), relay.to_string()));
+            }
         }
-        count
+        seed
     };
-    if seeded_count > 0 {
-        info!(count = seeded_count, "Seeded peer relay hints into address lookup");
+    if !supervisor_seed.is_empty() {
+        info!(
+            count = supervisor_seed.len(),
+            "Seeded peer_lookup from (allowlist × known_public_relays)"
+        );
     }
 
     let mesh_name = daemon_config.mesh_name.clone().unwrap_or_else(|| {
@@ -462,10 +528,12 @@ async fn startup_inner(
         shutdown,
     );
 
-    // Give the reconnect supervisor its starting address book — the same persisted
-    // hints the lookup was just seeded with. After a partition, the supervisor
-    // re-seeds and re-bootstraps gossip from this snapshot without a restart.
-    daemon.seed_peer_relays_snapshot(daemon_config.peer_relays.clone());
+    // Give the reconnect supervisor its starting address book — the same
+    // cross-product `(allowlist × known_public_relays)` the live lookup was just
+    // seeded with. After a partition, the supervisor re-bootstraps gossip from this
+    // snapshot without a restart. (The freshness fields are runtime-only state, so
+    // a restart resetting backoff is fine — nothing here is read from disk.)
+    daemon.seed_peer_relays_snapshot(supervisor_seed);
 
     // Network-change detection: iroh's watch_addr fires when the endpoint's relay
     // or direct addresses change (i.e. the network changed). Forward each change

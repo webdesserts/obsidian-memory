@@ -293,15 +293,22 @@ async fn test_run_with_shutdown_cancels_after_startup() {
 
 /// `run_with_shutdown` with `relay_listen` + `advertised_relay_url` writes the
 /// advertised URL (not the bound localhost address) to daemon.toml's `relay_url`
-/// field, and round-trips a pre-seeded `peer_relays` entry without erasing it.
+/// field, seeds that own relay into `known_public_relays`, and round-trips a
+/// pre-seeded `peer_relays` entry without erasing it.
 ///
-/// This pins the two behaviors fixed by the umbra-relay branch:
+/// This pins the behaviors of the umbra-relay / Tier-2 startup path:
 /// - The headless path no longer ignores `advertised_relay_url`.
+/// - A SERVER seeds its OWN public relay into `known_public_relays` at startup, so
+///   its cross-product `(allowlist × known_public_relays)` is non-empty and the
+///   supervisor can re-dial peers through its own relay (not idle after a restart).
 /// - Startup does not erase existing `peer_relays` entries when writing `relay_url`.
 ///
 /// What is pinned vs what isn't:
 /// - **Pinned**: daemon.toml's `relay_url` field equals the advertised URL after
 ///   startup, not the bound `127.0.0.1` address.
+/// - **Pinned**: `known_public_relays` contains the server's own advertised relay
+///   after startup (the consistency seed — its off-LAN-reachable guard passes for
+///   the globally-routable advertised IP).
 /// - **Pinned**: a pre-seeded `peer_relays` entry round-trips cleanly — startup
 ///   completes without error, and daemon.toml still contains the entry after
 ///   startup (it is not erased by set_relay_url or any startup path).
@@ -342,8 +349,11 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
 
     // Pre-seed a peer_relays entry in daemon.toml before startup. The entry uses
     // a valid 64-hex endpoint_id (distinct from our own, so self-skip won't drop it)
-    // and an arbitrary relay URL. Startup should load and forward this to the
-    // address-lookup service, leaving the file entry intact.
+    // and an arbitrary relay URL. Startup no longer forwards `peer_relays` to the
+    // address-lookup service (that seed now comes from the
+    // `allowlist × known_public_relays` cross-product), but it must still leave the
+    // persisted entry intact — the field is preserved on load/save until it is
+    // removed entirely in a later chunk.
     let sync_dir = vault_path.join(".sync");
     fs::create_dir_all(&sync_dir).expect("Failed to create .sync dir");
 
@@ -422,6 +432,20 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
     assert!(
         toml_contents.contains(peer_relay_url),
         "daemon.toml must still contain the pre-seeded peer_relay URL after startup"
+    );
+
+    // --- Assert 3: the server's own advertised relay landed in known_public_relays ---
+    // A server is itself a public relay, so startup adds its own advertised URL to
+    // the set. Without this its cross-product would be empty and its supervisor
+    // would have no dial targets after a restart. Read the structured field rather
+    // than substring-matching, since relay_url also contains the same URL.
+    let (reloaded, _) = DaemonConfig::load_or_generate(&vault_path, None)
+        .await
+        .expect("should reload daemon config after server startup");
+    assert!(
+        reloaded.known_public_relays.contains(&advertised_url),
+        "a server must seed its own advertised relay into known_public_relays; set was {:?}",
+        reloaded.known_public_relays
     );
 
     // Shut down cleanly.

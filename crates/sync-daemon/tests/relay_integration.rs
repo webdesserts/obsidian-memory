@@ -881,6 +881,207 @@ async fn supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial() -> an
     Ok(())
 }
 
+/// The reconnect supervisor recovers an off-LAN peer when its working snapshot is
+/// seeded SOLELY from the `(allowlist peers) × (known_public_relays)` cross-product
+/// — NO saved per-peer hint.
+///
+/// This is the Tier-2 simplification (plan chunk C5): per-peer relay hints are no
+/// longer persisted; the only durable networking store is the public-relay set, and
+/// the supervisor's working set is rebuilt at startup by crossing the allowlist with
+/// that set. This test proves that cross-product seed is sufficient to recover a
+/// parked off-LAN peer — exactly the path `startup.rs` now wires.
+///
+/// Setup mirrors `supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial`
+/// (relay-only A + B, relay the sole route, A's first bare-id bootstrap dial parks
+/// so gossip alone can never recover B). The ONLY difference is the seed source: the
+/// supervisor snapshot is built from `A.allowlist.list_peers() × [relay_url]` — the
+/// same cross-product `startup.rs` computes — rather than a hand-built hint. With B
+/// in A's allowlist and the relay in the public set, the cross-product yields exactly
+/// the `(B, relay)` hint the supervisor needs.
+///
+/// We assert the durable observable — A pulls a note B wrote — not a spy call, so a
+/// pass requires the connection to actually establish and sync, not merely that a
+/// hint was enqueued. `MAX_HINT_BACKOFF_MS` (30 min) ≫ the 30s test budget, so the
+/// cross-product seed is the sole thing that can drive the reconnect — there is no
+/// background backoff window that could mask a missing seed.
+///
+/// Seeds 122/123 reserved.
+#[tokio::test]
+async fn supervisor_recovers_offlan_peer_from_cross_product_seed() -> anyhow::Result<()> {
+    use sync_core::fs::FileSystem;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("iroh_gossip::net=debug,sync_daemon=info")
+        .with_test_writer()
+        .try_init();
+
+    let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_url = relay.relay_url().clone();
+
+    // Relay-only nodes (no IP transports) — the relay is the sole route (off-LAN sim).
+    let node_a = common::build_relay_only_node(122, &relay_url).await?;
+    let node_b = common::build_relay_only_node(123, &relay_url).await?;
+
+    node_a.allowlist.add_peer(node_b.node_id, "node-b").await?;
+    node_b.allowlist.add_peer(node_a.node_id, "node-a").await?;
+
+    let a_id = node_a.sync_node.node_id();
+    let b_id = node_b.sync_node.node_id();
+
+    node_a.sync_node.endpoint.online().await;
+    node_b.sync_node.endpoint.online().await;
+
+    // Seed a note into B's vault so A pulling it proves the partition healed.
+    node_b
+        .fs
+        .write("notes/from-cross-product-seed.md", b"# Delivered via cross-product seed")
+        .await?;
+    {
+        let vault = node_b.vault.lock().await;
+        vault.on_file_changed("notes/from-cross-product-seed.md").await?;
+    }
+
+    let vault_id: VaultId = "cafebabe0beef122".parse().unwrap();
+
+    // A bootstraps off B's bare id while B's hint is ABSENT — the first dial parks
+    // and leaves B `Pending` with a non-empty queue (gossip can never re-dial it).
+    let gossip_b = node_b
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![])
+        .await?;
+    let gossip_a = node_a
+        .sync_node
+        .join_vault_gossip(&vault_id, vec![b_id])
+        .await?;
+
+    // Let the first bootstrap dial fail before any hint exists, so B is left
+    // `Pending` with a non-empty queue (the H3' precondition).
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    // The hint becomes present in the live lookup right after the failed first dial.
+    // Under C5 this is the cross-product seed at work; here we add it to the lookup
+    // explicitly (mirroring startup's `sync_node.add_peer_relay` over the
+    // cross-product) so A can resolve B once the supervisor re-dials.
+    node_a.sync_node.add_peer_relay(b_id, &relay_url);
+
+    let a_vault = node_a.vault.clone();
+    let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+    let a_shutdown = CancellationToken::new();
+    let (net_tx, net_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut daemon_a = Daemon::new(
+        a_vault.clone(),
+        node_a.sync_node,
+        gossip_a,
+        a_file_rx,
+        None,
+        node_a.allowlist.clone(),
+        "device-a".to_string(),
+        None,
+        "/test-vault-cross-product-seed".into(),
+        a_shutdown.clone(),
+    );
+    daemon_a.set_net_change_rx(net_rx);
+
+    // THE C5 PATH: build the supervisor snapshot from the cross-product
+    // `(allowlist peers) × (known_public_relays)` — NOT a hand-built per-peer hint.
+    // This is the exact computation `startup.rs` performs; with B in A's allowlist
+    // and `relay_url` the sole public relay, it yields the `(B, relay)` hint.
+    let known_public_relays = [relay_url.clone()];
+    let cross_product: Vec<PeerRelay> = {
+        let peers = node_a.allowlist.list_peers().await?;
+        let mut seed = Vec::new();
+        for peer in &peers {
+            for relay in &known_public_relays {
+                seed.push(PeerRelay::new(peer.node_id.to_string(), relay.to_string()));
+            }
+        }
+        seed
+    };
+    assert!(
+        cross_product
+            .iter()
+            .any(|h| h.endpoint_id == b_id.to_string() && h.relay_url == relay_url.to_string()),
+        "the cross-product must contain the (B, relay) hint; built {cross_product:?}"
+    );
+    daemon_a.seed_peer_relays_snapshot(cross_product);
+    daemon_a.set_reconnect_interval(Duration::from_millis(200));
+
+    let a_loop = tokio::spawn(async move {
+        daemon_a.run_loop().await;
+    });
+
+    // Keep A's hint perpetually due by firing a network-change signal every 500ms so
+    // the supervisor re-dials B every tick instead of backing off after one failure.
+    let net_shutdown = CancellationToken::new();
+    let net_pump = {
+        let net_shutdown = net_shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = net_shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if net_tx.send(()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // B just needs to stay alive to answer A's pull once A connects.
+    let b_vault = node_b.vault.clone();
+    let b_fs = node_b.fs.clone();
+    let b_allowlist = node_b.allowlist.clone();
+    let (_b_file_tx, b_file_rx) = mpsc::unbounded_channel::<FileEvent>();
+    let b_shutdown = CancellationToken::new();
+    let mut daemon_b = Daemon::new(
+        b_vault.clone(),
+        node_b.sync_node,
+        gossip_b,
+        b_file_rx,
+        None,
+        b_allowlist,
+        "device-b".to_string(),
+        None,
+        "/test-vault-cross-product-seed-b".into(),
+        b_shutdown.clone(),
+    );
+    let b_loop = tokio::spawn(async move {
+        daemon_b.run_loop().await;
+    });
+
+    // PROOF: the supervisor's relay-carrying connect — driven SOLELY by the
+    // cross-product-seeded snapshot — recovers the parked peer and A pulls B's note.
+    common::wait_until(
+        "A pulls B's note after the supervisor recovers the peer from the cross-product seed",
+        Duration::from_secs(30),
+        || {
+            let vault = a_vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/from-cross-product-seed.md".to_string())
+            }
+        },
+    )
+    .await;
+
+    net_shutdown.cancel();
+    a_shutdown.cancel();
+    b_shutdown.cancel();
+    let _ = net_pump.await;
+    let _ = a_loop.await;
+    let _ = b_loop.await;
+    let _ = (a_id, b_fs, b_vault);
+    relay.shutdown().await;
+    Ok(())
+}
+
 /// A node built with a SET of relays (`&[relay_a, relay_b]`) homes on ONE of them.
 ///
 /// This is the Tier-2 wire fix: `SyncNode::new` now takes a relay slice and builds
@@ -997,5 +1198,258 @@ async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
         "home relay did not fail over to the surviving relay {survivor} within the wait"
     );
 
+    Ok(())
+}
+
+/// A laptop homes on a relay drawn from its persisted `known_public_relays` set.
+///
+/// This pins the C5 laptop wire: at startup a laptop (no embedded relay) parses its
+/// persisted `known_public_relays` into a `RelayUrl` slice and hands it to
+/// `SyncNode::new` as the RelayMap. Here we model that exact transform — a
+/// `Vec<String>` public set → `Vec<RelayUrl>` → `new_relay_only` — and assert the
+/// endpoint actually homes on the public relay it was given. Relay-only so no IP
+/// transport can mask the relay-home selection.
+///
+/// Seeds 124 reserved.
+#[tokio::test]
+async fn laptop_homes_on_persisted_public_relay() -> anyhow::Result<()> {
+    let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
+    let relay_url: RelayUrl = relay.relay_url().clone();
+
+    // Model the persisted store: the laptop has one known public relay (its paired
+    // server's). Parse it exactly as startup.rs does (String → RelayUrl).
+    let known_public_relays: Vec<String> = vec![relay_url.to_string()];
+    let home_relays: Vec<RelayUrl> = known_public_relays
+        .iter()
+        .filter_map(|u| u.parse::<RelayUrl>().ok())
+        .collect();
+
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new_relay_only(common::seed(124), &home_relays, allowlist).await?;
+
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
+        .await
+        .expect("laptop with a persisted public relay failed to home on it");
+
+    let homed: Vec<RelayUrl> = node
+        .endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .filter(|s| s.is_connected())
+        .map(|s| s.url().clone())
+        .collect();
+    assert!(
+        homed.contains(&relay_url),
+        "laptop should home on its persisted public relay {relay_url}, homed on {homed:?}"
+    );
+
+    relay.shutdown().await;
+    Ok(())
+}
+
+/// A laptop that has never met a server (empty `known_public_relays`) builds with
+/// `RelayMode::Disabled` and homes on no relay — LAN-only, no panic.
+///
+/// This documents the never-met-a-server edge: an empty public set → empty relay
+/// slice → `RelayMode::Disabled`. The node still constructs and runs (it keeps its
+/// IP transports + mDNS + peer_lookup for LAN-direct sync), it simply has no relay
+/// home. We use the regular `SyncNode::new` here — NOT `new_relay_only` — because a
+/// real laptop in this state keeps its IP transports; a relay-only node with neither
+/// a relay nor IP transports has no transport at all and cannot construct an
+/// endpoint. We assert the endpoint reports no connected relay home rather than
+/// calling `online()` (which would block forever with no relay to connect to).
+///
+/// Seeds 125 reserved.
+#[tokio::test]
+async fn laptop_with_empty_public_set_is_relay_disabled() -> anyhow::Result<()> {
+    // Empty persisted public set → empty relay slice (the C5 laptop edge).
+    let home_relays: Vec<RelayUrl> = Vec::new();
+
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new(common::seed(125), &home_relays, allowlist).await?;
+
+    // With RelayMode::Disabled there is no relay to home on. Give the endpoint a
+    // brief window to (not) select a home, then assert no relay home is connected.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let connected_homes: Vec<RelayUrl> = node
+        .endpoint
+        .home_relay_status()
+        .get()
+        .iter()
+        .filter(|s| s.is_connected())
+        .map(|s| s.url().clone())
+        .collect();
+    assert!(
+        connected_homes.is_empty(),
+        "an empty public set must yield RelayMode::Disabled (no relay home), got {connected_homes:?}"
+    );
+
+    node.shutdown().await.ok();
+    Ok(())
+}
+
+/// The startup cross-product seeds the live `peer_lookup` with EVERY
+/// `(allowlist peer, known public relay)` combination — and skips this node's own
+/// identity even when it is in its own allowlist.
+///
+/// Regression guard for the C5 seed-source change: the live lookup is no longer
+/// seeded from persisted per-peer hints but from `(allowlist peers) × (public set)`.
+/// With 2 OTHER allowlisted peers and 2 public relays, all 4 combinations must be
+/// resolvable — so each peer can be reached by trying it through either relay. The
+/// node's OWN id (added to its allowlist by the first-pair bootstrap) must NOT be
+/// seeded: a self-directed relay path is rejected by iroh and would make the
+/// supervisor dial this node itself. We replicate startup's exact seeding loop
+/// (self-skip + `add_peer_relay` over the cross-product) and assert both.
+///
+/// Seeds 126 reserved.
+#[tokio::test]
+async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::Result<()> {
+    // Two public relays (just need valid, distinct URLs — not dialed here).
+    let relay_x: RelayUrl = "https://relay-x.test/".parse().unwrap();
+    let relay_y: RelayUrl = "https://relay-y.test/".parse().unwrap();
+    let public_relays = [relay_x.clone(), relay_y.clone()];
+
+    // Two allowlisted peers (distinct from our own identity).
+    let peer_1 = PeerId::from_secret_bytes(common::seed(200));
+    let peer_2 = PeerId::from_secret_bytes(common::seed(201));
+
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new(common::seed(126), &[], allowlist.clone()).await?;
+
+    // Add the node's OWN id to its allowlist (what the first-pair bootstrap does),
+    // alongside the two real peers — so the self-skip is actually exercised.
+    let own_endpoint_id = node.node_id();
+    let own_peer_id = PeerId::from_bytes(*own_endpoint_id.as_bytes());
+    allowlist.add_peer(own_peer_id, "self").await?;
+    allowlist.add_peer(peer_1, "peer-1").await?;
+    allowlist.add_peer(peer_2, "peer-2").await?;
+
+    // Replicate startup's cross-product seed verbatim: skip self, then for each
+    // remaining (peer, relay) call `add_peer_relay` (the live lookup wire) AND push
+    // a `PeerRelay` (the supervisor-snapshot wire) — the same dual write startup
+    // performs from one cross-product pass.
+    let peers = allowlist.list_peers().await?;
+    let mut supervisor_seed: Vec<PeerRelay> = Vec::new();
+    for peer in &peers {
+        let endpoint_id = EndpointId::from_bytes(peer.node_id.as_bytes())?;
+        if endpoint_id == own_endpoint_id {
+            continue;
+        }
+        let endpoint_hex = peer.node_id.to_string();
+        for relay in &public_relays {
+            node.add_peer_relay(endpoint_id, relay);
+            supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.to_string()));
+        }
+    }
+
+    // peer_lookup wire: every one of the 4 (peer, relay) pairs must resolve.
+    for peer in [peer_1, peer_2] {
+        let endpoint_id = EndpointId::from_bytes(peer.as_bytes())?;
+        let info = node
+            .peer_lookup
+            .get_endpoint_info(endpoint_id)
+            .unwrap_or_else(|| panic!("peer {peer} should be resolvable from the cross-product seed"));
+        let relay_urls: Vec<RelayUrl> = info.into_endpoint_addr().relay_urls().cloned().collect();
+        for relay in &public_relays {
+            assert!(
+                relay_urls.contains(relay),
+                "peer {peer}'s lookup entry should carry relay {relay}; got {relay_urls:?}"
+            );
+        }
+    }
+
+    // supervisor-snapshot wire: exactly the 4 cross-product entries, and crucially
+    // NONE for this node's own id — a self-entry would drive the supervisor to dial
+    // this node (iroh rejects self-directed relay paths). This is the behavior the
+    // startup self-skip guards; `add_peer_relay`'s own skip only protects the
+    // peer_lookup wire, not the supervisor snapshot.
+    assert_eq!(
+        supervisor_seed.len(),
+        4,
+        "2 peers × 2 relays = 4 supervisor-snapshot entries; got {supervisor_seed:?}"
+    );
+    let own_hex = own_peer_id.to_string();
+    assert!(
+        supervisor_seed.iter().all(|h| h.endpoint_id != own_hex),
+        "the supervisor snapshot must not contain this node's own id; got {supervisor_seed:?}"
+    );
+
+    node.shutdown().await.ok();
+    Ok(())
+}
+
+/// A SERVER's cross-product is `(other allowlist peers) × {its own relay}` — non-empty
+/// and self-skipped — so its reconnect supervisor has dial targets after a restart.
+///
+/// Regression guard for the server-own-relay consistency seed (C5): a server's own
+/// public relay is added to `known_public_relays` at startup, so its public set is
+/// `{own relay}` (it only ever LEARNS others' relays via pairing, never its own). We
+/// model that post-seed state — public set = the server's own relay, two OTHER peers
+/// in the allowlist plus self — and assert the cross-product gives the supervisor a
+/// dial target for each peer through the server's own relay, with self excluded.
+/// This is what lets e.g. umbra re-dial laptops `(charon,rhea) × {umbra}` instead of
+/// the supervisor sitting idle.
+///
+/// Seeds 127 reserved.
+#[tokio::test]
+async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<()> {
+    // The server's own public relay — the sole member of its public set after the
+    // startup consistency seed (a server learns others' relays only via pairing).
+    let own_relay: RelayUrl = "https://umbra-server.test/".parse().unwrap();
+    let public_relays = [own_relay.clone()];
+
+    let peer_charon = PeerId::from_secret_bytes(common::seed(210));
+    let peer_rhea = PeerId::from_secret_bytes(common::seed(211));
+
+    let allowlist = Arc::new(InMemoryAllowlist::new());
+    let node = SyncNode::new(common::seed(127), &[], allowlist.clone()).await?;
+
+    // The server is in its own allowlist (first-pair bootstrap) alongside the laptops.
+    let own_endpoint_id = node.node_id();
+    let own_peer_id = PeerId::from_bytes(*own_endpoint_id.as_bytes());
+    allowlist.add_peer(own_peer_id, "self").await?;
+    allowlist.add_peer(peer_charon, "charon").await?;
+    allowlist.add_peer(peer_rhea, "rhea").await?;
+
+    // Replicate startup's cross-product seed (self-skipped) over the server's set.
+    let peers = allowlist.list_peers().await?;
+    let mut supervisor_seed: Vec<PeerRelay> = Vec::new();
+    for peer in &peers {
+        let endpoint_id = EndpointId::from_bytes(peer.node_id.as_bytes())?;
+        if endpoint_id == own_endpoint_id {
+            continue;
+        }
+        let endpoint_hex = peer.node_id.to_string();
+        for relay in &public_relays {
+            node.add_peer_relay(endpoint_id, relay);
+            supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.to_string()));
+        }
+    }
+
+    // The supervisor now has a dial target per laptop through the server's own relay
+    // — NON-empty (the bug this seed fixes was an empty cross-product → idle
+    // supervisor) — and self is excluded.
+    assert_eq!(
+        supervisor_seed.len(),
+        2,
+        "2 laptops × 1 own relay = 2 supervisor targets; got {supervisor_seed:?}"
+    );
+    let own_hex = own_peer_id.to_string();
+    for peer in [peer_charon, peer_rhea] {
+        let peer_hex = peer.to_string();
+        assert!(
+            supervisor_seed
+                .iter()
+                .any(|h| h.endpoint_id == peer_hex && h.relay_url == own_relay.to_string()),
+            "supervisor should target {peer} through the server's own relay; got {supervisor_seed:?}"
+        );
+    }
+    assert!(
+        supervisor_seed.iter().all(|h| h.endpoint_id != own_hex),
+        "the server must not target itself; got {supervisor_seed:?}"
+    );
+
+    node.shutdown().await.ok();
     Ok(())
 }
