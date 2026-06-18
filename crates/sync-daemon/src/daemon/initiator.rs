@@ -390,9 +390,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         }
 
-        // Persist the responder's relay URL keyed by their transport-verified
-        // EndpointId and seed the live lookup so the current session can reach
-        // them through their relay without a restart.
+        // Adopt the responder's PUBLIC relay into the persisted public-relay set
+        // (the cold off-LAN store) and seed the live lookup so the current session
+        // can reach them through their relay without a restart.
         //
         // `responder_endpoint_id` is the QUIC connection target the initiator
         // dialed — not inferred from `mesh_members` — so the binding is correct
@@ -406,10 +406,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         )
         .await;
 
-        // Keep the reconnect supervisor's in-memory snapshot in step with what
-        // `persist_adopted_relay` just wrote to disk, so a post-pair partition can
-        // re-dial this peer without a restart. Mirrors persist's URL selection
-        // (first non-empty advertised relay).
+        // Give the reconnect supervisor an in-memory per-peer hint for this
+        // freshly-paired peer so a post-pair partition can re-dial it without a
+        // restart. This is distinct from what `persist_adopted_relay` wrote: that
+        // adopted the responder's relay into the persisted PUBLIC-relay set (a
+        // node-level home/failover input), whereas the supervisor's working set is
+        // per-peer. The peer was added to the allowlist AFTER boot, so it is NOT in
+        // the startup `(allowlist × known_public_relays)` cross-product seed —
+        // hence this in-memory-only twin. Mirrors persist's URL selection (first
+        // non-empty advertised relay).
         if let Some(url_str) = result.relay_urls.iter().find(|u| !u.is_empty()).cloned() {
             self.upsert_peer_relay_snapshot(responder_endpoint_id.to_string(), url_str);
         }

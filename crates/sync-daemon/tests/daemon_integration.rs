@@ -1144,20 +1144,25 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// After a successful two-step pairing, the responder's (endpoint_id, relay_url)
-    /// is persisted to B's `DaemonConfig.peer_relays` AND seeded into B's live
-    /// `peer_lookup`, keyed by the responder's transport-verified EndpointId.
+    /// After a successful two-step pairing, the responder's PUBLIC relay URL is
+    /// adopted into B's persisted `known_public_relays` set AND its
+    /// (endpoint_id, relay_url) is seeded into B's live `peer_lookup`, keyed by
+    /// the responder's transport-verified EndpointId.
     ///
-    /// This test verifies commit 4 of the Umbra Relay plan:
-    /// - `persist_adopted_relay` now takes the responder's `EndpointId` explicitly
-    ///   and writes to `peer_relays` (not the discarded `relay_url` field).
-    /// - After persist, `sync_node.add_peer_relay` is called so the current session
-    ///   benefits without restart.
-    /// - The stored entry survives a config reload.
+    /// This verifies the Tier-2 pairing-seed reframe (plan chunk C4):
+    /// - `persist_adopted_relay` adopts the responder's public relay into the
+    ///   `known_public_relays` cold store (the sole durable networking store) —
+    ///   NOT a per-peer hint, and only when the URL is off-LAN-reachable.
+    /// - After persist, `sync_node.add_peer_relay` still seeds the live lookup so
+    ///   the current session reaches the responder by EndpointId without restart.
+    /// - The adopted public relay survives a config reload, and no per-peer
+    ///   `peer_relays` entry is persisted.
     ///
-    /// A's relay URL is the transport-verified source: it is A's `relay_url` field
-    /// (the URL A advertises in `PairingResult.relay_urls`), and A's `EndpointId` is
-    /// the QUIC connection target B dialed — not inferred from `mesh_members`.
+    /// A advertises a PUBLIC (domain) relay URL so the public-set adoption path is
+    /// exercised — a loopback relay would be (correctly) rejected by the
+    /// off-LAN-reachable guard. The advertised URL is A's `relay_url` field (the
+    /// URL A carries in `PairingResult.relay_urls`), and A's `EndpointId` is the
+    /// QUIC connection target B dialed — not inferred from `mesh_members`.
     ///
     /// Seeds 68/69 reserved.
     #[tokio::test(flavor = "multi_thread")]
@@ -1179,11 +1184,15 @@ mod daemon_integration {
         let b_vault_id = node_b.vault.lock().await.vault_id();
         assert_ne!(a_vault_id, b_vault_id, "test requires distinct initial VaultIds");
 
-        // Start a relay for A to advertise. This gives `relay_urls` something to
-        // carry over the pairing wire so B can persist A's relay after onboarding.
+        // Start a relay for A so the daemon wiring is realistic, but advertise a
+        // PUBLIC (domain) URL over the pairing wire: only an off-LAN-reachable URL
+        // is adopted into `known_public_relays`, and the actual loopback bind URL
+        // would be rejected by that guard. The advertised string is independent of
+        // the relay's bind address (the responder fills `relay_urls` from its
+        // configured `relay_url`), and this pairing-only test never routes traffic
+        // through the relay, so a public-looking URL is sound here.
         let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
-        let relay_url = relay.relay_url().clone();
-        let relay_url_str = relay_url.to_string();
+        let relay_url_str = "https://relay-a.test/".to_string();
 
         let a_endpoint_id: EndpointId = node_a.sync_node.node_id();
 
@@ -1332,20 +1341,24 @@ mod daemon_integration {
             hint_relay_urls,
         );
 
-        // Persistence: reload B's DaemonConfig and verify peer_relays was written.
+        // Persistence: reload B's DaemonConfig and verify A's public relay was
+        // adopted into `known_public_relays` (the sole durable networking store)
+        // and NOT written as a per-peer hint.
         // `DaemonConfig::load_or_generate` reads from the real temp vault path.
         let (b_config, _) = DaemonConfig::load_or_generate(&b_vault_path, None)
             .await
             .expect("should be able to reload B's daemon config");
-        let a_endpoint_hex = a_endpoint_id.to_string();
-        let persisted = b_config
-            .peer_relays
-            .iter()
-            .find(|r| r.endpoint_id == a_endpoint_hex)
-            .expect("B's peer_relays should contain A's entry after pairing");
-        assert_eq!(
-            persisted.relay_url, relay_url_str,
-            "persisted relay_url should match A's advertised URL"
+        assert!(
+            b_config.known_public_relays.contains(&relay_url_str),
+            "B's known_public_relays should contain A's advertised public relay \
+             after pairing; set was {:?}",
+            b_config.known_public_relays,
+        );
+        assert!(
+            b_config.peer_relays.is_empty(),
+            "no per-peer hint should be persisted on pairing — the public-relay \
+             set is the sole durable networking store; peer_relays was {:?}",
+            b_config.peer_relays,
         );
 
         b_shutdown.cancel();

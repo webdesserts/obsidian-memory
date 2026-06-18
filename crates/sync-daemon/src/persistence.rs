@@ -172,6 +172,19 @@ pub struct DaemonConfig {
     /// entries survive restarts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peer_relays: Vec<PeerRelay>,
+    /// The set of PUBLIC relay URLs this node homes on.
+    ///
+    /// This is the ONLY persisted networking store: it populates the endpoint's
+    /// `RelayMap` at construction (this node's home + failover + cold rendezvous)
+    /// and, crossed with the allowlist, seeds peer-reaching at startup. A laptop
+    /// learns the set at pairing (the paired server's public relay) and expands it
+    /// via gossip; a server's set is its own public relay so it homes on itself.
+    ///
+    /// Only off-LAN-reachable URLs belong here (gated by
+    /// [`relay_class::relay_is_offlan_reachable`](crate::relay_class)): a private
+    /// LAN-IP relay must never be homed on off-LAN.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_public_relays: Vec<String>,
 }
 
 impl DaemonConfig {
@@ -248,6 +261,9 @@ impl DaemonConfig {
                 // Peer relay hints are durable — preserved across restarts so the
                 // daemon can seed address-lookup without re-pairing.
                 peer_relays: existing.peer_relays,
+                // The public-relay set is durable — it survives restarts so the
+                // laptop can rebuild its RelayMap and reach off-LAN peers.
+                known_public_relays: existing.known_public_relays,
             };
             info!(peer_id = %config.peer_id, "Loaded daemon config");
             config
@@ -258,6 +274,7 @@ impl DaemonConfig {
                 relay_url: None,
                 mesh_name: None,
                 peer_relays: vec![],
+                known_public_relays: vec![],
             };
             info!(peer_id = %config.peer_id, "Generated new daemon config");
             config
@@ -381,6 +398,28 @@ impl DaemonConfig {
         }
     }
 
+    /// Add a PUBLIC relay URL to the persisted `known_public_relays` set (in memory).
+    ///
+    /// This is the cold-bootstrap writer — called when pairing hands over a
+    /// server's public relay. The URL must be off-LAN-reachable: a private
+    /// LAN-IP relay is rejected outright (`relay_is_offlan_reachable` guard) so a
+    /// laptop can never home on a relay that's useless once it leaves that LAN.
+    ///
+    /// **Dedup:** a URL already present is a no-op, so re-pairing or re-learning
+    /// the same server doesn't grow the set.
+    ///
+    /// Mutates the in-memory config only; the caller persists (via
+    /// [`persist_config_change`], which applies the `relay_url` clobber-guard).
+    pub fn add_known_public_relay(&mut self, url: &str) {
+        if !crate::relay_class::relay_is_offlan_reachable(url) {
+            return;
+        }
+        if self.known_public_relays.iter().any(|u| u == url) {
+            return;
+        }
+        self.known_public_relays.push(url.to_string());
+    }
+
     /// Save the current config to `.sync/daemon.toml`.
     pub fn save(&self, vault_path: &Path) -> Result<()> {
         let config_path = vault_path.join(DAEMON_CONFIG_FILE);
@@ -426,8 +465,8 @@ pub async fn persist_config_change(
 }
 
 /// Raw deserialization type for migration — accepts optional `incarnation`,
-/// `legacy_peer_id`, `relay_url`, `mesh_name`, and `peer_relays` fields from
-/// older `daemon.toml` files without failing.
+/// `legacy_peer_id`, `relay_url`, `mesh_name`, `peer_relays`, and
+/// `known_public_relays` fields from older `daemon.toml` files without failing.
 #[derive(Deserialize)]
 struct DaemonConfigRaw {
     peer_id: PeerId,
@@ -443,6 +482,10 @@ struct DaemonConfigRaw {
     /// Preserved on load — peer relay hints survive restarts, unlike our own relay_url.
     #[serde(default)]
     peer_relays: Vec<PeerRelay>,
+    /// Preserved on load — the public-relay set survives restarts so the laptop
+    /// can rebuild its RelayMap before re-pairing.
+    #[serde(default)]
+    known_public_relays: Vec<String>,
 }
 
 /// Clear `known_peers.json` after a PeerId migration.
@@ -810,6 +853,95 @@ incarnation = 3
             config.peer_relays.is_empty(),
             "peer_relays should be empty when the field is absent from the file"
         );
+    }
+
+    // ==================== known_public_relays tests ====================
+
+    /// The public-relay set round-trips through save/load and dedups: the same
+    /// URL added twice yields a single entry, and both distinct URLs survive a
+    /// restart.
+    #[tokio::test]
+    async fn known_public_relays_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        config.add_known_public_relay("https://umbra.computer/");
+        config.add_known_public_relay("https://relay.example.com/");
+        // Duplicate — must not grow the set.
+        config.add_known_public_relay("https://umbra.computer/");
+        config.save(vault_path).unwrap();
+
+        let (loaded, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded.known_public_relays.len(),
+            2,
+            "two distinct public relays, deduped; set was {:?}",
+            loaded.known_public_relays
+        );
+        assert!(loaded
+            .known_public_relays
+            .contains(&"https://umbra.computer/".to_string()));
+        assert!(loaded
+            .known_public_relays
+            .contains(&"https://relay.example.com/".to_string()));
+    }
+
+    /// An old daemon.toml without `known_public_relays` loads fine — the field
+    /// defaults to empty (the same migration story as `peer_relays`).
+    #[tokio::test]
+    async fn known_public_relays_migration_from_old_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let sync_dir = vault_path.join(".sync");
+        fs::create_dir_all(&sync_dir).unwrap();
+
+        // A daemon.toml that predates the known_public_relays field.
+        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
+        let peer_id = key.peer_id();
+        fs::write(
+            sync_dir.join("daemon.toml"),
+            format!("peer_id = \"{peer_id}\"\n"),
+        )
+        .unwrap();
+
+        let (config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+        assert!(
+            config.known_public_relays.is_empty(),
+            "known_public_relays should be empty when absent from the file"
+        );
+    }
+
+    /// A private LAN-IP relay is NEVER added to the public set — homing a laptop
+    /// on such a relay would strand it the moment it leaves that LAN.
+    #[tokio::test]
+    async fn add_known_public_relay_rejects_private_lan_ip() {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        let (mut config, _) = DaemonConfig::load_or_generate(vault_path, None)
+            .await
+            .unwrap();
+
+        config.add_known_public_relay("http://192.168.68.52:3340/");
+        assert!(
+            config.known_public_relays.is_empty(),
+            "a private LAN-IP relay must be rejected by the off-LAN-reachable guard"
+        );
+
+        // A public/domain relay alongside it is still accepted.
+        config.add_known_public_relay("https://umbra.computer/");
+        assert_eq!(config.known_public_relays.len(), 1);
+        assert_eq!(config.known_public_relays[0], "https://umbra.computer/");
     }
 
     /// A `peer_relays` entry written before the freshness fields existed loads

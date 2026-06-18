@@ -72,17 +72,28 @@ pub async fn adopt_vault_id_on_disk(vault_path: &Path, new_id: VaultId) -> anyho
     Ok(())
 }
 
-/// Persist the responder's relay URL keyed by their `EndpointId` and seed the
-/// live address-lookup so the current session can route through their relay
-/// without a restart.
+/// Adopt the responder's PUBLIC relay into the persisted public-relay set and
+/// seed the live address-lookup so the current session can route through their
+/// relay without a restart.
+///
+/// The relay the responder hands over is its own PUBLIC relay (it is a server).
+/// Two destinations, only one durable:
+/// - **`known_public_relays`** (persisted) — the cold-bootstrap that lets the
+///   laptop home on this relay off-LAN after a restart. Only added if the URL is
+///   off-LAN-reachable (a laptop-to-laptop pair with no server hands a private
+///   LAN-IP relay, which the `add_known_public_relay` guard rejects — see D-2).
+/// - **`peer_lookup`** (live/ephemeral) — seeded so the current session reaches
+///   the responder by `EndpointId` before gossip warms up (pairing-then-immediate
+///   -sync needs it). This is an in-memory write only; per-peer relay hints are
+///   no longer persisted (the public-relay set is the sole durable store).
 ///
 /// `responder_id` is the transport-verified identity of the QUIC connection the
 /// initiator dialed — not inferred from `PairingResult.mesh_members` — so the
 /// binding is correct even if `mesh_members` ordering or content differs.
 ///
 /// `relay_urls` is currently always single-source (the responder's own relay),
-/// so binding `relay_urls.first()` to `responder_id` is sound. Mesh-wide relay
-/// propagation (other members' relays) is deferred.
+/// so taking the first non-empty entry is sound. Mesh-wide relay propagation
+/// (other members' relays) is deferred.
 ///
 /// **Asymmetry note:** the responder side does NOT learn the initiator's relay
 /// today — the `PairingHello` message does not carry a relay URL. That
@@ -108,20 +119,23 @@ pub async fn persist_adopted_relay(
         return;
     };
 
-    let responder_id_hex = responder_id.to_string();
-    let now = crate::daemon::now_ms();
-
+    // Persist the responder's public relay into the public-relay set (the cold
+    // off-LAN-reach store). `add_known_public_relay` self-guards on
+    // off-LAN-reachability, so a same-LAN-only pair (private relay URL) is a
+    // no-op here — the live lookup seed below still happens for that session.
     if let Err(e) = crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
-        config.upsert_peer_relay(&responder_id_hex, &url_str, now)
+        config.add_known_public_relay(&url_str)
     })
     .await
     {
-        warn!("Failed to persist adopted relay URL: {}", e);
+        warn!("Failed to persist adopted public relay URL: {}", e);
         return;
     }
 
     // Seed the live lookup so gossip can route to the responder through their
-    // relay in the current session without waiting for a restart.
+    // relay in the current session without waiting for a restart. This is an
+    // EPHEMERAL in-memory write — no persisted per-peer hint (the public-relay
+    // set above is the only durable networking store).
     if let Ok(relay_url) = url_str.parse::<RelayUrl>() {
         sync_node.add_peer_relay(responder_id, &relay_url);
     } else {
@@ -222,14 +236,16 @@ mod tests {
     }
 
     /// Regression: adopting a pairing relay must NOT clobber the daemon's own
-    /// advertised `relay_url` out of `daemon.toml`.
+    /// advertised `relay_url` out of `daemon.toml`, and the adopted relay lands
+    /// in the persisted PUBLIC-relay set (not a per-peer hint).
     ///
     /// `persist_adopted_relay` does a load → mutate → save round-trip, and
     /// `load_or_generate` deliberately drops `relay_url` (runtime state). Before
     /// the fix, the function never re-stamped it, so an active daemon (running
     /// its own relay) that paired in would silently lose its advertised URL.
     /// Threading `self_relay_url` through to the persist helper's clobber-guard
-    /// is the fix; this proves the URL survives the adopt-write.
+    /// is the fix; this proves the URL survives the adopt-write while the
+    /// responder's public relay is recorded in `known_public_relays`.
     #[tokio::test]
     async fn persist_adopted_relay_preserves_own_relay_url() {
         use crate::persistence::DaemonConfig;
@@ -282,16 +298,22 @@ mod tests {
              pairing relay; daemon.toml was:\n{contents}"
         );
 
-        // And the responder's relay was actually persisted as a peer hint.
+        // And the responder's PUBLIC relay was recorded in the public-relay set
+        // (the cold off-LAN store) — NOT as a persisted per-peer hint.
         let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)
             .await
             .unwrap();
-        let hint = reloaded
-            .peer_relays
-            .iter()
-            .find(|r| r.endpoint_id == responder_id.to_string())
-            .expect("responder's relay should be persisted to peer_relays");
-        assert_eq!(hint.relay_url, responder_relay);
+        assert!(
+            reloaded.known_public_relays.contains(&responder_relay),
+            "responder's public relay should land in known_public_relays; set was {:?}",
+            reloaded.known_public_relays
+        );
+        assert!(
+            reloaded.peer_relays.is_empty(),
+            "no per-peer hint should be persisted — the public-relay set is the \
+             sole durable networking store; peer_relays was {:?}",
+            reloaded.peer_relays
+        );
 
         sync_node.shutdown().await.ok();
     }
