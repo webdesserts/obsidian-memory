@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey};
 #[cfg(feature = "native")]
 use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
 use iroh_gossip::net::GOSSIP_ALPN;
@@ -375,6 +375,26 @@ impl SyncNode {
         }
         let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url.clone());
         self.peer_lookup.add_endpoint_info(addr);
+    }
+
+    /// Add a relay to this node's live `RelayMap` so it can home on / fail over to
+    /// it this session, without a restart (native only).
+    ///
+    /// Used by gossip expansion: when a peer's learned home relay is a new public
+    /// relay (e.g. a second server's), adopting it into the RelayMap lets net-report
+    /// probe it and fail over to it — net-report only probes relays that are in the
+    /// RelayMap, so a relay we merely persist but never insert here is invisible to
+    /// failover until the next cold start.
+    ///
+    /// Idempotent at the iroh layer: `insert_relay` replaces any existing config for
+    /// the URL and returns the prior one (ignored here). Returns without effect if
+    /// the endpoint is closed (`insert_relay` yields `None`).
+    #[cfg(feature = "native")]
+    pub async fn add_home_relay(&self, relay_url: &RelayUrl) {
+        self.endpoint
+            .insert_relay(relay_url.clone(), Arc::new(RelayConfig::from(relay_url.clone())))
+            .await;
+        tracing::info!(relay_url = %relay_url, "Added learned public relay to live RelayMap");
     }
 
     /// Replace a peer's relay hint in the address-lookup service (native only).

@@ -2691,6 +2691,182 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// C6 gossip expansion: a public relay learned from a peer (e.g. a second
+    /// server's home relay, discovered once the laptop joins the mesh) is adopted
+    /// into the laptop's persisted `known_public_relays` — the cold-bootstrap store
+    /// that survives restart, so next launch homes on it too. This is what gives a
+    /// laptop failover redundancy across servers it never directly paired with.
+    ///
+    /// Drives the real learn-on-exchange adoption path with a fabricated learned
+    /// relay (the genuine exchange yields a loopback URL, which is correctly
+    /// rejected; the cross-network public URL a real second server advertises is
+    /// what the adoption path is for), then asserts the persisted config.
+    ///
+    /// Seed 110 reserved.
+    #[tokio::test]
+    async fn gossip_learned_public_relay_is_persisted() -> anyhow::Result<()> {
+        use sync_daemon::persistence::DaemonConfig;
+        use tempfile::TempDir;
+
+        let node = build_node(110).await?;
+
+        let vault_dir = TempDir::new()?;
+        let vault_path = vault_dir.path().to_path_buf();
+
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let (_file_tx, file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let shutdown = CancellationToken::new();
+        let mut daemon = Daemon::new(
+            node.vault.clone(),
+            node.sync_node,
+            gossip,
+            file_rx,
+            None,
+            node.allowlist.clone(),
+            "device".to_string(),
+            None,
+            vault_path.clone(),
+            shutdown.clone(),
+        );
+
+        let learned: iroh::RelayUrl = "https://server2.example.com/".parse().unwrap();
+        daemon.learn_public_relay_for_test(&learned).await;
+
+        let (config, _) = DaemonConfig::load_or_generate(&vault_path, None).await?;
+        assert!(
+            config
+                .known_public_relays
+                .contains(&"https://server2.example.com/".to_string()),
+            "learned public relay should be adopted into known_public_relays; set was {:?}",
+            config.known_public_relays
+        );
+
+        Ok(())
+    }
+
+    /// C6 classifier guard: a learned LAN-IP relay is NEVER adopted into the public
+    /// set. A private relay is useless to any peer not on that LAN, so homing on it
+    /// would leave a laptop unreachable once it leaves — the exact failure the
+    /// public-relay model exists to prevent.
+    ///
+    /// Seed 111 reserved.
+    #[tokio::test]
+    async fn gossip_learned_private_relay_is_not_persisted() -> anyhow::Result<()> {
+        use sync_daemon::persistence::DaemonConfig;
+        use tempfile::TempDir;
+
+        let node = build_node(111).await?;
+
+        let vault_dir = TempDir::new()?;
+        let vault_path = vault_dir.path().to_path_buf();
+
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let (_file_tx, file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let shutdown = CancellationToken::new();
+        let mut daemon = Daemon::new(
+            node.vault.clone(),
+            node.sync_node,
+            gossip,
+            file_rx,
+            None,
+            node.allowlist.clone(),
+            "device".to_string(),
+            None,
+            vault_path.clone(),
+            shutdown.clone(),
+        );
+
+        let learned: iroh::RelayUrl = "http://192.168.68.52:3340/".parse().unwrap();
+        daemon.learn_public_relay_for_test(&learned).await;
+
+        let (config, _) = DaemonConfig::load_or_generate(&vault_path, None).await?;
+        assert!(
+            config.known_public_relays.is_empty(),
+            "a learned private LAN-IP relay must not be adopted; set was {:?}",
+            config.known_public_relays
+        );
+
+        Ok(())
+    }
+
+    /// C6 cross-product refresh: a newly-learned public relay means new
+    /// `(allowlist peer) × {new relay}` reconnect targets, so the supervisor's
+    /// in-memory snapshot gains a `(peer, new_relay)` entry — without it, the
+    /// laptop could home on the new relay but would never DIAL its already-trusted
+    /// peers through it. The trusted peer comes from the ALLOWLIST (the trust
+    /// anchor); the relay is only ever a transport hint paired with it.
+    ///
+    /// Asserts the user-facing effect via the persisted store plus the snapshot the
+    /// supervisor re-dials from. Seeds 112/113 reserved (113 only mints a valid
+    /// peer EndpointId for the allowlist).
+    #[tokio::test]
+    async fn gossip_learned_public_relay_refreshes_cross_product() -> anyhow::Result<()> {
+        use sync_daemon::persistence::DaemonConfig;
+        use tempfile::TempDir;
+
+        let node = build_node(112).await?;
+        // A trusted peer B already in the allowlist (the trust anchor the
+        // cross-product enumerates). B is never a live node here — only its
+        // EndpointId matters for the (peer × relay) pairing.
+        let b_peer = PeerId::from_secret_bytes(super::common::seed(113));
+        node.allowlist.add_peer(b_peer, "peer-b").await?;
+        let b_hex = b_peer.to_string();
+
+        let vault_dir = TempDir::new()?;
+        let vault_path = vault_dir.path().to_path_buf();
+
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let (_file_tx, file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let shutdown = CancellationToken::new();
+        let mut daemon = Daemon::new(
+            node.vault.clone(),
+            node.sync_node,
+            gossip,
+            file_rx,
+            None,
+            node.allowlist.clone(),
+            "device".to_string(),
+            None,
+            vault_path.clone(),
+            shutdown.clone(),
+        );
+
+        let relay_str = "https://server2.example.com/".to_string();
+        let learned: iroh::RelayUrl = relay_str.parse().unwrap();
+        daemon.learn_public_relay_for_test(&learned).await;
+
+        // Persisted into the cold store.
+        let (config, _) = DaemonConfig::load_or_generate(&vault_path, None).await?;
+        assert!(
+            config.known_public_relays.contains(&relay_str),
+            "learned public relay should be persisted; set was {:?}",
+            config.known_public_relays
+        );
+
+        // Supervisor snapshot gained the (B, new_relay) reconnect target so a future
+        // tick dials B through server2's relay.
+        assert!(
+            daemon.peer_relays_snapshot_for_test().iter().any(|h| h
+                .endpoint_id
+                == b_hex
+                && h.relay_url == relay_str),
+            "supervisor snapshot should gain a (peer, new_relay) cross-product entry; \
+             snapshot was {:?}",
+            daemon.peer_relays_snapshot_for_test()
+        );
+
+        Ok(())
+    }
+
     /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
     /// `last_attempt_ms` values land on the same clock the supervisor reads.
     fn now_ms_test() -> u64 {

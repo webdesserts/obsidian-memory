@@ -114,6 +114,36 @@ fn hint_attempt_due(hint: &crate::persistence::PeerRelay, now_ms: u64) -> bool {
     }
 }
 
+/// Decide whether a relay learned from a peer should be adopted into this node's
+/// public-relay set (C6 gossip expansion).
+///
+/// Once connected, gossip carries each peer's home relay; a server's home relay
+/// IS its public relay, so a laptop can discover a second server's relay it was
+/// never paired with and add it for failover redundancy. We adopt only when the
+/// learned relay is:
+/// - present (a LAN-direct exchange yields `None` — nothing to learn), AND
+/// - off-LAN-reachable (a private LAN-IP relay is useless once we leave that LAN,
+///   so it must never become a home candidate — mirrors the `add_known_public_relay`
+///   classifier guard), AND
+/// - not already in `known_public_relays` (the idempotency guard: iroh exposes no
+///   public `Endpoint::contains_relay()`, so the persisted set stands in for
+///   RelayMap membership — every relay we insert we also persist and vice-versa —
+///   preventing per-exchange RelayMap churn and duplicate cross-product entries).
+fn learned_public_relay_to_adopt(
+    learned: Option<&iroh::RelayUrl>,
+    known_public_relays: &[String],
+) -> Option<iroh::RelayUrl> {
+    let url = learned?;
+    let url_str = url.to_string();
+    if !relay_is_offlan_reachable(&url_str) {
+        return None;
+    }
+    if known_public_relays.iter().any(|u| u == &url_str) {
+        return None;
+    }
+    Some(url.clone())
+}
+
 /// Configuration for running the sync daemon.
 pub struct DaemonRunConfig {
     pub vault: PathBuf,
@@ -976,12 +1006,123 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             warn!("Failed to persist learned peer relay: {e}");
         }
 
+        // (C6 gossip expansion) The learned relay may also be a NEW public relay
+        // (a second server's home relay), in which case we adopt it into our own
+        // RelayMap + public-set for failover redundancy. Borrows the relay URL so
+        // block (3) below can still move it. No-op for LAN-direct (`None`), private,
+        // or already-known relays.
+        self.learn_public_relay(learned.relay_url.as_ref()).await;
+
         // (3) Live re-seed so the next dial uses the fresh hint.
         if let Some(url) = learned.relay_url {
             self.sync_node.set_peer_relay(learned.endpoint_id, &url);
         }
 
         debug!(endpoint_id = %endpoint_hex, "Refreshed peer relay hint on successful exchange");
+    }
+
+    /// Adopt a relay learned from a peer into this node's public-relay set, when it
+    /// is a new public relay (C6 gossip expansion).
+    ///
+    /// A server's home relay IS its public relay, so once a laptop joins the mesh
+    /// it can discover public relays it was never paired with (e.g. a second
+    /// server's) and adopt them for failover redundancy — live (no restart) and
+    /// persisted (so the next cold start homes on them too).
+    ///
+    /// Three effects, gated together on the adoption decision (so a private,
+    /// already-known, or absent relay does nothing):
+    /// 1. **Live RelayMap** (`add_home_relay` → `insert_relay`) so net-report can
+    ///    probe + fail over to it THIS session.
+    /// 2. **Persisted public set** (`add_known_public_relay`) so it survives restart.
+    /// 3. **Supervisor cross-product** — a new public relay means new
+    ///    `(allowlist peers) × {new relay}` reconnect targets, so each trusted peer
+    ///    gains a `(peer, new_relay)` hint (in-memory snapshot + live `peer_lookup`),
+    ///    letting the supervisor dial already-trusted peers through it.
+    ///
+    /// SECURITY: this only ever adds a TRANSPORT hint. The trusted EndpointIds come
+    /// from the ALLOWLIST; the relay never contributes or changes an identity. A
+    /// learned relay paired with an already-trusted EndpointId is TLS-verified on
+    /// dial regardless of the relay, so a hostile relay is DoS/metadata only.
+    ///
+    /// The idempotency guard reads the persisted `known_public_relays` (iroh exposes
+    /// no `Endpoint::contains_relay()`): since every relay we insert we also persist
+    /// and vice-versa, set-membership stands in for RelayMap membership and prevents
+    /// per-exchange churn. The config read is skipped for the common LAN-direct /
+    /// private cases via the cheap classifier pre-check below.
+    async fn learn_public_relay(&mut self, learned: Option<&iroh::RelayUrl>) {
+        // Cheap pre-filter: skip the disk read for the overwhelmingly common cases
+        // (LAN-direct exchange → None; a loopback/LAN relay → private). Only a
+        // genuinely public learned relay is worth a config round-trip.
+        let candidate = match learned {
+            Some(url) if relay_is_offlan_reachable(&url.to_string()) => url,
+            _ => return,
+        };
+
+        // Load the persisted set to apply the idempotency guard. A read failure is
+        // non-fatal: skip this adoption rather than risk churn on an unknown state.
+        let known = match crate::persistence::DaemonConfig::load_or_generate(&self.vault_path, None)
+            .await
+        {
+            Ok((config, _)) => config.known_public_relays,
+            Err(e) => {
+                warn!("Failed to read config for learned-relay adoption: {e}");
+                return;
+            }
+        };
+        let Some(url) = learned_public_relay_to_adopt(Some(candidate), &known) else {
+            return;
+        };
+        let url_str = url.to_string();
+
+        // (1) Live RelayMap.
+        self.sync_node.add_home_relay(&url).await;
+
+        // (2) Persist into the cold store.
+        let persist = crate::persistence::persist_config_change(
+            &self.vault_path,
+            self.relay_url.clone(),
+            |config| config.add_known_public_relay(&url_str),
+        )
+        .await;
+        if let Err(e) = persist {
+            warn!("Failed to persist learned public relay: {e}");
+        }
+
+        // (3) Refresh the supervisor's cross-product with (allowlist peers) × {new
+        // relay}. Mirrors the startup seed in `startup.rs`: skip self (iroh rejects
+        // self-directed relay paths) and invalid EndpointIds; dedup against the
+        // existing snapshot so re-learning is a no-op.
+        let own_endpoint_id = self.sync_node.node_id();
+        let peers = match self.allowlist.list_peers().await {
+            Ok(peers) => peers,
+            Err(e) => {
+                warn!("Failed to read allowlist for learned-relay cross-product: {e}");
+                return;
+            }
+        };
+        for peer in &peers {
+            let endpoint_id = match EndpointId::from_bytes(peer.node_id.as_bytes()) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("Skipping invalid allowlist peer for learned-relay seed: {e}");
+                    continue;
+                }
+            };
+            if endpoint_id == own_endpoint_id {
+                continue;
+            }
+            let endpoint_hex = peer.node_id.to_string();
+            let already = self
+                .peer_relays
+                .iter()
+                .any(|h| h.endpoint_id == endpoint_hex && h.relay_url == url_str);
+            if already {
+                continue;
+            }
+            self.sync_node.add_peer_relay(endpoint_id, &url);
+            self.peer_relays
+                .push(crate::persistence::PeerRelay::new(endpoint_hex, url_str.clone()));
+        }
     }
 
     /// Shrink the reconnect-supervisor tick interval so integration tests can
@@ -1029,6 +1170,29 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// real.
     pub fn seed_peer_relays_snapshot(&mut self, peer_relays: Vec<crate::persistence::PeerRelay>) {
         self.peer_relays = peer_relays;
+    }
+
+    /// Drive the C6 learned-public-relay adoption path with a fabricated learned
+    /// relay, for integration-test access.
+    ///
+    /// A genuine relay-routed exchange between in-process nodes learns a loopback
+    /// URL, which the off-LAN-reachable classifier (correctly) rejects — so the
+    /// positive adoption path (a public relay a real second server advertises) is
+    /// only reachable in tests by injecting the URL. Exercises the real
+    /// `learn_public_relay` logic; the production loop reaches it via
+    /// `on_exchange_learned`. `pub` for the same seam rationale as
+    /// [`Daemon::seed_peer_relays_snapshot`] — integration-test binaries compile
+    /// this crate without the `test` cfg, so a `#[cfg(test)]` gate would break them.
+    /// Not a public production API.
+    pub async fn learn_public_relay_for_test(&mut self, relay_url: &iroh::RelayUrl) {
+        self.learn_public_relay(Some(relay_url)).await;
+    }
+
+    /// Read-only view of the supervisor's in-memory peer-relay snapshot, for
+    /// integration-test assertions (e.g. that a learned public relay seeded the
+    /// cross-product). `pub` for the same seam rationale as the methods above.
+    pub fn peer_relays_snapshot_for_test(&self) -> &[crate::persistence::PeerRelay] {
+        &self.peer_relays
     }
 
     /// Record a single learned/refreshed peer relay into the in-memory snapshot
@@ -1699,5 +1863,57 @@ mod backoff_tests {
         assert!(!hint_attempt_due(&h, 0));
         // Once the clock advances past attempt + window, it's due again.
         assert!(hint_attempt_due(&h, 1_000_000 + HINT_BACKOFF_BASE_MS));
+    }
+}
+
+/// Tests for the C6 gossip-expansion decision: which learned relays a node
+/// should adopt into its public-relay set (RelayMap + `known_public_relays`).
+#[cfg(test)]
+mod learn_public_relay_tests {
+    use super::learned_public_relay_to_adopt;
+
+    fn url(s: &str) -> iroh::RelayUrl {
+        s.parse().expect("test relay URL should parse")
+    }
+
+    /// A peer's home relay that is off-LAN-reachable (a public server relay) and
+    /// not yet in our set is adopted — this is how a laptop discovers a second
+    /// server's relay from the mesh for failover redundancy.
+    #[test]
+    fn adopts_new_public_relay() {
+        let learned = url("https://server2.example.com/");
+        let known: Vec<String> = vec!["https://umbra.computer/".to_string()];
+        assert_eq!(
+            learned_public_relay_to_adopt(Some(&learned), &known),
+            Some(learned.clone())
+        );
+    }
+
+    /// A LAN-direct exchange carries no relay path (`relay_url = None`) — there is
+    /// nothing to adopt.
+    #[test]
+    fn lan_direct_exchange_adopts_nothing() {
+        let known: Vec<String> = vec![];
+        assert_eq!(learned_public_relay_to_adopt(None, &known), None);
+    }
+
+    /// A learned private LAN-IP relay is never adopted into the public set: it is
+    /// useless to any peer that isn't on that LAN, so it must not become a home
+    /// candidate. Mirrors the `add_known_public_relay` classifier guard.
+    #[test]
+    fn private_lan_relay_is_not_adopted() {
+        let learned = url("http://192.168.68.52:3340/");
+        let known: Vec<String> = vec![];
+        assert_eq!(learned_public_relay_to_adopt(Some(&learned), &known), None);
+    }
+
+    /// A relay we already track is not re-adopted — this is the idempotency guard
+    /// that prevents per-exchange RelayMap churn and duplicate cross-product
+    /// reconnect entries.
+    #[test]
+    fn already_known_relay_is_not_re_adopted() {
+        let learned = url("https://umbra.computer/");
+        let known: Vec<String> = vec!["https://umbra.computer/".to_string()];
+        assert_eq!(learned_public_relay_to_adopt(Some(&learned), &known), None);
     }
 }
