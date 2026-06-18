@@ -1202,7 +1202,7 @@ mod daemon_integration {
         let b_peer_lookup = node_b.sync_node.peer_lookup.clone();
 
         // B needs a real on-disk vault path so `persist_adopted_relay` can write
-        // `DaemonConfig.peer_relays` to `daemon.toml` and we can reload it.
+        // `known_public_relays` to `daemon.toml` and we can reload it.
         let b_vault_dir = TempDir::new()?;
         let b_vault_path = b_vault_dir.path().to_path_buf();
 
@@ -1342,8 +1342,8 @@ mod daemon_integration {
         );
 
         // Persistence: reload B's DaemonConfig and verify A's public relay was
-        // adopted into `known_public_relays` (the sole durable networking store)
-        // and NOT written as a per-peer hint.
+        // adopted into `known_public_relays` — the sole durable networking store.
+        // (No per-peer hint is persisted; the `peer_relays` field is gone.)
         // `DaemonConfig::load_or_generate` reads from the real temp vault path.
         let (b_config, _) = DaemonConfig::load_or_generate(&b_vault_path, None)
             .await
@@ -1353,12 +1353,6 @@ mod daemon_integration {
             "B's known_public_relays should contain A's advertised public relay \
              after pairing; set was {:?}",
             b_config.known_public_relays,
-        );
-        assert!(
-            b_config.peer_relays.is_empty(),
-            "no per-peer hint should be persisted on pairing — the public-relay \
-             set is the sole durable networking store; peer_relays was {:?}",
-            b_config.peer_relays,
         );
 
         b_shutdown.cancel();
@@ -2312,125 +2306,93 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// A successful NeighborUp sync resets the peer's hint freshness — the
-    /// learn-on-exchange behavior that makes stale-hint eviction safe.
+    /// A successful sync exchange resets the peer's IN-MEMORY hint freshness —
+    /// the learn-on-exchange behavior that makes stale-hint eviction safe.
     ///
-    /// A carries a throttled hint for B on disk (high failure_count, recorded
-    /// attempt). A and B form a swarm; NeighborUp fires; A pulls B's note. On
-    /// that success, A's `on_exchange_learned` stamps the hint and resets the
-    /// failure count. The connection is direct (no relay), so this exercises the
-    /// `mark_peer_relay_success` (LAN-direct, no learned URL) path. We assert on
-    /// A's persisted `daemon.toml`, which is what drives the next session's
-    /// supervisor.
+    /// The supervisor carries a THROTTLED hint for B in its in-memory working set
+    /// (high failure_count, recorded attempt). A successful exchange with B fires
+    /// `on_exchange_learned`, which stamps the hint and zeroes its failure count
+    /// so the supervisor stops backing it off. This is a LAN-direct exchange (no
+    /// learned relay URL), the path that used to be `mark_peer_relay_success`.
     ///
-    /// Direct-address wiring → immune to the live-app embedded-relay interference.
-    /// Seeds 87/88 reserved.
+    /// The supervisor's working set is now runtime-only (`known_public_relays` is
+    /// the sole durable networking store), so the reset is observable in memory,
+    /// not on disk — we assert it via `peer_relays_snapshot_for_test()`. We drive
+    /// the real `on_exchange_learned` handler directly (via the test seam) rather
+    /// than through a spawned `run_loop`, so the daemon stays owned by the test
+    /// and its in-memory snapshot is readable. The real run-loop supervisor with a
+    /// real swarm is exercised by `net_change_redials_throttled_peer_and_heals_partition`
+    /// and the off-LAN-lifeline test; this test's unique value is the reset-on-success.
+    ///
+    /// Seeds 87/88 reserved (88 only mints B's EndpointId).
     #[tokio::test]
     async fn successful_exchange_resets_hint_freshness() -> anyhow::Result<()> {
-        use sync_daemon::persistence::{DaemonConfig, PeerRelay};
+        use sync_daemon::persistence::PeerRelay;
         use tempfile::TempDir;
 
-        let node_a = build_node(87).await?; // receiver — learns on exchange
-        let node_b = build_node(88).await?; // sender — supplies a note to pull
+        let node_a = build_node(87).await?;
+        // B is never a live node here — only its EndpointId matters, as the hint
+        // key and the exchange's reported peer.
+        let node_b = build_node(88).await?;
+        let b_endpoint = node_b.sync_node.node_id();
+        let b_hex = b_endpoint.to_string();
 
-        connect_nodes(&node_a, &node_b).await?;
+        let vault_dir = TempDir::new()?;
+        let vault_path = vault_dir.path().to_path_buf();
 
-        // Seed a note into B's vault so A's pull proves the exchange happened.
-        node_b
-            .fs
-            .write("notes/learn-probe.md", b"# Learned on exchange")
-            .await?;
-        {
-            let vault = node_b.vault.lock().await;
-            vault.on_file_changed("notes/learn-probe.md").await?;
-        }
-
-        let b_hex = node_b.sync_node.node_id().to_string();
-
-        // A's real on-disk vault path, pre-seeded with a THROTTLED hint for B so
-        // the reset is observable (failure_count 4 → 0, last_success_ms set).
-        let a_vault_dir = TempDir::new()?;
-        let a_vault_path = a_vault_dir.path().to_path_buf();
-        let (mut a_config, _) = DaemonConfig::load_or_generate(&a_vault_path, None).await?;
-        let mut seeded = PeerRelay::new(b_hex.clone(), "http://example.com:3340/".to_string());
-        seeded.failure_count = 4;
-        seeded.last_attempt_ms = Some(1_000);
-        a_config.peer_relays.push(seeded.clone());
-        a_config.save(&a_vault_path)?;
-
-        // A and B form a swarm (B bootstraps off A) so NeighborUp fires both ways.
-        let gossip_a = node_a
+        let gossip = node_a
             .sync_node
             .join_vault_gossip(&shared_vault_id(), vec![])
             .await?;
-        let gossip_b = node_b
-            .sync_node
-            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
-            .await?;
-
-        let a_vault = node_a.vault.clone();
-        let (_a_file_tx, a_file_rx) = mpsc::unbounded_channel::<FileEvent>();
-        let a_shutdown = CancellationToken::new();
+        let (_file_tx, file_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let shutdown = CancellationToken::new();
         let mut daemon_a = Daemon::new(
-            a_vault.clone(),
+            node_a.vault.clone(),
             node_a.sync_node,
-            gossip_a,
-            a_file_rx,
+            gossip,
+            file_rx,
             None,
             node_a.allowlist.clone(),
             "device-a".to_string(),
             None,
-            a_vault_path.clone(),
-            a_shutdown.clone(),
+            vault_path,
+            shutdown.clone(),
         );
-        // The supervisor snapshot starts with the same throttled hint, mirroring
-        // what startup seeding would load from disk.
+
+        // The supervisor's working set starts with a THROTTLED hint for B
+        // (failure_count 4, a recorded attempt), as a long-partitioned peer would.
+        let mut seeded = PeerRelay::new(b_hex.clone(), "http://example.com:3340/".to_string());
+        seeded.failure_count = 4;
+        seeded.last_attempt_ms = Some(1_000);
         daemon_a.seed_peer_relays_snapshot(vec![seeded]);
 
-        let a_loop = tokio::spawn(async move {
-            daemon_a.run_loop().await;
-        });
-        let daemon_b = spawn_daemon(node_b, gossip_b);
+        // A successful LAN-direct exchange with B (no learned relay URL).
+        daemon_a
+            .apply_exchange_success_for_test(b_endpoint, None)
+            .await;
 
-        // Prove the exchange happened: A pulls B's note.
-        wait_until("A pulled notes/learn-probe.md", || {
-            let vault = a_vault.clone();
-            async move {
-                vault
-                    .lock()
-                    .await
-                    .list_files()
-                    .await
-                    .unwrap_or_default()
-                    .contains(&"notes/learn-probe.md".to_string())
-            }
-        })
-        .await;
+        // The hint's backoff is reset in the supervisor's in-memory snapshot:
+        // failure_count back to 0 and a success stamped, so the next tick stops
+        // throttling B. The URL is untouched (none was learned).
+        let snapshot = daemon_a.peer_relays_snapshot_for_test();
+        let hint = snapshot
+            .iter()
+            .find(|r| r.endpoint_id == b_hex)
+            .expect("B's hint should still be present in the supervisor snapshot");
+        assert_eq!(
+            hint.failure_count, 0,
+            "a successful exchange must reset the in-memory failure count"
+        );
+        assert!(
+            hint.last_success_ms.is_some(),
+            "a successful exchange must stamp last_success_ms"
+        );
+        assert_eq!(
+            hint.relay_url, "http://example.com:3340/",
+            "a LAN-direct exchange (no learned URL) must not change the stored relay URL"
+        );
 
-        // The hint's freshness is reset on A's persisted config. The learn-on-
-        // exchange write is async relative to the file pull, so poll for it.
-        wait_until("A's persisted hint for B is reset", || {
-            let path = a_vault_path.clone();
-            let b_hex = b_hex.clone();
-            async move {
-                let Ok((config, _)) = DaemonConfig::load_or_generate(&path, None).await else {
-                    return false;
-                };
-                config
-                    .peer_relays
-                    .iter()
-                    .find(|r| r.endpoint_id == b_hex)
-                    .map(|r| r.failure_count == 0 && r.last_success_ms.is_some())
-                    .unwrap_or(false)
-            }
-        })
-        .await;
-
-        a_shutdown.cancel();
-        daemon_b.shutdown.cancel();
-        let _ = a_loop.await;
-        let _ = daemon_b.loop_handle.await;
-
+        shutdown.cancel();
         Ok(())
     }
 

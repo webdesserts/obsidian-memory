@@ -275,7 +275,7 @@ mod tests {
             .expect("failed to build SyncNode for test");
 
         // The responder is a DIFFERENT device, so its EndpointId won't trip the
-        // self-skip in upsert_peer_relay.
+        // self-skip in the live-lookup seed (`add_peer_relay`).
         let responder_secret = SecretKey::from_bytes(&[7u8; 32]);
         let responder_id = responder_secret.public();
         let responder_relay = "http://responder-relay:3340/".to_string();
@@ -299,7 +299,8 @@ mod tests {
         );
 
         // And the responder's PUBLIC relay was recorded in the public-relay set
-        // (the cold off-LAN store) — NOT as a persisted per-peer hint.
+        // (the cold off-LAN store) — the sole durable networking store. (No
+        // per-peer hint is persisted; the persisted `peer_relays` field is gone.)
         let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)
             .await
             .unwrap();
@@ -307,12 +308,6 @@ mod tests {
             reloaded.known_public_relays.contains(&responder_relay),
             "responder's public relay should land in known_public_relays; set was {:?}",
             reloaded.known_public_relays
-        );
-        assert!(
-            reloaded.peer_relays.is_empty(),
-            "no per-peer hint should be persisted — the public-relay set is the \
-             sole durable networking store; peer_relays was {:?}",
-            reloaded.peer_relays
         );
 
         sync_node.shutdown().await.ok();

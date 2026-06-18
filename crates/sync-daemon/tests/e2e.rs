@@ -320,7 +320,7 @@ async fn test_run_with_shutdown_cancels_after_startup() {
 async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
     use std::fs;
     use sync_daemon::daemon::{DaemonRunConfig, run_with_shutdown};
-    use sync_daemon::persistence::{DaemonConfig, PeerRelay};
+    use sync_daemon::persistence::DaemonConfig;
     use tokio::net::TcpListener;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
@@ -347,32 +347,31 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
     // 127.0.0.1 address, without risking a real network dial.
     let advertised_url = "http://198.51.100.7:3340/".to_string();
 
-    // Pre-seed a peer_relays entry in daemon.toml before startup. The entry uses
-    // a valid 64-hex endpoint_id (distinct from our own, so self-skip won't drop it)
-    // and an arbitrary relay URL. Startup no longer forwards `peer_relays` to the
-    // address-lookup service (that seed now comes from the
-    // `allowlist × known_public_relays` cross-product), but it must still leave the
-    // persisted entry intact — the field is preserved on load/save until it is
-    // removed entirely in a later chunk.
+    // Pre-seed an EXISTING-MESH daemon.toml carrying a retired `[[peer_relays]]`
+    // block, exactly what a pre-upgrade daemon left on disk. The persisted
+    // per-peer hint store is gone (`known_public_relays` is the sole durable
+    // networking store), so startup must (a) load this config without erroring —
+    // the stale block is parsed-and-discarded — and (b) drop the field when it
+    // resaves daemon.toml. This is the full-daemon-startup counterpart to the
+    // `old_config_with_peer_relays_loads_without_error` config-layer unit test.
     let sync_dir = vault_path.join(".sync");
     fs::create_dir_all(&sync_dir).expect("Failed to create .sync dir");
 
-    // Generate an identity so we have a known peer_id to construct the TOML.
-    // We write a minimal daemon.toml with the peer_relay pre-seeded; startup
-    // will generate daemon.key and extend the file normally.
     let peer_relay_endpoint = "b".repeat(64); // 64 hex chars, distinct from any real id
     let peer_relay_url = "http://peer-relay.example.com:3340/";
 
-    // Write a bare daemon.toml — peer_id will be filled on first keygen, but we need
-    // the peer_relays there. Use DaemonConfig::load_or_generate to produce a valid
-    // config, then inject the peer relay and re-save before the daemon starts.
-    let (mut seed_config, _seed_key) = DaemonConfig::load_or_generate(&vault_path, None)
+    // Generate a valid config first (so peer_id is filled), then APPEND a raw
+    // `[[peer_relays]]` block via TOML text — the field no longer exists on
+    // DaemonConfig, so an existing-mesh file is the only way to produce one.
+    let (_seed_config, _seed_key) = DaemonConfig::load_or_generate(&vault_path, None)
         .await
         .expect("Failed to seed initial config");
-    seed_config
-        .peer_relays
-        .push(PeerRelay::new(peer_relay_endpoint.clone(), peer_relay_url.to_string()));
-    seed_config.save(&vault_path).expect("Failed to save seeded config");
+    let mut toml_text =
+        fs::read_to_string(vault_path.join(".sync/daemon.toml")).expect("Failed to read seed toml");
+    toml_text.push_str(&format!(
+        "\n[[peer_relays]]\nendpoint_id = \"{peer_relay_endpoint}\"\nrelay_url = \"{peer_relay_url}\"\nfailure_count = 2\n"
+    ));
+    fs::write(vault_path.join(".sync/daemon.toml"), toml_text).expect("Failed to write seeded config");
 
     let config = DaemonRunConfig {
         vault: vault_path.clone(),
@@ -422,16 +421,22 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
         "daemon.toml must NOT contain the raw bound address as relay_url; advertised URL should win"
     );
 
-    // --- Assert 2: peer_relays entry round-tripped cleanly ---
-    // The pre-seeded entry must still be in daemon.toml after startup — startup
-    // must not erase peer_relays when writing relay_url.
+    // --- Assert 2: the retired peer_relays block was tolerated and dropped ---
+    // The daemon started cleanly (the health check above passed) despite the
+    // stale `[[peer_relays]]` block, and its resave of daemon.toml no longer
+    // re-emits the retired field. The pre-seeded endpoint_id and URL must both be
+    // gone from the file.
     assert!(
-        toml_contents.contains(&peer_relay_endpoint),
-        "daemon.toml must still contain the pre-seeded peer_relay endpoint_id after startup"
+        !toml_contents.contains("peer_relays"),
+        "startup must drop the retired peer_relays field when it resaves daemon.toml; got:\n{toml_contents}"
     );
     assert!(
-        toml_contents.contains(peer_relay_url),
-        "daemon.toml must still contain the pre-seeded peer_relay URL after startup"
+        !toml_contents.contains(&peer_relay_endpoint),
+        "the retired peer_relay endpoint_id must not survive into the resaved daemon.toml"
+    );
+    assert!(
+        !toml_contents.contains(peer_relay_url),
+        "the retired peer_relay URL must not survive into the resaved daemon.toml"
     );
 
     // --- Assert 3: the server's own advertised relay landed in known_public_relays ---

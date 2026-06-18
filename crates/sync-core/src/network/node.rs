@@ -112,9 +112,10 @@ pub struct SyncNode {
     mdns: Option<crate::network::mesh_mdns::MeshMdns>,
     /// In-memory address lookup seeded with known peer relay hints (native only).
     ///
-    /// Populated at startup from `DaemonConfig.peer_relays` so gossip bootstrap
-    /// can resolve off-LAN peers through their relay before mDNS finds them.
-    /// Also updated at runtime after pairing via `add_peer_relay`.
+    /// Populated at startup from the `allowlist × known_public_relays`
+    /// cross-product so gossip bootstrap can resolve off-LAN peers through a
+    /// public relay before mDNS finds them. Also updated at runtime after pairing
+    /// and on learn-on-exchange via `add_peer_relay`.
     ///
     /// Exposed as `pub` so integration tests can inspect hint registration
     /// without a live connection — the canonical production verification path
@@ -358,8 +359,8 @@ impl SyncNode {
     ///
     /// After this call, gossip bootstrap with the peer's bare `EndpointId` will
     /// resolve the hint and attempt a connection through their relay. This is
-    /// called at startup for each entry in `DaemonConfig.peer_relays`, and at
-    /// runtime after a successful pairing.
+    /// called at startup for each `allowlist × known_public_relays` cross-product
+    /// entry, and at runtime after a successful pairing or learn-on-exchange.
     ///
     /// If the relay is unreachable off-LAN, connection attempts through that hint
     /// will simply fail; there is no automatic fallback to mDNS off-LAN because

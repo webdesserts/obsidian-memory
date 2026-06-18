@@ -738,9 +738,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         // Step 5: every due hint failed to yield a neighbor this tick (step 1
-        // returned when connected). Record the failure so the throttle ramps and
-        // survives a restart.
-        self.record_due_hint_failures(&due_ids, now).await;
+        // returned when connected). Bump the in-memory throttle so the per-hint
+        // backoff ramps for the rest of this session.
+        self.record_due_hint_failures(&due_ids);
     }
 
     /// Establish a relay-carrying connection to a due peer and hand it to gossip,
@@ -837,12 +837,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// Bump `failure_count` for each hint dialed-but-unconnected this tick.
     ///
     /// Updates the in-memory snapshot (drives the next tick's throttle) and
-    /// persists to `daemon.toml` (so the throttle survives a restart — the
-    /// restart-reflood is the symptom this feature kills). Persistence is a
-    /// load → mutate → save against disk, mirroring `pair_shared::persist_adopted_relay`,
-    /// done at most once per backoff window per hint (cheap). Emits the one-shot
-    /// eviction log when a hint first crosses [`STALE_FAILURE_THRESHOLD`].
-    async fn record_due_hint_failures(&mut self, due_ids: &[EndpointId], now: u64) {
+    /// bumps the hint's in-memory `failure_count` and emits the one-shot eviction
+    /// log when a hint first crosses [`STALE_FAILURE_THRESHOLD`].
+    ///
+    /// The throttle is runtime-only: the supervisor's working set is seeded from
+    /// the `allowlist × known_public_relays` cross-product on each boot, so a
+    /// restart resetting backoff is fine and there is nothing to persist.
+    fn record_due_hint_failures(&mut self, due_ids: &[EndpointId]) {
         if due_ids.is_empty() {
             return;
         }
@@ -862,25 +863,6 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     );
                 }
             }
-        }
-
-        // Persist the throttle. The daemon doesn't hold a live DaemonConfig, so
-        // this is a load → mutate → save round-trip; `persist_config_change`
-        // applies the `relay_url` clobber-guard for us.
-        let persist = crate::persistence::persist_config_change(
-            &self.vault_path,
-            self.relay_url.clone(),
-            |config| {
-                for hex in &due_hex {
-                    config.record_hint_failure(hex, now);
-                }
-            },
-        )
-        .await;
-        if let Err(e) = persist {
-            // Non-fatal: the in-memory throttle still works this session; only
-            // the across-restart persistence is lost.
-            warn!("Failed to persist reconnect hint failures: {e}");
         }
     }
 
@@ -913,63 +895,44 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             "Network change detected — resetting reconnect backoff"
         );
 
-        // (1) In-memory snapshot (the supervisor's source of truth).
+        // (1) In-memory snapshot (the supervisor's source of truth). This working
+        // set is runtime-only — re-seeded from the cross-product on each boot — so
+        // there is nothing to persist; a restart mid-flap re-seeds fresh anyway.
         for hint in self.peer_relays.iter_mut() {
             hint.failure_count = 0;
             hint.last_attempt_ms = None;
         }
 
-        // (2) Persist so a restart mid-flap doesn't resurrect the stale throttle.
-        self.persist_backoff_reset().await;
-
-        // (3) Kick mDNS: re-advertise addresses + restart the browse for prompt
+        // (2) Kick mDNS: re-advertise addresses + restart the browse for prompt
         // same-LAN re-discovery. Strictly additive — synchronous, best-effort,
         // and a no-op when mDNS is unavailable.
         self.sync_node.republish_mdns_on_net_change();
     }
 
-    /// Persist the network-change backoff reset to `daemon.toml`.
-    ///
-    /// Reuses [`persist_config_change`], which owns the `relay_url` clobber-guard
-    /// (`load_or_generate` returns `relay_url = None`, so the helper re-stamps the
-    /// daemon's advertised URL before saving) — so this can't drop the relay URL
-    /// out of disk. We pass [`DaemonConfig::reset_hint_backoff`] as the mutation:
-    /// NOT `mark_peer_relay_success`, which would lie about reaching the peer.
-    async fn persist_backoff_reset(&self) {
-        let persist = crate::persistence::persist_config_change(
-            &self.vault_path,
-            self.relay_url.clone(),
-            |config| config.reset_hint_backoff(),
-        )
-        .await;
-        if let Err(e) = persist {
-            // Non-fatal: the in-memory reset already un-throttled the hints this
-            // session; only the across-restart persistence is lost.
-            warn!("Failed to persist reconnect backoff reset: {e}");
-        }
-    }
-
     /// Refresh a peer's hint after a successful background sync exchange.
     ///
-    /// This is what makes stale-hint eviction safe: a reachable peer's hint is
-    /// continuously reset (success stamped, `failure_count` zeroed) so it never
-    /// goes stale, and a fresh relay URL learned mid-session replaces a moved
-    /// peer's stale one. Touches three places, kept in step:
+    /// This is what makes stale-hint eviction safe: a reachable peer's
+    /// in-memory hint is continuously reset (success stamped, `failure_count`
+    /// zeroed) so it never goes stale, and a fresh relay URL learned mid-session
+    /// replaces a moved peer's stale one. Touches three runtime places, kept in
+    /// step (the per-peer hint is NOT persisted — `known_public_relays` is the
+    /// sole durable networking store; this only refreshes session state):
     ///
     /// 1. **In-memory snapshot** (supervisor's truth): stamp + reset the matching
     ///    hint. If we learned a relay for a peer we had NO hint for, INSERT one —
     ///    this fixes the responder-side asymmetry where only the pairing initiator
-    ///    ever persisted the other side's relay.
-    /// 2. **Disk** (`daemon.toml`): `upsert_peer_relay` when a URL was learned
-    ///    (stamps success + saves), else `mark_peer_relay_success` (no invented
-    ///    URL). Both no-op gracefully if the entry/config is absent.
+    ///    ever seeded the other side's relay.
+    /// 2. **Public-relay set** (`learn_public_relay`): a learned relay that is a
+    ///    NEW public relay (a second server's home) is adopted into the RelayMap +
+    ///    persisted `known_public_relays` for failover. No-op otherwise.
     /// 3. **Live lookup** (`set_peer_relay`): only when a URL is known, so the
     ///    next dial uses the fresh hint.
     async fn on_exchange_learned(&mut self, learned: ExchangeLearned) {
         let endpoint_hex = learned.endpoint_id.to_string();
         let now = now_ms();
 
-        // (1) In-memory snapshot.
+        // (1) In-memory snapshot (session-only; re-seeded from the cross-product
+        // on the next boot).
         if let Some(hint) = self
             .peer_relays
             .iter_mut()
@@ -982,35 +945,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
         } else if let Some(ref url) = learned.relay_url {
             // No hint yet, but we learned this peer's relay — record it so the
-            // supervisor can reach them on a future restart (responder-asymmetry fix).
+            // supervisor can re-dial them this session (responder-asymmetry fix).
             let mut entry =
                 crate::persistence::PeerRelay::new(endpoint_hex.clone(), url.to_string());
             entry.last_success_ms = Some(now);
             self.peer_relays.push(entry);
         }
 
-        // (2) Persist. Load → mutate → save via the shared helper, which applies
-        // the `relay_url` clobber-guard. Upsert when a URL was learned (stamps
-        // success), else just mark success without inventing a URL.
-        let learned_url = learned.relay_url.as_ref().map(|u| u.to_string());
-        let persist = crate::persistence::persist_config_change(
-            &self.vault_path,
-            self.relay_url.clone(),
-            |config| match learned_url {
-                Some(ref url) => config.upsert_peer_relay(&endpoint_hex, url, now),
-                None => config.mark_peer_relay_success(&endpoint_hex, now),
-            },
-        )
-        .await;
-        if let Err(e) = persist {
-            warn!("Failed to persist learned peer relay: {e}");
-        }
-
-        // (C6 gossip expansion) The learned relay may also be a NEW public relay
-        // (a second server's home relay), in which case we adopt it into our own
-        // RelayMap + public-set for failover redundancy. Borrows the relay URL so
-        // block (3) below can still move it. No-op for LAN-direct (`None`), private,
-        // or already-known relays.
+        // (2 — C6 gossip expansion) The learned relay may also be a NEW public
+        // relay (a second server's home relay), in which case we adopt it into our
+        // own RelayMap + persisted public-set for failover redundancy. Borrows the
+        // relay URL so block (3) below can still move it. No-op for LAN-direct
+        // (`None`), private, or already-known relays.
         self.learn_public_relay(learned.relay_url.as_ref()).await;
 
         // (3) Live re-seed so the next dial uses the fresh hint.
@@ -1153,17 +1099,19 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
     /// Populate the in-memory peer-relay snapshot the supervisor re-dials from.
     ///
-    /// Called once at startup with the entries from `DaemonConfig.peer_relays`
-    /// (the same source the startup lookup seeding uses) and again by pairing
-    /// when a new peer's relay is learned. Held in memory rather than reloaded
-    /// from disk per tick so the integration harness — which runs against a
-    /// non-existent vault path — can seed it directly.
+    /// Called once at startup with the `allowlist × known_public_relays`
+    /// cross-product (built in `startup.rs` — the same set that seeds the live
+    /// lookup), and refreshed at runtime by pairing / learn-on-exchange. Held in
+    /// memory rather than reloaded from disk per tick: the per-peer hint is no
+    /// longer persisted (`known_public_relays` is the sole durable store), and the
+    /// integration harness — which runs against a non-existent vault path — can
+    /// seed it directly.
     ///
     /// Asymmetry (inherited from pairing, see `pair_shared.rs`): only the
-    /// INITIATOR learns and persists the responder's relay, so after a fresh
-    /// pair only the initiator's snapshot gains an entry — the responder can't
-    /// supervisor-reconnect to the initiator until a learn-on-exchange
-    /// follow-up ships or it initiates a pairing itself.
+    /// INITIATOR learns the responder's relay at pair time, so after a fresh pair
+    /// only the initiator's snapshot gains a direct entry — the responder reaches
+    /// the initiator via the cross-product (the initiator's public relay is in
+    /// `known_public_relays`) or once a learn-on-exchange follow-up fires.
     ///
     /// In `MemoryLookup` test wiring the actual dial resolves via direct
     /// addresses, so a seeded relay URL only needs to parse, not point anywhere
@@ -1193,6 +1141,30 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// cross-product). `pub` for the same seam rationale as the methods above.
     pub fn peer_relays_snapshot_for_test(&self) -> &[crate::persistence::PeerRelay] {
         &self.peer_relays
+    }
+
+    /// Drive the real learn-on-exchange refresh with a fabricated exchange
+    /// outcome, for integration-test access.
+    ///
+    /// Exercises the production [`Daemon::on_exchange_learned`] handler — the
+    /// path a genuine NeighborUp sync reaches via the run loop's
+    /// `exchange_learn_rx` arm. A test owns the daemon and drives this directly so
+    /// it can then assert the in-memory reset via [`Daemon::peer_relays_snapshot_for_test`]
+    /// (the supervisor's working set lives inside the daemon, so it can't be read
+    /// from a daemon that has been moved into a spawned `run_loop` task). `pub` for
+    /// the same seam rationale as [`Daemon::seed_peer_relays_snapshot`] —
+    /// integration-test binaries compile this crate without the `test` cfg, so a
+    /// `#[cfg(test)]` gate would break them. Not a public production API.
+    pub async fn apply_exchange_success_for_test(
+        &mut self,
+        endpoint_id: EndpointId,
+        relay_url: Option<iroh::RelayUrl>,
+    ) {
+        self.on_exchange_learned(ExchangeLearned {
+            endpoint_id,
+            relay_url,
+        })
+        .await;
     }
 
     /// Record a single learned/refreshed peer relay into the in-memory snapshot

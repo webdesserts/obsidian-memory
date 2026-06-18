@@ -399,9 +399,8 @@ async fn startup_inner(
             // Skip self: the first-pair bootstrap adds this node to its OWN
             // allowlist, but seeding ourselves would make the supervisor (and
             // gossip bootstrap) try to dial this node through a relay — iroh
-            // rejects self-directed relay paths. Mirrors `add_peer_relay`'s and
-            // `upsert_peer_relay`'s self-skip; the old persisted-`peer_relays` seed
-            // never contained self because `upsert_peer_relay` filtered it.
+            // rejects self-directed relay paths. Mirrors `add_peer_relay`'s
+            // self-skip on the live lookup.
             if endpoint_id == own_endpoint_id {
                 continue;
             }

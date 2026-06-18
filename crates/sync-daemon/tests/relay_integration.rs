@@ -147,9 +147,10 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 /// `add_peer_relay` registers a relay hint that is resolvable via the node's
 /// peer lookup service.
 ///
-/// This validates the seam used at startup when `DaemonConfig.peer_relays` is
-/// non-empty: the hint is written to the `MemoryLookup` and can be queried
-/// back by endpoint id before any live connection is attempted.
+/// This validates the seam used at startup when the
+/// `allowlist × known_public_relays` cross-product is non-empty: the hint is
+/// written to the `MemoryLookup` and can be queried back by endpoint id before
+/// any live connection is attempted.
 #[tokio::test]
 async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
@@ -193,9 +194,9 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
 /// node's own EndpointId, leaving the lookup empty.
 ///
 /// iroh rejects self-directed relay paths, so seeding our own id into the
-/// lookup is a footgun (`upsert_peer_relay` in persistence skips self, but
-/// `add_peer_relay` is also called directly after pairing; this guard closes
-/// the gap at the method level).
+/// lookup is a footgun. The startup cross-product seed skips self explicitly,
+/// but `add_peer_relay` is also called directly after pairing and on
+/// learn-on-exchange; this guard closes the gap at the method level.
 #[tokio::test]
 async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
@@ -233,7 +234,7 @@ async fn test_empty_peer_relays_leaves_lookup_empty() -> anyhow::Result<()> {
     let peer_secret = SecretKey::from_bytes(&[99u8; 32]);
     let peer_endpoint_id: EndpointId = peer_secret.public();
 
-    // With no add_peer_relay calls (simulating empty DaemonConfig.peer_relays),
+    // With no add_peer_relay calls (simulating an empty cross-product seed),
     // the lookup must return None for any peer id.
     assert!(
         node.peer_lookup.get_endpoint_info(peer_endpoint_id).is_none(),
