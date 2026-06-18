@@ -26,7 +26,7 @@
 /// reachability methods. IPv6 link-local (`fe80::/10`) and unique-local
 /// (`fc00::/7`) are matched bit-wise because the corresponding `Ipv6Addr` helpers
 /// are unstable on this toolchain.
-pub(crate) fn relay_is_offlan_reachable(relay_url: &str) -> bool {
+pub fn relay_is_offlan_reachable(relay_url: &str) -> bool {
     let Ok(parsed) = relay_url.parse::<iroh::RelayUrl>() else {
         return false; // unparseable → not a dial-able relay lifeline.
     };
