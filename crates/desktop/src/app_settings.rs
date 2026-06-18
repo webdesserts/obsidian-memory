@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn empty_env_string_falls_through_to_stored() {
         // An empty env var (e.g. `OBSIDIAN_MEMORY_VAULT=`) is treated as unset,
-        // mirroring how `resolve_advertised_relay_url` handles empty env strings.
+        // mirroring how the relay-URL env var is empty-filtered before use.
         assert_eq!(
             resolve_vault_path(Some(""), Some("/Users/michael/notes")),
             Some(PathBuf::from("/Users/michael/notes")),

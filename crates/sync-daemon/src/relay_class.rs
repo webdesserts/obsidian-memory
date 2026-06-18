@@ -23,10 +23,9 @@
 /// `RelayUrl` derefs to `url::Url`, so we read `host_str()` and try to parse it
 /// as an `IpAddr`: a domain host fails the parse and is therefore off-LAN —
 /// exactly the semantics we want — while an IP host is classified by the std
-/// reachability methods (mirroring the house pattern in
-/// `crates/desktop/src/main.rs`'s `score_candidate`). IPv6 link-local
-/// (`fe80::/10`) and unique-local (`fc00::/7`) are matched bit-wise because the
-/// corresponding `Ipv6Addr` helpers are unstable on this toolchain.
+/// reachability methods. IPv6 link-local (`fe80::/10`) and unique-local
+/// (`fc00::/7`) are matched bit-wise because the corresponding `Ipv6Addr` helpers
+/// are unstable on this toolchain.
 pub(crate) fn relay_is_offlan_reachable(relay_url: &str) -> bool {
     let Ok(parsed) = relay_url.parse::<iroh::RelayUrl>() else {
         return false; // unparseable → not a dial-able relay lifeline.
