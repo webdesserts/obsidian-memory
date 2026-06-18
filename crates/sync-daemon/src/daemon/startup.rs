@@ -468,9 +468,14 @@ async fn startup_inner(
     // We are only ONE consumer of this signal. iroh consumes the same change
     // internally to rebind sockets, re-home its relay, and re-publish our updated
     // EndpointAddr over gossip (the warm re-announce — see `join_vault_gossip`). So
-    // do NOT add manual address re-advertising on net change; iroh already does it.
-    // Our job is the one thing iroh can't: re-inject gossip bootstrap (reset backoff
-    // → the supervisor re-dials), since a partition empties gossip's peer views.
+    // do NOT add manual re-advertising of the iroh-level EndpointAddr on the GOSSIP
+    // channel — iroh already does that, and only for peers we're already connected to.
+    // That is a DIFFERENT channel from our mDNS service registration, which
+    // `on_network_change` DOES kick (republish addresses + restart browse) to
+    // re-establish LAN discovery with peers we got partitioned from on the move —
+    // the one thing the gossip re-announce can't reach. Our other job here is to
+    // re-inject gossip bootstrap (reset backoff → the supervisor re-dials), since a
+    // partition empties gossip's peer views.
     {
         use futures::StreamExt;
         use iroh::Watcher;

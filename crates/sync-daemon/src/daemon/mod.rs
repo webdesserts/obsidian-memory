@@ -916,6 +916,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// the public-relay lifeline across a network switch: retention keeps it
     /// resident in the lookup even if a reconnect tick races ahead of this reset,
     /// and this reset re-dials it immediately on the new network.
+    ///
+    /// It ALSO kicks the mDNS discovery channel (republish addresses + restart
+    /// the browse) so same-LAN re-discovery after a migration is prompt. Note this
+    /// is a DIFFERENT channel from iroh's gossip re-announce: iroh re-publishes our
+    /// `EndpointAddr` to peers we're ALREADY connected to (see `startup.rs`), while
+    /// mDNS republish+re-browse is what re-establishes LAN discovery with peers we
+    /// got partitioned from on the move. They don't overlap.
     async fn on_network_change(&mut self) {
         if self.peer_relays.is_empty() {
             return; // unpaired / hint-less — nothing to re-dial.
@@ -933,6 +940,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         // (2) Persist so a restart mid-flap doesn't resurrect the stale throttle.
         self.persist_backoff_reset().await;
+
+        // (3) Kick mDNS: re-advertise addresses + restart the browse for prompt
+        // same-LAN re-discovery. Strictly additive — synchronous, best-effort,
+        // and a no-op when mDNS is unavailable.
+        self.sync_node.republish_mdns_on_net_change();
     }
 
     /// Persist the network-change backoff reset to `daemon.toml`.

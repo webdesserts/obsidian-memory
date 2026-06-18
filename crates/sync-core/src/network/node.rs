@@ -520,6 +520,49 @@ impl SyncNode {
         info!(mesh = %metadata.mesh, vid = %metadata.vid, "Published mesh info via mDNS");
     }
 
+    /// On a network change, re-advertise our mDNS addresses and restart the
+    /// browse so same-LAN re-discovery after a migration is prompt rather than
+    /// waiting for the next periodic re-query tick (`SLOW_REQUERY_INTERVAL`).
+    ///
+    /// This is the address-only subset of [`Self::publish_mesh_info`]: it
+    /// re-snapshots the bound IPv4 sockets and restarts the browse, but it
+    /// deliberately does NOT re-send user-data or the relay URL — a network move
+    /// changes our network position, not our mesh metadata, and the stale
+    /// launch-time relay-URL re-advertisement is separate (Tier-2) work.
+    ///
+    /// Note on addresses: `bound_sockets()` on a wildcard-bound endpoint yields
+    /// `0.0.0.0:port`, so the republish is a "re-snapshot and re-announce NOW"
+    /// nudge — mdns-sd's `enable_addr_auto()` supplies the real per-interface IPs
+    /// at register time. The port is the durable contribution and is stable across
+    /// a LAN move, so there is no ordering requirement against iroh's rebind.
+    #[cfg(feature = "native")]
+    pub fn republish_mdns_on_net_change(&self) {
+        use crate::network::mesh_mdns::socket_addrs_to_port_addrs;
+
+        let Some(ref mdns) = self.mdns else {
+            tracing::debug!("mDNS not available, skipping net-change republish");
+            return;
+        };
+
+        // Field-observability: a firm, unconditional log so a live network switch
+        // can be confirmed to have kicked the mDNS path (not just the backoff reset).
+        tracing::debug!("Re-publishing mDNS addresses + restarting browse after network change");
+
+        // Re-advertise current bound addresses (IPv4 only, matching V4Only scope).
+        // Mirror `publish_mesh_info`'s guard so the two paths don't drift.
+        let bound = self.endpoint.bound_sockets();
+        let v4_bound: Vec<std::net::SocketAddr> =
+            bound.into_iter().filter(|sa| sa.is_ipv4()).collect();
+        if !v4_bound.is_empty() {
+            let (port, ips) = socket_addrs_to_port_addrs(&v4_bound);
+            mdns.republish_addrs(port, ips);
+        }
+
+        // Restart the browse UNCONDITIONALLY — it is what re-discovers peers, so
+        // it must fire even if the IPv4 set is momentarily empty mid-migration.
+        mdns.restart_browse();
+    }
+
     /// Subscribe to mDNS discovery events for nearby meshes.
     ///
     /// Each `DiscoveryEvent::Discovered` event carries a peer's `EndpointInfo`,

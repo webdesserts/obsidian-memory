@@ -152,9 +152,11 @@ enum Message {
         EndpointId,
         mpsc::Sender<Result<AddressLookupItem, AddressLookupError>>,
     ),
-    /// Periodic re-query tick: verify known peers and restart the browse.
+    /// Re-query tick: verify known peers and restart the browse.
     ///
-    /// Sent by the requery task while at least one subscriber is connected.
+    /// Sent by the requery task while at least one subscriber is connected, and
+    /// on demand via [`MeshMdns::restart_browse`] (e.g. on a network change, so
+    /// LAN re-discovery is prompt rather than waiting for the next periodic tick).
     Requery,
     /// Seed a peer directly into the actor's peers map.
     ///
@@ -768,6 +770,24 @@ impl MeshMdns {
         let _ = self.sender.try_send(Message::RepublishAddrs(port, addrs));
     }
 
+    /// Force an immediate re-browse: restart the mDNS browse so a fresh PTR query
+    /// elicits re-announcements from all visible peers right now, instead of
+    /// waiting for the next periodic re-query tick. Used on a network change so
+    /// re-discovery after a LAN migration is prompt rather than tick-paced.
+    ///
+    /// Best-effort `try_send` like the other public methods: if the actor channel
+    /// is saturated the requery is dropped and we fall back to the next periodic
+    /// tick (the pre-existing behavior).
+    ///
+    /// Its browse-restart contract (drives the actor's `Requery` handler →
+    /// `stop_browse` + `browse` + flume bridge receiver swap) is guarded by
+    /// `bridge_survives_multiple_requery_cycles`, which exercises this method
+    /// through the `trigger_requery_for_test` delegation: a no-op `restart_browse`
+    /// would break that test.
+    pub fn restart_browse(&self) {
+        let _ = self.sender.try_send(Message::Requery);
+    }
+
     /// Subscribe to a stream of `DiscoveryEvent`s from this actor.
     ///
     /// Each subscriber gets an independent channel. Already-known peers are
@@ -832,11 +852,14 @@ impl MeshMdns {
     /// Directly inject a `Requery` message into the actor, triggering a
     /// browse restart and bridge receiver swap without waiting for the timer.
     ///
-    /// Only available in `#[cfg(test)]`. Used to exercise the bridge swap path
-    /// in deterministic tests without sleeping for `REQUERY_INTERVAL`.
+    /// Only available in `#[cfg(test)]`. Delegates to the production
+    /// [`Self::restart_browse`] so the test path and the real net-change path
+    /// drive the actor through the same sender (no second `Requery` injector to
+    /// drift). Used to exercise the bridge swap path in deterministic tests
+    /// without sleeping for `REQUERY_INTERVAL`.
     #[cfg(test)]
-    async fn trigger_requery_for_test(&self) {
-        self.sender.send(Message::Requery).await.ok();
+    fn trigger_requery_for_test(&self) {
+        self.restart_browse();
     }
 }
 
@@ -1378,8 +1401,8 @@ mod tests {
         // Fire two Requery cycles back-to-back. Each cycle calls stop_browse
         // (drops the old flume Sender) and browse (issues new Sender), exercising
         // the bridge swap path twice.
-        mdns.trigger_requery_for_test().await;
-        mdns.trigger_requery_for_test().await;
+        mdns.trigger_requery_for_test();
+        mdns.trigger_requery_for_test();
 
         // Seed a peer AFTER both Requery cycles. If the bridge is dead the actor
         // receives the SeedPeerForTest message (the actor itself is fine) but the
