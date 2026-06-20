@@ -114,20 +114,61 @@ async fn test_sync_empty_vault_receives_files() {
 /// A corrupt document in a sync batch must not take down the whole batch.
 /// Before the per-item containment fix, `apply_document_updates` propagated
 /// the first error and dropped every other (valid) document with it.
+///
+/// BOTH documents here are already-synced docs whose registry nodes are
+/// established via a prior full_sync. That matters: the corrupt entry must
+/// reach the loro decode to produce an error. The C2 Flow-2 apply gate
+/// (`document_apply.rs`) hard-skips a NODE-LESS new doc *before* the decode, so
+/// a node-less corrupt entry would be silently gate-skipped (`Ok(false)`) and
+/// would never exercise the per-item containment `Err` arm at all. Giving the
+/// corrupt path an established node lets it pass the gate and reach the loro
+/// decode, where the garbage bytes fail ("Invalid import data") — which is what
+/// genuinely tests that one document's error doesn't drop its valid sibling.
 #[tokio::test]
 async fn test_apply_document_updates_continues_on_corrupt_entry() {
     use std::collections::HashMap;
 
+    // Donor has good.md + bad.md; receiver syncs both so each has a node + content.
+    let donor_fs = Arc::new(InMemoryFs::new());
+    donor_fs.write("good.md", b"# Good").await.unwrap();
+    donor_fs.write("bad.md", b"# Bad").await.unwrap();
+    let donor = Vault::init(Arc::clone(&donor_fs), author(2)).await.unwrap();
+    donor.on_file_changed("good.md").await.unwrap();
+    donor.on_file_changed("bad.md").await.unwrap();
+
     let fs = Arc::new(InMemoryFs::new());
     let vault = Vault::init(Arc::clone(&fs), author(1)).await.unwrap();
+    full_sync(&vault, &donor).await;
+    assert!(
+        fs.exists("good.md").await.unwrap(),
+        "setup: receiver must have good.md before the crafted batch"
+    );
+    assert!(
+        fs.exists("bad.md").await.unwrap(),
+        "setup: receiver must have bad.md (node established) so its corrupt \
+         update reaches the decode rather than being gate-skipped"
+    );
 
-    // A real snapshot for a path the receiver doesn't have yet -> lands as a
-    // new document.
-    let valid_doc = NoteDocument::from_markdown("good.md", "# Good", author(2)).unwrap();
-    let valid_snapshot = valid_doc.export_snapshot().unwrap();
+    // Donor edits good.md, producing a real update the receiver doesn't yet have.
+    donor_fs.write("good.md", b"# Good edited").await.unwrap();
+    donor.on_file_changed("good.md").await.unwrap();
+    let good_update = donor
+        .prepare_document_update("good.md")
+        .await
+        .unwrap()
+        .unwrap();
+    // Unwrap to the raw document bytes the apply path consumes.
+    let good_bytes = match bincode::deserialize::<SyncMessage>(&good_update).unwrap() {
+        SyncMessage::DocumentUpdate { data, .. } => data,
+        other => panic!("expected DocumentUpdate, got {:?}", other),
+    };
 
+    // Craft a batch: the good update alongside garbage bytes for bad.md. Because
+    // bad.md has an established node it passes the apply gate and reaches the loro
+    // decode, where the garbage fails — the guarantee under test is that this
+    // error stays contained and the good sibling still lands.
     let mut document_updates = HashMap::new();
-    document_updates.insert("good.md".to_string(), valid_snapshot);
+    document_updates.insert("good.md".to_string(), good_bytes);
     document_updates.insert("bad.md".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
 
     let response = SyncMessage::SyncResponse {
@@ -153,22 +194,27 @@ async fn test_apply_document_updates_continues_on_corrupt_entry() {
         "good.md must be in the applied list"
     );
 
-    // The valid document landed and is readable.
+    // The good update landed and is readable.
     let good = vault.get_document("good.md").await.unwrap();
-    assert!(good.to_markdown().contains("Good"));
+    assert!(good.to_markdown().contains("Good edited"));
     assert!(
         fs.exists("good.md").await.unwrap(),
         "valid document markdown should be written to disk"
     );
 
-    // The corrupt document was never applied: its markdown was never written.
-    // (get_document can't be used as the check here — it falls back to a fresh
-    // empty doc for unknown paths, so it always returns Ok.) Combined with
-    // modified.len() == 1 above, this is the per-item containment guarantee:
-    // the bad entry is dropped while the good sibling lands.
+    // The corrupt update was contained: it is NOT in the applied list, and the
+    // pre-existing bad.md on disk still holds its original synced content (the
+    // failed garbage import left it untouched). Combined with modified.len() == 1,
+    // this is the per-item containment guarantee — the bad entry's error is
+    // dropped while the good sibling lands.
     assert!(
-        !fs.exists("bad.md").await.unwrap(),
-        "corrupt document markdown must not be written"
+        !modified.contains(&"bad.md".to_string()),
+        "the corrupt entry must not be reported applied"
+    );
+    let bad = vault.get_document("bad.md").await.unwrap();
+    assert!(
+        bad.to_markdown().contains("Bad"),
+        "bad.md keeps its original synced content; the garbage import is rejected"
     );
 }
 
@@ -289,18 +335,29 @@ async fn test_document_update_is_idempotent() {
     let vault1 = Vault::init(Arc::clone(&fs1), author(1)).await.unwrap();
     let vault2 = Vault::init(Arc::clone(&fs2), author(2)).await.unwrap();
 
-    // Vault1 creates a file.
+    // Vault1 creates a file and syncs it so vault2 has the node + content. The
+    // C2 apply gate hard-skips NEW node-less docs, so the idempotency property
+    // (which is about re-applying an UPDATE to a known doc) is exercised after
+    // the doc is established — the realistic path, since the native daemon always
+    // ships the node with a new doc.
     fs1.write("note.md", b"# Content").await.unwrap();
     vault1.on_file_changed("note.md").await.unwrap();
+    full_sync(&vault2, &vault1).await;
+    assert!(
+        fs2.exists("note.md").await.unwrap(),
+        "setup: vault2 must have note.md before the idempotency check"
+    );
 
-    // Get the document update.
+    // Vault1 edits the file, producing an update vault2 doesn't yet have.
+    fs1.write("note.md", b"# Content updated").await.unwrap();
+    vault1.on_file_changed("note.md").await.unwrap();
     let update = vault1
         .prepare_document_update("note.md")
         .await
         .unwrap()
         .unwrap();
 
-    // Apply to vault2 first time.
+    // Apply the update to vault2 first time.
     let (_, modified1) = vault2.process_sync_message(&update).await.unwrap();
     assert!(
         modified1.contains(&"note.md".to_string()),
@@ -316,7 +373,7 @@ async fn test_document_update_is_idempotent() {
 
     // Content should still be correct.
     let doc = vault2.get_document("note.md").await.unwrap();
-    assert!(doc.to_markdown().contains("# Content"));
+    assert!(doc.to_markdown().contains("# Content updated"));
 }
 
 #[tokio::test]
@@ -1100,5 +1157,103 @@ async fn test_cold_restart_alive_node_allows_create() {
     assert!(
         doc.to_markdown().contains("Brand new"),
         "reloaded vault2 must have the re-created content"
+    );
+}
+
+// ========== Flow-2 Apply Gate Tests (C2) ==========
+
+/// A new-doc content snapshot that arrives WITHOUT a backing registry node must
+/// NOT be written to disk (the Flow-2 apply gate). This is the exact shape of
+/// the fs↔registry divergence bug: `apply_single_update`'s new-doc branch used
+/// to write `.md`+`.loro` unconditionally, minting a file that no registry node
+/// tracks — permanently, since nothing reconciled it back.
+///
+/// The gate hard-skips instead. Nothing is stranded on disk (the `.loro` was
+/// never written), and the doc re-applies cleanly once its node lands (C3 ships
+/// the node with the doc) or is reconciled at boot (C4 adopts a pre-existing
+/// node-less file). On the gate-less base this test is RED — the file is written
+/// and the path lands a divergent file-without-node.
+#[tokio::test]
+async fn test_new_doc_without_registry_node_is_hard_skipped() {
+    let fs = Arc::new(InMemoryFs::new());
+    let vault = Vault::init(Arc::clone(&fs), author(1)).await.unwrap();
+
+    // A brand-new doc the receiver has never seen, delivered with NO registry
+    // payload — so no node-create op accompanies it (registry_updates: None).
+    let orphan = NoteDocument::from_markdown("orphan.md", "# Orphan", author(2)).unwrap();
+    let snapshot = orphan.export_snapshot().unwrap();
+
+    let mut document_updates = std::collections::HashMap::new();
+    document_updates.insert("orphan.md".to_string(), snapshot);
+    let response = SyncMessage::SyncResponse {
+        registry_updates: None,
+        document_updates,
+    };
+    let response_bytes = bincode::serialize(&response).unwrap();
+
+    let (followup, modified) = vault.process_sync_message(&response_bytes).await.unwrap();
+    assert!(
+        followup.is_none(),
+        "SyncResponse needs no follow-up message"
+    );
+
+    // The gate skipped the write: no file on disk, no `.loro`, not reported modified.
+    assert!(
+        !modified.contains(&"orphan.md".to_string()),
+        "a node-less new doc must not be reported applied (got modified={:?})",
+        modified
+    );
+    assert!(
+        !fs.exists("orphan.md").await.unwrap(),
+        "a node-less new doc must NOT be written to disk (Flow-2 gate)"
+    );
+    // Registry-truth confirms no node was minted (is_file_deleted is true when
+    // there's no alive node for the path) — so the file-without-node divergence
+    // is not created.
+    assert!(
+        vault.is_file_deleted("orphan.md"),
+        "the skipped path must have no alive registry node"
+    );
+}
+
+/// The complement of the hard-skip: when the registry node IS present (it ships
+/// with the doc in a normal exchange, applied before documents), the new-doc
+/// snapshot writes normally. This proves the gate lets real incoming files
+/// through — it skips only the node-less bug case, not legitimate first-contact
+/// content. Driven through the full public handshake, which ships registry +
+/// docs together exactly as the production gossip pull does.
+#[tokio::test]
+async fn test_new_doc_with_registry_node_is_written() {
+    // Donor vault that has registered orphan.md; receiver has nothing.
+    let donor_fs = Arc::new(InMemoryFs::new());
+    donor_fs.write("orphan.md", b"# Orphan").await.unwrap();
+    let donor = Vault::init(Arc::clone(&donor_fs), author(2)).await.unwrap();
+    donor.on_file_changed("orphan.md").await.unwrap();
+
+    let fs = Arc::new(InMemoryFs::new());
+    let receiver = Vault::init(Arc::clone(&fs), author(1)).await.unwrap();
+
+    // Full handshake: the receiver requests, the donor answers with registry +
+    // doc, the receiver applies the registry first then the doc. The node is
+    // present by the time the doc-apply gate runs, so the gate passes.
+    let (modified_receiver, _) = full_sync(&receiver, &donor).await;
+
+    assert!(
+        modified_receiver.contains(&"orphan.md".to_string()),
+        "a new doc WITH its registry node must be applied (got modified={:?})",
+        modified_receiver
+    );
+    assert!(
+        fs.exists("orphan.md").await.unwrap(),
+        "a new doc with its registry node must be written to disk"
+    );
+    assert!(
+        !receiver.is_file_deleted("orphan.md"),
+        "the written path must have an alive registry node"
+    );
+    let doc = receiver.get_document("orphan.md").await.unwrap();
+    assert!(
+        doc.to_markdown().contains("Orphan"),
+        "the written doc must carry the donor's content"
     );
 }

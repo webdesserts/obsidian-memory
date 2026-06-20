@@ -53,9 +53,15 @@ impl<F: FileSystem> Vault<F> {
         let pre_import_paths: HashMap<String, TreeID> = self.path_to_node().clone();
 
         // Import registry updates
-        self.registry_mut().import(data).map_err(|e| {
+        let status = self.registry_mut().import(data).map_err(|e| {
             SyncEngineError::Deserialization(format!("Registry import failed: {}", e))
         })?;
+
+        // Surface a registry delta that arrived with unsatisfied causal deps (e.g. a
+        // node-create op buffered pending because an ancestor folder-create op is missing).
+        // Logging only — the buffered ops apply when their deps land via a later exchange,
+        // and boot reconciliation (C4) backstops anything still stranded.
+        crate::document::warn_if_pending(&status, "registry");
 
         // Collect deleted paths from the cache BEFORE rebuilding it.
         //

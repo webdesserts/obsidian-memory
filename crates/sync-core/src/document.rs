@@ -10,13 +10,33 @@
 
 use crate::PeerId;
 use crate::markdown;
-use loro::{ExportMode, Frontiers, LoroDoc, LoroMap, LoroText, UpdateOptions, VersionVector};
+use loro::{
+    ExportMode, Frontiers, ImportStatus, LoroDoc, LoroMap, LoroText, UpdateOptions, VersionVector,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use thiserror::Error;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
+
+/// Surface a loro import that landed ops with unsatisfied causal dependencies.
+///
+/// `LoroDoc::import` parks such ops (it neither applies nor errors on them) and
+/// reports them in `ImportStatus.pending`. We previously discarded the status at
+/// every callsite, making a "delta arrived but its ancestor op is missing"
+/// condition invisible. This is the shared sink for that signal — logging only,
+/// no control-flow change: the parked ops apply once their deps land via a later
+/// exchange, and boot reconciliation (C4) backstops anything still stranded.
+/// `ctx` names the import site (e.g. "registry" / a document path) for the log.
+pub(crate) fn warn_if_pending(status: &ImportStatus, ctx: &str) {
+    if let Some(pending) = &status.pending {
+        warn!(
+            "loro import for {} has pending ops with unsatisfied dependencies: {:?}",
+            ctx, pending
+        );
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DocumentError {
@@ -342,7 +362,7 @@ impl NoteDocument {
             "loro_import: starting"
         );
 
-        self.doc.import(data).map_err(|e| {
+        let status = self.doc.import(data).map_err(|e| {
             error!(
                 path = %self.path,
                 body_len = body_len_before,
@@ -353,6 +373,9 @@ impl NoteDocument {
             );
             DocumentError::Loro(e.to_string())
         })?;
+
+        // Surface (but don't act on) ops parked with unsatisfied dependencies.
+        warn_if_pending(&status, &self.path);
 
         let body_len_after = self.body().len_unicode();
         let vv_after = self.version();

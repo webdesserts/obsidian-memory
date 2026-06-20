@@ -53,6 +53,13 @@ impl<F: FileSystem> Vault<F> {
                 // Apply registry updates first (handles deletes/renames).
                 // The returned deleted_paths filters out document updates that would
                 // re-create files the registry just deleted.
+                //
+                // This registry-before-documents ordering is load-bearing for the Flow-2
+                // apply gate in `document_apply.rs`: that gate hard-skips a new doc whose
+                // registry node isn't present, so the node from this same message must be
+                // applied here first. A future refactor that reorders these two calls would
+                // break the gate. The send-side guarantee that the node ships with the doc
+                // is C3 in `prepare.rs`.
                 let deleted_paths = if let Some(reg_data) = registry_updates {
                     self.apply_registry_updates(&reg_data).await?
                 } else {
@@ -95,6 +102,11 @@ impl<F: FileSystem> Vault<F> {
                 // Apply registry updates first (handles deletes/renames).
                 // The returned deleted_paths filters out document updates that would
                 // re-create files the registry just deleted.
+                //
+                // As in the SyncResponse arm: registry-before-documents is load-bearing for
+                // the Flow-2 apply gate in `document_apply.rs` (a new doc whose node isn't
+                // present is hard-skipped, so its node must be applied here first). Don't
+                // reorder these two calls.
                 let deleted_paths = if let Some(reg_data) = response.registry_updates {
                     self.apply_registry_updates(&reg_data).await?
                 } else {

@@ -185,6 +185,38 @@ impl<F: FileSystem> Vault<F> {
                 return Ok(false);
             }
 
+            // Flow-2 apply gate: do NOT materialize a brand-new doc unless its registry
+            // node is already present. Node presence is the RECEIVE-SIDE half of a
+            // three-file contract; the other halves live in:
+            //   - C3 send side (`prepare.rs`): when any new-doc snapshot ships, the full
+            //     registry snapshot rides with it, so the node lands before this apply.
+            //   - boot backstop (`reconcile.rs` C4): a pre-existing on-disk file lacking a
+            //     node is adopted at load, healing anything this gate skipped.
+            // The ordering this gate depends on is load-bearing: registry updates are
+            // applied BEFORE document updates in `process.rs` (both the SyncResponse and
+            // SyncExchange arms), so by the time we reach here the node from the same
+            // message is already in `path_to_node`. Skipping (hard-skip, no disk write)
+            // is correct: without a node, writing `.md`+`.loro` would mint exactly the
+            // file-without-node divergence this fix exists to prevent. The only case this
+            // ever fires is the bug case (node-create op absent though the doc arrived);
+            // nothing is stranded on disk because the `.loro` was never written, and the
+            // doc re-applies cleanly once its node arrives (C3) or is reconciled at boot (C4).
+            //
+            // One arm has NO preceding registry-apply: the real-time `DocumentUpdate`
+            // case (`process.rs:155`) calls `apply_single_update` directly. Today that's
+            // safe because a brand-new doc's node always reaches the peer via a SyncResponse/
+            // SyncExchange (which DO apply registry first) before any real-time update for
+            // it. If a future change starts broadcasting `DocumentUpdate`s for newly-created
+            // docs over the native path, it MUST ship/establish the node first, or this gate
+            // will hard-skip the create until a later registry sync or boot reconcile heals it.
+            if !self.path_to_node().contains_key(path) {
+                warn!(
+                    "apply_single_update: skipping create for path with no registry node (Flow-2 gate): {}",
+                    path
+                );
+                return Ok(false);
+            }
+
             // Document is new - create directly from sync data; new ops author under this device
             let doc = NoteDocument::from_bytes(path, data, self.loro_author)?;
 
