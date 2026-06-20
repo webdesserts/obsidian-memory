@@ -38,7 +38,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 # CRDT (for sync crates)
-loro = "1.10"
+loro = "1.13"
 
 # Serialization (for sync crates)
 serde_yaml = "0.9"
