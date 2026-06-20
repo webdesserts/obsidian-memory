@@ -4,6 +4,7 @@ use crate::sync::{SyncMessage, SyncRequestData, SyncResponseData};
 use crate::vault::Vault;
 
 use std::collections::HashMap;
+use tracing::warn;
 
 use super::{Result, SyncEngineError};
 
@@ -187,6 +188,16 @@ impl<F: FileSystem> Vault<F> {
     ) -> Result<SyncResponseData> {
         let mut document_updates = HashMap::new();
 
+        // Tracks whether this response ships a brand-new doc (a full snapshot for a
+        // path the peer lacks). The registry node-create op for such a doc rides a
+        // resend-once VV-delta, so a peer whose registry VV already "covers" the
+        // op without it having landed would get the doc but not the node. When any
+        // new doc ships, we force a full registry snapshot below so the node is as
+        // resend-durable as its content — this is the send-side guarantee the
+        // Flow-2 apply gate in `document_apply.rs` depends on (it hard-skips a new
+        // doc whose node isn't present).
+        let mut sent_new_doc_snapshot = false;
+
         // Get all our files
         let our_files = self.list_files().await?;
 
@@ -211,11 +222,41 @@ impl<F: FileSystem> Vault<F> {
             } else {
                 // They don't have it - send full snapshot
                 document_updates.insert(path, doc.export_snapshot()?);
+                sent_new_doc_snapshot = true;
             }
         }
 
-        // Export registry updates if they have an older version
-        let registry_updates = if !their_registry_version.is_empty() {
+        // Export registry updates.
+        //
+        // When this response ships any new-doc snapshot, send the FULL registry
+        // snapshot regardless of their registry version. This closes the
+        // resend-once asymmetry: documents are resent from disk until the peer
+        // catches up, but registry node-creates ride a one-shot VV-delta, so a
+        // doc could otherwise arrive without its node. The full snapshot (~194 KB
+        // on the umbra vault, cheap on an exchange already shipping new content)
+        // guarantees the node lands before the doc — exactly what the receive-side
+        // gate in `document_apply.rs` relies on. loro can't cross-reference the two
+        // separate docs, so this durability coupling is necessarily application-level.
+        let registry_updates = if sent_new_doc_snapshot {
+            // A new-doc snapshot is riding along, so the receiver's Flow-2 apply
+            // gate (`document_apply.rs`) will hard-skip the doc unless its registry
+            // node arrives in the SAME message. Dropping the snapshot here silently
+            // (export error → `None`) produces an invisible no-sync: the doc ships
+            // but never materializes on the peer until a later registry sync or boot
+            // reconcile heals it. Warn so that failure is at least visible.
+            match self.registry().export(loro::ExportMode::snapshot()) {
+                Ok(updates) => Some(updates),
+                Err(e) => {
+                    warn!(
+                        "prepare_sync_response: failed to export registry snapshot \
+                         while shipping a new-doc snapshot; receiver will skip the new \
+                         doc until its node arrives: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else if !their_registry_version.is_empty() {
             if let Ok(their_version) = loro::VersionVector::decode(their_registry_version) {
                 match self
                     .registry()

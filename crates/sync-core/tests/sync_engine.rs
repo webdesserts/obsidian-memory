@@ -1257,3 +1257,90 @@ async fn test_new_doc_with_registry_node_is_written() {
         "the written doc must carry the donor's content"
     );
 }
+
+// ========== Send-side Registry Durability Tests (C3) ==========
+
+/// When a sync response ships a brand-new doc, it must also carry a FULL registry
+/// snapshot — not the resend-once VV-delta — so the doc's registry node is exactly
+/// as resend-durable as its content. This closes the asymmetry that lets a doc
+/// land without its node (the send side of the divergence bug, and the guarantee
+/// the C2 receive-side gate depends on).
+///
+/// Distinguishing observable: the captured registry payload is delivered to a
+/// FRESH EMPTY registry. A full snapshot reconstructs the new node standalone; a
+/// VV-delta exported against the requester's (non-empty) registry version would
+/// omit ancestor ops the empty registry lacks, so the node would NOT materialize.
+/// On the pre-C3 base — where a non-empty requester registry version routes to the
+/// delta branch — this test is RED.
+#[tokio::test]
+async fn test_new_doc_response_ships_full_registry_snapshot() {
+    use sync_core::SyncMessage;
+
+    // Sender registers shared.md, then the requester syncs it. This gives the
+    // requester SHARED registry history (it now covers the sender's root/folder
+    // ops), which is what makes a later VV-delta PARTIAL rather than a de-facto
+    // full export — the precise condition C3 has to defend against.
+    let sender_fs = Arc::new(InMemoryFs::new());
+    sender_fs.write("shared.md", b"# Shared").await.unwrap();
+    let sender = Vault::init(Arc::clone(&sender_fs), author(1))
+        .await
+        .unwrap();
+    sender.on_file_changed("shared.md").await.unwrap();
+
+    let requester_fs = Arc::new(InMemoryFs::new());
+    let requester = Vault::init(Arc::clone(&requester_fs), author(2))
+        .await
+        .unwrap();
+    full_sync(&requester, &sender).await;
+    assert!(
+        !requester.is_file_deleted("shared.md"),
+        "setup: requester must share shared.md's registry history with the sender"
+    );
+
+    // Now the sender adds new.md ON TOP of the shared history. The requester's
+    // registry version covers shared.md but not new.md's node-create op.
+    sender_fs.write("new.md", b"# New").await.unwrap();
+    sender.on_file_changed("new.md").await.unwrap();
+
+    // Requester asks the sender for what it's missing; the sender answers with a
+    // SyncExchange carrying the response.
+    let request_bytes = requester.prepare_sync_request().await.unwrap();
+    let (exchange_bytes, _) = sender.process_sync_message(&request_bytes).await.unwrap();
+    let exchange: SyncMessage = bincode::deserialize(&exchange_bytes.unwrap()).unwrap();
+    let response = match exchange {
+        SyncMessage::SyncExchange { response, .. } => response,
+        other => panic!("expected SyncExchange, got {:?}", other),
+    };
+
+    // The sender ships new.md as a new-doc snapshot...
+    assert!(
+        response.document_updates.contains_key("new.md"),
+        "sender must ship new.md as a new-doc snapshot"
+    );
+    // ...and therefore must include a registry payload.
+    let registry_payload = response
+        .registry_updates
+        .expect("a new-doc response must carry a registry payload (C3)");
+
+    // The decisive check: deliver ONLY the registry payload to a fresh, empty
+    // vault. A full snapshot reconstructs new.md's node standalone; a VV-delta
+    // exported against the requester's version omits the shared ancestor ops the
+    // empty registry lacks, so the node would NOT materialize there.
+    let fresh_fs = Arc::new(InMemoryFs::new());
+    let fresh = Vault::init(Arc::clone(&fresh_fs), author(3)).await.unwrap();
+    let registry_only = SyncMessage::SyncResponse {
+        registry_updates: Some(registry_payload),
+        document_updates: std::collections::HashMap::new(),
+    };
+    let registry_only_bytes = bincode::serialize(&registry_only).unwrap();
+    fresh
+        .process_sync_message(&registry_only_bytes)
+        .await
+        .unwrap();
+
+    assert!(
+        !fresh.is_file_deleted("new.md"),
+        "the new doc's registry node must materialize from the response's registry \
+         payload alone — proving a full snapshot (C3) shipped, not a partial VV-delta"
+    );
+}
