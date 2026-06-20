@@ -1605,5 +1605,272 @@ mod tests {
             "re-applying a stale report must tombstone nothing (losers already gone)"
         );
     }
-}
 
+    // ========== C4 Boot FS-First Reconciliation Tests (inline: pub(crate) state) ==========
+
+    /// Plant a disk `.md` + its `.loro` for `path` with NO registry node — the fs↔loro
+    /// divergence the boot reconcile must heal. The `.loro` is built from markdown via
+    /// `from_markdown`, so it carries a fresh lineage `doc_id` we capture and return; the
+    /// adopt path must preserve THAT id (not mint a new one), which proves it adopted the
+    /// existing `.loro` rather than rebuilding from the markdown. Returns the captured
+    /// lineage `doc_id`.
+    ///
+    /// The vault is `init`-ed on an empty fs first (so `.sync`/registry exist for a later
+    /// `load`), then the `.md`+`.loro` are written directly — never through `register_file`
+    /// — so the persisted registry has no node for the path.
+    async fn plant_orphan_loro(
+        fs: &std::sync::Arc<InMemoryFs>,
+        path: &str,
+        content: &str,
+    ) -> String {
+        // init on the still-empty fs: creates .sync + an empty registry, indexes nothing.
+        let _vault = Vault::init(std::sync::Arc::clone(fs), test_peer_id())
+            .await
+            .unwrap();
+
+        // Now plant the disk file and a matching .loro carrying a real lineage doc_id,
+        // with no registry node registered for it.
+        fs.write(path, content.as_bytes()).await.unwrap();
+        let doc = NoteDocument::from_markdown(path, content, test_peer_id()).unwrap();
+        let lineage_doc_id = doc
+            .doc_id()
+            .expect("from_markdown always mints a lineage doc_id");
+        let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, simple_hash(path));
+        fs.atomic_write(&sync_path, &doc.export_snapshot().unwrap())
+            .await
+            .unwrap();
+
+        lineage_doc_id
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_adopts_orphan_loro_preserving_lineage() {
+        // The fs↔loro divergence heal: a disk `.md`+`.loro` with no registry node and no
+        // tombstone is ADOPTED at boot — a node is registered for the EXISTING `.loro`,
+        // preserving its lineage doc_id (NOT rebuilt from the markdown, which would mint a
+        // new id and diverge from peers on the next sync). RED on the pre-C4 base: the
+        // `.loro`-present branch judged this "consistent" and registered no node, so the
+        // path stayed node-less forever.
+        //
+        // Inline because it asserts on `path_to_node` and `ReconcileReport.adopted`
+        // (pub(crate)) and plants the `.loro` at the `simple_hash`-derived path.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        let lineage_doc_id = plant_orphan_loro(&fs, "orphan.md", "# Orphan").await;
+
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // Boot reconcile (the one inside `load`) already ran; drive it again to inspect the
+        // report. On THIS pass the node already exists (the in-load adopt registered it), so
+        // it takes the reindex arm and reports nothing — but the FIRST observable, a live
+        // node now present for the path, is the heal.
+        assert!(
+            vault.path_to_node().contains_key("orphan.md"),
+            "boot reconcile must register a node adopting the orphaned .loro"
+        );
+
+        // Adopt-not-rebuild: the adopted document must keep the EXISTING `.loro`'s lineage
+        // doc_id. A rebuild-from-markdown would mint a fresh uuid here — the anti-divergence
+        // tripwire.
+        let doc = vault.get_document("orphan.md").await.unwrap();
+        assert_eq!(
+            doc.doc_id().as_deref(),
+            Some(lineage_doc_id.as_str()),
+            "adopt must preserve the existing .loro's lineage doc_id, not rebuild from markdown"
+        );
+
+        // The path must NOT be treated as deleted — it was a divergence, not a tombstone.
+        assert!(
+            !vault.is_path_deleted_in_registry("orphan.md"),
+            "an adopted orphan is alive, never tombstoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_adopt_is_idempotent() {
+        // The adopt heals exactly once: after a node is registered for the orphan, a re-run
+        // reconcile finds the node present → reindex arm → adopts nothing. Without this, a
+        // path could re-adopt on every pass (the un-persisted-loop the save gate also
+        // guards against). `load` already ran one reconcile (which adopted); the explicit
+        // reconcile below is the second pass over an already-noded path.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+        plant_orphan_loro(&fs, "orphan.md", "# Orphan").await;
+
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            vault.path_to_node().contains_key("orphan.md"),
+            "precondition: the in-load reconcile adopted the orphan"
+        );
+
+        let report = vault.reconcile().await.unwrap();
+        assert!(
+            report.adopted.is_empty(),
+            "a re-run reconcile must not re-adopt an already-noded path, got: {:?}",
+            report.adopted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_adopt_tombstoned_loro() {
+        // S1 resurrection guard: a disk `.md`+`.loro` whose registry state is TOMBSTONED
+        // must NOT be adopted — adopting would resurrect a real user deletion. It is
+        // quarantined to `.trash/` instead. This is the dangerous case the explicit
+        // `(has_loro, has_node, tombstoned)` match catches by exhaustiveness (the
+        // `.loro`-present + tombstoned tuple falls into the quarantine arm, never adopt).
+        //
+        // Inline because it drives `delete_file`/`register_file`/`is_path_deleted_in_registry`
+        // (pub(crate)) to construct the tombstoned-but-`.loro`-present state.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // Create + register the file (writes node + .loro), then tombstone the node while
+        // LEAVING the `.loro` on disk — the exact state where a Pull wrote `.loro`+`.md`,
+        // a later tombstone arrived, but the `.loro` cleanup didn't remove the file.
+        fs.write("deleted.md", b"# Deleted").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, simple_hash("deleted.md"));
+        assert!(
+            fs.exists(&sync_path).await.unwrap(),
+            "precondition: registering the file wrote its .loro"
+        );
+
+        // Tombstone the node (delete_file removes the .loro too), then re-plant the `.loro`
+        // and the `.md` on disk so the path is BOTH tombstoned AND `.loro`-present.
+        vault.delete_file("deleted.md").await.unwrap();
+        vault.save_registry().await.unwrap();
+        let doc = NoteDocument::from_markdown("deleted.md", "# Deleted", test_peer_id()).unwrap();
+        fs.atomic_write(&sync_path, &doc.export_snapshot().unwrap())
+            .await
+            .unwrap();
+        fs.write("deleted.md", b"# Deleted").await.unwrap();
+        drop(vault);
+
+        // `load` runs the boot reconcile; assert on the resulting END STATE (the in-load
+        // report is discarded by `load`, and a second explicit reconcile would see the file
+        // already trashed). The end state fully distinguishes the two outcomes: an adopt
+        // would leave a LIVE node and the file in place; the S1 guard instead leaves no live
+        // node and moves the file to `.trash/`.
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+
+        // NOT resurrected: no live node was registered for the tombstoned path (an adopt
+        // would have created one). RED on the pre-C4 base too — but the decisive
+        // base-vs-C4 discriminator is the `.trash/` move below.
+        assert!(
+            !vault.path_to_node().contains_key("deleted.md"),
+            "a tombstoned path must not gain a live node (no adopt-as-resurrection)"
+        );
+        assert!(
+            vault.is_path_deleted_in_registry("deleted.md"),
+            "the tombstone is respected: the path stays deleted in the registry"
+        );
+
+        // Quarantined, not resurrected: the disk file is moved to `.trash/` and removed from
+        // its original location. On the pre-C4 base this `.loro`-present tombstoned path took
+        // the reindex arm and was left on disk untouched, so `.trash/deleted.md` did NOT
+        // exist — this is the RED→GREEN discriminator for the S1 guard.
+        assert!(
+            fs.exists(".trash/deleted.md").await.unwrap(),
+            "the tombstoned-but-on-disk orphan must be quarantined to .trash/"
+        );
+        assert!(
+            !fs.exists("deleted.md").await.unwrap(),
+            "the original orphan file must be removed once quarantined"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_missing_file_is_report_only() {
+        // Inverse direction: an alive registry node whose `.md` is gone from disk is
+        // REPORT-ONLY. Reconcile must NOT recreate the file (resurrection) and must NOT
+        // tombstone the node (deletion-propagation) — both are the data-loss classes the
+        // registry-truth guard hardened against. The divergence is surfaced in
+        // `report.missing_files` only.
+        //
+        // Inline because it asserts on `is_path_deleted_in_registry`, `path_to_node`, and
+        // `ReconcileReport.missing_files` (pub(crate)).
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+
+        // Register a file (node + .md + .loro), then delete ONLY the `.md` from disk —
+        // leaving the alive node and the `.loro`.
+        fs.write("ghost.md", b"# Ghost").await.unwrap();
+        let vault = Vault::init(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, simple_hash("ghost.md"));
+        fs.delete("ghost.md").await.unwrap();
+
+        let report = vault.reconcile().await.unwrap();
+
+        // The node stays alive (NOT tombstoned), the file is NOT recreated, and the `.loro`
+        // is untouched. Only the report surfaces the divergence.
+        assert!(
+            vault.path_to_node().contains_key("ghost.md"),
+            "the alive node must remain (no deletion-propagation)"
+        );
+        assert!(
+            !vault.is_path_deleted_in_registry("ghost.md"),
+            "reconcile must not tombstone the node for a missing file"
+        );
+        assert!(
+            !fs.exists("ghost.md").await.unwrap(),
+            "the missing `.md` must NOT be recreated (no resurrection)"
+        );
+        assert!(
+            fs.exists(&sync_path).await.unwrap(),
+            "the `.loro` must be left untouched"
+        );
+        assert!(
+            report.missing_files.contains(&"ghost.md".to_string()),
+            "the missing-file divergence must be reported, got: {:?}",
+            report.missing_files
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_adopt_persists_across_reload() {
+        // S2 persistence: an adopt-only reconcile MUST persist the registry. Without
+        // including `adopted` in the save gate, the adopted node lives only in memory and
+        // re-adopts on every restart, never landing on disk — the heal would be illusory.
+        // This asserts directly on the persisted `registry.loro` bytes (not on a second
+        // reconcile, which would re-adopt and mask the bug): after one adopt-only load, the
+        // on-disk registry must contain an alive node for the orphan path.
+        //
+        // Inline because it plants the `.loro` at the `simple_hash` path and reads the
+        // persisted registry to assert ground-truth persistence.
+        use std::sync::Arc;
+        let fs = Arc::new(InMemoryFs::new());
+        plant_orphan_loro(&fs, "orphan.md", "# Orphan").await;
+
+        // One load → the in-load reconcile adopts (and, with the fixed save gate, persists).
+        let vault = Vault::load(Arc::clone(&fs), test_peer_id()).await.unwrap();
+        assert!(
+            vault.path_to_node().contains_key("orphan.md"),
+            "precondition: the in-load reconcile adopted the orphan in memory"
+        );
+        drop(vault);
+
+        // Ground truth: import the PERSISTED registry into a throwaway doc and confirm an
+        // alive `type==file` node exists at the orphan path. If the save gate omitted
+        // `adopted`, these bytes would carry no such node (RED).
+        let registry_bytes = fs.read(REGISTRY_FILE).await.unwrap();
+        let persisted = loro::LoroDoc::new();
+        persisted.import(&registry_bytes).unwrap();
+        let tree = persisted.get_tree(REGISTRY_TREE);
+        let persisted_alive_orphan = tree.nodes().into_iter().any(|node_id| {
+            if tree.is_node_deleted(&node_id).unwrap_or(true) {
+                return false;
+            }
+            let Ok(meta) = tree.get_meta(node_id) else {
+                return false;
+            };
+            let meta_str = |key| Vault::<Arc<InMemoryFs>>::tree_meta_string(&meta, key);
+            meta_str(TREE_META_TYPE).as_deref() == Some("file")
+                && meta_str(TREE_META_PATH).as_deref() == Some("orphan.md")
+        });
+        assert!(
+            persisted_alive_orphan,
+            "an adopt-only reconcile must persist the new node to registry.loro on disk"
+        );
+    }
+}

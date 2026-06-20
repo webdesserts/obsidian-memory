@@ -229,16 +229,35 @@ pub struct ReconcileReport {
     /// local disk cleanup with no registry mutation and no sync implications, so it
     /// must not cause the daemon to broadcast.
     pub quarantined: Vec<String>,
+    /// Disk `.md` files that already had a `.loro` (a peer's content) but no registry
+    /// node, for which boot reconcile registered a node *adopting the existing `.loro`*
+    /// — preserving the peer's lineage `doc_id` rather than rebuilding from markdown.
+    /// This is the fs↔loro divergence heal (e.g. the orphaned notes a peer's content
+    /// landed without its registry node). It IS a change: the freshly-registered node
+    /// is genuinely new to this device's registry and peers should learn it, so it
+    /// counts in `has_changes()`.
+    pub adopted: Vec<String>,
+    /// Alive registry nodes whose backing `.md` file is missing from disk (the inverse
+    /// divergence). REPORT-ONLY: reconcile takes NO action here — it neither recreates
+    /// the file (resurrection) nor tombstones the node (deletion-propagation), the two
+    /// data-loss classes the registry-truth resurrection guard hardened against. Like
+    /// `quarantined`, this is excluded from `has_changes()` — surfacing a count in the
+    /// boot logs must not trigger a broadcast.
+    pub missing_files: Vec<String>,
 }
 
 impl ReconcileReport {
     /// Check if any changes were made
     ///
-    /// `quarantined` is intentionally NOT consulted here — see the field doc: it is
-    /// local cleanup with no sync implications, and the daemon gates broadcasts on
-    /// this method.
+    /// `quarantined` and `missing_files` are intentionally NOT consulted here — see
+    /// their field docs: both are local-only (disk cleanup / report-only) with no sync
+    /// implications, and the daemon gates broadcasts on this method. `adopted` IS
+    /// consulted: it registers a new registry node peers should learn.
     pub fn has_changes(&self) -> bool {
-        !self.indexed.is_empty() || !self.reindexed.is_empty() || !self.moved.is_empty()
+        !self.indexed.is_empty()
+            || !self.reindexed.is_empty()
+            || !self.moved.is_empty()
+            || !self.adopted.is_empty()
     }
 
     /// Total number of files processed

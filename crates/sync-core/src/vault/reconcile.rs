@@ -170,15 +170,62 @@ impl<F: FileSystem> Vault<F> {
             }
         }
 
-        // Persist the new-file registrations made during this reconcile pass. Batched
-        // here (not per on_file_changed call) to avoid O(n) snapshot writes when
-        // hundreds of files are indexed at startup. Moves aren't included: each move
-        // goes through migrate_document, which already persists its own registration.
-        if !report.indexed.is_empty() {
+        // Inverse divergence: alive registry nodes whose backing `.md` is gone from disk.
+        // REPORT-ONLY — see report_missing_files: never recreate the file or tombstone
+        // the node here (the resurrection/deletion data-loss classes).
+        self.report_missing_files(&md_files, &mut report).await;
+
+        // Persist the registry mutations made during this reconcile pass. Batched here
+        // (not per on_file_changed/register_file call) to avoid O(n) snapshot writes when
+        // hundreds of files are indexed at startup. `adopted` must be included: an adopt
+        // registers a node that only lives in memory until saved — without this the heal
+        // is illusory (the node re-adopts on every restart, never persisting). Moves
+        // aren't included: each move goes through migrate_document, which already persists
+        // its own registration.
+        if !report.indexed.is_empty() || !report.adopted.is_empty() {
             self.save_registry().await?;
         }
 
         Ok(report)
+    }
+
+    /// Record alive registry file nodes that have no backing `.md` on disk
+    /// (`report.missing_files`) — the inverse of the adopt direction.
+    ///
+    /// This is the resurrection/deletion-risk direction and is deliberately REPORT-ONLY:
+    /// reconcile does NOT recreate the file from the node's `.loro` (resurrection) and
+    /// does NOT tombstone the node (deletion-propagation) — both are the data-loss classes
+    /// the registry-truth resurrection guard hardened against. The both-gone subset
+    /// (no `.md` AND no `.loro`) is also surfaced by the `find_registry_debris` operator
+    /// tool as a "relic"; this surface is broader (it reports a missing `.md` even when the
+    /// `.loro` is still present) and never mutates, so the two do not fight.
+    ///
+    /// `md_files` is the same on-disk markdown set `reconcile` already scanned, passed in
+    /// so this pass needs no second directory walk.
+    async fn report_missing_files(
+        &self,
+        md_files: &std::collections::HashSet<String>,
+        report: &mut ReconcileReport,
+    ) {
+        // Collect alive file-node paths while holding the tree borrow, then release it
+        // before the fs probes — mirror find_registry_debris (never hold a registry guard
+        // across an await). path_to_node already holds exactly the alive file nodes
+        // (rebuild_path_cache populates it from alive `type=="file"` nodes), so it is the
+        // cheap source of truth here — no tree walk needed.
+        let alive_paths: Vec<String> = self.path_to_node().keys().cloned().collect();
+
+        for path in alive_paths {
+            // A path whose `.md` is on disk is consistent; only a missing `.md` is the
+            // inverse divergence. Use the already-scanned md_files set first to avoid an
+            // fs probe for the common (present) case.
+            if md_files.contains(&path) {
+                continue;
+            }
+            if !self.fs.exists(&path).await.unwrap_or(false) {
+                tracing::info!("Registry node with no backing file (report-only): {}", path);
+                report.missing_files.push(path);
+            }
+        }
     }
 
     /// Reconcile a single markdown file against its Loro state, recording the
@@ -196,37 +243,89 @@ impl<F: FileSystem> Vault<F> {
         report: &mut ReconcileReport,
     ) -> Result<()> {
         let hash = simple_hash(path);
-        let sync_path = format!("{}/documents/{}.loro", SYNC_DIR, hash);
+        let sync_path = self.document_sync_path(path);
 
-        if loro_hashes.contains(&hash) {
-            // Both exist - check if markdown was modified externally
-            if self.needs_reindex(path, &sync_path).await? {
-                tracing::info!("File modified externally, re-indexing: {}", path);
-                self.reindex_file(path).await?;
-                report.reindexed.push(path.to_string());
+        // Classify the file by the three axes the reconcile decision actually turns on,
+        // then `match` over the tuple so every case is enumerable and the dangerous ones
+        // fall out of exhaustiveness rather than a hand-written guard. The prior nested
+        // `if loro_hashes.contains / else if tombstoned / else` keyed on a *mix* of
+        // `.loro`-presence and tombstone state on a single axis, which hid that a
+        // tombstoned-but-`.loro`-present path took the reindex arm — the S1 resurrection
+        // risk. Making node-presence explicit is also what lets boot reconcile adopt a
+        // `.loro` that has no node (the fs↔loro divergence heal).
+        //
+        // Axes:
+        // - has_loro:   a `.loro` document file exists on disk for this path.
+        // - has_node:   an *alive* registry tree node exists for this path.
+        // - tombstoned: the registry tree marks this path deleted (alive-wins: a path
+        //               with an alive node is never tombstoned after rebuild_path_cache).
+        let has_loro = loro_hashes.contains(&hash);
+        let has_node = self.path_to_node().contains_key(path);
+        let tombstoned = self.is_path_deleted_in_registry(path);
+
+        match (has_loro, has_node, tombstoned) {
+            // `.loro` + node both present → both exist: check if markdown was modified
+            // externally and re-index if so (unchanged behavior). The `_` on tombstoned is
+            // correct: alive-wins means a live-node path is not tombstoned, but even in the
+            // stale-armed window (delete_file inserted before rebuild) an alive node makes
+            // this the reindex case, never a resurrection.
+            (true, true, _) => {
+                if self.needs_reindex(path, &sync_path).await? {
+                    tracing::info!("File modified externally, re-indexing: {}", path);
+                    self.reindex_file(path).await?;
+                    report.reindexed.push(path.to_string());
+                }
             }
-        } else if self.is_path_deleted_in_registry(path) {
-            // A disk `.md` whose registry state is tombstoned is an untracked
-            // orphan (a historical-bug or offline-window strand), not a new file.
-            // Quarantine it to .trash/ instead of resurrecting it as a new node.
-            // The .trash/ exclusion in list_files (and the watcher) is what keeps
-            // this idempotent — the moved file is no longer a reconcile candidate.
+
+            // `.loro` present, NO node, NOT tombstoned → the fs↔loro divergence: a peer's
+            // content landed on disk without its registry node. ADOPT the existing `.loro`
+            // by registering a node for it. register_file writes the node + path-derived
+            // doc_id meta WITHOUT touching the `.loro`, so the document's own lineage
+            // doc_id is preserved. Rebuilding from `.md` instead would mint a fresh lineage
+            // doc_id → on the next sync the file would look independently-created and
+            // diverge ("latest wins") instead of CRDT-merging. Adopt-not-rebuild is
+            // mandatory. register_file is sync (no await) and no-ops if a node already
+            // exists, so it cannot fight a concurrent re-create.
+            (true, false, false) => {
+                tracing::info!("Adopting orphaned .loro (no registry node): {}", path);
+                self.register_file(path)?;
+                report.adopted.push(path.to_string());
+            }
+
+            // Tombstoned (with or without `.loro`) → quarantine; NEVER resurrect. The
+            // S1 case `(true, false, true)` — a `.loro`-present path the registry has
+            // tombstoned — lands HERE by exhaustiveness, so a real user deletion is not
+            // resurrected as an adopted node. A disk `.md` whose registry state is
+            // tombstoned is an untracked orphan (a historical-bug or offline-window
+            // strand), not a new file: move it to `.trash/` rather than re-minting a
+            // node. The `.trash/` exclusion in list_files (and the watcher) keeps this
+            // idempotent — the moved file is no longer a reconcile candidate.
+            // quarantine_orphan's own A1 guard short-circuits (no quarantine) if an alive
+            // node occupies the path, so the stale-armed `(false, true, true)` window is
+            // safe here too.
             //
-            // Inner log-and-continue (mirroring index_existing_files): cleanup of
-            // one orphan failing must not block the vault from loading, and its
-            // specific failure message is more useful than the caller's generic one.
-            if let Err(e) = self.quarantine_orphan(path).await {
-                tracing::warn!("Failed to quarantine orphan {}: {}", path, e);
-            } else {
-                report.quarantined.push(path.to_string());
+            // Inner log-and-continue (mirroring index_existing_files): cleanup of one
+            // orphan failing must not block the vault from loading, and its specific
+            // failure message is more useful than the caller's generic one.
+            (_, _, true) => {
+                if let Err(e) = self.quarantine_orphan(path).await {
+                    tracing::warn!("Failed to quarantine orphan {}: {}", path, e);
+                } else {
+                    report.quarantined.push(path.to_string());
+                }
             }
-        } else {
-            // Truly new file (not a move target, not a tombstoned orphan).
-            // on_file_changed registers the new file node in the tree as part of
-            // creating its document, so no separate register_file call is needed.
-            tracing::info!("New file detected, indexing: {}", path);
-            self.on_file_changed(path).await?;
-            report.indexed.push(path.to_string());
+
+            // No `.loro`, not tombstoned → treat as a (possibly already-noded) new file.
+            // on_file_changed registers the file node in the tree as part of creating its
+            // document, so no separate register_file call is needed; register_file no-ops
+            // if a node is already present, so the degenerate `(false, true, false)` case
+            // (node but no `.loro`, e.g. a `.loro` deleted out from under a live node) is
+            // handled the same way — recreate the `.loro` from markdown.
+            (false, _, false) => {
+                tracing::info!("New file detected, indexing: {}", path);
+                self.on_file_changed(path).await?;
+                report.indexed.push(path.to_string());
+            }
         }
 
         Ok(())
