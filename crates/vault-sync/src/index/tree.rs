@@ -166,6 +166,45 @@ impl Index {
         Self::tree_meta_string(&meta, TREE_META_UUID).and_then(|s| Uuid::parse_str(&s).ok())
     }
 
+    /// The path a *tombstoned* file node carrying `uuid` was deleted at — the
+    /// orphan's last-known location, recovered for the native-move adopt (OQ-3).
+    ///
+    /// A move arrives at boot as a `delete(old)` + `create(new)`: the old node is
+    /// tombstoned but its `path` meta still reads `old` and its `uuid` meta still
+    /// reads the moved document's UUID. The live caches deliberately exclude
+    /// tombstoned nodes, so this walks the tree to find the deleted node. It is the
+    /// replacement for the deleted `_meta.path` in the content doc — the content doc
+    /// is now location-agnostic, so the move's old path is recovered HERE (from the
+    /// Index), not from the content doc.
+    ///
+    /// Returns `None` when no tombstoned file node carries that UUID (e.g. an
+    /// orphaned content doc whose node never existed — the fs↔loro divergence case,
+    /// which is healed by the divergence-adopt arm rather than the move-adopt arm).
+    pub fn deleted_node_path_for_uuid(&self, uuid: &Uuid) -> Option<String> {
+        let tree = self.index_tree();
+        for node_id in tree.nodes() {
+            // Only a tombstoned node is a candidate — a live node carrying this UUID
+            // is resolvable through the caches and is not an orphan.
+            if !tree.is_node_deleted(&node_id).unwrap_or(true) {
+                continue;
+            }
+            let Ok(meta) = tree.get_meta(node_id) else {
+                continue;
+            };
+            if Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() != Some("file") {
+                continue;
+            }
+            let matches_uuid = Self::tree_meta_string(&meta, TREE_META_UUID)
+                .and_then(|s| Uuid::parse_str(&s).ok())
+                .as_ref()
+                == Some(uuid);
+            if matches_uuid {
+                return Self::tree_meta_string(&meta, TREE_META_PATH);
+            }
+        }
+        None
+    }
+
     /// The denormalized `content_version` fingerprint stored on a node, if present.
     ///
     /// A derived cache (the content doc's `state_vv()` is authoritative); the

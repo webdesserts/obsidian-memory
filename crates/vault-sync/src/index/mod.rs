@@ -28,6 +28,7 @@
 //! fs-agnostic. The public `Vault<F>` handle (a later chunk) owns the fs, the
 //! content docs, and the flows that tie them to the Index.
 
+mod reconcile;
 mod state;
 mod tree;
 
@@ -50,8 +51,19 @@ use std::cell::RefCell;
 /// The `.sync/` directory holding all vault sync state.
 pub(crate) const SYNC_DIR: &str = ".sync";
 
+/// The `.trash/` directory where boot reconcile quarantines tombstoned disk
+/// orphans (a tombstoned-in-index `.md` still on disk). Quarantine is reversible —
+/// the file is preserved here rather than deleted — and `Vault::list_files` excludes
+/// any hidden directory (a leading `.`), so a quarantined file is no longer a
+/// reconcile candidate (which is what keeps the quarantine idempotent).
+pub(crate) const TRASH_DIR: &str = ".trash";
+
 /// The persisted index CRDT (`.sync/index.loro`).
 pub(crate) const INDEX_FILE: &str = ".sync/index.loro";
+
+/// The `.sync/docs/` directory holding every document's content `.loro`
+/// (`docs/<uuid>.loro`), addressed by UUID so a move never relocates a content file.
+pub(crate) const DOCS_DIR: &str = ".sync/docs";
 
 /// The `LoroTree` container name inside the index document.
 ///

@@ -194,10 +194,14 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// `loro_author` is this device's Loro peer id (see [[Loro Peer ID Semantics]]).
     ///
-    /// Note: the fs-first boot reconcile (adopt/quarantine/report — INV-7) lands in
-    /// a later chunk and runs here, before any inbound sync, once the receive flow
-    /// exists. For now `load` only documents what already round-trips through the
-    /// Index.
+    /// ## Boot order (INV-7 — load-bearing)
+    ///
+    /// Load is strictly ordered: (1) load the Index, hard-failing on corruption
+    /// (EC-9); (2) rebuild the caches (both inside `Index::load_index`); (3) run the
+    /// fs-first boot reconcile, documenting local fs state into the Index
+    /// (adopt/quarantine/report — INV-7); and ONLY THEN does the consumer open the
+    /// vault to remote sync (`process_message`). Local state is fully captured before
+    /// any remote delta integrates — "commit before pull."
     pub async fn load(fs: F, loro_author: u64) -> Result<Self> {
         if !fs.exists(SYNC_DIR).await? {
             return Err(IndexError::NotInitialized);
@@ -210,7 +214,14 @@ impl<F: FileSystem> Vault<F> {
         // from the loaded tree.
         let index = Index::load_index(&fs, loro_author).await?;
 
-        Ok(Self::assemble(index, fs, vault_id, loro_author))
+        let vault = Self::assemble(index, fs, vault_id, loro_author);
+
+        // Reconcile the filesystem into the Index before the vault opens to remote
+        // sync. The per-file work is log-and-continue inside reconcile, so only a
+        // structural failure (e.g. persisting the merged Index) propagates here.
+        vault.reconcile().await?;
+
+        Ok(vault)
     }
 
     /// The vault's identity (gossip topic seed and mDNS mesh grouping key).
