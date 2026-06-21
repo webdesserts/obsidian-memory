@@ -17,10 +17,10 @@
 
 mod common;
 use common::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use uuid::Uuid;
-use vault_sync::{FileSystem, InMemoryFs, Vault};
+use vault_sync::{DocId, FileSystem, InMemoryFs, SyncMessage, Vault, content_doc_path};
 
 // ============================ shared assertion helpers ============================
 
@@ -712,6 +712,181 @@ mod dp5_move_delete_interplay {
             md_files(&b).await,
             BTreeSet::from(["archive/topic.md".to_string()]),
             "exactly the moved file, no stray conflict files"
+        );
+    }
+}
+
+// ============ DP-6 — a live-push DocUpdate completes a Flow-2-gated collision ============
+
+mod dp6_live_push_completes_collision {
+    use super::*;
+
+    /// Deliver ONLY `sender`'s Index snapshot to `receiver` (no document content),
+    /// the way a partial/Index-only exchange does. The colliding node lands but its
+    /// body stays Flow-2-gated, so the cascade cannot yet resolve it (DP-6 omits a
+    /// content-less collider from its view). Mirrors the Index-only delivery the
+    /// reconcile suite uses to stage a node-without-content state.
+    async fn deliver_index_only(sender: &V, receiver: &V) {
+        let index_only = SyncMessage::SyncResponse {
+            index_updates: Some(sender.index().export_snapshot().unwrap()),
+            document_updates: HashMap::new(),
+        };
+        receiver
+            .process_message(&bincode::serialize(&index_only).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// The latency guarantee on the live-push path (INV-5 / DP-6): a collision whose
+    /// other node arrived in a PRIOR Index sync — but whose CONTENT was Flow-2-gated —
+    /// is resolved by the real-time `DocUpdate` that finally lands that content, within
+    /// the SAME `process_message`, WITHOUT waiting for a subsequent full sync.
+    ///
+    /// Staging: B holds its own document at `Note.md`. A's competing node at `Note.md`
+    /// is delivered to B via an Index-only message (its `.loro` does not arrive), so the
+    /// collision exists structurally but the cascade omits A's content-less node and
+    /// leaves it unresolved. Then A's content arrives as a lone `DocUpdate` — the
+    /// live-push path. With the cascade wired into that arm, B converges immediately:
+    /// the min-UUID survivor at the path, the loser at its conflict file.
+    ///
+    /// RED on the pre-fix code: the `DocUpdate` arm did not fire the cascade, so the
+    /// collision lingered (no conflict file) until the next full sync.
+    #[tokio::test]
+    async fn live_push_resolves_a_collision_staged_by_a_prior_index_sync() {
+        let (a, b, fs_a, fs_b) = two_vaults().await;
+
+        // Both sides independently create a distinct, non-empty document at one path.
+        write_and_index(&a, &fs_a, "Note.md", "# A\n\nAlpha body.\n").await;
+        write_and_index(&b, &fs_b, "Note.md", "# B\n\nBeta body.\n").await;
+
+        let ua = uuid_at(&a, "Note.md");
+        let ub = uuid_at(&b, "Note.md");
+        let survivor = ua.min(ub);
+        let loser = ua.max(ub);
+
+        // Step 1 — A's NODE lands on B (Index only), but its CONTENT does not. The
+        // collision now exists in B's merged tree, yet the cascade cannot resolve it:
+        // A's `.loro` is absent, so DP-6 omits A's node from the view.
+        deliver_index_only(&a, &b).await;
+
+        // Precondition: B sees both nodes alive at the path (a real, unresolved
+        // collision), A's content is NOT on disk, and NO conflict file exists yet — the
+        // cascade left the content-less collision pending.
+        assert!(
+            b.index().find_node_by_uuid(&ua).is_some()
+                && b.index().find_node_by_uuid(&ub).is_some(),
+            "both colliding nodes are alive on B after the Index-only delivery"
+        );
+        assert!(
+            !fs_b.exists(&content_doc_path(&ua)).await.unwrap(),
+            "A's content is still Flow-2-gated on B (no <uuid>.loro)"
+        );
+        let loser_conflict = conflict_path("Note.md", &loser);
+        assert!(
+            !fs_b.exists(&loser_conflict).await.unwrap(),
+            "no conflict file yet — the content-less collision is unresolved"
+        );
+
+        // Step 2 — A's CONTENT arrives as a lone real-time DocUpdate (the live-push
+        // path), NOT a full sync. This is the message that completes the collision.
+        let push = a.prepare_doc_update(DocId(ua)).await.unwrap().unwrap();
+        b.process_message(&push).await.unwrap();
+
+        // The collision is resolved by the push alone — no subsequent full sync. The
+        // min-UUID survivor holds the path; the loser is at its full-UUID conflict file;
+        // both bodies are present (INV-3). This is exactly what the pre-fix `DocUpdate`
+        // arm failed to do.
+        assert_eq!(
+            uuid_at(&b, "Note.md"),
+            survivor,
+            "the min-UUID survivor holds the path after the live push"
+        );
+        assert!(
+            fs_b.exists(&loser_conflict).await.unwrap(),
+            "the live push resolved the collision: the loser is at its conflict file"
+        );
+        assert_eq!(
+            md_files(&b).await,
+            BTreeSet::from(["Note.md".to_string(), loser_conflict.clone()]),
+            "exactly the survivor + one conflict file — the collision is fully resolved"
+        );
+
+        // Both originals survive somewhere on B — nothing dropped.
+        let mut bodies = Vec::new();
+        for path in md_files(&b).await {
+            bodies.push(read_md_str(&fs_b, &path).await);
+        }
+        let all = bodies.join("\n");
+        assert!(
+            all.contains("Alpha body."),
+            "A's body survived the resolution"
+        );
+        assert!(
+            all.contains("Beta body."),
+            "B's body survived the resolution"
+        );
+    }
+}
+
+// ============ DP-5 — the swap branch keeps a re-occupied old path's .md ============
+
+mod dp5_swap_keeps_reoccupied_path {
+    use super::*;
+
+    /// Two documents genuinely SWAP paths in one import batch: X moves P1→P2 while Y
+    /// moves P2→P1. The move-detection's per-path `old_path_vacated = false` branch must
+    /// KEEP each old path's `.md` (it is now the swapped-in document's), so BOTH files
+    /// survive with their correct final bodies — nothing deleted.
+    ///
+    /// This exercises the swap branch directly, which neither existing DP-5 test reaches
+    /// (the local-loser case has `new_path == old_path`; the genuine-move case always has
+    /// `old_path_vacated == true`). If the `if mv.old_path_vacated` guard were inverted,
+    /// processing one move would delete the other's just-materialized file — so the test
+    /// fails (exactly one of the two files goes missing) unless the guard is correct.
+    #[tokio::test]
+    async fn two_docs_swapping_paths_both_survive_with_correct_bodies() {
+        let (a, b, fs_a, fs_b) = two_vaults().await;
+
+        // A creates X at one.md and Y at two.md, then syncs both to B (B gets both
+        // nodes, both `.loro`s, and both `.md`s).
+        write_and_index(&a, &fs_a, "one.md", "# X\n\nBody of X.\n").await;
+        write_and_index(&a, &fs_a, "two.md", "# Y\n\nBody of Y.\n").await;
+        full_sync(&a, &b).await;
+        let x = uuid_at(&b, "one.md");
+        let y = uuid_at(&b, "two.md");
+        assert_ne!(x, y, "precondition: two distinct documents");
+
+        // A swaps them: X one.md→two.md and Y two.md→one.md. A direct swap can't move
+        // into an occupied path, so route Y through a temp path — the net tree effect is
+        // a clean two-node swap, which is what B's import sees.
+        move_file(&a, &fs_a, "two.md", "_swap_tmp.md").await; // Y: two.md -> tmp
+        move_file(&a, &fs_a, "one.md", "two.md").await; // X: one.md -> two.md
+        move_file(&a, &fs_a, "_swap_tmp.md", "one.md").await; // Y: tmp  -> one.md
+
+        // B imports the swap. The swap is zero-content (INV-1), so no document content
+        // crosses — each moved `.md` is re-materialized on B from its local `<uuid>.loro`,
+        // and the swap branch must keep each re-occupied old path's `.md`.
+        sync_both_ways(&a, &b).await;
+
+        // Both documents survive on B at their swapped paths, with the right UUID and
+        // body each — neither file was deleted by the other move's cleanup.
+        assert_eq!(uuid_at(&b, "two.md"), x, "X now lives at two.md on B");
+        assert_eq!(uuid_at(&b, "one.md"), y, "Y now lives at one.md on B");
+        assert!(
+            read_md_str(&fs_b, "two.md").await.contains("Body of X."),
+            "X's body is at two.md on B (not deleted by Y's move cleanup)"
+        );
+        assert!(
+            read_md_str(&fs_b, "one.md").await.contains("Body of Y."),
+            "Y's body is at one.md on B (not deleted by X's move cleanup)"
+        );
+
+        // Exactly the two swapped files, nothing stray (no leaked temp path, no
+        // conflict files — a swap is not a collision).
+        assert_eq!(
+            md_files(&b).await,
+            BTreeSet::from(["one.md".to_string(), "two.md".to_string()]),
+            "exactly the two swapped files survive on B"
         );
     }
 }

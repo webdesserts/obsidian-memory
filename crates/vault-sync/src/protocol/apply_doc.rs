@@ -110,6 +110,11 @@ impl<F: FileSystem> Vault<F> {
     /// Whether the document cached at `path` is the one for `uuid` (its `doc_id`
     /// matches). False when the path is uncached OR — the collision case — the cached
     /// doc belongs to a different UUID that happens to share this display path.
+    ///
+    /// A `false` here routes the caller to the disk-load path (read `<uuid>.loro`),
+    /// which is the safe direction: an uncached path, a cached doc with no readable
+    /// `doc_id`, and an unparseable `doc_id` string all fall through to loading THIS
+    /// uuid's own content from disk rather than risking a merge into the wrong document.
     fn cached_doc_matches_uuid(&self, path: &str, uuid: &DocId) -> bool {
         self.documents()
             .get(path)

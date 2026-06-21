@@ -115,6 +115,21 @@ impl<F: FileSystem> Vault<F> {
             SyncMessage::DocUpdate { uuid, data } => {
                 let modified = self.apply_doc_update(&uuid, &data).await?;
                 if modified {
+                    // A live-push that materializes content can COMPLETE a collision
+                    // whose other node arrived in a prior Index sync but whose body was
+                    // Flow-2-gated until now: the cascade is gated on a path holding ≥2
+                    // nodes, but it cannot resolve a collider whose content is still
+                    // absent (DP-6 omits it from the view), so it leaves that collision
+                    // pending. Firing the cascade here — on the now-merged Index +
+                    // just-landed content — resolves it within this same
+                    // `process_message`, so a live push honors INV-5's latency
+                    // guarantee instead of waiting for the next full sync (DP-6). It is
+                    // self-contained: its own cheap tree-scan gate no-ops when no path
+                    // has ≥2 nodes, and it persists its own mutations. A `DocDeleted`
+                    // only REMOVES a node, so it can never complete a collision and does
+                    // not need this.
+                    self.resolve_structural_conflicts().await?;
+
                     self.emit(SyncEvent::DocumentUpdated {
                         path: uuid.to_string(),
                         timestamp: self.now_ms(),

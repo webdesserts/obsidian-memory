@@ -157,16 +157,19 @@ impl<F: FileSystem> Vault<F> {
         self.index().rebuild_caches();
 
         // NOTE: the structural-conflict cascade (INV-5.0/5.3) does NOT fire here.
-        // It runs in `resolve_structural_conflicts`, called by `apply_response_updates`
-        // AFTER `apply_doc_updates` — because a colliding peer's CONTENT lands in the
-        // same message's document updates, which apply AFTER this Index-apply (INV-8
-        // registry-before-documents). Firing the cascade here would see the colliding
-        // node WITHOUT its content (forcing the DP-6 defensive omit), and — proven by
-        // experiment — the collision would never re-resolve (once the Index version
-        // vectors converge no further Index delta arrives to re-trigger this path). So
-        // the cascade fires once the merged Index AND the just-arrived content are both
-        // present. The move/delete detection below is unaffected: it consumes the
-        // pre-import snapshots captured above, all of which predate the cascade.
+        // It runs in `resolve_structural_conflicts`, called AFTER `apply_doc_updates`
+        // (from `apply_response_updates` on the bulk path, and from the `DocUpdate` arm
+        // on the live-push path) — because a colliding peer's CONTENT lands in the same
+        // message's document updates, which apply AFTER this Index-apply (INV-8
+        // registry-before-documents). Firing the cascade HERE is useless: at this point
+        // `apply_doc_updates` has not yet run, so the colliding node's content is still
+        // absent, the DP-6 defensive omit drops it from the view, and the pass produces
+        // no ops. And the cascade is not invoked a second time within this same
+        // `process_message`, so a here-fire would simply be a wasted no-op — the real
+        // resolution always happens at the downstream call once the merged Index AND the
+        // just-arrived content are both present. The move/delete detection below is
+        // unaffected: it consumes the pre-import snapshots captured above, all of which
+        // predate the cascade.
 
         // Alive-wins for the captured deleted set: `deleted_paths` was built from the
         // PRE-import cache, so a path some alive node still occupies after rebuild
@@ -253,11 +256,14 @@ impl<F: FileSystem> Vault<F> {
     /// A colliding peer's NODE arrives in the Index delta but its CONTENT arrives in
     /// the SAME message's document updates, which apply AFTER `apply_index_updates`
     /// (INV-8 registry-before-documents). The cascade needs both contents present to
-    /// decide identical-vs-empty-vs-distinct, so it fires from `apply_response_updates`
-    /// once both the merged Index and the just-arrived content are on disk. Firing it
-    /// inside the Index-apply would force the DP-6 defensive content-omit, and the
-    /// collision would then never re-resolve (once the Index version vectors converge,
-    /// no further Index delta arrives to re-trigger the Index-apply path).
+    /// decide identical-vs-empty-vs-distinct, so it fires only after `apply_doc_updates`
+    /// — from `apply_response_updates` on the bulk SyncResponse/SyncExchange path, and
+    /// from the `DocUpdate` arm on the live-push path (a push can complete a collision
+    /// whose other content was Flow-2-gated). Firing it inside the Index-apply instead
+    /// would be useless: at that point `apply_doc_updates` has not run, so the colliding
+    /// node's content is absent, the DP-6 defensive omit drops it from the view, and the
+    /// pass produces no ops — and the cascade is not invoked again from there within the
+    /// same `process_message`, so it would be a wasted no-op rather than a resolution.
     ///
     /// ## Cheap when there is no collision
     ///
@@ -405,9 +411,13 @@ impl<F: FileSystem> Vault<F> {
     /// (`deleted_paths`/`pre_import_paths`, captured before the cascade fired, and
     /// already consumed by the time the cascade runs after `apply_doc_updates`). A
     /// cascade `CollapseFile` is not in `deleted_paths`, and a cascade `RenameFile` of
-    /// a pre-existing loser is not detected as a "move" (the survivor occupies the
-    /// loser's old path, so the move-detection's `!rebuilt.contains_key(old_path)` guard
-    /// skips it). Keeping the two cleanups distinct is what preserves that interplay.
+    /// a pre-existing loser is not in the import's move set either — the import's
+    /// move/delete detection ran against snapshots captured before the cascade, so it
+    /// never sees the cascade's tree ops at all. (Even if it did, the import's move
+    /// path no longer suppresses a whole move: a move is detected unconditionally and
+    /// its per-path `old_path_vacated` flag — `false` here, since the survivor occupies
+    /// the loser's old path — only governs whether `cleanup_vacated_paths` deletes the
+    /// OLD `.md`.) Keeping the two cleanups distinct is what preserves that interplay.
     ///
     /// **S1 (fail loud):** a `MoveTargetExists` on a rename means the resolver's
     /// fixpoint produced two ops targeting one path — a real P2a measure bug. We
