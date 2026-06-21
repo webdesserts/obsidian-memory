@@ -110,6 +110,13 @@ impl<F: FileSystem> Vault<F> {
         // doc's actual `state_vv()`, so the compare digest (P3) reads a correct cache.
         let repaired = self.repair_content_versions().await?;
 
+        // Materialize the folder set from the Index (INV-1.5a): a fresh clone / `reload`
+        // re-creates each tracked empty directory and removes a tombstoned folder's empty
+        // directory. Folders are invisible to the file passes above (which see only
+        // `.md` files), so without this an empty folder never appears on a freshly-loaded
+        // vault. fs-only (no Index mutation), so it runs regardless of the save gate.
+        self.materialize_folders().await?;
+
         // Persist the Index mutations made during this pass — batched here (not per
         // adopt/register) to avoid O(n) snapshot writes when many files are indexed at
         // startup. `adopted`/`moved` register nodes that only live in memory until

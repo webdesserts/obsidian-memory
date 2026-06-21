@@ -239,6 +239,12 @@ impl<F: FileSystem> Vault<F> {
         self.index().save_index(self.fs()).await?;
         self.index().sync_state.mark_index_synced();
 
+        // Materialize the folder set: a synced empty folder appears as a real directory
+        // and a tombstoned one's empty directory is removed (INV-1.5a). Folders are
+        // invisible to the file-level cleanup above (which keys on `.md` files), so this
+        // is the only place an inbound apply reflects folder-node creates/deletes on disk.
+        self.materialize_folders().await?;
+
         debug!(
             "apply_index_updates: complete, deleted={:?}, moves={}",
             vacated.deleted,

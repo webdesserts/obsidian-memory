@@ -711,3 +711,160 @@ mod folder_cascade_determinism {
         }
     }
 }
+
+// ===================== AC-INV-1.5a — empty folders sync + materialize =====================
+//
+// A first-class empty folder node syncs to peers and materializes as a real empty
+// DIRECTORY (not merely a side effect of writing files into it), and deleting it removes
+// that directory — but ONLY when the directory is empty (a tombstoned folder whose
+// directory still holds anything is left in place, never recursively removed: INV-3).
+// Folders are invisible to `list_files`/the caches, so these behaviours are observed via
+// the on-disk directory state that `materialize_folders` drives.
+
+mod ac_inv_1_5a_empty_folder_materialize {
+    use super::*;
+
+    /// Create an empty folder node on `vault` at `path` (no files inside) and flush the
+    /// Index — the catalog-level "make an empty directory" the daemon would drive in P4,
+    /// returning the folder node's `TreeID` so the test can later delete it by id.
+    async fn create_empty_folder(vault: &V, path: &str) -> loro::TreeID {
+        let id = vault.index().create_folder(path).unwrap();
+        vault.save_index().await.unwrap();
+        id
+    }
+
+    /// Tombstone an empty folder node by its `TreeID` and flush the Index — the catalog
+    /// half of "remove the empty directory". Keyed by id because folders aren't in the
+    /// path cache (`delete_node` resolves only file nodes).
+    async fn delete_folder(vault: &V, id: loro::TreeID, path: &str) {
+        vault.index().delete_node_by_id(id, path).unwrap();
+        vault.save_index().await.unwrap();
+    }
+
+    /// Whether a directory exists on disk and is empty (the user-visible materialized
+    /// state for an empty folder). A non-existent path is reported as absent.
+    async fn empty_dir_exists(fs: &Fs, path: &str) -> bool {
+        match fs.list(path).await {
+            Ok(entries) => entries.is_empty(),
+            Err(_) => false,
+        }
+    }
+
+    /// An empty folder created on A syncs to B and materializes as an empty directory on
+    /// B's disk; deleting it on A removes the directory on B. The whole lifecycle carries
+    /// only the structural folder node — no document content — and is observed via B's
+    /// on-disk directory state (an empty folder has no `.md` to track) plus the Index
+    /// folder-node count.
+    #[tokio::test]
+    async fn empty_folder_syncs_and_materializes_then_removes() {
+        let (a, b, _fs_a, fs_b) = two_vaults().await;
+
+        // A creates an empty `notes/` folder node (no files under it).
+        let id_a = create_empty_folder(&a, "notes").await;
+
+        // Sync to B → B learns the folder node and materializes the empty directory.
+        full_sync(&a, &b).await;
+        assert!(
+            empty_dir_exists(&fs_b, "notes").await,
+            "B materializes the synced empty folder as a real empty directory"
+        );
+        assert_eq!(
+            folder_nodes_at(&b, "notes"),
+            1,
+            "B has the alive folder node in its Index"
+        );
+
+        // A deletes the (still-empty) folder node; sync → B removes the empty directory.
+        delete_folder(&a, id_a, "notes").await;
+
+        full_sync(&a, &b).await;
+        assert!(
+            !fs_b.exists("notes").await.unwrap(),
+            "B removes the now-tombstoned empty folder's directory"
+        );
+        assert_eq!(
+            folder_nodes_at(&b, "notes"),
+            0,
+            "B's folder node is tombstoned (no alive folder at the path)"
+        );
+    }
+
+    /// A freshly-loaded vault re-materializes its tracked empty folders from the Index on
+    /// boot (INV-1.5a via reconcile), INCLUDING a nested folder's parent chain. An empty
+    /// directory leaves no `.md` on disk, so a cold load that did not consult the folder
+    /// set would silently drop it — boot reconcile's `materialize_folders` is what
+    /// re-creates it. The folder node is created in the Index only (no `mkdir`), so the
+    /// directory is genuinely absent until the reload's reconcile materializes it.
+    #[tokio::test]
+    async fn boot_reconcile_rematerializes_empty_folder() {
+        let (vault, fs) = one_vault().await;
+        // Stage a nested empty folder node in the Index. `create_folder` is catalog-only
+        // (it does not touch disk), so neither `archive/` nor `archive/old/` exists on
+        // disk yet — exactly the state a fresh clone has (the Index `.loro` synced, the
+        // empty directories not).
+        create_empty_folder(&vault, "archive/old").await;
+        assert!(
+            !fs.exists("archive/old").await.unwrap() && !fs.exists("archive").await.unwrap(),
+            "precondition: the empty directories are absent before reload (create_folder is catalog-only)"
+        );
+
+        // Reload from the persisted Index — boot reconcile runs `materialize_folders`.
+        let reloaded = reload(vault, &fs).await;
+
+        // Boot reconcile re-materialized the tracked empty folder AND its parent chain.
+        assert!(
+            empty_dir_exists(&fs, "archive/old").await,
+            "reload re-materializes the nested tracked empty folder from the Index"
+        );
+        assert!(
+            fs.exists("archive").await.unwrap(),
+            "the parent folder is materialized too (the chain)"
+        );
+        assert_eq!(
+            folder_nodes_at(&reloaded, "archive/old"),
+            1,
+            "the reloaded Index still holds the empty folder node"
+        );
+    }
+
+    /// Materialize NEVER recursively deletes a non-empty directory (INV-3): a folder node
+    /// is tombstoned, but its on-disk directory still holds an UNTRACKED file (something
+    /// the user dropped there, or a concurrent peer's content) — the directory must be
+    /// LEFT IN PLACE, never `rm -rf`'d. Driven through a real inbound apply so the apply
+    /// tail's `materialize_folders` runs against the tombstoned-folder + non-empty-dir state.
+    #[tokio::test]
+    async fn materialize_never_recursively_deletes_nonempty_dir() {
+        let (a, b, _fs_a, fs_b) = two_vaults().await;
+
+        // A creates an empty `proj/` folder; both converge with the directory on B.
+        let id_a = create_empty_folder(&a, "proj").await;
+        full_sync(&a, &b).await;
+        assert!(
+            empty_dir_exists(&fs_b, "proj").await,
+            "B has the empty proj/ dir"
+        );
+
+        // An UNTRACKED file appears in B's `proj/` directory (not indexed — e.g. dropped
+        // by the user, or a sidecar the library doesn't manage). It is NOT a vault `.md`
+        // node; `materialize_folders` must treat the directory as non-empty.
+        fs_b.write("proj/untracked.txt", b"not a tracked note")
+            .await
+            .unwrap();
+
+        // A deletes the `proj/` folder node; sync delivers the tombstone to B, whose
+        // apply-tail materialize runs against "tombstoned folder + non-empty dir".
+        delete_folder(&a, id_a, "proj").await;
+        full_sync(&a, &b).await;
+
+        // The directory and its untracked file survive — no recursive delete (INV-3).
+        assert!(
+            fs_b.exists("proj").await.unwrap(),
+            "the directory is preserved because it is non-empty (INV-3 — no recursive delete)"
+        );
+        assert_eq!(
+            fs_b.read("proj/untracked.txt").await.unwrap(),
+            b"not a tracked note",
+            "the untracked file inside the tombstoned folder is untouched"
+        );
+    }
+}

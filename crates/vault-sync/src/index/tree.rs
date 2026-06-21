@@ -52,6 +52,20 @@ impl StructuralNode {
     }
 }
 
+/// One folder node's display path and tombstone state — what the empty-folder
+/// materialization pass (INV-1.5a) needs to decide mkdir vs rmdir.
+///
+/// A folder carries no UUID and no content, so its display path plus whether it is
+/// deleted is the entire materialization-relevant state. Produced by
+/// [`Index::folder_paths`].
+#[derive(Debug, Clone)]
+pub struct FolderEntry {
+    /// The folder's vault-relative display path (e.g. `proj/sub`).
+    pub path: String,
+    /// Whether the folder node is tombstoned in the merged state.
+    pub is_deleted: bool,
+}
+
 impl Index {
     // ========== File tree operations (LoroTree) ==========
 
@@ -177,6 +191,67 @@ impl Index {
         }
 
         nodes
+    }
+
+    /// Every FOLDER node's display path paired with whether it is tombstoned — the
+    /// input the empty-folder materialization pass (INV-1.5a) walks.
+    ///
+    /// Folders are invisible to `list_files` (it yields only `.md` files) and to the
+    /// caches (which hold file nodes only), so the materialization pass — which
+    /// creates a real directory for every alive folder node and removes the directory
+    /// of a tombstoned one — has no other way to see them. This walks `tree.nodes()`
+    /// (which includes tombstoned nodes), keeps the folder nodes, and derives each
+    /// one's path via `get_node_path` (whose name-chain walk is valid for a tombstoned
+    /// node too — its `name` meta and parent links persist). Both an alive AND a
+    /// tombstoned folder are reported; the caller's mkdir/rmdir decision turns on the
+    /// `is_deleted` flag.
+    ///
+    /// A folder whose path can't be derived (a malformed node) is skipped — it can't
+    /// be materialized without a path.
+    pub fn folder_paths(&self) -> Vec<FolderEntry> {
+        let tree = self.index_tree();
+        let mut folders = Vec::new();
+
+        for node_id in tree.nodes() {
+            let Ok(meta) = tree.get_meta(node_id) else {
+                continue;
+            };
+            if Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() != Some("folder") {
+                continue;
+            }
+            let Some(path) = self.get_node_path(&node_id) else {
+                continue;
+            };
+            let is_deleted = tree.is_node_deleted(&node_id).unwrap_or(true);
+            folders.push(FolderEntry { path, is_deleted });
+        }
+
+        folders
+    }
+
+    /// Create an empty FOLDER node at `path` (and any missing parent folders),
+    /// returning its `TreeID` — the public, pure-structural empty-folder create.
+    ///
+    /// First-class empty folders (INV-1.5a) are normally created by the daemon when a
+    /// user makes an empty directory; this is the catalog-level primitive behind that
+    /// (and the handle tests use it directly to stage empty-folder state without a P4
+    /// daemon). It mirrors the implicit folder creation `register_document` does for a
+    /// file's parents, but as a standalone operation with no file. Idempotent: an
+    /// existing folder at `path` is returned unchanged. In-memory only — the caller
+    /// persists via `save_index`.
+    pub fn create_folder(&self, path: &str) -> Result<TreeID> {
+        let mut parent = TreeParentId::Root;
+        for segment in path.split('/') {
+            parent = self.get_or_create_folder(parent, segment)?;
+        }
+        match parent {
+            TreeParentId::Node(id) => Ok(id),
+            // `path` is non-empty (split always yields ≥1 segment), so the loop ran at
+            // least once and `parent` is a Node — Root is unreachable here.
+            _ => Err(IndexError::TreeOperation(format!(
+                "create_folder produced no folder node for {path}"
+            ))),
+        }
     }
 
     /// Read a string-valued tree node meta field, or `None` if absent / not a string.

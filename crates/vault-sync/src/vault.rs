@@ -366,6 +366,78 @@ impl<F: FileSystem> Vault<F> {
         Ok(files)
     }
 
+    /// Materialize the folder tree to disk: create a real directory for every alive
+    /// folder node, and remove the directory of a tombstoned folder node when it is
+    /// EMPTY (INV-1.5a — first-class empty folders).
+    ///
+    /// `list_files` yields only `.md` files, so an empty folder is invisible to the
+    /// file reconcile — this pass is the ONLY thing that makes a tracked empty folder
+    /// appear (an alive node → `mkdir`) or disappear (a tombstoned node → `rmdir`) as a
+    /// directory on disk. It runs at the tail of an inbound apply and during boot
+    /// reconcile, so a synced or freshly-loaded vault reflects the Index's folder set.
+    ///
+    /// **Removal is empty-only and never recursive (INV-3).** A tombstoned folder whose
+    /// on-disk directory still holds anything — a live descendant `.md`, an untracked
+    /// file, or a sub-directory — is LEFT IN PLACE: a non-empty directory means content
+    /// the user (or a concurrent peer) still has there, and silently `rm -rf`-ing it
+    /// would be exactly the silent loss INV-3 forbids. Only a genuinely empty directory
+    /// for a tombstoned folder is removed; the check is best-effort, and a removal
+    /// failure is logged, never propagated (it must not fail an apply or a load).
+    ///
+    /// `mkdir` is idempotent (creating an existing directory is a no-op), so re-running
+    /// the pass is safe and cheap.
+    pub(crate) async fn materialize_folders(&self) -> Result<()> {
+        // Snapshot the folder set before any await (never hold the Index borrow across
+        // an fs call). Each entry is a folder node's display path + tombstone state.
+        let folders = self.index.folder_paths();
+
+        for folder in folders {
+            if folder.is_deleted {
+                // A tombstoned folder: remove its directory ONLY if empty. A non-empty
+                // directory holds content we must not destroy (INV-3) — skip it.
+                if self.dir_is_empty(&folder.path).await {
+                    if let Err(e) = self.fs.delete(&folder.path).await {
+                        tracing::warn!(
+                            "materialize_folders: failed to remove empty tombstoned folder {}: {}",
+                            folder.path,
+                            e
+                        );
+                    } else {
+                        tracing::debug!(
+                            "materialize_folders: removed empty folder {}",
+                            folder.path
+                        );
+                    }
+                }
+            } else {
+                // An alive folder node materializes as a real directory (idempotent).
+                if let Err(e) = self.fs.mkdir(&folder.path).await {
+                    tracing::warn!(
+                        "materialize_folders: failed to mkdir alive folder {}: {}",
+                        folder.path,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Whether the on-disk directory at `path` exists and contains no entries.
+    ///
+    /// Used by [`Self::materialize_folders`] to gate the removal of a tombstoned
+    /// folder: a directory that does not exist (already gone) is not "empty" to remove,
+    /// and a directory that still holds anything must be preserved (INV-3). A `list`
+    /// error (e.g. the path is not a directory, or vanished mid-pass) is treated as
+    /// "not safe to remove" → `false`.
+    async fn dir_is_empty(&self, path: &str) -> bool {
+        match self.fs.list(path).await {
+            Ok(entries) => entries.is_empty(),
+            Err(_) => false,
+        }
+    }
+
     /// Document every existing markdown file into the catalog (Flow-1 over each).
     ///
     /// Called at `init` so every file is tracked before any sync. Persists the

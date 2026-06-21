@@ -23,3 +23,6 @@ web-time.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+# The public Index folder API returns/takes loro `TreeID`s (`create_folder`,
+# `delete_node_by_id`); the integration tests name that type to drive folder lifecycle.
+loro.workspace = true
