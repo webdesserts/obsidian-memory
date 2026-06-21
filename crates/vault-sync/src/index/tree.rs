@@ -143,6 +143,11 @@ impl Index {
         let tree = self.index_tree();
         let mut nodes = Vec::new();
 
+        // Cross-replica determinism relies on `tree.nodes()` returning a STABLE order for
+        // identical CRDT state: two replicas at the same merged tree must build the same
+        // view so their `find_map`/iteration over it (and thus the resolver's plan) match.
+        // That stable iteration is the CRDT property the conflict cascade's determinism
+        // (INV-5.3(c)) is anchored on.
         for node_id in tree.nodes() {
             if tree.is_node_deleted(&node_id).unwrap_or(true) {
                 continue;
@@ -800,6 +805,10 @@ impl Index {
 
         // Re-parent every ALIVE direct child of the loser under the survivor. A
         // tombstoned child is left in the Deleted set (INV-3) — it must NOT move.
+        // `tree.children(loser)` returns DIRECT children only; grandchildren follow
+        // their re-parented parent structurally (loro carries a whole subtree on a
+        // single `tree.mov`), so re-parenting the direct children is sufficient — the
+        // whole subtree follows without per-node moves.
         let children = tree.children(loser).unwrap_or_default();
         for child in children {
             if tree.is_node_deleted(&child).unwrap_or(true) {
@@ -828,7 +837,12 @@ impl Index {
     /// Folders are absent from `path_to_node` (only file nodes are cached), so this
     /// descends the prefix's segments from the root, requiring each to be an existing
     /// folder. Returns `None` if any segment is missing or is not a folder.
-    fn find_folder_node(&self, prefix: &str) -> Option<TreeID> {
+    ///
+    /// `pub(crate)` so the structural-apply path (`protocol::apply_index`) can ask
+    /// "is this move target occupied by a FOLDER?" — `node_for_path` only sees file
+    /// nodes, so the apply path pairs it with this to treat a folder occupant as
+    /// occupied (S1 fail-loud), never silently move a file onto a folder path.
+    pub(crate) fn find_folder_node(&self, prefix: &str) -> Option<TreeID> {
         let mut parent = TreeParentId::Root;
         let mut found = None;
         for segment in prefix.split('/') {

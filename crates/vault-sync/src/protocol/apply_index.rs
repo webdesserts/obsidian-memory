@@ -513,8 +513,19 @@ impl<F: FileSystem> Vault<F> {
             let mut still_pending = Vec::new();
             for uuid in pending {
                 let to = final_target[&uuid].clone();
-                // The target is free iff no node currently occupies it.
-                if self.index().node_for_path(&to).is_none() {
+                // The target is free iff no node — file OR folder — currently occupies it.
+                // `node_for_path` sees only FILE nodes (the path cache excludes folders),
+                // so a folder occupying `to` would be invisible to a file-only check; a
+                // move would then silently land a file onto a folder path (a tree
+                // inconsistency: a file and a folder at one display path). Treating a folder
+                // occupant as occupied routes that case into the `!placed_any` deadlock arm
+                // below — a loud S1 error rather than silent corruption. The current
+                // resolver never emits such a plan (its fixpoint relocates inside an
+                // occupying folder instead), so this is defense-in-depth for a future
+                // resolver bug, matching the "fail loud, never silently corrupt" principle.
+                let target_free = self.index().node_for_path(&to).is_none()
+                    && self.index().find_folder_node(&to).is_none();
+                if target_free {
                     if let Some(from) = self.move_file_node(uuid, &to)? {
                         touched_paths.insert(from);
                         touched_paths.insert(to);
@@ -754,5 +765,76 @@ impl<F: FileSystem> Vault<F> {
                 warn!("Failed to delete {}: {}", path, e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::conflict::StructuralOp;
+    use crate::fs::{FileSystem, InMemoryFs};
+    use crate::index::IndexError;
+    use crate::protocol::SyncError;
+    use crate::vault::Vault;
+    use std::sync::Arc;
+
+    /// S1 fail-loud (defense-in-depth): a structural move whose target is occupied by
+    /// a FOLDER must NOT silently land the file onto the folder path — it must hit the
+    /// deadlock arm and return a loud `MoveTargetExists` error.
+    ///
+    /// The resolver never produces such a plan (its fixpoint relocates a file INSIDE an
+    /// occupying folder rather than onto it), so this hand-crafts the plan and calls the
+    /// apply path directly. It guards a future resolver bug: `node_for_path` sees only
+    /// FILE nodes, so without also checking `find_folder_node`, the move-target-free test
+    /// would treat a folder-occupied path as free and silently move a file onto it —
+    /// leaving a file AND a folder at one display path (a tree inconsistency). The fix
+    /// classifies a folder occupant as occupied → the move can't be placed → S1 error.
+    ///
+    /// The target is a `.md`-suffixed folder path (`Notes.md` as a folder — the real
+    /// file-vs-folder shape), because every conflict rename/relocate targets a `.md`
+    /// path: that is what makes the un-fixed path a SILENT `Ok` corruption (the inner
+    /// `validate_sync_path` passes) rather than an incidental `InvalidPath` rejection.
+    #[tokio::test]
+    async fn structural_move_onto_folder_occupied_target_fails_loud() {
+        let fs = Arc::new(InMemoryFs::new());
+        let vault = Vault::init(Arc::clone(&fs), 1).await.unwrap();
+
+        // A loose file we will try to (mis-)relocate, and a FOLDER occupying the move
+        // target. Indexing `Notes.md/inner.md` auto-creates a `Notes.md` FOLDER node —
+        // folders are absent from the path cache, which is exactly why a file-only target
+        // check would miss this occupant.
+        fs.write("loose.md", b"# Loose\n\nbody").await.unwrap();
+        vault.on_file_changed("loose.md").await.unwrap();
+        fs.write("Notes.md/inner.md", b"# Inner\n\nbody")
+            .await
+            .unwrap();
+        vault.on_file_changed("Notes.md/inner.md").await.unwrap();
+
+        let loose_uuid = vault
+            .index()
+            .node_uuid(&vault.index().node_for_path("loose.md").unwrap())
+            .expect("loose.md has an indexed UUID");
+        assert!(
+            vault.index().node_for_path("Notes.md").is_none(),
+            "the `Notes.md` folder is invisible to the FILE-only path cache — the exact gap"
+        );
+        assert!(
+            vault.index().find_folder_node("Notes.md").is_some(),
+            "but it IS a real folder node the structural check must treat as occupied"
+        );
+
+        // Hand-craft the bad plan: relocate `loose.md` onto the folder path `Notes.md`.
+        let plan = vec![StructuralOp::RelocateFile {
+            uuid: loose_uuid,
+            to: "Notes.md".to_string(),
+        }];
+        let result = vault.apply_structural_ops(plan).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SyncError::Index(IndexError::MoveTargetExists(_)))
+            ),
+            "a move onto a folder-occupied target must fail loud (S1), got {result:?}"
+        );
     }
 }

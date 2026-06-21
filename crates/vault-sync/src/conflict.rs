@@ -1170,6 +1170,64 @@ mod tests {
         assert!(resolved.measure() < m0);
     }
 
+    /// Mechanical PER-STEP evidence of INV-5.3(b): applying the resolved plan ONE op at a
+    /// time, the lexicographic measure strictly decreases at every step (`m_{k+1} < m_k`)
+    /// — not just from the start to the resolved endpoint. The scenario composes a
+    /// folder-merge that surfaces a file collision AND a file-vs-folder relocate onto an
+    /// OCCUPIED target, so the trace exercises every step type whose per-step decrease is
+    /// the cross-rule-family termination guarantee: `MergeFolder` (drops a folder-collision
+    /// site), `RelocateFile` (drops a file-vs-folder site, surfacing a strictly-lower
+    /// file-collision site — net-zero on a flat SUM, strictly-down lexicographically), and
+    /// the surfaced `RenameFile` (drops the file-collision site).
+    ///
+    /// Scope: this pins the per-step decrease for the SHAPE rules + the file collision
+    /// they surface — the rule families whose ordering the lexicographic measure governs.
+    /// It deliberately does NOT extend to a standalone multi-way file cascade: there a
+    /// rename onto an already-occupied conflict path transiently RAISES the
+    /// file-collision count when the flat output plan is replayed op-by-op (that cascade's
+    /// termination rests on INV-5.2's UUID-unique naming, not a per-op measure drop — see
+    /// `fixpoint_terminates_on_transitive_rename_onto_occupied_path`).
+    #[test]
+    fn each_resolved_op_strictly_decreases_lexicographic_measure() {
+        // X.md holds 2 folders + 1 file; X.md/X.md (the file's relocation target) already
+        // holds a live file → the relocate surfaces a collision the cascade then resolves.
+        let mut occupants = BTreeMap::new();
+        occupants.insert("X.md".to_string(), vec![folder(2), folder(1), file(U2, 2)]);
+        occupants.insert("X.md/X.md".to_string(), vec![file(U1, 1)]);
+        let start = StructuralView { occupants };
+
+        let ops = resolve_structure(start.clone());
+        assert!(
+            ops.len() >= 3,
+            "the composed scenario must produce a merge, a relocate, and a rename — got {ops:?}"
+        );
+
+        // Walk the plan op-by-op, asserting a STRICT lexicographic decrease at each step.
+        let mut view = start.clone();
+        let mut prev = view.measure();
+        for op in &ops {
+            view = apply_plan_to_view(view, std::slice::from_ref(op));
+            let next = view.measure();
+            assert!(
+                next < prev,
+                "op {op:?} must strictly decrease the lexicographic measure: {prev:?} -> {next:?}"
+            );
+            prev = next;
+        }
+
+        // And the plan lands fully resolved — the zero tuple, nothing materializable left.
+        assert_eq!(
+            prev,
+            Measure {
+                revive_sites: 0,
+                folder_collision_sites: 0,
+                file_vs_folder_sites: 0,
+                file_collision_sites: 0,
+            },
+            "the fully-applied plan leaves no structural collision"
+        );
+    }
+
     // --- Transitive self-collision resolved within the same fixpoint (INV-5.2) ---
 
     /// A file-collision group whose loser's conflict path ALREADY holds a live user
