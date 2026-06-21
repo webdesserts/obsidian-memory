@@ -10,14 +10,18 @@
 //!   identity dissolves — distinct documents now have distinct UUIDs, so they never
 //!   shadow each other in the caches. The inline duplicate-twin data-loss tests went
 //!   with it.
-//! - **`.loro` cleanup splits by reason.** A content `.loro` is addressed by UUID
-//!   (`docs/<uuid>.loro`), path-independently. So a DELETED path's `.loro` must be
-//!   removed (the document is gone), but a MOVED-away path's `.loro` must SURVIVE
-//!   (the same document lives on at the new path under the same UUID). Conflating
-//!   them — as the old path-addressed cleanup could — would delete a live document's
-//!   content. The two sets are tracked and cleaned separately here.
+//! - **`.loro` cleanup splits by reason, and a move re-materializes the `.md`.** A
+//!   content `.loro` is addressed by UUID (`docs/<uuid>.loro`), path-independently.
+//!   So a DELETED path's `.loro` is removed (the document is gone), but a MOVED-away
+//!   path keeps its `.loro` (the same document lives on at the new path under the
+//!   same UUID). Crucially, because a move re-transfers ZERO content (INV-1), the
+//!   moved document's `.md` never arrives over the wire — so the receiver must
+//!   re-materialize the `.md` at the NEW path from its existing local `<uuid>.loro`.
+//!   (The old path-keyed sync sidestepped this by re-sending the whole document under
+//!   the new path; the UUID model makes the move zero-content and re-materializes
+//!   locally instead.)
 
-use crate::content_doc::warn_if_pending;
+use crate::content_doc::{ContentDoc, warn_if_pending};
 use crate::fs::FileSystem;
 use crate::vault::Vault;
 
@@ -27,8 +31,21 @@ use tracing::{debug, warn};
 
 use super::{DocId, Result};
 
+/// A move detected during an Index import: a still-alive node that now lives at a
+/// different path than before.
+struct DetectedMove {
+    /// The path the node moved away from (its old `.md` is removed).
+    from: String,
+    /// The path the node now lives at (its `.md` is re-materialized here from the
+    /// path-independent `<uuid>.loro`, since the move carried zero content).
+    to: String,
+    /// The moved document's UUID (stable across the move) — addresses the `.loro`.
+    uuid: uuid::Uuid,
+}
+
 /// What an Index import vacated on this device, classified by reason so the caller
-/// can both filter document updates and clean the filesystem correctly.
+/// can both filter document updates and clean/re-materialize the filesystem
+/// correctly.
 ///
 /// The distinction is load-bearing under UUID keying: a DELETED document's update
 /// must be dropped (it would resurrect a tombstoned file), but a MOVED document's
@@ -41,10 +58,10 @@ pub(super) struct VacatedPaths {
     /// `.md` and the `docs/<uuid>.loro` are removed, and the UUID's document update
     /// is filtered out (resurrection guard).
     deleted: Vec<(String, uuid::Uuid)>,
-    /// Old paths a still-alive node moved away from. Only the old `.md` is removed —
-    /// the `docs/<uuid>.loro` is path-independent and the node still owns it at its
-    /// new path, so the moved document's update is NOT filtered.
-    moved_from: Vec<String>,
+    /// Moves: a still-alive node relocated. The old `.md` is removed and the new `.md`
+    /// is re-materialized from the unchanged `<uuid>.loro`; the document's update is
+    /// NOT filtered (it would apply cleanly at the new path).
+    moves: Vec<DetectedMove>,
 }
 
 impl VacatedPaths {
@@ -155,8 +172,9 @@ impl<F: FileSystem> Vault<F> {
 
         // Detect moves: an old path whose node (same `TreeID`) now lives at a
         // different path. Orthogonal to the deleted set (which keys on tombstoned
-        // nodes); a moved node stays alive, just under a new path.
-        let mut moved_from: Vec<String> = Vec::new();
+        // nodes); a moved node stays alive, just under a new path. Capture the new
+        // path and the (stable) UUID so the `.md` can be re-materialized there.
+        let mut moves: Vec<DetectedMove> = Vec::new();
         {
             let rebuilt = self.index().path_to_node();
             let node_to_new_path: HashMap<TreeID, &String> =
@@ -168,16 +186,22 @@ impl<F: FileSystem> Vault<F> {
                     // B1 exclusion: a vacated path an alive node now occupies must be
                     // neither fs-cleaned nor filtered from doc updates (the swap case).
                     && !rebuilt.contains_key(old_path)
+                    && let Some(uuid) = pre_import_uuids.get(old_path)
                 {
-                    moved_from.push(old_path.clone());
+                    moves.push(DetectedMove {
+                        from: old_path.clone(),
+                        to: (*new_path).clone(),
+                        uuid: *uuid,
+                    });
                 }
             }
         }
 
-        let vacated = VacatedPaths { deleted, moved_from };
+        let vacated = VacatedPaths { deleted, moves };
 
-        // Clean up the filesystem for vacated paths (deletes remove `.md` + `.loro`,
-        // moves remove only the old `.md`).
+        // Clean up the filesystem for vacated paths: deletes remove `.md` + `.loro`;
+        // a move removes the old `.md` and re-materializes the new `.md` from the
+        // unchanged `<uuid>.loro` (the move carried zero content — INV-1).
         self.cleanup_vacated_paths(&vacated).await?;
 
         // Persist the merged Index, then mark it synced so it reconciles before the
@@ -186,18 +210,20 @@ impl<F: FileSystem> Vault<F> {
         self.index().sync_state.mark_index_synced();
 
         debug!(
-            "apply_index_updates: complete, deleted={:?}, moved_from={:?}",
-            vacated.deleted, vacated.moved_from
+            "apply_index_updates: complete, deleted={:?}, moves={}",
+            vacated.deleted,
+            vacated.moves.len()
         );
         Ok(vacated)
     }
 
     /// Filesystem cleanup for vacated paths.
     ///
-    /// Deletes remove the `.md` and the `docs/<uuid>.loro` (the document is gone).
-    /// Moves remove only the old `.md` — the `.loro` is UUID-addressed and the same
-    /// document lives on at its new path. Both mark the path synced before deletion
-    /// (echo detection) and drop the document cache entry under the vacated path.
+    /// Deletes remove the `.md` and the `docs/<uuid>.loro` (the document is gone). A
+    /// move removes the old `.md`, keeps the `.loro` (UUID-addressed, path-
+    /// independent), and re-materializes the `.md` at the NEW path from that `.loro`
+    /// — because the move carried zero content (INV-1), the new-path `.md` arrives no
+    /// other way. Every fs mutation marks the path synced first (echo detection).
     async fn cleanup_vacated_paths(&self, vacated: &VacatedPaths) -> Result<()> {
         for (path, uuid) in &vacated.deleted {
             self.remove_md_file(path).await;
@@ -215,13 +241,52 @@ impl<F: FileSystem> Vault<F> {
             self.documents_mut().remove(path);
         }
 
-        for path in &vacated.moved_from {
-            // Only the stale `.md` at the old path — the `.loro` survives (the same
-            // document is now at its new path under the same UUID).
-            self.remove_md_file(path).await;
-            self.documents_mut().remove(path);
+        for mv in &vacated.moves {
+            // Remove the stale `.md` at the old path; the cache entry under the old
+            // path is no longer valid.
+            self.remove_md_file(&mv.from).await;
+            self.documents_mut().remove(&mv.from);
+
+            // Re-materialize the `.md` at the new path from the unchanged `<uuid>.loro`.
+            // The content never crossed the wire (zero-content move), so the receiver
+            // renders it locally from the document it already holds.
+            if let Err(e) = self.rematerialize_moved_md(mv).await {
+                warn!(
+                    "apply_index_updates: failed to re-materialize moved doc {} at {}: {}",
+                    mv.uuid, mv.to, e
+                );
+            }
         }
 
+        Ok(())
+    }
+
+    /// Re-materialize a moved document's `.md` at its new path from the local
+    /// `<uuid>.loro` (the path-independent content the receiver already holds).
+    ///
+    /// Marks the new path synced before the write (echo detection), so the local file
+    /// watcher recognizes our own materialization and does not re-broadcast it.
+    async fn rematerialize_moved_md(&self, mv: &DetectedMove) -> Result<()> {
+        let loro_path = Self::doc_content_path(&DocId(mv.uuid));
+        // The `.loro` should be present (a move keeps it); if it is genuinely absent
+        // (e.g. this device never had the document materialized), there is nothing to
+        // render here. The moved `.md` will be absent at the new path on this receiver
+        // until boot reconcile / a later full sync backstops it — a user-visible
+        // content gap, so warn rather than log quietly.
+        if !self.fs().exists(&loro_path).await? {
+            warn!(
+                "rematerialize_moved_md: no local .loro for {} — moved .md absent at {} until reconcile backstops it",
+                mv.uuid, mv.to
+            );
+            return Ok(());
+        }
+
+        let bytes = self.fs().read(&loro_path).await?;
+        let doc = ContentDoc::from_bytes(&bytes, self.loro_author())?;
+        self.mark_synced(&mv.to);
+        self.fs().write(&mv.to, doc.to_markdown().as_bytes()).await?;
+        self.documents_mut().insert(mv.to.clone(), doc);
+        debug!("rematerialize_moved_md: rendered {} at {}", mv.uuid, mv.to);
         Ok(())
     }
 

@@ -210,12 +210,19 @@ impl<F: FileSystem> Vault<F> {
             let doc = self.get_document(&path).await?;
 
             if let Some(their_version_bytes) = their_versions.get(&doc_id) {
-                // They have it — send updates since their version.
-                if let Ok(their_version) = loro::VersionVector::decode(their_version_bytes) {
-                    let updates = doc.export_updates(&their_version)?;
-                    if !updates.is_empty() {
-                        document_updates.insert(doc_id, updates);
-                    }
+                // They have it — send updates since their version, but ONLY when we
+                // actually hold ops they lack. Gating on version-vector inclusion
+                // (not on a byte-length check) is what keeps a pure MOVE zero-content:
+                // `export_updates(their_version)` returns a non-empty (~22-byte)
+                // FRAMED-EMPTY payload even when there is nothing new, so a byte-length
+                // (`is_empty()`) guard would ship that no-op for every already-converged
+                // document on every sync. `includes_vv` is the semantically correct
+                // condition: if their version already covers ours, we owe them nothing —
+                // and once it does NOT, the export is necessarily non-empty.
+                if let Ok(their_version) = loro::VersionVector::decode(their_version_bytes)
+                    && !their_version.includes_vv(&doc.version())
+                {
+                    document_updates.insert(doc_id, doc.export_updates(&their_version)?);
                 }
             } else {
                 // They lack it — send a full snapshot.

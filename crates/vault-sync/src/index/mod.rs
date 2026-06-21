@@ -220,14 +220,20 @@ impl Index {
 
     /// The Index CRDT's current version vector.
     ///
-    /// The basis for computing what Index updates a peer is missing.
-    pub(crate) fn state_vv(&self) -> loro::VersionVector {
+    /// The basis for computing what Index updates a peer is missing. Public as a
+    /// convergence observable: a consumer can compare two replicas' Index version
+    /// vectors to confirm their catalogs have converged (the analogue of
+    /// [`crate::ContentDoc::version`] for a single document).
+    pub fn state_vv(&self) -> loro::VersionVector {
         self.index().state_vv()
     }
 
-    /// Export the entire Index CRDT as a snapshot (for a peer that lacks it, or
-    /// when a new-doc snapshot rides along and the node must be resend-durable).
-    pub(crate) fn export_snapshot(&self) -> Result<Vec<u8>> {
+    /// Export the entire Index CRDT as a snapshot.
+    ///
+    /// The sync protocol uses this when a peer lacks the Index, or when a new-doc
+    /// snapshot rides along and the node must be resend-durable. Public as the Index
+    /// analogue of [`crate::ContentDoc::export_snapshot`].
+    pub fn export_snapshot(&self) -> Result<Vec<u8>> {
         self.index()
             .export(loro::ExportMode::Snapshot)
             .map_err(|e| IndexError::IndexExport(format!("Failed to export Index snapshot: {}", e)))
