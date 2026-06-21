@@ -962,3 +962,284 @@ impl Index {
         Ok(TreeParentId::Node(node_id))
     }
 }
+
+#[cfg(test)]
+mod loro_liveness_probe {
+    //! DP-3 — does loro's movable tree keep a deleted ANCESTOR folder alive when a
+    //! peer concurrently puts a live node under it?
+    //!
+    //! This is the gating question for the folder-revive case (P2e). The answer
+    //! determines whether `resolve_structure` must EMIT a `ReviveFolderChain` op (loro
+    //! leaves the ancestor tombstoned) or whether revive is a structural no-op (loro
+    //! un-deletes the ancestor automatically). The probe is kept as a regression so the
+    //! revive design's premise can't silently drift if we ever bump the loro version.
+
+    use super::*;
+    use crate::index::Index;
+
+    /// Merge B's full state into A and A's into B (snapshot exchange — loro merges
+    /// either direction), so both replicas reach the identical converged tree.
+    fn converge(a: &Index, b: &Index) {
+        let a_snap = a.export_snapshot().unwrap();
+        let b_snap = b.export_snapshot().unwrap();
+        a.import_updates(&b_snap).unwrap();
+        b.import_updates(&a_snap).unwrap();
+        a.rebuild_caches();
+        b.rebuild_caches();
+    }
+
+    /// The denormalized fingerprint a registration needs (content is irrelevant here —
+    /// the probe is about tree structure, not document content).
+    const FP: [u8; 32] = [0u8; 32];
+
+    /// Register `proj/keep.md` + `proj/gone.md` on a fresh replica, then seed an
+    /// independent peer from its snapshot so both share the `proj/` folder TreeID.
+    fn two_replicas_sharing_proj() -> (Index, Index, TreeID) {
+        let a = Index::new(1);
+        a.register_document("proj/keep.md", &Uuid::from_u128(1), &FP)
+            .unwrap();
+        a.register_document("proj/gone.md", &Uuid::from_u128(2), &FP)
+            .unwrap();
+        let b = Index::new(2);
+        let seed = a.export_snapshot().unwrap();
+        b.import_updates(&seed).unwrap();
+        b.rebuild_caches();
+
+        let proj_a = a.find_folder_node("proj").expect("A has proj/ folder");
+        let proj_b = b.find_folder_node("proj").expect("B has proj/ folder");
+        assert_eq!(
+            proj_a, proj_b,
+            "both replicas share the proj/ folder TreeID"
+        );
+        (a, b, proj_a)
+    }
+
+    /// **The decisive probe** for the realistic folder-delete shape: A deletes the
+    /// folder's CHILD FILES (the way the daemon's per-file delete-detection tombstones a
+    /// removed directory's contents — NOT a subtree `tree.delete` on the folder node),
+    /// while B concurrently creates a live file under the SAME `proj/` folder node. After
+    /// merge, does the `proj/` folder node read `is_node_deleted`, and does B's live child
+    /// survive?
+    ///
+    /// This is the EC-7 shape the revive case must handle. The folder node here is NOT
+    /// explicitly deleted by A — only its files are. Whether the folder reads deleted in
+    /// the merged state, and whether revive must run, is exactly the gating question.
+    #[test]
+    fn folder_files_deleted_with_live_concurrent_child() {
+        let (a, b, proj) = two_replicas_sharing_proj();
+
+        // A deletes both child FILES (per-file deletes — the realistic folder-removal
+        // path). It does NOT touch the folder node itself.
+        a.delete_node("proj/keep.md").unwrap();
+        a.delete_node("proj/gone.md").unwrap();
+        a.rebuild_caches();
+
+        // B concurrently creates a live file UNDER the shared proj/ folder.
+        let new_uuid = Uuid::from_u128(99);
+        let new_node = b.register_document("proj/new.md", &new_uuid, &FP).unwrap();
+
+        converge(&a, &b);
+
+        let tree_a = a.index_tree();
+        let child_alive = !tree_a.is_node_deleted(&new_node).unwrap_or(true);
+        let ancestor_deleted = tree_a.is_node_deleted(&proj).unwrap_or(true);
+        let child_path = a.get_node_path(&new_node);
+        println!(
+            "DP-3 PROBE [files-deleted]: child_alive={child_alive}, \
+             ancestor_deleted={ancestor_deleted}, child_path={child_path:?}, proj={proj:?}, \
+             new_node={new_node:?}"
+        );
+
+        // The child survives (its create is concurrent with only the SIBLINGS' deletes,
+        // never an ancestor subtree-delete), and the folder node was never deleted →
+        // ancestor stays ALIVE. In this shape revive is moot; the live child keeps proj/
+        // alive because the folder node itself is alive.
+        assert!(
+            child_alive,
+            "the concurrently-created child survives (INV-3)"
+        );
+        assert!(
+            !ancestor_deleted,
+            "PROBE: deleting only the child files leaves the proj/ folder node ALIVE — so a \
+             live child under it needs no revive (the folder is not tombstoned)"
+        );
+    }
+
+    /// The HARDER probe — A explicitly deletes the `proj/` FOLDER NODE itself (a subtree
+    /// `tree.delete`, which is what tombstones the folder so it would need reviving),
+    /// while B concurrently adds a live child under it. This is the shape that decides
+    /// whether `ReviveFolderChain` is a structural no-op or a real op — AND it surfaces a
+    /// hard loro property: a subtree-delete tombstones the concurrently-added child too.
+    ///
+    /// **Outcome (pinned):** loro leaves the folder TOMBSTONED after merge AND the
+    /// concurrently-created child is ALSO tombstoned (the subtree delete subsumes it).
+    /// So a naive "scan ALIVE file nodes, revive their tombstoned ancestors" finds NO
+    /// live node under `proj/` to trigger a revive — the child is dead. This is why the
+    /// resolver's revive trigger must look at whether a *would-be-alive* descendant
+    /// exists, and why the daemon must NOT model a folder delete as a node-subtree
+    /// delete (it would eat concurrent additions — an INV-3 violation). The revive case
+    /// (P2e) is therefore driven by the FILE-delete shape above, where children that are
+    /// concurrently added stay alive; an explicit folder-node subtree-delete is a
+    /// separate, more aggressive operation the library's own delete path does not emit.
+    #[test]
+    fn folder_node_subtree_delete_subsumes_concurrent_child() {
+        let (a, b, proj) = two_replicas_sharing_proj();
+
+        // A deletes the folder NODE — a subtree delete (tombstones proj/ + its files in
+        // one op).
+        {
+            let tree = a.index_tree();
+            tree.delete(proj).unwrap();
+        }
+        a.rebuild_caches();
+        assert!(
+            a.index_tree().is_node_deleted(&proj).unwrap(),
+            "A tombstoned its proj/ folder node"
+        );
+
+        // B concurrently creates a live file under the shared proj/ folder.
+        let new_uuid = Uuid::from_u128(99);
+        let new_node = b.register_document("proj/new.md", &new_uuid, &FP).unwrap();
+        assert!(
+            !b.index_tree().is_node_deleted(&new_node).unwrap(),
+            "B's child is alive pre-merge"
+        );
+
+        converge(&a, &b);
+
+        let tree_a = a.index_tree();
+        let child_alive = !tree_a.is_node_deleted(&new_node).unwrap_or(true);
+        let ancestor_deleted = tree_a.is_node_deleted(&proj).unwrap_or(true);
+        println!(
+            "DP-3 PROBE [node-subtree-delete]: child_alive={child_alive}, \
+             ancestor_deleted={ancestor_deleted}, proj={proj:?}, new_node={new_node:?}"
+        );
+
+        // Pinned outcomes (a loro-version bump that changes either must re-trigger this
+        // design review):
+        assert!(
+            ancestor_deleted,
+            "loro keeps the folder node tombstoned after merge — it does NOT auto-revive"
+        );
+        assert!(
+            !child_alive,
+            "a subtree tree.delete TOMBSTONES the concurrently-added child too — which is \
+             exactly why the library models a folder delete as per-file deletes (above), \
+             NOT a folder-node subtree delete that would eat concurrent additions (INV-3)"
+        );
+    }
+
+    /// The "remove the directory the thorough way" shape: A deletes the child files AND
+    /// THEN tombstones the now-EMPTY `proj/` folder node, while B concurrently adds a live
+    /// child. One might expect that, because the folder is empty at A's delete-moment, the
+    /// subtree-delete has nothing live to subsume and B's child survives under a
+    /// tombstoned ancestor (the classic "revive me" state).
+    ///
+    /// **It does NOT.** loro tombstones B's concurrently-created child anyway
+    /// (`child_alive=false`): the delete targets the folder NODE, and in the merged state
+    /// B's child is parented to that tombstoned node, so it inherits the tombstone — the
+    /// emptiness-at-delete-moment on A is irrelevant. So even this path does not produce a
+    /// surviving live node under a dead ancestor; instead it SILENTLY LOSES B's child,
+    /// which is exactly the INV-3 violation EC-7 forbids. This is the core reason a
+    /// folder-node subtree-delete must NOT be how the library models a folder delete.
+    #[test]
+    fn empty_folder_node_deleted_after_files_subsumes_concurrent_child() {
+        let (a, b, proj) = two_replicas_sharing_proj();
+
+        // A removes the directory: delete both files, THEN tombstone the now-empty folder
+        // node. At A's delete-moment the folder has no alive children.
+        a.delete_node("proj/keep.md").unwrap();
+        a.delete_node("proj/gone.md").unwrap();
+        a.rebuild_caches();
+        {
+            let tree = a.index_tree();
+            tree.delete(proj).unwrap();
+        }
+        a.rebuild_caches();
+
+        // B concurrently creates a live file under the shared proj/ folder.
+        let new_uuid = Uuid::from_u128(99);
+        let new_node = b.register_document("proj/new.md", &new_uuid, &FP).unwrap();
+
+        converge(&a, &b);
+
+        let tree_a = a.index_tree();
+        let child_alive = !tree_a.is_node_deleted(&new_node).unwrap_or(true);
+        let ancestor_deleted = tree_a.is_node_deleted(&proj).unwrap_or(true);
+        let child_path = a.get_node_path(&new_node);
+        println!(
+            "DP-3 PROBE [empty-folder-then-deleted]: child_alive={child_alive}, \
+             ancestor_deleted={ancestor_deleted}, child_path={child_path:?}, proj={proj:?}, \
+             new_node={new_node:?}"
+        );
+
+        // Pinned: the child is SUBSUMED (not a surviving live node under a dead ancestor),
+        // and the folder reads tombstoned. So this path yields silent loss, not a
+        // revive-able state — the design must avoid folder-node subtree-deletes entirely.
+        assert!(
+            !child_alive,
+            "loro subsumes the concurrently-created child even when the folder was empty at \
+             A's delete-moment — emptiness-at-delete does not save a concurrent add"
+        );
+        assert!(ancestor_deleted, "the proj/ folder node stays tombstoned");
+    }
+
+    /// EC-7's MOVE leg (vs the CREATE leg above): A deletes the `proj/` folder node while
+    /// B MOVES an ALREADY-EXISTING live node (`loose.md` at root) INTO `proj/`. Unlike a
+    /// create-under-the-subtree, the moved node pre-exists outside the deleted subtree, so
+    /// the question is whether a `tree.mov` INTO a concurrently-deleted folder leaves the
+    /// moved node alive (its identity was never under the tombstoned subtree).
+    ///
+    /// This is the strongest candidate for producing a genuine "live node under a dead
+    /// folder" — and the probe records which way loro resolves it.
+    #[test]
+    fn move_into_concurrently_deleted_folder() {
+        let (a, b, proj) = two_replicas_sharing_proj();
+        // Add a loose root file to the shared state so both replicas have its node.
+        a.register_document("loose.md", &Uuid::from_u128(50), &FP)
+            .unwrap();
+        let loose_node = a.find_node_by_uuid(&Uuid::from_u128(50)).unwrap();
+        // Re-seed B with loose.md so both share it.
+        {
+            let delta = a.export_snapshot().unwrap();
+            b.import_updates(&delta).unwrap();
+            b.rebuild_caches();
+        }
+
+        // A deletes the proj/ folder NODE (subtree delete).
+        {
+            let tree = a.index_tree();
+            tree.delete(proj).unwrap();
+        }
+        a.rebuild_caches();
+
+        // B concurrently MOVES the pre-existing loose.md INTO proj/.
+        b.move_node("loose.md", "proj/loose.md").unwrap();
+        assert!(
+            !b.index_tree().is_node_deleted(&loose_node).unwrap(),
+            "the moved node is alive on B pre-merge"
+        );
+
+        converge(&a, &b);
+
+        let tree_a = a.index_tree();
+        let moved_alive = !tree_a.is_node_deleted(&loose_node).unwrap_or(true);
+        let ancestor_deleted = tree_a.is_node_deleted(&proj).unwrap_or(true);
+        let moved_path = a.get_node_path(&loose_node);
+        println!(
+            "DP-3 PROBE [move-into-deleted-folder]: moved_alive={moved_alive}, \
+             ancestor_deleted={ancestor_deleted}, moved_path={moved_path:?}, proj={proj:?}, \
+             loose_node={loose_node:?}"
+        );
+
+        // The moved node's survival is the INV-3 question. Whatever loro does, pin it:
+        // a move INTO a tombstoned folder is subsumed by the subtree delete just like a
+        // create is (the node's parent is the tombstoned folder in the merged state).
+        assert!(
+            !moved_alive,
+            "loro subsumes a node moved INTO a concurrently-subtree-deleted folder too — \
+             the moved node reads deleted in the merged state (same as the create leg)"
+        );
+        assert!(ancestor_deleted, "the folder node stays tombstoned");
+    }
+}
