@@ -284,7 +284,9 @@ impl<F: FileSystem> Vault<F> {
         let bytes = self.fs().read(&loro_path).await?;
         let doc = ContentDoc::from_bytes(&bytes, self.loro_author())?;
         self.mark_synced(&mv.to);
-        self.fs().write(&mv.to, doc.to_markdown().as_bytes()).await?;
+        self.fs()
+            .write(&mv.to, doc.to_markdown().as_bytes())
+            .await?;
         self.documents_mut().insert(mv.to.clone(), doc);
         debug!("rematerialize_moved_md: rendered {} at {}", mv.uuid, mv.to);
         Ok(())

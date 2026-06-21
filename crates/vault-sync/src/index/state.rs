@@ -161,7 +161,10 @@ impl SyncMetadata {
                 .map_err(|e| IndexError::CorruptMetadata(format!("invalid TOML: {}", e)))?;
 
             if meta.version > CURRENT_SYNC_VERSION {
-                return Err(IndexError::VersionTooNew(meta.version, CURRENT_SYNC_VERSION));
+                return Err(IndexError::VersionTooNew(
+                    meta.version,
+                    CURRENT_SYNC_VERSION,
+                ));
             }
 
             tracing::info!(vault_id = %meta.vault_id, version = meta.version, "Loaded vault metadata");
@@ -431,10 +434,7 @@ impl SyncState {
     /// before the next index sync is still guarded against resurrecting the
     /// just-deleted path.
     pub fn mark_path_deleted(&self, path: &str) {
-        self.deleted_paths
-            .lock()
-            .unwrap()
-            .insert(path.to_string());
+        self.deleted_paths.lock().unwrap().insert(path.to_string());
     }
 
     /// Replace the entire deleted-paths set with one freshly derived from index truth.

@@ -32,14 +32,12 @@ mod reconcile;
 mod state;
 mod tree;
 
-pub use state::{
-    FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId,
-};
+pub use state::{FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId};
 
 use crate::fs::FileSystem;
 use loro::LoroDoc;
-use std::collections::HashMap;
 use loro::TreeID;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[cfg(not(target_arch = "wasm32"))]

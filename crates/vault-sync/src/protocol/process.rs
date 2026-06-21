@@ -40,8 +40,8 @@ impl<F: FileSystem> Vault<F> {
             timestamp: self.now_ms(),
         });
 
-        let msg: SyncMessage = bincode::deserialize(data)
-            .map_err(|e| SyncError::Deserialization(e.to_string()))?;
+        let msg: SyncMessage =
+            bincode::deserialize(data).map_err(|e| SyncError::Deserialization(e.to_string()))?;
 
         match msg {
             SyncMessage::SyncRequest {

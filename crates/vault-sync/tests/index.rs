@@ -7,7 +7,7 @@
 //! and a move touches no content (its `docs/<uuid>.loro` path never changes).
 
 use uuid::Uuid;
-use vault_sync::{ContentDoc, Index, InMemoryFs, content_version_fingerprint};
+use vault_sync::{ContentDoc, InMemoryFs, Index, content_version_fingerprint};
 
 /// A device's Loro author id for the index doc.
 const AUTHOR: u64 = 0x0101_0101_0101_0101;
@@ -38,7 +38,11 @@ mod register_document {
             .unwrap();
 
         // Meta landed: uuid identity, denormalized content_version, recoverable path.
-        assert_eq!(index.node_uuid(&node), Some(uuid), "node carries its UUID meta");
+        assert_eq!(
+            index.node_uuid(&node),
+            Some(uuid),
+            "node carries its UUID meta"
+        );
         assert_eq!(
             index.node_content_version(&node),
             Some(fingerprint),
@@ -71,8 +75,12 @@ mod register_document {
         let index = Index::new(AUTHOR);
         let (_doc, uuid, fingerprint) = doc_with_identity("body");
 
-        let first = index.register_document("a.md", &uuid, &fingerprint).unwrap();
-        let second = index.register_document("a.md", &uuid, &fingerprint).unwrap();
+        let first = index
+            .register_document("a.md", &uuid, &fingerprint)
+            .unwrap();
+        let second = index
+            .register_document("a.md", &uuid, &fingerprint)
+            .unwrap();
 
         assert_eq!(first, second, "the second register returns the same node");
     }
@@ -231,12 +239,16 @@ mod validate_sync_path {
         );
         // Absolute path.
         assert!(
-            index.register_document("/etc/passwd.md", &uuid, &fp).is_err(),
+            index
+                .register_document("/etc/passwd.md", &uuid, &fp)
+                .is_err(),
             "absolute path is rejected"
         );
         // Non-markdown.
         assert!(
-            index.register_document("notes/data.json", &uuid, &fp).is_err(),
+            index
+                .register_document("notes/data.json", &uuid, &fp)
+                .is_err(),
             "non-markdown path is rejected"
         );
         // Empty.

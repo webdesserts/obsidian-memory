@@ -102,7 +102,10 @@ mod ac_inv_1_zero_content_move {
         // The content `.loro` was never relocated — it is addressed by the stable
         // UUID, so the same file backs the document before and after the move.
         let loro = content_doc_path(&original_uuid);
-        assert!(fs_b.exists(&loro).await.unwrap(), "B still has the same <uuid>.loro");
+        assert!(
+            fs_b.exists(&loro).await.unwrap(),
+            "B still has the same <uuid>.loro"
+        );
         // B's old-path `.md` is gone; the new-path `.md` is present.
         assert!(!fs_b.exists("notes/topic.md").await.unwrap());
         assert!(fs_b.exists("archive/topic.md").await.unwrap());
@@ -144,7 +147,10 @@ mod ac_inv_2_concurrent_merge {
         // Both replicas converge to byte-identical markdown containing BOTH edits.
         let md_a = String::from_utf8(read_md(&fs_a, "doc.md").await).unwrap();
         let md_b = String::from_utf8(read_md(&fs_b, "doc.md").await).unwrap();
-        assert_eq!(md_a, md_b, "both replicas converge to byte-identical content");
+        assert_eq!(
+            md_a, md_b,
+            "both replicas converge to byte-identical content"
+        );
         assert!(md_a.contains("EDITED BY A"), "A's edit survived: {md_a:?}");
         assert!(md_a.contains("EDITED BY B"), "B's edit survived: {md_a:?}");
 
@@ -196,7 +202,9 @@ mod ac_inv_4_convergence {
         b.index().delete_node("delete-me.md").unwrap();
         b.save_index().await.unwrap();
         fs_b.delete("delete-me.md").await.unwrap();
-        fs_b.delete(&content_doc_path(&delete_me_uuid)).await.unwrap();
+        fs_b.delete(&content_doc_path(&delete_me_uuid))
+            .await
+            .unwrap();
 
         // Pump both directions until quiescent (two rounds settle a delete +
         // create + move + edit fan-out).
@@ -208,7 +216,10 @@ mod ac_inv_4_convergence {
         let mut files_b = b.list_files().await.unwrap();
         files_a.sort();
         files_b.sort();
-        assert_eq!(files_a, files_b, "both replicas hold the same set of live paths");
+        assert_eq!(
+            files_a, files_b,
+            "both replicas hold the same set of live paths"
+        );
         assert_eq!(
             files_a,
             vec![
@@ -271,7 +282,10 @@ mod ac_inv_8_flow2_gate {
         let outcome = b.process_message(&push).await.unwrap();
 
         // The gate held it: nothing materialized on B.
-        assert!(outcome.modified.is_empty(), "the held update reports no modification");
+        assert!(
+            outcome.modified.is_empty(),
+            "the held update reports no modification"
+        );
         assert!(
             !fs_b.exists("secret.md").await.unwrap(),
             "no .md materializes for a document whose node has not arrived"
@@ -295,7 +309,10 @@ mod ac_inv_8_flow2_gate {
             "the materialized document carries the shared UUID"
         );
         let md = String::from_utf8(read_md(&fs_b, "secret.md").await).unwrap();
-        assert!(md.contains("hidden content"), "the materialized content is correct");
+        assert!(
+            md.contains("hidden content"),
+            "the materialized content is correct"
+        );
     }
 }
 
@@ -313,7 +330,10 @@ mod ac_inv_9_delete_propagation {
         write_and_index(&a, &fs_a, "doomed.md", "delete me\n").await;
         full_sync(&a, &b).await;
         let uuid = uuid_at(&b, "doomed.md");
-        assert!(fs_b.exists("doomed.md").await.unwrap(), "B has the file before the delete");
+        assert!(
+            fs_b.exists("doomed.md").await.unwrap(),
+            "B has the file before the delete"
+        );
 
         // A deletes the document (Index tombstone + fs cleanup) and syncs.
         a.index().delete_node("doomed.md").unwrap();
@@ -322,7 +342,10 @@ mod ac_inv_9_delete_propagation {
         sync_both_ways(&a, &b).await;
 
         // B's file, content `.loro`, and live node are all gone.
-        assert!(!fs_b.exists("doomed.md").await.unwrap(), "B's .md is removed");
+        assert!(
+            !fs_b.exists("doomed.md").await.unwrap(),
+            "B's .md is removed"
+        );
         assert!(
             !fs_b.exists(&content_doc_path(&uuid)).await.unwrap(),
             "B's <uuid>.loro is removed"
@@ -359,12 +382,18 @@ mod ac_inv_9_delete_propagation {
             b.index().node_for_path("contested.md").is_none(),
             "B agrees the document is deleted (tombstone wins over the concurrent edit)"
         );
-        assert!(!fs_b.exists("contested.md").await.unwrap(), "B's file is gone");
+        assert!(
+            !fs_b.exists("contested.md").await.unwrap(),
+            "B's file is gone"
+        );
         assert!(
             a.index().node_for_path("contested.md").is_none(),
             "A's deletion stands"
         );
-        assert!(!fs_a.exists("contested.md").await.unwrap(), "A's file stays gone");
+        assert!(
+            !fs_a.exists("contested.md").await.unwrap(),
+            "A's file stays gone"
+        );
     }
 }
 
@@ -389,8 +418,14 @@ mod ac_inv_10_idempotent_ordered {
 
         let md_after_second = read_md(&fs_b, "doc.md").await;
         let vv_after_second = b.get_document("doc.md").await.unwrap().version();
-        assert_eq!(md_after_first, md_after_second, "re-applying changes nothing on disk");
-        assert_eq!(vv_after_first, vv_after_second, "re-applying changes no version vector");
+        assert_eq!(
+            md_after_first, md_after_second,
+            "re-applying changes nothing on disk"
+        );
+        assert_eq!(
+            vv_after_first, vv_after_second,
+            "re-applying changes no version vector"
+        );
     }
 
     /// A 3-op causal chain delivered in EVERY ordering converges to identical state.
@@ -409,7 +444,12 @@ mod ac_inv_10_idempotent_ordered {
 
         // A complete, self-contained snapshot of the document at step 0 (the base the
         // deltas attach to) plus the Index snapshot that carries its node.
-        let step0_snapshot = src.get_document("chain.md").await.unwrap().export_snapshot().unwrap();
+        let step0_snapshot = src
+            .get_document("chain.md")
+            .await
+            .unwrap()
+            .export_snapshot()
+            .unwrap();
         let index_snapshot = src.index().export_snapshot().unwrap();
         let vv0 = src.get_document("chain.md").await.unwrap().version();
 
@@ -417,7 +457,13 @@ mod ac_inv_10_idempotent_ordered {
         let vv1 = src.get_document("chain.md").await.unwrap().version();
         write_and_index(&src, &fs_src, "chain.md", "step 0\nstep 1\nstep 2\n").await;
         let vv2 = src.get_document("chain.md").await.unwrap().version();
-        write_and_index(&src, &fs_src, "chain.md", "step 0\nstep 1\nstep 2\nstep 3\n").await;
+        write_and_index(
+            &src,
+            &fs_src,
+            "chain.md",
+            "step 0\nstep 1\nstep 2\nstep 3\n",
+        )
+        .await;
 
         let doc = src.get_document("chain.md").await.unwrap();
         let deltas = [
@@ -510,7 +556,11 @@ mod ac_s5_send_side_node_first {
             fs_b.exists("fresh.md").await.unwrap(),
             "the document materializes once a full sync ships its node"
         );
-        assert_eq!(uuid_at(&b, "fresh.md"), uuid.0, "B's node carries the shared UUID");
+        assert_eq!(
+            uuid_at(&b, "fresh.md"),
+            uuid.0,
+            "B's node carries the shared UUID"
+        );
     }
 }
 
@@ -560,10 +610,17 @@ mod ac_seam_lossy_transport {
         let mut files_b = b.list_files().await.unwrap();
         files_a.sort();
         files_b.sort();
-        assert_eq!(files_a, files_b, "lossy transport still converges the path set");
+        assert_eq!(
+            files_a, files_b,
+            "lossy transport still converges the path set"
+        );
         assert_eq!(
             files_a,
-            vec!["b-side.md".to_string(), "one.md".to_string(), "two.md".to_string()],
+            vec![
+                "b-side.md".to_string(),
+                "one.md".to_string(),
+                "two.md".to_string()
+            ],
             "every document converged across the lossy channel"
         );
         for path in &files_a {

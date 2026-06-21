@@ -93,7 +93,8 @@ impl<F: FileSystem> Vault<F> {
         let exists_on_disk = self.fs().exists(&loro_path).await?;
 
         if exists_in_cache || exists_on_disk {
-            self.merge_into_existing(uuid, &path, &loro_path, data).await
+            self.merge_into_existing(uuid, &path, &loro_path, data)
+                .await
         } else {
             self.materialize_new(uuid, &path, &loro_path, data).await
         }
@@ -110,7 +111,11 @@ impl<F: FileSystem> Vault<F> {
         data: &[u8],
     ) -> Result<bool> {
         // Load the document from cache, else from its `<uuid>.loro` on disk.
-        let mut doc = match self.documents().get(path).cloned() {
+        // Bind the cache lookup to a local so the `documents()` mutex guard is
+        // released before the `.await` below — never hold a MutexGuard across an
+        // await point (clippy::await_holding_lock; keeps the Flow-2 future Send).
+        let cached = self.documents().get(path).cloned();
+        let mut doc = match cached {
             Some(doc) => doc,
             None => {
                 let bytes = self.fs().read(loro_path).await?;
@@ -124,7 +129,10 @@ impl<F: FileSystem> Vault<F> {
         doc.import(data)?;
         let modified = version_before != doc.version();
 
-        debug!("apply_doc_update: {} ({}) - merged, modified={}", path, uuid, modified);
+        debug!(
+            "apply_doc_update: {} ({}) - merged, modified={}",
+            path, uuid, modified
+        );
 
         if modified {
             doc.commit();
@@ -200,7 +208,10 @@ impl<F: FileSystem> Vault<F> {
     /// deletion is a tracked CRDT op that propagates and survives a restart.
     pub(super) async fn apply_doc_deleted(&self, uuid: &DocId) -> Result<bool> {
         let Some(path) = self.path_for_doc(uuid) else {
-            debug!("apply_doc_deleted: no Index node for {} — nothing to delete", uuid);
+            debug!(
+                "apply_doc_deleted: no Index node for {} — nothing to delete",
+                uuid
+            );
             return Ok(false);
         };
 
@@ -224,7 +235,10 @@ impl<F: FileSystem> Vault<F> {
         }
         self.documents_mut().remove(&path);
 
-        debug!("apply_doc_deleted: deleted {} ({}), tombstoned={}", path, uuid, tombstoned);
+        debug!(
+            "apply_doc_deleted: deleted {} ({}), tombstoned={}",
+            path, uuid, tombstoned
+        );
         Ok(tombstoned)
     }
 }

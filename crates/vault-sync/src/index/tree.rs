@@ -225,13 +225,12 @@ impl Index {
     /// flow calls this on each real content change so the derived cache stays in step
     /// with the content doc's `state_vv()` (the authoritative source). In-memory only
     /// — the caller persists via `save_index`.
-    pub fn set_content_version(
-        &self,
-        node_id: &TreeID,
-        content_version: &[u8; 32],
-    ) -> Result<()> {
+    pub fn set_content_version(&self, node_id: &TreeID, content_version: &[u8; 32]) -> Result<()> {
         let meta = self.index_tree().get_meta(*node_id).map_err(|e| {
-            IndexError::TreeOperation(format!("Failed to get file meta for content_version: {}", e))
+            IndexError::TreeOperation(format!(
+                "Failed to get file meta for content_version: {}",
+                e
+            ))
         })?;
         meta.insert(TREE_META_CONTENT_VERSION, content_version.as_slice())
             .map_err(|e| {
@@ -514,8 +513,8 @@ impl Index {
 
         for child_id in children {
             if let Ok(meta) = tree.get_meta(child_id) {
-                let is_folder = Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref()
-                    == Some("folder");
+                let is_folder =
+                    Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() == Some("folder");
                 let child_name = Self::tree_meta_string(&meta, TREE_META_NAME);
 
                 if is_folder && child_name.as_deref() == Some(name) {

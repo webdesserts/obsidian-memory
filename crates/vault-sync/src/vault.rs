@@ -29,9 +29,7 @@ use crate::content_doc::ContentDoc;
 use crate::events::{EventBus, Subscription, SyncEvent};
 use crate::fs::FileSystem;
 use crate::hash::content_version_fingerprint;
-use crate::index::{
-    Index, IndexError, Result, SyncMetadata, VaultId, content_doc_path,
-};
+use crate::index::{Index, IndexError, Result, SyncMetadata, VaultId, content_doc_path};
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -40,12 +38,12 @@ use uuid::Uuid;
 // (multi-threaded Tokio), wasm uses Rc/RefCell (single-threaded browser). The
 // Index owns its own interior-mutability internals (and the SyncState owns an
 // unconditional Arc<Mutex<…>>), so the Vault only wraps what it adds on top.
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Mutex};
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
 
 /// The `.sync/` directory holding all vault sync state.
 const SYNC_DIR: &str = ".sync";
