@@ -177,6 +177,21 @@ impl ContentDoc {
         markdown::serialize(frontmatter.as_ref(), &body)
     }
 
+    /// Whether the document carries no frontmatter (the map is absent or has no keys).
+    ///
+    /// This is the frontmatter half of the INV-5.1 emptiness predicate (see
+    /// `hash::content_summary`): a document is "empty" for the conflict cascade only
+    /// if BOTH its body and its frontmatter are blank. Checking key presence on the
+    /// raw map — rather than the materialized-map result — is deliberate: any
+    /// frontmatter key (`title`, `tags`, …) is real content INV-3 forbids the cascade
+    /// from silently dropping, independent of how it serializes.
+    pub fn frontmatter_is_empty(&self) -> bool {
+        match self.frontmatter().get_deep_value() {
+            loro::LoroValue::Map(map) => map.is_empty(),
+            _ => true,
+        }
+    }
+
     /// Get frontmatter as a map.
     ///
     /// Key ordering here is irrelevant to determinism — `markdown::serialize` sorts

@@ -17,8 +17,10 @@
 
 pub mod content_doc;
 pub mod fs;
+pub mod hash;
 pub mod markdown;
 
 pub use content_doc::{ContentDoc, DocumentError};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
+pub use hash::{ContentSummary, content_hash, content_summary};
 pub use markdown::ParsedMarkdown;

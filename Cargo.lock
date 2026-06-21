@@ -9384,6 +9384,7 @@ name = "vault-sync"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "loro",
  "serde",
  "serde_json",

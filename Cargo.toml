@@ -41,6 +41,9 @@ futures = "0.3"
 # CRDT (for sync crates)
 loro = "1.13"
 
+# Portable content hashing (deterministic across machines — pure-Rust, no SIMD/iroh deps)
+blake3 = "1"
+
 # Serialization (for sync crates)
 serde_yaml = "0.9"
 bincode = "1.3"

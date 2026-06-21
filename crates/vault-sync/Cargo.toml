@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+blake3.workspace = true
 thiserror.workspace = true
 loro.workspace = true
 serde = { workspace = true }
