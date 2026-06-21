@@ -97,13 +97,19 @@ export function SettingsPanel() {
             id="relay-url"
             value={relayUrl}
             invalid={relayError !== null}
-            placeholder="https://umbra.computer/"
+            placeholder="https://relay.example.com/"
             onChange={(event) => {
               setRelayUrl(event.target.value);
               setRelayError(null);
             }}
           />
-          {relayError && <p className="text-xs text-danger">{relayError}</p>}
+          {relayError ? (
+            <p className="text-xs text-danger">{relayError}</p>
+          ) : (
+            <p className="text-xs text-text-secondary">
+              Optional — only if you self-host a relay. Leave blank to sync through the mesh.
+            </p>
+          )}
         </div>
 
         <div className="flex flex-col gap-1.5">
