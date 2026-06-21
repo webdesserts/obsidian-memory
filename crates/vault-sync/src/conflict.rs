@@ -106,8 +106,11 @@ pub enum StructuralOp {
 /// new collision the next iteration resolves (the transitive resolution IS the
 /// fixpoint; there is no separate recursion).
 ///
-/// P2a implements only the **file-cascade** case (precedence slot 4). The folder
-/// cases (slots 1–3) are added into this same loop in P2d/P2e.
+/// The cases, in pinned precedence (INV-5.3(a)): **folder-merge** (slot 2) →
+/// **file-vs-folder** (slot 3) → the **file cascade** (slot 4). The shape rules (2,3)
+/// settle the tree to a fixpoint — ≤1 node-type per path — before the cascade resolves
+/// the document-level collisions the now-stable shape exposes. Folder-revive (slot 1)
+/// is added ahead of all of these in P2e.
 ///
 /// ## Determinism (INV-5.3(c))
 ///
@@ -148,6 +151,10 @@ pub fn resolve_structure(view: StructuralView) -> Vec<StructuralOp> {
         );
 
         match site {
+            Site::FolderMerge { path } => resolve_folder_merge(&mut working, &path, &mut ops),
+            Site::FileVsFolder { path } => {
+                resolve_file_vs_folder_site(&mut working, &path, &mut ops)
+            }
             Site::FileCollision { path } => resolve_file_collision(&mut working, &path, &mut ops),
         }
     }
@@ -186,9 +193,19 @@ pub fn conflict_name(path: &str, loser_uuid: &Uuid) -> String {
 
 /// The kind of unresolved collision at a path, in pinned-precedence order.
 ///
-/// P2a only has `FileCollision` (slot 4). P2d/P2e add the higher-precedence
-/// structural-shape variants (revive, folder-merge, file-vs-folder) AHEAD of it.
+/// The structural-SHAPE sites (`FolderMerge` slot 2, `FileVsFolder` slot 3) outrank
+/// the document-level `FileCollision` (slot 4): the tree's shape must be resolved to a
+/// fixpoint — ≤1 node-type per path — before file collisions are settled, because a
+/// folder-merge or a file-vs-folder relocate can CREATE or DISSOLVE a file collision,
+/// so file collisions must be resolved against the FINAL shape, never an intermediate
+/// one (the between-families analogue of INV-5.0). Slot 1 (folder-revive) is added in
+/// P2e ahead of all of these.
 enum Site {
+    /// ≥2 folder nodes at one path (slot 2) → merge into the min-TreeID survivor.
+    FolderMerge { path: String },
+    /// A file node and a folder node at one path (slot 3) → folder wins, file relocates.
+    FileVsFolder { path: String },
+    /// ≥2 file nodes at one path (slot 4) → the file cascade (INV-5.1).
     FileCollision { path: String },
 }
 
@@ -226,14 +243,34 @@ impl StructuralView {
     /// Find the highest-precedence unresolved collision site, or `None` when the
     /// view is fully resolved (every path holds exactly one materializable node).
     ///
-    /// Sites are scanned in the `occupants` `BTreeMap`'s ordered iteration, so the
-    /// choice of which site to resolve next is itself content-independent and
-    /// identical on every replica. P2a recognizes only the file-collision site;
-    /// P2d/P2e insert the structural-shape sites ahead of it.
+    /// The scan walks the pinned precedence (INV-5.3(a)): it returns the highest-
+    /// precedence site found ANYWHERE before considering any lower-precedence one — so
+    /// a folder-merge at any path preempts every file-vs-folder, which preempts every
+    /// file collision. The resolver then settles that site and re-scans, which is what
+    /// drives the shape rules to a fixpoint before the cascade runs. Within each slot,
+    /// sites are visited in the `occupants` `BTreeMap`'s ordered iteration, so the choice
+    /// is content-independent and identical on every replica. Slot 1 (folder-revive) is
+    /// inserted ahead of these in P2e.
     fn next_unresolved_site(&self) -> Option<Site> {
-        // Precedence slot 4 — file collision (≥2 file nodes at one path). The
-        // higher-precedence structural-shape slots are added in P2d/P2e and must be
-        // scanned BEFORE this one when present.
+        // Slot 2 — folder collision (≥2 folder nodes at one path). Scanned first so the
+        // tree's folder shape settles before file-vs-folder and the file cascade.
+        for (path, occupants) in &self.occupants {
+            if occupants.iter().filter(|n| n.is_folder()).count() >= 2 {
+                return Some(Site::FolderMerge { path: path.clone() });
+            }
+        }
+
+        // Slot 3 — file-vs-folder (a file node AND a folder node at one path). Reached
+        // only once no path has ≥2 folders, so a matching path has exactly one folder.
+        for (path, occupants) in &self.occupants {
+            let has_file = occupants.iter().any(|n| n.is_file());
+            let has_folder = occupants.iter().any(|n| n.is_folder());
+            if has_file && has_folder {
+                return Some(Site::FileVsFolder { path: path.clone() });
+            }
+        }
+
+        // Slot 4 — file collision (≥2 file nodes at one path).
         for (path, occupants) in &self.occupants {
             if occupants.iter().filter(|n| n.is_file()).count() >= 2 {
                 return Some(Site::FileCollision { path: path.clone() });
@@ -276,7 +313,6 @@ impl NodeKind {
         matches!(self, NodeKind::File { .. })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn is_folder(&self) -> bool {
         matches!(self, NodeKind::Folder { .. })
     }
@@ -440,6 +476,153 @@ fn apply_file_resolution(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The folder-merge case (INV-1.5c / OQ-5) — min-TreeID survivor, union children
+// ---------------------------------------------------------------------------
+
+/// Resolve one folder-collision site (≥2 distinct-TreeID folder nodes at `path`) by
+/// merging into the **min-TreeID** survivor (INV-1.5c), emitting one `MergeFolder` per
+/// loser and mutating `working` so the next fixpoint iteration sees the result.
+///
+/// **Survivor key = min-TreeID** (folders have no content-UUID — DP-1; `TreeID` derives
+/// `Ord`, so the minimum is a globally-agreed total order, identical on every replica).
+/// Whole-group, not iterative-pairwise: EVERY non-min folder loses to the SAME survivor.
+///
+/// **Why the working view only drops the loser folder node.** The view is keyed by
+/// display PATH, and both folders sit at the same path `P`, so their children already
+/// occupy the SAME child paths (`P/child`) in the view — the union is already reflected
+/// by the path-keying. So reflecting the merge is just removing the loser folder node
+/// from `P`; any same-name file collision (≥2 files at `P/Notes.md`) or same-name
+/// sub-folder collision (≥2 folders at `P/sub`) is already present in the view and is
+/// resolved by a lower-precedence case (file cascade) or by folder-merge again
+/// (transitively) on a later iteration. (The APPLY side, by contrast, must actually
+/// re-parent the loser's children under the survivor before tombstoning it, because
+/// there the children hang under genuinely-distinct tree nodes — see
+/// `apply_structural_ops`.)
+///
+/// **Termination contribution:** each `MergeFolder` removes one folder node at `P`,
+/// strictly decreasing the folder-collision-site count (the slot-2 shape component);
+/// the collisions its union "surfaces" were already counted in the lower components, so
+/// no higher component ever rises (INV-5.3(b)).
+fn resolve_folder_merge(working: &mut StructuralView, path: &str, ops: &mut Vec<StructuralOp>) {
+    let folders: Vec<TreeID> = working
+        .occupants
+        .get(path)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| match n {
+                    NodeKind::Folder { tree_id } => Some(*tree_id),
+                    NodeKind::File { .. } => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let Some(survivor) = folders.iter().copied().min() else {
+        return;
+    };
+
+    // Emit a merge for every loser, and drop the loser folder nodes from the working
+    // view (the survivor folder stays at `path`). The same-path children are already
+    // unioned by the view's path-keying, so nothing else moves here.
+    for &loser in &folders {
+        if loser != survivor {
+            ops.push(StructuralOp::MergeFolder { survivor, loser });
+        }
+    }
+    if let Some(nodes) = working.occupants.get_mut(path) {
+        nodes.retain(|n| !matches!(n, NodeKind::Folder { tree_id } if *tree_id != survivor));
+        if nodes.is_empty() {
+            working.occupants.remove(path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The file-vs-folder case (INV-1.5d) — folder wins, file relocates inside
+// ---------------------------------------------------------------------------
+
+/// Resolve one file-vs-folder site at `path` (one file node + one folder node) by the
+/// DECIDED relocate-inside rule (INV-1.5d): the **folder wins the path**, the file
+/// relocates to `<path>/<filename>`, mutating `working` so the next iteration sees it.
+///
+/// The site is only reached once no path has ≥2 folders (folder-merge has higher
+/// precedence), so there is exactly one folder here; if the file's content is needed it
+/// is carried on the moved `NodeKind`. The relocation may land on a path already
+/// occupied by a live file → a file collision the slot-4 cascade then resolves.
+///
+/// The pure rule itself — which node wins and where the file goes — is the isolated
+/// [`resolve_file_vs_folder`] helper (DP-7, code cleanliness); this wrapper applies its
+/// output to the working view.
+fn resolve_file_vs_folder_site(
+    working: &mut StructuralView,
+    path: &str,
+    ops: &mut Vec<StructuralOp>,
+) {
+    let nodes = match working.occupants.get(path) {
+        Some(nodes) => nodes,
+        None => return,
+    };
+    let file = nodes.iter().find_map(|n| match n {
+        NodeKind::File { uuid, summary } => Some((*uuid, *summary)),
+        NodeKind::Folder { .. } => None,
+    });
+    let folder = nodes.iter().find_map(|n| match n {
+        NodeKind::Folder { tree_id } => Some(*tree_id),
+        NodeKind::File { .. } => None,
+    });
+    let (Some((file_uuid, file_summary)), Some(_folder)) = (file, folder) else {
+        return;
+    };
+
+    let relocate_ops = resolve_file_vs_folder(path, file_uuid);
+    ops.extend(relocate_ops.iter().cloned());
+
+    // Apply to the working view: the folder keeps `path`; the file node moves to its
+    // relocation target (carrying its summary, since a relocate is pure-structural).
+    let to = match relocate_ops.first() {
+        Some(StructuralOp::RelocateFile { to, .. }) => to.clone(),
+        _ => return,
+    };
+    if let Some(nodes) = working.occupants.get_mut(path) {
+        nodes.retain(|n| n.file_uuid() != Some(file_uuid));
+        if nodes.is_empty() {
+            working.occupants.remove(path);
+        }
+    }
+    working
+        .occupants
+        .entry(to)
+        .or_default()
+        .push(NodeKind::File {
+            uuid: file_uuid,
+            summary: file_summary,
+        });
+}
+
+/// The isolated file-vs-folder rule (INV-1.5d / DP-7): the folder wins `folder_path`,
+/// the file relocates INSIDE it at `<folder_path>/<filename>` — emitted as a single
+/// `RelocateFile`. Kept as one focused helper for code cleanliness.
+///
+/// `<filename>` is the last path segment of `folder_path` (its basename), so the
+/// relocation target is `folder_path` + "/" + that basename — e.g. `Notes.md` →
+/// `Notes.md/Notes.md`, `a/b/Notes.md` → `a/b/Notes.md/Notes.md`. The target is
+/// content-independent (folder-wins is a fixed rule), so every replica derives the
+/// identical relocation. relocate-inside is DECIDED, not swappable (Michael 2026-06-21,
+/// reaffirmed 06-22); there is deliberately no "sibling conflict-copy" alternative here.
+fn resolve_file_vs_folder(folder_path: &str, file_uuid: Uuid) -> Vec<StructuralOp> {
+    let filename = match folder_path.rfind('/') {
+        Some(slash) => &folder_path[slash + 1..],
+        None => folder_path,
+    };
+    let to = format!("{folder_path}/{filename}");
+    vec![StructuralOp::RelocateFile {
+        uuid: file_uuid,
+        to,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +665,16 @@ mod tests {
         }
     }
 
+    /// A folder node identified by a `TreeID` whose `counter` is `n` (peer fixed), so
+    /// `folder(1)` < `folder(2)` < … by the derived `TreeID` ordering — making the
+    /// min-TreeID survivor obvious by construction, the folder analogue of `file`'s
+    /// numeric-UUID ordering.
+    fn folder(n: i32) -> NodeKind {
+        NodeKind::Folder {
+            tree_id: TreeID::new(0, n),
+        }
+    }
+
     fn view_at(path: &str, nodes: Vec<NodeKind>) -> StructuralView {
         let mut occupants = BTreeMap::new();
         occupants.insert(path.to_string(), nodes);
@@ -507,6 +700,34 @@ mod tests {
             .iter()
             .filter_map(|op| match op {
                 StructuralOp::RenameFile { loser, to } => Some((*loser, to.clone())),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Extract `(survivor, loser)` folder-merge pairs from an op plan, sorted for set
+    /// comparison.
+    fn merged_folders(ops: &[StructuralOp]) -> Vec<(TreeID, TreeID)> {
+        let mut v: Vec<(TreeID, TreeID)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                StructuralOp::MergeFolder { survivor, loser } => Some((*survivor, *loser)),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Extract `(uuid, to)` file-relocation pairs from an op plan, sorted for set
+    /// comparison.
+    fn relocated(ops: &[StructuralOp]) -> Vec<(Uuid, String)> {
+        let mut v: Vec<(Uuid, String)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                StructuralOp::RelocateFile { uuid, to } => Some((*uuid, to.clone())),
                 _ => None,
             })
             .collect();
@@ -678,6 +899,275 @@ mod tests {
             vec![(uuid(U4), format!("Note (conflict {}).md", uuid(U4)))],
             "U1 survives; U4 (the other non-empty) is renamed"
         );
+    }
+
+    // --- Folder-merge (INV-1.5c / OQ-5) — min-TreeID survivor, drop the loser ---
+
+    /// Two distinct folder nodes at one path merge into the min-TreeID survivor: a
+    /// single `MergeFolder { survivor, loser }` is emitted, no file ops. The view's
+    /// path-keying already unions same-named children onto shared child paths, so a
+    /// bare two-folder collision (no children in the view) resolves to exactly the one
+    /// merge op.
+    #[test]
+    fn folder_merge_two_folders_min_tree_id_survives() {
+        let ops = resolve_structure(view_at("proj", vec![folder(2), folder(1)]));
+        assert_eq!(
+            merged_folders(&ops),
+            vec![(TreeID::new(0, 1), TreeID::new(0, 2))],
+            "the min-TreeID folder survives; the other is the merge loser"
+        );
+        assert!(
+            collapsed(&ops).is_empty() && renamed(&ops).is_empty() && relocated(&ops).is_empty(),
+            "a bare folder collision emits only the merge — no file ops"
+        );
+    }
+
+    /// N≥3 folders at one path all merge into the single global-min-TreeID survivor —
+    /// each other folder is a loser against the SAME survivor (whole-group, not a
+    /// pairwise chain that could pick differently per replica). Shuffling the input
+    /// yields the identical plan.
+    #[test]
+    fn folder_merge_n_folders_all_lose_to_global_min() {
+        let nodes = vec![folder(3), folder(1), folder(2)];
+        let ops = resolve_structure(view_at("proj", nodes.clone()));
+        assert_eq!(
+            merged_folders(&ops),
+            vec![
+                (TreeID::new(0, 1), TreeID::new(0, 2)),
+                (TreeID::new(0, 1), TreeID::new(0, 3)),
+            ],
+            "every non-min folder loses to the SAME global-min-TreeID survivor"
+        );
+        for shuffle in permutations(&nodes) {
+            assert_eq!(
+                merged_folders(&resolve_structure(view_at("proj", shuffle))),
+                merged_folders(&ops),
+                "shuffled folder order produces the identical merge plan"
+            );
+        }
+    }
+
+    /// The union a folder-merge surfaces — a same-name file under each original folder
+    /// (already at the shared child path in the view) — falls to the file cascade in
+    /// the SAME pass: the merge drops the loser folder, then the two files at the child
+    /// path resolve by min-UUID + a conflict file for the loser. Nothing lost (INV-3).
+    #[test]
+    fn folder_merge_surfaced_file_collision_falls_to_cascade() {
+        let mut occupants = BTreeMap::new();
+        occupants.insert("proj".to_string(), vec![folder(1), folder(2)]);
+        // A same-named `proj/Notes.md` under each folder is already unioned onto the one
+        // child path by the view's path-keying — distinct UUIDs, distinct content.
+        occupants.insert("proj/Notes.md".to_string(), vec![file(U1, 1), file(U2, 2)]);
+        let ops = resolve_structure(StructuralView { occupants });
+
+        // The folder merges (min-TreeID), AND the surfaced file collision resolves.
+        assert_eq!(
+            merged_folders(&ops),
+            vec![(TreeID::new(0, 1), TreeID::new(0, 2))]
+        );
+        assert_eq!(
+            renamed(&ops),
+            vec![(uuid(U2), format!("proj/Notes (conflict {}).md", uuid(U2)))],
+            "the unioned same-name file collision resolves by the file cascade"
+        );
+    }
+
+    /// Same-name SUB-folders under the merging folders merge transitively: the parent
+    /// `proj/` merge and the child `proj/sub/` merge are BOTH emitted (the fixpoint
+    /// re-scans and resolves the nested folder collision the same pass).
+    #[test]
+    fn folder_merge_nested_subfolders_merge_transitively() {
+        let mut occupants = BTreeMap::new();
+        occupants.insert("proj".to_string(), vec![folder(1), folder(2)]);
+        // A same-named `proj/sub` sub-folder under each parent → already two folder
+        // nodes at the shared child path `proj/sub`.
+        occupants.insert("proj/sub".to_string(), vec![folder(3), folder(4)]);
+        let ops = resolve_structure(StructuralView { occupants });
+        assert_eq!(
+            merged_folders(&ops),
+            vec![
+                (TreeID::new(0, 1), TreeID::new(0, 2)),
+                (TreeID::new(0, 3), TreeID::new(0, 4)),
+            ],
+            "both the parent and the nested sub-folder collision merge (transitive)"
+        );
+    }
+
+    // --- File-vs-folder (INV-1.5d) — folder wins, file relocates inside ---
+
+    /// A file and a folder at one path: the folder wins the path; the file relocates to
+    /// `<path>/<filename>`. A single `RelocateFile` is emitted, no merge/cascade (the
+    /// relocation target is unoccupied here). DECIDED relocate-inside (DP-7), uniform.
+    #[test]
+    fn file_vs_folder_folder_wins_file_relocates_inside() {
+        let ops = resolve_structure(view_at("Notes.md", vec![file(U1, 1), folder(1)]));
+        assert_eq!(
+            relocated(&ops),
+            vec![(uuid(U1), "Notes.md/Notes.md".to_string())],
+            "the file relocates inside the folder at <folder>/<filename>"
+        );
+        assert!(
+            merged_folders(&ops).is_empty()
+                && collapsed(&ops).is_empty()
+                && renamed(&ops).is_empty(),
+            "an unoccupied relocation target emits only the relocate"
+        );
+    }
+
+    /// File-vs-folder in a nested directory: the relocation target preserves the full
+    /// parent path — `a/b/Notes.md` (file+folder) → the file moves to
+    /// `a/b/Notes.md/Notes.md`.
+    #[test]
+    fn file_vs_folder_relocation_target_is_nested() {
+        let ops = resolve_structure(view_at("a/b/Notes.md", vec![file(U1, 1), folder(1)]));
+        assert_eq!(
+            relocated(&ops),
+            vec![(uuid(U1), "a/b/Notes.md/Notes.md".to_string())]
+        );
+    }
+
+    /// File-vs-folder whose relocation target is ALREADY occupied by a live file → the
+    /// relocate surfaces a file collision the same pass resolves: min-UUID wins
+    /// `<folder>/<filename>`, the other gets a conflict file. Nothing lost.
+    #[test]
+    fn file_vs_folder_occupied_target_falls_to_cascade() {
+        let mut occupants = BTreeMap::new();
+        // U2 (file) collides with a folder at `Notes.md`; an occupant U1 already lives
+        // at the relocation target `Notes.md/Notes.md`.
+        occupants.insert("Notes.md".to_string(), vec![file(U2, 2), folder(1)]);
+        occupants.insert("Notes.md/Notes.md".to_string(), vec![file(U1, 1)]);
+        let view = StructuralView { occupants };
+
+        let ops = resolve_structure(view.clone());
+
+        // The file relocates into the folder, then the collision at the target resolves
+        // by min-UUID: U1 (the occupant) keeps the target; U2 (relocated) gets a
+        // conflict file off it.
+        assert_eq!(
+            relocated(&ops),
+            vec![(uuid(U2), "Notes.md/Notes.md".to_string())],
+            "the file is relocated inside the folder"
+        );
+        let final_paths = replay(view, &ops);
+        assert_eq!(
+            final_paths.get("Notes.md/Notes.md"),
+            Some(&uuid(U1)),
+            "the min-UUID occupant keeps the relocation target"
+        );
+        let u2_conflict = conflict_name("Notes.md/Notes.md", &uuid(U2));
+        assert_eq!(
+            final_paths.get(&u2_conflict),
+            Some(&uuid(U2)),
+            "the relocated file (larger UUID) gets a conflict file off the target"
+        );
+    }
+
+    /// File-vs-folder whose relocation target holds an IDENTICAL-content occupant → the
+    /// relocate surfaces a collision the cascade COLLAPSES (rule 1), not a conflict file:
+    /// the relocated file (larger UUID, same content as the occupant) is collapsed, no
+    /// conflict file. A relocate followed by a collapse on the same UUID is exactly the
+    /// case the apply side must guard (collapse wins over the move).
+    #[test]
+    fn file_vs_folder_identical_occupant_collapses_no_conflict_file() {
+        let mut occupants = BTreeMap::new();
+        // U2 (file, hash 7) collides with a folder at `Notes.md`; an occupant U1 with the
+        // SAME content (hash 7) already lives at the relocation target.
+        occupants.insert("Notes.md".to_string(), vec![file(U2, 7), folder(1)]);
+        occupants.insert("Notes.md/Notes.md".to_string(), vec![file(U1, 7)]);
+        let view = StructuralView { occupants };
+
+        let ops = resolve_structure(view.clone());
+
+        // The relocate is emitted, then U2 collapses (identical to U1) — no conflict file.
+        assert_eq!(
+            relocated(&ops),
+            vec![(uuid(U2), "Notes.md/Notes.md".to_string())]
+        );
+        assert_eq!(
+            collapsed(&ops),
+            vec![uuid(U2)],
+            "the relocated file collapses into the identical occupant"
+        );
+        assert!(
+            renamed(&ops).is_empty(),
+            "identical content never produces a conflict file"
+        );
+        // Only U1 survives, at the relocation target (U2's content was identical, INV-3).
+        let final_paths = replay(view, &ops);
+        assert_eq!(final_paths.get("Notes.md/Notes.md"), Some(&uuid(U1)));
+        assert_eq!(
+            final_paths.len(),
+            1,
+            "only the occupant survives — nothing lost"
+        );
+    }
+
+    // --- Composition: folder-merge → file-vs-folder → cascade in one pass ---
+
+    /// The pinned-order composition (INV-5.3): a path holds TWO folders AND a file.
+    /// Folder-merge (slot 2) runs first → one folder remains → file-vs-folder (slot 3)
+    /// relocates the file inside. Both shape rules fire in precedence order in the one
+    /// fixpoint, and a shuffled input produces the identical plan (determinism).
+    #[test]
+    fn composition_folder_merge_then_file_vs_folder() {
+        let nodes = vec![folder(2), file(U1, 1), folder(1)];
+        let ops = resolve_structure(view_at("X.md", nodes.clone()));
+
+        assert_eq!(
+            merged_folders(&ops),
+            vec![(TreeID::new(0, 1), TreeID::new(0, 2))],
+            "the two folders merge first (min-TreeID survivor)"
+        );
+        assert_eq!(
+            relocated(&ops),
+            vec![(uuid(U1), "X.md/X.md".to_string())],
+            "then the file relocates into the surviving folder"
+        );
+
+        for shuffle in permutations(&nodes) {
+            let shuffled = resolve_structure(view_at("X.md", shuffle));
+            assert_eq!(merged_folders(&shuffled), merged_folders(&ops));
+            assert_eq!(relocated(&shuffled), relocated(&ops));
+        }
+    }
+
+    // --- Termination: the shape rules strictly decrease the lexicographic measure ---
+
+    /// Each structural-SHAPE rule strictly DECREASES the lexicographic measure at the
+    /// site it resolves while only surfacing strictly-lower components (INV-5.3(b)) —
+    /// pinned here by stepping the measure across a folder-merge-then-file-vs-folder
+    /// composition and asserting it falls monotonically to the resolved view.
+    #[test]
+    fn composition_strictly_decreases_lexicographic_measure() {
+        // X.md holds 2 folders + 1 file: folder-collision=1, file-vs-folder=1.
+        let start = view_at("X.md", vec![folder(2), folder(1), file(U1, 1)]);
+        let m0 = start.measure();
+        assert_eq!(
+            m0,
+            Measure {
+                revive_sites: 0,
+                folder_collision_sites: 1,
+                file_vs_folder_sites: 1,
+                file_collision_sites: 0,
+            }
+        );
+
+        // After resolving the WHOLE plan, the view is materializable — the measure is
+        // the zero tuple (no unresolved site).
+        let ops = resolve_structure(start.clone());
+        let resolved = apply_plan_to_view(start, &ops);
+        assert_eq!(
+            resolved.measure(),
+            Measure {
+                revive_sites: 0,
+                folder_collision_sites: 0,
+                file_vs_folder_sites: 0,
+                file_collision_sites: 0,
+            },
+            "the fully-resolved view has no remaining structural collision"
+        );
+        // And the resolved measure is strictly below the start (lexicographically).
+        assert!(resolved.measure() < m0);
     }
 
     // --- Transitive self-collision resolved within the same fixpoint (INV-5.2) ---
@@ -881,9 +1371,11 @@ mod tests {
     ///
     /// Tracks placement **per UUID** (`uuid -> current path`), NOT per path — the
     /// starting view can hold several files at one path, which a path-keyed map would
-    /// collapse. A `CollapseFile` removes its loser; a `RenameFile` moves its loser to
-    /// the new path. After a correctly-resolved plan every surviving UUID holds a
-    /// distinct path, so inverting to path → uuid is lossless.
+    /// collapse. A `CollapseFile` removes its loser; a `RenameFile` (conflict rename) or
+    /// a `RelocateFile` (file-vs-folder relocate-inside) moves its file to the new path.
+    /// After a correctly-resolved plan every surviving FILE UUID holds a distinct path,
+    /// so inverting to path → uuid is lossless. Folder ops (`MergeFolder`) don't move
+    /// files, so they don't affect file placement and are ignored here.
     fn replay(view: StructuralView, ops: &[StructuralOp]) -> BTreeMap<String, Uuid> {
         let mut by_uuid: BTreeMap<Uuid, String> = BTreeMap::new();
         for (path, nodes) in &view.occupants {
@@ -901,8 +1393,12 @@ mod tests {
                 StructuralOp::RenameFile { loser, to } => {
                     by_uuid.insert(*loser, to.clone());
                 }
-                // P2a emits no folder ops; ignore for the replay model.
-                _ => {}
+                StructuralOp::RelocateFile { uuid, to } => {
+                    by_uuid.insert(*uuid, to.clone());
+                }
+                // A folder merge moves no files; folder-revive is a P2e shape op. Neither
+                // changes file placement.
+                StructuralOp::MergeFolder { .. } | StructuralOp::ReviveFolderChain { .. } => {}
             }
         }
 
@@ -915,6 +1411,60 @@ mod tests {
             );
         }
         by_path
+    }
+
+    /// Apply a plan to a starting view and return the resulting `StructuralView` — a
+    /// path-keyed projection of the apply side, used to assert the resolved view is
+    /// materializable (its [`StructuralView::measure`] is the zero tuple). It replays
+    /// the resolver's OUTPUT plan (the public contract), NOT the resolver's internal
+    /// fixpoint steps, so it does not duplicate the resolver's logic:
+    /// - `CollapseFile` removes the loser file node from wherever it sits.
+    /// - `RenameFile`/`RelocateFile` move that file node to the target path.
+    /// - `MergeFolder` removes the loser folder node (its children are already unioned
+    ///   onto shared child paths by the view's path-keying, so only the loser folder
+    ///   node itself leaves).
+    fn apply_plan_to_view(view: StructuralView, ops: &[StructuralOp]) -> StructuralView {
+        let mut occupants = view.occupants;
+
+        // Move a file node (by UUID) out of its current path to `to`.
+        let move_file = |occ: &mut BTreeMap<String, Vec<NodeKind>>, uuid: Uuid, to: &str| {
+            let mut moved = None;
+            for nodes in occ.values_mut() {
+                if let Some(i) = nodes.iter().position(|n| n.file_uuid() == Some(uuid)) {
+                    moved = Some(nodes.remove(i));
+                    break;
+                }
+            }
+            occ.retain(|_, nodes| !nodes.is_empty());
+            if let Some(node) = moved {
+                occ.entry(to.to_string()).or_default().push(node);
+            }
+        };
+
+        for op in ops {
+            match op {
+                StructuralOp::CollapseFile { loser } => {
+                    for nodes in occupants.values_mut() {
+                        nodes.retain(|n| n.file_uuid() != Some(*loser));
+                    }
+                    occupants.retain(|_, nodes| !nodes.is_empty());
+                }
+                StructuralOp::RenameFile { loser, to } => move_file(&mut occupants, *loser, to),
+                StructuralOp::RelocateFile { uuid, to } => move_file(&mut occupants, *uuid, to),
+                StructuralOp::MergeFolder { loser, .. } => {
+                    for nodes in occupants.values_mut() {
+                        nodes.retain(
+                            |n| !matches!(n, NodeKind::Folder { tree_id } if tree_id == loser),
+                        );
+                    }
+                    occupants.retain(|_, nodes| !nodes.is_empty());
+                }
+                // P2e shape op — not produced by the P2d resolver.
+                StructuralOp::ReviveFolderChain { .. } => {}
+            }
+        }
+
+        StructuralView { occupants }
     }
 
     /// All permutations of a small node slice (for input-shuffle determinism checks).

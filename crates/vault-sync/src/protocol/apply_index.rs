@@ -383,80 +383,111 @@ impl<F: FileSystem> Vault<F> {
         StructuralView { occupants }
     }
 
-    /// Replay a resolved cascade plan against the loro tree + filesystem.
+    /// Replay a resolved structural plan against the loro tree + filesystem.
     ///
-    /// Two phases keep the materialization correct when several documents share a path
-    /// (which is exactly when the cascade runs):
+    /// Three phases keep the materialization correct when several nodes share a path
+    /// (which is exactly when the resolver runs):
     ///
-    /// 1. **Tree ops.** Tombstone each collapsed loser by its `TreeID` (NOT by path —
-    ///    the survivor shares the path, so a path-keyed delete could remove the wrong
-    ///    node) and remove its content `.loro`; move each renamed loser to its conflict
-    ///    path by `TreeID`. Collapses run before renames so a rename onto a
-    ///    just-collapsed loser's old path can't hit `MoveTargetExists`.
-    /// 2. **Re-materialize.** After rebuilding the caches, re-render the `.md` for every
-    ///    path the cascade touched (each survivor path + each conflict path) from the
-    ///    `.loro` of the node the merged tree now says owns it. This is the load-bearing
-    ///    step: on disk, a colliding path's `.md` was last written by whichever doc
-    ///    update landed last (both colliding docs resolve to the same path during
-    ///    `apply_doc_updates`), so it may hold the loser's body; re-materializing from
-    ///    the resolved owner guarantees the survivor's body sits at the path and each
-    ///    loser's body sits at its conflict path. No path is ever fully vacated by the
-    ///    cascade (a survivor always backfills the old path), so nothing is removed here
-    ///    beyond the collapsed losers' `.loro` files.
+    /// 0. **Shape ops (`MergeFolder`).** Settle the tree's folder shape FIRST, because a
+    ///    folder merge unions two folders' children onto shared child paths and so
+    ///    CREATES the same-name file collisions the cascade then resolves — the cascade
+    ///    must run against the post-merge tree (the shape-before-content order, INV-5.3).
+    ///    Keyed by `TreeID` ([`Index::merge_folder_into`]): re-parent the loser's alive
+    ///    children under the survivor, tombstone the loser. Because both folders sit at
+    ///    one display path, the merge moves no `.md` (every child keeps its display
+    ///    path), so it contributes no touched path of its own — only the file collisions
+    ///    it surfaces do. Caches are rebuilt after, so the cascade's lookups see the
+    ///    merged tree.
+    /// 1. **File ops (`CollapseFile`, `RenameFile`, `RelocateFile`).** Tombstone each
+    ///    collapsed loser by its `TreeID` (NOT by path — the survivor shares the path, so
+    ///    a path-keyed delete could remove the wrong node) and remove its `.loro`; then
+    ///    MOVE each file with a target (a conflict rename OR a file-vs-folder relocate —
+    ///    both are a pure file move keyed by UUID) to its final path. Collapses run
+    ///    before moves so a move onto a just-collapsed loser's old path can't hit
+    ///    `MoveTargetExists`. Moves apply in DEPENDENCY order (a target may be another
+    ///    file's current path — the transitive case).
+    /// 2. **Re-materialize.** After rebuilding caches, re-render the `.md` for every
+    ///    touched path (each survivor/relocation/conflict path) from the `.loro` the
+    ///    merged tree now says owns it. Load-bearing: on disk a colliding path's `.md`
+    ///    was last written by whichever doc update landed last, so it may hold the wrong
+    ///    body; re-materializing from the resolved owner puts the right body at each
+    ///    path. A path the resolver fully vacates (e.g. the old file path in a
+    ///    file-vs-folder relocate, now owned by the folder) has no file owner, so its
+    ///    stale `.md` is removed instead — which is also what makes a file-and-folder
+    ///    collision materializable (a real filesystem can't hold both at one path).
     ///
     /// ## Distinct from the existing vacated-path cleanup (DP-5)
     ///
-    /// This cleans the cascade's OWN losers — it is intentionally SEPARATE from
+    /// This cleans the resolver's OWN losers — it is intentionally SEPARATE from
     /// `cleanup_vacated_paths`, which keys on the IMPORT's deletes/moves
-    /// (`deleted_paths`/`pre_import_paths`, captured before the cascade fired, and
-    /// already consumed by the time the cascade runs after `apply_doc_updates`). A
-    /// cascade `CollapseFile` is not in `deleted_paths`, and a cascade `RenameFile` of
-    /// a pre-existing loser is not in the import's move set either — the import's
-    /// move/delete detection ran against snapshots captured before the cascade, so it
-    /// never sees the cascade's tree ops at all. (Even if it did, the import's move
-    /// path no longer suppresses a whole move: a move is detected unconditionally and
-    /// its per-path `old_path_vacated` flag — `false` here, since the survivor occupies
-    /// the loser's old path — only governs whether `cleanup_vacated_paths` deletes the
-    /// OLD `.md`.) Keeping the two cleanups distinct is what preserves that interplay.
+    /// (`deleted_paths`/`pre_import_paths`, captured before the resolver fired, and
+    /// already consumed by the time it runs after `apply_doc_updates`). A `CollapseFile`
+    /// is not in `deleted_paths`, and a `RenameFile`/`RelocateFile` of a pre-existing
+    /// node is not in the import's move set either — the import's move/delete detection
+    /// ran against snapshots captured before the resolver, so it never sees these tree
+    /// ops at all. (Even if it did, the import's move path no longer suppresses a whole
+    /// move: a move is detected unconditionally and its per-path `old_path_vacated`
+    /// flag — `false` here, since the survivor occupies the loser's old path — only
+    /// governs whether `cleanup_vacated_paths` deletes the OLD `.md`.) Keeping the two
+    /// cleanups distinct is what preserves that interplay.
     ///
-    /// **S1 (fail loud):** a `MoveTargetExists` on a rename means the resolver's
-    /// fixpoint produced two ops targeting one path — a real P2a measure bug. We
-    /// `error!` + return `Err` rather than `warn!`+skip, because a silently-skipped
-    /// rename drops the loser's conflict file = INV-3 content loss.
+    /// **S1 (fail loud):** a `MoveTargetExists` on a move means the resolver's fixpoint
+    /// produced two ops targeting one path — a real measure bug. We `error!` + return
+    /// `Err` rather than `warn!`+skip, because a silently-skipped move drops the file's
+    /// conflict/relocation = INV-3 content loss.
     ///
-    /// P2a emits only `CollapseFile`/`RenameFile`; the folder-op arms (`MergeFolder`,
-    /// `RelocateFile`, `ReviveFolderChain`) land in P2d/P2e.
+    /// `ReviveFolderChain` (slot 1) lands in P2e; the P2d resolver never emits it.
     async fn apply_structural_ops(&self, ops: Vec<StructuralOp>) -> Result<()> {
-        // Partition into collapses (apply first) and renames. The resolver's fixpoint
-        // can emit SEVERAL `RenameFile`s for one loser (it relocates the loser step by
-        // step in its working view when a conflict path is itself occupied — the
-        // transitive case), so collapse them to each loser's FINAL target (the last
-        // emitted `to` wins), keeping emission order for the dependency ordering below.
+        // Partition the plan. Folder merges (shape) apply first; collapses next; file
+        // moves (conflict renames AND file-vs-folder relocates — both a pure file move
+        // keyed by UUID) last, in dependency order. The resolver's fixpoint can emit
+        // SEVERAL move ops for one file (it relocates it step by step in its working view
+        // when a target is itself occupied — the transitive case), so collapse them to
+        // each file's FINAL target (the last emitted `to` wins), keeping emission order
+        // for the dependency ordering below.
+        let mut merges: Vec<(loro::TreeID, loro::TreeID)> = Vec::new();
         let mut collapses: Vec<uuid::Uuid> = Vec::new();
         let mut final_target: std::collections::HashMap<uuid::Uuid, String> =
             std::collections::HashMap::new();
-        let mut rename_order: Vec<uuid::Uuid> = Vec::new();
+        let mut move_order: Vec<uuid::Uuid> = Vec::new();
         for op in ops {
             match op {
+                StructuralOp::MergeFolder { survivor, loser } => merges.push((survivor, loser)),
                 StructuralOp::CollapseFile { loser } => collapses.push(loser),
                 StructuralOp::RenameFile { loser, to } => {
                     if final_target.insert(loser, to).is_none() {
-                        rename_order.push(loser);
+                        move_order.push(loser);
                     }
                 }
-                StructuralOp::MergeFolder { .. }
-                | StructuralOp::RelocateFile { .. }
-                | StructuralOp::ReviveFolderChain { .. } => {
-                    // The folder cases are added in P2d/P2e; the P2a resolver never
-                    // emits them, so reaching one here is a forward-compat gap, not a
-                    // runtime path. Skip rather than fail (the resolver is the gate).
-                    debug!("apply_structural_ops: folder op not yet supported, skipping: {op:?}");
+                StructuralOp::RelocateFile { uuid, to } => {
+                    if final_target.insert(uuid, to).is_none() {
+                        move_order.push(uuid);
+                    }
+                }
+                StructuralOp::ReviveFolderChain { .. } => {
+                    // Folder-revive (slot 1) is added in P2e; the P2d resolver never emits
+                    // it, so reaching one here is a forward-compat gap, not a runtime path.
+                    debug!("apply_structural_ops: ReviveFolderChain not yet supported, skipping");
                 }
             }
         }
 
-        // Phase 1 — tree ops. Collect every path the cascade touches so phase 2 can
-        // re-materialize each from its resolved owner.
+        // A file that is also collapsed must not be moved — the collapse (tombstone)
+        // wins. This happens when a file-vs-folder relocate lands on an identical
+        // occupant: the relocate moves the file in, then the cascade collapses it.
+        final_target.retain(|uuid, _| !collapses.contains(uuid));
+        move_order.retain(|uuid| final_target.contains_key(uuid));
+
+        // Phase 0 — folder merges, in plan order (parents before children, the BTreeMap
+        // order the resolver emits), then rebuild caches so phase 1's lookups see the
+        // post-merge tree (the merge surfaced the file collisions phase 1 resolves).
+        for (survivor, loser) in merges {
+            self.index().merge_folder_into(survivor, loser)?;
+        }
+        self.index().rebuild_caches();
+
+        // Phase 1 — file ops. Collect every path touched so phase 2 can re-materialize
+        // each from its resolved owner.
         let mut touched_paths: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
 
@@ -466,46 +497,47 @@ impl<F: FileSystem> Vault<F> {
             }
         }
 
-        // Apply renames in DEPENDENCY order: a loser can only move into its final path
-        // once that path is free, but one loser's final path may be ANOTHER loser's
-        // current path (the transitive case — e.g. loser U2 wants the conflict path that
-        // occupant U3 currently sits at, while U3 moves further out). So apply any
-        // rename whose target is currently unoccupied, and loop until all are placed.
-        // Targets embed the loser's own full UUID (INV-5.2), so they are unique and form
-        // no cycle — a pass that places nothing while renames remain is a resolver bug
-        // (S1), surfaced loudly. The bound is the rename count (each iteration of the
-        // outer loop places ≥1).
-        let mut pending: Vec<uuid::Uuid> = rename_order;
+        // Apply file moves in DEPENDENCY order: a file can only move into its final path
+        // once that path is free, but one file's final path may be ANOTHER file's current
+        // path (the transitive case — e.g. a loser wants the conflict path an occupant
+        // currently sits at, while the occupant moves further out; or a relocated file
+        // and the occupant of its target). So apply any move whose target is currently
+        // unoccupied, and loop until all are placed. Targets embed the file's own full
+        // UUID (a conflict path) or the content-independent `<folder>/<filename>` (a
+        // relocate), so they are unique and form no cycle — a pass that places nothing
+        // while moves remain is a resolver bug (S1), surfaced loudly. The bound is the
+        // move count (each iteration of the outer loop places ≥1).
+        let mut pending: Vec<uuid::Uuid> = move_order;
         while !pending.is_empty() {
             let mut placed_any = false;
             let mut still_pending = Vec::new();
-            for loser in pending {
-                let to = final_target[&loser].clone();
+            for uuid in pending {
+                let to = final_target[&uuid].clone();
                 // The target is free iff no node currently occupies it.
                 if self.index().node_for_path(&to).is_none() {
-                    if let Some(from) = self.rename_loser_node(loser, &to)? {
+                    if let Some(from) = self.move_file_node(uuid, &to)? {
                         touched_paths.insert(from);
                         touched_paths.insert(to);
                     }
                     placed_any = true;
                 } else {
-                    still_pending.push(loser);
+                    still_pending.push(uuid);
                 }
             }
             if !placed_any {
-                // No rename could be placed yet every remaining target is occupied — a
-                // cycle the UUID-unique naming should make impossible. Fail loud (S1):
-                // silently skipping would drop conflict files (INV-3 loss).
+                // No move could be placed yet every remaining target is occupied — a
+                // cycle the unique naming should make impossible. Fail loud (S1):
+                // silently skipping would drop conflict/relocation files (INV-3 loss).
                 let blocked: Vec<String> = still_pending
                     .iter()
                     .map(|u| format!("{u} -> {}", final_target[u]))
                     .collect();
                 error!(
-                    "apply_structural_ops: deadlocked placing conflict renames (every \
+                    "apply_structural_ops: deadlocked placing structural moves (every \
                      remaining target occupied) — a resolver bug: {blocked:?}"
                 );
                 return Err(crate::index::IndexError::MoveTargetExists(format!(
-                    "cascade rename deadlock: {blocked:?}"
+                    "structural move deadlock: {blocked:?}"
                 ))
                 .into());
             }
@@ -556,35 +588,38 @@ impl<F: FileSystem> Vault<F> {
         Ok(Some(path))
     }
 
-    /// Move a renamed loser to its conflict path by its `TreeID` (a pure-structural
-    /// `tree.mov` — UUID + content preserved), returning the old path so the caller can
-    /// re-materialize the survivor there.
+    /// Move a file node (by its document UUID) to a resolved target path — the shared
+    /// primitive behind both a conflict-cascade `RenameFile` and a file-vs-folder
+    /// `RelocateFile` (both are a pure-structural `tree.mov`, UUID + content preserved).
+    /// Returns the old path so the caller can re-materialize whatever now owns it.
     ///
-    /// No `.md` is written or removed here — phase 2 re-materializes both the old path
-    /// (now the survivor's) and the conflict path (now the loser's) from their resolved
-    /// owners. A `MoveTargetExists` fails loudly (S1).
-    fn rename_loser_node(&self, loser: uuid::Uuid, to: &str) -> Result<Option<String>> {
-        let Some(node) = self.index().find_node_by_uuid(&loser) else {
-            debug!("rename_loser_node: no node for {loser} — already resolved");
+    /// Keyed by `TreeID` (resolved from the UUID), not by path, because a cascade rename
+    /// targets a loser whose old path is SHARED with the survivor — a path-keyed move
+    /// could relocate the survivor instead. No `.md` is written or removed here — phase 2
+    /// re-materializes both the old path and the new path from their resolved owners. A
+    /// `MoveTargetExists` fails loudly (S1).
+    fn move_file_node(&self, uuid: uuid::Uuid, to: &str) -> Result<Option<String>> {
+        let Some(node) = self.index().find_node_by_uuid(&uuid) else {
+            debug!("move_file_node: no node for {uuid} — already resolved");
             return Ok(None);
         };
         let Some(from) = self.index().path_for_node(&node) else {
-            debug!("rename_loser_node: no path for {loser} — already resolved");
+            debug!("move_file_node: no path for {uuid} — already resolved");
             return Ok(None);
         };
 
-        // Move THIS node by id (the survivor shares `from`; a path-keyed move could
+        // Move THIS node by id (the survivor may share `from`; a path-keyed move could
         // relocate the survivor instead).
         if let Err(e) = self.index().move_node_by_id(node, &from, to) {
             error!(
-                "rename_loser_node: move {from} -> {to} failed for loser {loser}: {e} — \
-                 the cascade plan is inconsistent (a resolver measure bug); failing loudly \
-                 rather than dropping the conflict file (INV-3)"
+                "move_file_node: move {from} -> {to} failed for {uuid}: {e} — the resolver \
+                 plan is inconsistent (a measure bug); failing loudly rather than dropping \
+                 the file (INV-3)"
             );
             return Err(e.into());
         }
 
-        debug!("rename_loser_node: renamed {loser} ({from} -> {to})");
+        debug!("move_file_node: moved {uuid} ({from} -> {to})");
         Ok(Some(from.clone()))
     }
 

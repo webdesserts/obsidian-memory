@@ -764,6 +764,65 @@ impl Index {
         Ok(())
     }
 
+    /// Merge a loser folder node into a survivor folder node — the conflict resolver's
+    /// folder-merge primitive (INV-1.5c), keyed by `TreeID` not by path.
+    ///
+    /// The resolver emits a `MergeFolder { survivor, loser }` only for two folder nodes
+    /// at the SAME display path; this re-parents every ALIVE child of the loser under
+    /// the survivor, then tombstones the now-emptied loser. Because both folders sit at
+    /// the same display path, re-parenting a child from loser to survivor leaves that
+    /// child's display path UNCHANGED (`P/child` either way) — so, unlike
+    /// [`Self::move_subtree`], no descendant `path` meta needs rewriting; the caller's
+    /// [`Self::rebuild_caches`] re-derives the (unchanged) paths from the tree.
+    ///
+    /// **Only ALIVE children move** (INV-3 / EC-7): a tombstoned child of the loser
+    /// stays tombstoned and is not resurrected. Re-parenting all alive children OUT
+    /// first is required before the delete — loro's `tree.delete` makes a deleted node's
+    /// remaining children "not appear in the state", so any alive child left under the
+    /// loser would be lost.
+    ///
+    /// Keyed by `TreeID` because folder-merge runs precisely when two folder nodes share
+    /// one path, where a path-keyed lookup can't tell them apart. Same-name child
+    /// collisions the union surfaces (two files at `P/Notes.md`, or two sub-folders at
+    /// `P/sub`) are resolved by the resolver's other cases in the same plan — they are
+    /// NOT this primitive's concern. In-memory only — the caller persists via
+    /// [`Self::save_index`] and rebuilds caches.
+    pub fn merge_folder_into(&self, survivor: TreeID, loser: TreeID) -> Result<()> {
+        let tree = self.index_tree();
+
+        // Defensive: a loser already tombstoned (or gone) is a no-op — the resolver
+        // emits one merge per loser, so this should not happen, but skipping rather than
+        // erroring keeps a redundant replay safe.
+        if tree.is_node_deleted(&loser).unwrap_or(true) {
+            tracing::debug!("merge_folder_into: loser {:?} already gone — no-op", loser);
+            return Ok(());
+        }
+
+        // Re-parent every ALIVE direct child of the loser under the survivor. A
+        // tombstoned child is left in the Deleted set (INV-3) — it must NOT move.
+        let children = tree.children(loser).unwrap_or_default();
+        for child in children {
+            if tree.is_node_deleted(&child).unwrap_or(true) {
+                continue;
+            }
+            tree.mov(child, TreeParentId::Node(survivor)).map_err(|e| {
+                IndexError::TreeOperation(format!("Failed to re-parent folder child: {}", e))
+            })?;
+        }
+
+        // Tombstone the emptied loser folder node.
+        tree.delete(loser).map_err(|e| {
+            IndexError::TreeOperation(format!("Failed to delete merged folder node: {}", e))
+        })?;
+
+        tracing::info!(
+            "Merged folder node into survivor: {:?} <- {:?}",
+            survivor,
+            loser
+        );
+        Ok(())
+    }
+
     /// Resolve a FOLDER node by its full prefix path (lookup-only — never creates).
     ///
     /// Folders are absent from `path_to_node` (only file nodes are cached), so this

@@ -16,7 +16,11 @@
 mod common;
 use common::*;
 
-use vault_sync::{FileSystem, IndexError, content_doc_path};
+use vault_sync::{FileSystem, InMemoryFs, IndexError, Vault, conflict_name, content_doc_path};
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use uuid::Uuid;
 
 // ========================= AC-INV-1.5b — folder move (zero content) =========================
 
@@ -266,5 +270,444 @@ mod move_subtree_edges {
             uuid_before,
             "an identical-prefix move leaves the subtree untouched"
         );
+    }
+}
+
+// ===================== shared assertion helpers (folder cascade) =====================
+
+/// The set of `.md` files a vault currently materializes on disk (survivors + conflict
+/// files + relocated files), for exact-set assertions.
+async fn md_files(vault: &V) -> BTreeSet<String> {
+    vault.list_files().await.unwrap().into_iter().collect()
+}
+
+/// The conflict-file path the file cascade renames a loser to (full-UUID suffix).
+fn conflict_path(original: &str, loser: &Uuid) -> String {
+    conflict_name(original, loser)
+}
+
+/// Read a `.md` file as a String (panics if absent).
+async fn read_md_str(fs: &Fs, path: &str) -> String {
+    String::from_utf8(read_md(fs, path).await).unwrap()
+}
+
+/// Count the ALIVE folder nodes whose display path equals `path` in `vault`'s Index —
+/// used to assert a folder collision merged down to exactly one surviving folder node
+/// (folders aren't materialized in `list_files`, so the merge is observed via the Index
+/// scan that the resolver itself reads).
+fn folder_nodes_at(vault: &V, path: &str) -> usize {
+    vault
+        .index()
+        .scan_structural_nodes()
+        .iter()
+        .filter(
+            |n| matches!(n, vault_sync::index::StructuralNode::Folder { path: p, .. } if p == path),
+        )
+        .count()
+}
+
+/// Build three empty in-memory vaults (A/B/C, authored 1/2/3) with their retained
+/// filesystems — for the ≥3-replica determinism checks.
+async fn three_vaults() -> (V, V, V, Fs, Fs, Fs) {
+    let fs_a = Arc::new(InMemoryFs::new());
+    let fs_b = Arc::new(InMemoryFs::new());
+    let fs_c = Arc::new(InMemoryFs::new());
+    let a = Vault::init(Arc::clone(&fs_a), author(1)).await.unwrap();
+    let b = Vault::init(Arc::clone(&fs_b), author(2)).await.unwrap();
+    let c = Vault::init(Arc::clone(&fs_c), author(3)).await.unwrap();
+    (a, b, c, fs_a, fs_b, fs_c)
+}
+
+// ===================== AC-OQ5-FOLDERMERGE — folder-collision merge =====================
+//
+// Two replicas independently create distinct FOLDER nodes at one display path (each
+// inserts its own `proj/` folder node when it indexes a file under `proj/`). On sync the
+// two folder nodes collide; the resolver merges them into the min-TreeID survivor and
+// unions their children — and any same-name file the union surfaces falls to the file
+// cascade. Checked in BOTH sync directions (the merge is symmetric — no locality).
+
+mod ac_oq5_folder_merge {
+    use super::*;
+
+    /// The full folder-merge AC: two replicas each build a distinct `proj/` folder with
+    /// a SAME-named `proj/Notes.md` (different content) plus a distinct file each
+    /// (`proj/a.md` on A, `proj/b.md` on B) and a SAME-named nested sub-folder
+    /// (`proj/sub/` each, a file inside). After converging, every replica agrees on:
+    /// a single survivor folder holding the UNION (`proj/a.md`, `proj/b.md`, the resolved
+    /// `proj/Notes.md` + its conflict file, `proj/sub/...`), and the surfaced
+    /// `proj/Notes.md` collision resolves by the cascade (min-UUID survivor + a full-UUID
+    /// conflict file), nothing lost (INV-3). The nested same-name sub-folder merges
+    /// transitively. Run BOTH directions — the outcome must be identical.
+    #[tokio::test]
+    async fn distinct_folders_merge_union_children_surface_file_falls_to_cascade() {
+        for direction in ["a_first", "b_first"] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+
+            // A's `proj/` folder: a distinct file, a same-named Notes.md, a nested file.
+            write_and_index(&a, &fs_a, "proj/a.md", "# A\n\nAlpha.\n").await;
+            write_and_index(&a, &fs_a, "proj/Notes.md", "# Notes A\n\nFrom A.\n").await;
+            write_and_index(&a, &fs_a, "proj/sub/deep.md", "# Deep A\n\nA deep.\n").await;
+            // B's `proj/` folder: a distinct file, a same-named Notes.md (DIFFERENT
+            // content), a nested file under a same-named sub-folder.
+            write_and_index(&b, &fs_b, "proj/b.md", "# B\n\nBeta.\n").await;
+            write_and_index(&b, &fs_b, "proj/Notes.md", "# Notes B\n\nFrom B.\n").await;
+            write_and_index(&b, &fs_b, "proj/sub/deeper.md", "# Deeper B\n\nB deep.\n").await;
+
+            // The two Notes.md docs collide; min-UUID wins the path, the loser gets a
+            // conflict file. (a.md/b.md/deep.md/deeper.md are distinct paths — no
+            // collision; they just union under the one survivor folder.)
+            let notes_a = uuid_at(&a, "proj/Notes.md");
+            let notes_b = uuid_at(&b, "proj/Notes.md");
+            let notes_survivor = notes_a.min(notes_b);
+            let notes_loser = notes_a.max(notes_b);
+
+            match direction {
+                "a_first" => sync_both_ways(&a, &b).await,
+                _ => sync_both_ways(&b, &a).await,
+            }
+
+            let notes_conflict = conflict_path("proj/Notes.md", &notes_loser);
+            // The exact union of `.md` files on both replicas: the four distinct files,
+            // the surviving Notes.md, and the one conflict file — nothing stray, nothing
+            // lost. (A stray duplicate folder would surface its children at a divergent
+            // path; the exact-set assertion is the no-instrument proof the merge unioned
+            // under ONE survivor folder.)
+            let expected = BTreeSet::from([
+                "proj/a.md".to_string(),
+                "proj/b.md".to_string(),
+                "proj/Notes.md".to_string(),
+                notes_conflict.clone(),
+                "proj/sub/deep.md".to_string(),
+                "proj/sub/deeper.md".to_string(),
+            ]);
+            assert_eq!(
+                md_files(&a).await,
+                expected,
+                "[{direction}] A: the union under one survivor folder + the Notes conflict file"
+            );
+            assert_eq!(
+                md_files(&b).await,
+                expected,
+                "[{direction}] B: same exact set (converged, both directions)"
+            );
+
+            // The Notes.md collision resolved deterministically (min-UUID survivor).
+            assert_eq!(
+                uuid_at(&a, "proj/Notes.md"),
+                notes_survivor,
+                "[{direction}] A: min-UUID Notes survivor"
+            );
+            assert_eq!(
+                uuid_at(&b, "proj/Notes.md"),
+                notes_survivor,
+                "[{direction}] B: min-UUID Notes survivor"
+            );
+
+            // Both Notes bodies survive (INV-3): the survivor's at the path, the loser's
+            // at the conflict file, on both replicas.
+            let want_survivor = if notes_survivor == notes_a {
+                "From A."
+            } else {
+                "From B."
+            };
+            let want_loser = if notes_loser == notes_a {
+                "From A."
+            } else {
+                "From B."
+            };
+            for (label, fs) in [("A", &fs_a), ("B", &fs_b)] {
+                assert!(
+                    read_md_str(fs, "proj/Notes.md")
+                        .await
+                        .contains(want_survivor),
+                    "[{direction}] {label}: survivor Notes body at the path"
+                );
+                assert!(
+                    read_md_str(fs, &notes_conflict).await.contains(want_loser),
+                    "[{direction}] {label}: loser Notes body at the conflict file"
+                );
+            }
+
+            // Exactly one `proj` folder node survives the merge — the duplicate is gone.
+            // (Folders aren't in list_files; assert via the index scan: the survivor + the
+            // sub-folder, no duplicate `proj`.)
+            for (label, vault) in [("A", &a), ("B", &b)] {
+                let proj_folders = folder_nodes_at(vault, "proj");
+                assert_eq!(
+                    proj_folders, 1,
+                    "[{direction}] {label}: exactly one `proj` folder node after the merge"
+                );
+                let sub_folders = folder_nodes_at(vault, "proj/sub");
+                assert_eq!(
+                    sub_folders, 1,
+                    "[{direction}] {label}: the nested `proj/sub` merged transitively to one node"
+                );
+            }
+        }
+    }
+
+    /// A tombstoned child of the LOSER folder stays tombstoned across the merge — the
+    /// folder-merge resurrects no deleted note (INV-3 / EC-7). B (the higher-peer
+    /// replica, so its `proj/` folder loses to A's min-TreeID survivor) deletes
+    /// `proj/gone.md` before syncing; after the merge `proj/gone.md` does NOT come back,
+    /// while B's alive `proj/keep_b.md` unions in. (`merge_folder_into` carries a
+    /// defensive `is_node_deleted` skip, but loro's `tree.children` already excludes a
+    /// tombstoned node — so this pins the user-facing "deleted note stays deleted"
+    /// guarantee rather than a load-bearing branch.)
+    #[tokio::test]
+    async fn tombstoned_child_of_loser_folder_stays_deleted() {
+        let (a, b, fs_a, fs_b) = two_vaults().await;
+
+        // A's `proj/` (peer author(1) → smaller TreeID → the survivor).
+        write_and_index(&a, &fs_a, "proj/keep_a.md", "# A\n\nKeep A.\n").await;
+        // B's `proj/` (peer author(2) → larger TreeID → the loser) with a doomed child.
+        write_and_index(&b, &fs_b, "proj/keep_b.md", "# B\n\nKeep B.\n").await;
+        write_and_index(&b, &fs_b, "proj/gone.md", "# Gone\n\nDeleted on B.\n").await;
+        // B deletes `proj/gone.md` (tombstone) before the merge.
+        b.index().delete_node("proj/gone.md").unwrap();
+        fs_b.delete("proj/gone.md").await.unwrap();
+        b.save_index().await.unwrap();
+
+        sync_both_ways(&a, &b).await;
+
+        // The two `proj` folders merged to one; both alive files unioned in.
+        let expected = BTreeSet::from(["proj/keep_a.md".to_string(), "proj/keep_b.md".to_string()]);
+        for (label, vault) in [("A", &a), ("B", &b)] {
+            assert_eq!(
+                md_files(vault).await,
+                expected,
+                "{label}: the merge unions the alive children and resurrects nothing"
+            );
+            assert_eq!(
+                folder_nodes_at(vault, "proj"),
+                1,
+                "{label}: one survivor `proj` folder"
+            );
+            // The deleted note is NOT resurrected by the merge (INV-3).
+            assert!(
+                vault.index().node_for_path("proj/gone.md").is_none(),
+                "{label}: the tombstoned child stays deleted across the folder merge"
+            );
+        }
+        assert!(!fs_a.exists("proj/gone.md").await.unwrap());
+        assert!(!fs_b.exists("proj/gone.md").await.unwrap());
+    }
+}
+
+// ===================== AC-INV-1.5d — file-vs-folder (relocate inside) =====================
+//
+// A file node and a folder node collide at one display path. The folder wins the path;
+// the file relocates INSIDE it at `<folder>/<filename>`, UUID + content preserved, zero
+// loss (INV-1.5d, DECIDED relocate-inside). To construct the shape, a folder is named to
+// coincide with a file — files are `.md`, so the folder segment ends in `.md`.
+
+mod ac_inv_1_5d_file_vs_folder {
+    use super::*;
+
+    /// A creates a FOLDER `Notes.md/` (by indexing `Notes.md/x.md`); B creates a FILE
+    /// `Notes.md`. After they converge, the folder keeps `Notes.md`, and B's file
+    /// relocates to `Notes.md/Notes.md` — its UUID and body preserved, both present, on
+    /// both replicas and in both directions.
+    #[tokio::test]
+    async fn folder_wins_path_file_relocates_inside() {
+        for direction in ["a_first", "b_first"] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+
+            // A: a folder named `Notes.md` holding a child file.
+            write_and_index(&a, &fs_a, "Notes.md/x.md", "# Inside\n\nFolder child.\n").await;
+            // B: a real file at `Notes.md`.
+            write_and_index(&b, &fs_b, "Notes.md", "# File\n\nA real note.\n").await;
+            let file_uuid = uuid_at(&b, "Notes.md");
+            let child_uuid = uuid_at(&a, "Notes.md/x.md");
+
+            match direction {
+                "a_first" => sync_both_ways(&a, &b).await,
+                _ => sync_both_ways(&b, &a).await,
+            }
+
+            // The folder wins `Notes.md`: its child still lives there, with its UUID.
+            for (label, vault) in [("A", &a), ("B", &b)] {
+                assert_eq!(
+                    uuid_at(vault, "Notes.md/x.md"),
+                    child_uuid,
+                    "[{direction}] {label}: the folder's child keeps its path + UUID"
+                );
+                // The relocated file lives INSIDE the folder, same UUID.
+                assert_eq!(
+                    uuid_at(vault, "Notes.md/Notes.md"),
+                    file_uuid,
+                    "[{direction}] {label}: B's file relocated to <folder>/<filename>, UUID preserved"
+                );
+            }
+
+            // Exactly the two files materialize — the folder child + the relocated file
+            // — on both replicas. (`Notes.md` is now a directory, not a `.md` file.)
+            let expected =
+                BTreeSet::from(["Notes.md/x.md".to_string(), "Notes.md/Notes.md".to_string()]);
+            assert_eq!(md_files(&a).await, expected, "[{direction}] A's file set");
+            assert_eq!(md_files(&b).await, expected, "[{direction}] B's file set");
+
+            // Both bodies survive (INV-3): the child's and the relocated file's.
+            for (label, fs) in [("A", &fs_a), ("B", &fs_b)] {
+                assert!(
+                    read_md_str(fs, "Notes.md/x.md")
+                        .await
+                        .contains("Folder child."),
+                    "[{direction}] {label}: the folder child's body survived"
+                );
+                assert!(
+                    read_md_str(fs, "Notes.md/Notes.md")
+                        .await
+                        .contains("A real note."),
+                    "[{direction}] {label}: the relocated file's body survived inside the folder"
+                );
+            }
+        }
+    }
+
+    /// File-vs-folder whose relocation target is ALREADY occupied: A's folder `Notes.md/`
+    /// already holds a live `Notes.md/Notes.md`, and B creates a file `Notes.md` that
+    /// would relocate onto exactly that path. The relocate surfaces a file collision the
+    /// same pass resolves — min-UUID wins `Notes.md/Notes.md`, the other gets a conflict
+    /// file — nothing lost.
+    #[tokio::test]
+    async fn relocation_onto_occupied_target_falls_to_cascade() {
+        let (a, b, fs_a, fs_b) = two_vaults().await;
+
+        // A: a folder `Notes.md/` that already holds a live file at the relocation
+        // target `Notes.md/Notes.md`.
+        write_and_index(
+            &a,
+            &fs_a,
+            "Notes.md/Notes.md",
+            "# Occupant\n\nAlready here.\n",
+        )
+        .await;
+        let occupant = uuid_at(&a, "Notes.md/Notes.md");
+        // B: a file at `Notes.md` that will relocate INTO the folder, onto the occupant.
+        write_and_index(&b, &fs_b, "Notes.md", "# Incoming\n\nRelocating in.\n").await;
+        let incoming = uuid_at(&b, "Notes.md");
+
+        sync_both_ways(&a, &b).await;
+
+        // The relocation target `Notes.md/Notes.md` resolves by min-UUID; the other gets
+        // a conflict file off it.
+        let target_winner = occupant.min(incoming);
+        let target_loser = occupant.max(incoming);
+        let further = conflict_path("Notes.md/Notes.md", &target_loser);
+
+        for (label, vault) in [("A", &a), ("B", &b)] {
+            assert_eq!(
+                uuid_at(vault, "Notes.md/Notes.md"),
+                target_winner,
+                "[{label}] min-UUID wins the relocation target"
+            );
+            assert_eq!(
+                uuid_at(vault, &further),
+                target_loser,
+                "[{label}] the other lands at a conflict file off the target"
+            );
+        }
+
+        // Both documents survive (INV-3): occupant + incoming, at distinct paths.
+        let expected = BTreeSet::from(["Notes.md/Notes.md".to_string(), further.clone()]);
+        assert_eq!(
+            md_files(&a).await,
+            expected,
+            "A: occupant + relocated-loser conflict"
+        );
+        assert_eq!(md_files(&b).await, expected, "B: same exact set");
+        for (label, fs) in [("A", &fs_a), ("B", &fs_b)] {
+            let bodies = format!(
+                "{}\n{}",
+                read_md_str(fs, "Notes.md/Notes.md").await,
+                read_md_str(fs, &further).await,
+            );
+            assert!(
+                bodies.contains("Already here."),
+                "[{label}] occupant body survived"
+            );
+            assert!(
+                bodies.contains("Relocating in."),
+                "[{label}] incoming body survived"
+            );
+        }
+    }
+}
+
+// ===================== determinism — ≥3 replicas, any order =====================
+
+mod folder_cascade_determinism {
+    use super::*;
+
+    /// The folder-merge composition converges to the IDENTICAL materialized state across
+    /// THREE replicas pumped to quiescence in arbitrary pair order — the cross-replica
+    /// determinism guarantee (INV-5.3c) for the folder rules. Three replicas each build a
+    /// distinct `proj/` folder with a same-named `proj/Shared.md` (different content) and
+    /// a distinct file each; the global-min-TreeID folder survives, the three Shared.md
+    /// docs resolve to one survivor + two conflict files, identical everywhere.
+    #[tokio::test]
+    async fn three_replicas_folder_merge_converges_identically() {
+        let (a, b, c, fs_a, fs_b, fs_c) = three_vaults().await;
+
+        write_and_index(&a, &fs_a, "proj/a.md", "# A\n\nAlpha.\n").await;
+        write_and_index(&a, &fs_a, "proj/Shared.md", "# Shared A\n\nA.\n").await;
+        write_and_index(&b, &fs_b, "proj/b.md", "# B\n\nBeta.\n").await;
+        write_and_index(&b, &fs_b, "proj/Shared.md", "# Shared B\n\nB.\n").await;
+        write_and_index(&c, &fs_c, "proj/c.md", "# C\n\nGamma.\n").await;
+        write_and_index(&c, &fs_c, "proj/Shared.md", "# Shared C\n\nC.\n").await;
+
+        let s_a = uuid_at(&a, "proj/Shared.md");
+        let s_b = uuid_at(&b, "proj/Shared.md");
+        let s_c = uuid_at(&c, "proj/Shared.md");
+        let survivor = s_a.min(s_b).min(s_c);
+        let losers: Vec<Uuid> = [s_a, s_b, s_c]
+            .into_iter()
+            .filter(|u| *u != survivor)
+            .collect();
+
+        pump_to_quiescence(&[&a, &b, &c]).await;
+
+        // Every replica: the three distinct files, the surviving Shared.md, and a conflict
+        // file per Shared loser — all under one survivor folder, identical everywhere.
+        let mut expected = BTreeSet::from([
+            "proj/a.md".to_string(),
+            "proj/b.md".to_string(),
+            "proj/c.md".to_string(),
+            "proj/Shared.md".to_string(),
+        ]);
+        for loser in &losers {
+            expected.insert(conflict_path("proj/Shared.md", loser));
+        }
+        for (label, vault) in [("A", &a), ("B", &b), ("C", &c)] {
+            assert_eq!(
+                md_files(vault).await,
+                expected,
+                "{label}: the converged union + Shared conflict files"
+            );
+            assert_eq!(
+                uuid_at(vault, "proj/Shared.md"),
+                survivor,
+                "{label}: global-min Shared survivor"
+            );
+            assert_eq!(
+                folder_nodes_at(vault, "proj"),
+                1,
+                "{label}: exactly one `proj` folder node (the others merged away)"
+            );
+        }
+
+        // No body lost: all three Shared bodies present on A.
+        let mut bodies = String::new();
+        for path in md_files(&a).await {
+            bodies.push_str(&read_md_str(&fs_a, &path).await);
+            bodies.push('\n');
+        }
+        for needle in ["A.", "B.", "C."] {
+            assert!(
+                bodies.contains(needle),
+                "the Shared {needle} body survived (INV-3)"
+            );
+        }
     }
 }
