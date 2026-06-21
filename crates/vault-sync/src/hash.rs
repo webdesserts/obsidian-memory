@@ -15,6 +15,24 @@
 //! process and would split replicas on identical content.
 
 use crate::content_doc::ContentDoc;
+use loro::VersionVector;
+
+/// Fingerprint a content document's version vector for the Index's denormalized
+/// `content_version` cache.
+///
+/// The Index stores this 32-byte blake3 digest of the encoded version vector on
+/// each file node, so the compare protocol can digest the catalog (detect which
+/// documents changed) WITHOUT opening every content `.loro`. It is a derived cache
+/// — each content doc's `state_vv()` remains authoritative; the fingerprint is set
+/// at registration and refreshed on each local edit.
+///
+/// Unlike [`content_hash`] (which hashes materialized markdown to answer "same
+/// content?"), this hashes the version-vector bytes to answer "same version?". The
+/// two are distinct: two replicas can converge to identical content via different
+/// op histories, so equal content does not imply equal version vector.
+pub fn content_version_fingerprint(vv: &VersionVector) -> [u8; 32] {
+    *blake3::hash(&vv.encode()).as_bytes()
+}
 
 /// A per-document content fingerprint plus the emptiness flag the cascade needs.
 ///
