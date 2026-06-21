@@ -15,6 +15,10 @@
 //!   because Cargo feature unification can't express "Send only when native feature is
 //!   enabled" — the arch check is the only reliable way to vary trait bounds.
 
+pub mod content_doc;
 pub mod fs;
+pub mod markdown;
 
+pub use content_doc::{ContentDoc, DocumentError};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
+pub use markdown::ParsedMarkdown;
