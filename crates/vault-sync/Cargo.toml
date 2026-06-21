@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bincode.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 loro.workspace = true
@@ -15,7 +16,9 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true
 tracing.workspace = true
-uuid = { workspace = true }
+# The `serde` feature lets `DocId(Uuid)` derive Serialize/Deserialize for the wire
+# (bincode encodes the UUID as 16 bytes, keeping the wire compact).
+uuid = { workspace = true, features = ["serde"] }
 web-time.workspace = true
 
 [dev-dependencies]

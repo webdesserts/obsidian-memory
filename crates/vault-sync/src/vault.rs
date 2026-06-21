@@ -107,25 +107,25 @@ impl<F: FileSystem> Vault<F> {
 
     /// Borrow the document cache for reading (WASM).
     #[cfg(target_arch = "wasm32")]
-    fn documents(&self) -> std::cell::Ref<'_, HashMap<String, ContentDoc>> {
+    pub(crate) fn documents(&self) -> std::cell::Ref<'_, HashMap<String, ContentDoc>> {
         self.documents.borrow()
     }
 
     /// Borrow the document cache for reading (native).
     #[cfg(not(target_arch = "wasm32"))]
-    fn documents(&self) -> std::sync::MutexGuard<'_, HashMap<String, ContentDoc>> {
+    pub(crate) fn documents(&self) -> std::sync::MutexGuard<'_, HashMap<String, ContentDoc>> {
         self.documents.lock().unwrap()
     }
 
     /// Borrow the document cache for mutation (WASM).
     #[cfg(target_arch = "wasm32")]
-    fn documents_mut(&self) -> std::cell::RefMut<'_, HashMap<String, ContentDoc>> {
+    pub(crate) fn documents_mut(&self) -> std::cell::RefMut<'_, HashMap<String, ContentDoc>> {
         self.documents.borrow_mut()
     }
 
     /// Borrow the document cache for mutation (native).
     #[cfg(not(target_arch = "wasm32"))]
-    fn documents_mut(&self) -> std::sync::MutexGuard<'_, HashMap<String, ContentDoc>> {
+    pub(crate) fn documents_mut(&self) -> std::sync::MutexGuard<'_, HashMap<String, ContentDoc>> {
         self.documents.lock().unwrap()
     }
 
@@ -415,9 +415,22 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Resolve the UUID for a path via the Index cache (a live node's UUID meta).
-    fn uuid_for_path(&self, path: &str) -> Option<Uuid> {
+    pub(crate) fn uuid_for_path(&self, path: &str) -> Option<Uuid> {
         let node = self.index.node_for_path(path)?;
         self.index.node_uuid(&node)
+    }
+
+    /// The filesystem this vault is bound to (for the protocol's apply paths).
+    pub(crate) fn fs(&self) -> &F {
+        &self.fs
+    }
+
+    /// Mark a path as synced before writing it to disk (echo detection).
+    ///
+    /// The inbound apply paths call this so the local file watcher, firing on the
+    /// write the apply just made, recognizes it as an echo and does not re-broadcast.
+    pub(crate) fn mark_synced(&self, path: &str) {
+        self.index.sync_state.mark_synced(path);
     }
 
     /// Resolve the UUID for a (path, doc) pair: prefer the Index node's UUID, else

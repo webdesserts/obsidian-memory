@@ -212,6 +212,46 @@ impl Index {
         self.index.borrow()
     }
 
+    // ========== Wire surface (consumed by the sync protocol) ==========
+    //
+    // The Index is the catalog CRDT; the sync protocol exchanges its updates as
+    // bytes. These wrap the underlying `LoroDoc` export/import so the protocol
+    // (a sibling module) never reaches into the `LoroDoc` directly.
+
+    /// The Index CRDT's current version vector.
+    ///
+    /// The basis for computing what Index updates a peer is missing.
+    pub(crate) fn state_vv(&self) -> loro::VersionVector {
+        self.index().state_vv()
+    }
+
+    /// Export the entire Index CRDT as a snapshot (for a peer that lacks it, or
+    /// when a new-doc snapshot rides along and the node must be resend-durable).
+    pub(crate) fn export_snapshot(&self) -> Result<Vec<u8>> {
+        self.index()
+            .export(loro::ExportMode::Snapshot)
+            .map_err(|e| IndexError::IndexExport(format!("Failed to export Index snapshot: {}", e)))
+    }
+
+    /// Export the Index CRDT updates since `from` (an incremental delta).
+    pub(crate) fn export_updates(&self, from: &loro::VersionVector) -> Result<Vec<u8>> {
+        self.index()
+            .export(loro::ExportMode::updates(from))
+            .map_err(|e| IndexError::IndexExport(format!("Failed to export Index updates: {}", e)))
+    }
+
+    /// Import Index CRDT updates from a peer (a delta or a snapshot — Loro merges
+    /// either). Returns the [`loro::ImportStatus`] so the caller can surface ops
+    /// parked with unsatisfied causal dependencies (`warn_if_pending`).
+    ///
+    /// Does NOT rebuild the caches — the caller does that after import (it also
+    /// needs the pre-import cache to detect deletes/moves).
+    pub(crate) fn import_updates(&self, data: &[u8]) -> Result<loro::ImportStatus> {
+        self.index()
+            .import(data)
+            .map_err(|e| IndexError::IndexImport(format!("Index import failed: {}", e)))
+    }
+
     /// Borrow the path → node cache for reads.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn path_to_node(&self) -> std::sync::MutexGuard<'_, HashMap<String, TreeID>> {

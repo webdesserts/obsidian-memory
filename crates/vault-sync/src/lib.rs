@@ -21,6 +21,7 @@ pub mod fs;
 pub mod hash;
 pub mod index;
 pub mod markdown;
+pub mod protocol;
 pub mod vault;
 
 pub use content_doc::{ContentDoc, DocumentError};
@@ -32,4 +33,5 @@ pub use index::{
     content_doc_path,
 };
 pub use markdown::ParsedMarkdown;
+pub use protocol::{DocId, SyncError, SyncMessage, SyncOutcome};
 pub use vault::Vault;
