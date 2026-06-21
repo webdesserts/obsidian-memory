@@ -16,12 +16,15 @@
 //!   enabled" — the arch check is the only reliable way to vary trait bounds.
 
 pub mod content_doc;
+pub mod events;
 pub mod fs;
 pub mod hash;
 pub mod index;
 pub mod markdown;
+pub mod vault;
 
 pub use content_doc::{ContentDoc, DocumentError};
+pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use hash::{ContentSummary, content_hash, content_summary, content_version_fingerprint};
 pub use index::{
@@ -29,3 +32,4 @@ pub use index::{
     content_doc_path,
 };
 pub use markdown::ParsedMarkdown;
+pub use vault::Vault;

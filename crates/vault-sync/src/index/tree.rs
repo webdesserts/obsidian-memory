@@ -180,6 +180,27 @@ impl Index {
         bytes.as_slice().try_into().ok()
     }
 
+    /// Refresh a node's denormalized `content_version` fingerprint after a local edit.
+    ///
+    /// `register_document` sets the initial value; the public handle's local-write
+    /// flow calls this on each real content change so the derived cache stays in step
+    /// with the content doc's `state_vv()` (the authoritative source). In-memory only
+    /// — the caller persists via `save_index`.
+    pub fn set_content_version(
+        &self,
+        node_id: &TreeID,
+        content_version: &[u8; 32],
+    ) -> Result<()> {
+        let meta = self.index_tree().get_meta(*node_id).map_err(|e| {
+            IndexError::TreeOperation(format!("Failed to get file meta for content_version: {}", e))
+        })?;
+        meta.insert(TREE_META_CONTENT_VERSION, content_version.as_slice())
+            .map_err(|e| {
+                IndexError::TreeOperation(format!("Failed to update content_version: {}", e))
+            })?;
+        Ok(())
+    }
+
     /// Validate a sync path for security.
     fn validate_sync_path(path: &str) -> Result<()> {
         // Empty path
