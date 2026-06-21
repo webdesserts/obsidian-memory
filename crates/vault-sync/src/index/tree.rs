@@ -651,6 +651,183 @@ impl Index {
         Ok(())
     }
 
+    /// Move/rename a whole FOLDER and everything under it — the folder-safe move
+    /// primitive (INV-1.5b) that the per-file [`Self::move_node`] is not.
+    ///
+    /// A folder move is ONE `tree.mov` on the folder node: loro's movable tree
+    /// carries every descendant structurally for free, so no content `.loro` is
+    /// touched and every descendant keeps its UUID — that is what makes "a folder
+    /// move re-transfers zero content" (INV-1) structurally true.
+    ///
+    /// The reason this can't just be `move_node` on the folder: `move_node` rewrites
+    /// only the single moved node's denormalized `path`/`name` meta and patches one
+    /// cache entry. After re-parenting a folder, every DESCENDANT file node's `path`
+    /// meta and `path_to_node` entry is stale — its tree position moved but its
+    /// stored path string didn't. That denormalized `path` meta is load-bearing: it's
+    /// the only way a tombstoned node's location is recovered
+    /// ([`Self::deleted_node_path_for_uuid`] + the deleted-paths re-derivation in
+    /// [`Self::rebuild_caches`]). So this rewrites every descendant file node's
+    /// `path` meta to its new location, then rebuilds the caches from index truth.
+    ///
+    /// Correctness-first: it does the single `tree.mov`, rewrites descendant `path`
+    /// meta, then a full [`Self::rebuild_caches`] (already O(nodes) on every load), in
+    /// that order. Folder descendants carry only `type`+`name` meta (no `path`), so
+    /// they need no rewrite — the rebuild re-derives their paths from the tree.
+    ///
+    /// This is a clean STRUCTURAL mover: it errors with [`IndexError::MoveTargetExists`]
+    /// if `new_prefix` is already occupied by a folder or a file. Collision POLICY
+    /// (folder-merge, file-vs-folder) lives in the conflict resolver, not here. In-memory
+    /// only — the caller persists via [`Self::save_index`].
+    pub fn move_subtree(&self, old_prefix: &str, new_prefix: &str) -> Result<()> {
+        // No-op if the prefixes are identical (mirrors `move_node`).
+        if old_prefix == new_prefix {
+            return Ok(());
+        }
+
+        // Resolve the folder node at `old_prefix`. Folders are not in `path_to_node`,
+        // so descend the prefix's segments from the root, requiring each to be an
+        // existing folder. A missing folder node means there is nothing to move.
+        let Some(folder_node) = self.find_folder_node(old_prefix) else {
+            return Err(IndexError::MoveSourceMissing(format!(
+                "Source folder not found: {}",
+                old_prefix
+            )));
+        };
+
+        // The raw primitive refuses an occupied target — `new_prefix` already taken by
+        // a folder (folder-MERGE territory) or a file (file-vs-folder). Collision
+        // policy is the resolver's job (P2d); here it's a hard error. Checked BEFORE
+        // creating the destination parent chain so a refused move leaves no spurious
+        // folders behind.
+        if self.find_folder_node(new_prefix).is_some()
+            || self.find_node_by_path(new_prefix).is_some()
+        {
+            return Err(IndexError::MoveTargetExists(format!(
+                "Target already exists: {}",
+                new_prefix
+            )));
+        }
+
+        // Ensure the destination PARENT chain exists (everything above the folder's
+        // own new name), then re-parent the folder node there in one move.
+        let new_parts: Vec<&str> = new_prefix.split('/').collect();
+        let (new_parent_folders, new_name) = new_parts.split_at(new_parts.len() - 1);
+        let mut new_parent = TreeParentId::Root;
+        for folder_name in new_parent_folders {
+            new_parent = self.get_or_create_folder(new_parent, folder_name)?;
+        }
+
+        let tree = self.index_tree();
+        tree.mov(folder_node, new_parent)
+            .map_err(|e| IndexError::TreeOperation(format!("Failed to move folder node: {}", e)))?;
+
+        // Rename the folder node itself to the new last segment. Descendants follow
+        // structurally, so their `name` meta is unchanged — only the moved folder's
+        // own name changes.
+        let folder_meta = tree
+            .get_meta(folder_node)
+            .map_err(|e| IndexError::TreeOperation(format!("Failed to get folder meta: {}", e)))?;
+        folder_meta
+            .insert(TREE_META_NAME, new_name[0])
+            .map_err(|e| {
+                IndexError::TreeOperation(format!("Failed to update folder name: {}", e))
+            })?;
+
+        // Rewrite each descendant FILE node's denormalized `path` meta to its new
+        // location. The tree is already re-parented, so `get_node_path` walks up
+        // through the renamed folder and yields the correct new path — the same
+        // derivation `rebuild_caches` uses, keeping the meta and the tree in lock-step.
+        for descendant in self.descendant_file_nodes(folder_node) {
+            let Some(new_path) = self.get_node_path(&descendant) else {
+                continue;
+            };
+            let meta = tree.get_meta(descendant).map_err(|e| {
+                IndexError::TreeOperation(format!("Failed to get descendant meta: {}", e))
+            })?;
+            meta.insert(TREE_META_PATH, new_path.as_str())
+                .map_err(|e| {
+                    IndexError::TreeOperation(format!(
+                        "Failed to update descendant path meta: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        // Rebuild both caches + the deleted-paths guard from the now-consistent tree.
+        self.rebuild_caches();
+
+        tracing::info!(
+            "Moved folder subtree in index: {} -> {}",
+            old_prefix,
+            new_prefix
+        );
+        Ok(())
+    }
+
+    /// Resolve a FOLDER node by its full prefix path (lookup-only — never creates).
+    ///
+    /// Folders are absent from `path_to_node` (only file nodes are cached), so this
+    /// descends the prefix's segments from the root, requiring each to be an existing
+    /// folder. Returns `None` if any segment is missing or is not a folder.
+    fn find_folder_node(&self, prefix: &str) -> Option<TreeID> {
+        let mut parent = TreeParentId::Root;
+        let mut found = None;
+        for segment in prefix.split('/') {
+            let child = self.find_folder_child(&parent, segment)?;
+            parent = TreeParentId::Node(child);
+            found = Some(child);
+        }
+        found
+    }
+
+    /// Find an existing FOLDER child named `name` under `parent` (lookup-only).
+    ///
+    /// The non-creating half of [`Self::get_or_create_folder`], used to resolve a
+    /// folder path without the create side-effect.
+    fn find_folder_child(&self, parent: &TreeParentId, name: &str) -> Option<TreeID> {
+        let tree = self.index_tree();
+        let children = match parent {
+            TreeParentId::Root => tree.roots(),
+            TreeParentId::Node(parent_id) => tree.children(parent_id).unwrap_or_default(),
+            _ => vec![],
+        };
+        for child_id in children {
+            let Ok(meta) = tree.get_meta(child_id) else {
+                continue;
+            };
+            let is_folder =
+                Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() == Some("folder");
+            let child_name = Self::tree_meta_string(&meta, TREE_META_NAME);
+            if is_folder && child_name.as_deref() == Some(name) {
+                return Some(child_id);
+            }
+        }
+        None
+    }
+
+    /// Collect every alive FILE node beneath `folder_node` at any depth — the set
+    /// whose denormalized `path` meta a subtree move must rewrite.
+    ///
+    /// Recurses the moved folder's `children`, descending into sub-folders and
+    /// collecting file nodes. Folder nodes themselves are not collected (they carry no
+    /// `path` meta to rewrite).
+    fn descendant_file_nodes(&self, folder_node: TreeID) -> Vec<TreeID> {
+        let tree = self.index_tree();
+        let mut files = Vec::new();
+        let mut stack = tree.children(folder_node).unwrap_or_default();
+        while let Some(node_id) = stack.pop() {
+            let Ok(meta) = tree.get_meta(node_id) else {
+                continue;
+            };
+            match Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() {
+                Some("file") => files.push(node_id),
+                Some("folder") => stack.extend(tree.children(node_id).unwrap_or_default()),
+                _ => {}
+            }
+        }
+        files
+    }
+
     /// Whether a path's node is deleted in the tree (or absent entirely).
     pub fn is_node_deleted(&self, path: &str) -> bool {
         match self.find_node_by_path(path) {

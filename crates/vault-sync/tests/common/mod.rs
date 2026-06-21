@@ -122,6 +122,38 @@ pub async fn move_file(vault: &V, fs: &Fs, from: &str, to: &str) {
     vault.save_index().await.unwrap();
 }
 
+/// Move a whole FOLDER on disk AND in `vault`'s Index — the local folder-move flow
+/// a real editor drives (the editor relocates the directory, the daemon's
+/// folder-move detection maps it to one `move_subtree`). Like [`move_file`], the
+/// content `.loro`s are path-independent, so none are touched.
+///
+/// Relocates every descendant `.md` on disk from `old_prefix/...` to
+/// `new_prefix/...` (so A's disk stays consistent with its Index, exactly as a real
+/// folder rename leaves it), then applies the single structural `move_subtree` to
+/// the Index and flushes. The on-disk renames here stand in for the daemon's
+/// event-coalescing (P4); P2c is the lib primitive, so the test drives it directly.
+pub async fn move_subtree(vault: &V, fs: &Fs, old_prefix: &str, new_prefix: &str) {
+    let old_dir = format!("{old_prefix}/");
+    let descendants: Vec<String> = vault
+        .list_files()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.starts_with(&old_dir))
+        .collect();
+
+    for from in &descendants {
+        let to = format!("{}{}", new_prefix, &from[old_prefix.len()..]);
+        if let Some((parent, _)) = to.rsplit_once('/') {
+            fs.mkdir(parent).await.unwrap();
+        }
+        fs.rename(from, &to).await.unwrap();
+    }
+
+    vault.index().move_subtree(old_prefix, new_prefix).unwrap();
+    vault.save_index().await.unwrap();
+}
+
 /// The UUID a path currently resolves to in `vault`'s Index (panics if no node).
 pub fn uuid_at(vault: &V, path: &str) -> Uuid {
     let node = vault
