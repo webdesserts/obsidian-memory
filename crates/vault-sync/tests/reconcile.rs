@@ -11,6 +11,10 @@
 //! repair.
 //!
 //! Everything runs against `InMemoryFs` — no test touches a real vault.
+//!
+//! The replica/edit/inspection helpers live in the shared [`common`] harness
+//! (`tests/common/mod.rs`); this file pulls `one_vault`, `write_and_index`, `uuid_at`,
+//! and `materialized_markdown` from there. `AUTHOR` is the single-vault author id.
 
 use std::sync::Arc;
 
@@ -20,46 +24,8 @@ use vault_sync::{
     content_version_fingerprint,
 };
 
-/// A device's Loro author id (a Loro peer id).
-const AUTHOR: u64 = 0x0101_0101_0101_0101;
-
-type Fs = Arc<InMemoryFs>;
-type V = Vault<Fs>;
-
-/// Seed an empty initialized vault over a fresh in-memory filesystem, returning the
-/// retained `Arc<InMemoryFs>` so a test can stage on-disk state directly.
-async fn empty_vault() -> (Fs, V) {
-    let fs = Arc::new(InMemoryFs::new());
-    let vault = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
-    (fs, vault)
-}
-
-/// Write `content` to `path` and document it into `vault` (Flow-1), flushing the
-/// Index so the registration survives a reload.
-async fn write_and_index(vault: &V, fs: &Fs, path: &str, content: &str) {
-    fs.write(path, content.as_bytes()).await.unwrap();
-    vault.on_file_changed(path).await.unwrap();
-    vault.save_index().await.unwrap();
-}
-
-/// The UUID a path currently resolves to in `vault`'s Index (panics if no node).
-fn uuid_at(vault: &V, path: &str) -> Uuid {
-    let node = vault
-        .index()
-        .node_for_path(path)
-        .unwrap_or_else(|| panic!("no index node for {path}"));
-    vault
-        .index()
-        .node_uuid(&node)
-        .unwrap_or_else(|| panic!("node for {path} carries no UUID"))
-}
-
-/// The canonical materialized markdown of the document currently at `path` — the
-/// exact bytes the document renders to, used to stage a "matching" `.md` at another
-/// path (a native move leaves byte-identical content).
-async fn materialized_markdown(vault: &V, path: &str) -> String {
-    vault.get_document(path).await.unwrap().to_markdown()
-}
+mod common;
+use common::*;
 
 // ========================= AC-INV-6/7 — adopt / quarantine / report =========================
 
@@ -72,7 +38,7 @@ mod ac_inv_6_7_reconcile_arms {
     /// This is the fs↔loro divergence heal (a peer's content landed without its node).
     #[tokio::test]
     async fn orphaned_loro_with_matching_md_is_adopted_preserving_lineage_uuid() {
-        let (fs, _seed) = empty_vault().await;
+        let (_seed, fs) = one_vault().await;
 
         // Stage a content doc on disk WITHOUT any Index node: write its `<uuid>.loro`
         // and its materialized `.md`, but never register it. Its UUID is its identity.
@@ -109,7 +75,7 @@ mod ac_inv_6_7_reconcile_arms {
     /// tombstoned — is QUARANTINED to `.trash/`, never resurrected as a live node.
     #[tokio::test]
     async fn tombstoned_md_still_on_disk_is_quarantined_not_resurrected() {
-        let (fs, vault) = empty_vault().await;
+        let (vault, fs) = one_vault().await;
 
         write_and_index(&vault, &fs, "old/note.md", "delete me\n").await;
         let uuid = uuid_at(&vault, "old/note.md");
@@ -143,7 +109,7 @@ mod ac_inv_6_7_reconcile_arms {
     /// (deletion-propagation).
     #[tokio::test]
     async fn alive_node_with_missing_md_is_report_only() {
-        let (fs, vault) = empty_vault().await;
+        let (vault, fs) = one_vault().await;
 
         write_and_index(&vault, &fs, "kept.md", "i exist\n").await;
 
@@ -168,7 +134,7 @@ mod ac_inv_6_7_reconcile_arms {
     /// brand-new-file arm.
     #[tokio::test]
     async fn brand_new_md_on_disk_is_indexed() {
-        let (fs, _seed) = empty_vault().await;
+        let (_seed, fs) = one_vault().await;
 
         // A `.md` appeared on disk while the vault was off (no node, no `.loro`).
         fs.write("fresh/idea.md", b"# Idea\n\nNew while offline.\n")
@@ -298,7 +264,7 @@ mod ac_s1_native_move_adopt {
     /// content doc is an adopt candidate, never a live one.
     #[tokio::test]
     async fn same_content_create_without_delete_is_not_adopted_window_bound() {
-        let (fs, vault) = empty_vault().await;
+        let (vault, fs) = one_vault().await;
 
         // A live document at `original.md` — its node is NOT deleted.
         write_and_index(&vault, &fs, "original.md", "# Shared\n\nSame body.\n").await;
@@ -336,7 +302,7 @@ mod ac_section_8_edge_cases {
     /// `load_index`, before reconcile runs.
     #[tokio::test]
     async fn corrupt_index_hard_fails_not_empty_fallback() {
-        let (fs, vault) = empty_vault().await;
+        let (vault, fs) = one_vault().await;
         write_and_index(&vault, &fs, "note.md", "body\n").await;
 
         // Corrupt the persisted Index CRDT.
@@ -357,7 +323,7 @@ mod ac_section_8_edge_cases {
     /// still adopted, and load succeeds.
     #[tokio::test]
     async fn corrupt_single_content_doc_is_skipped_rest_proceed() {
-        let (fs, _seed) = empty_vault().await;
+        let (_seed, fs) = one_vault().await;
 
         // A VALID orphan (content doc + matching `.md`, no node) that should adopt.
         let good = ContentDoc::from_markdown("# Good\n\nValid orphan body.\n", AUTHOR).unwrap();

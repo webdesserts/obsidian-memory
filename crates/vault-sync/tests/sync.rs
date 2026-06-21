@@ -10,114 +10,17 @@
 //! coupling (S5), and the lossy-transport seam contract (§5).
 //!
 //! Everything runs against `InMemoryFs` — no test touches a real vault.
+//!
+//! The replica/handshake/edit helpers live in the shared [`common`] harness
+//! (`tests/common/mod.rs`) so every test surface drives the seam identically.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use uuid::Uuid;
 use vault_sync::{DocId, FileSystem, InMemoryFs, SyncMessage, Vault, content_doc_path};
 
-/// Two device author ids (Loro peer ids) for the two sides of a handshake.
-const AUTHOR_A: u64 = 0x0101_0101_0101_0101;
-const AUTHOR_B: u64 = 0x0202_0202_0202_0202;
-
-type Fs = Arc<InMemoryFs>;
-type V = Vault<Fs>;
-
-// ========================= harness =========================
-
-/// Build two empty in-memory vaults, A authored by `AUTHOR_A`, B by `AUTHOR_B`,
-/// returning each vault alongside its retained `Arc<InMemoryFs>` so a test can write
-/// files and inspect on-disk bytes directly.
-async fn two_vaults() -> (V, V, Fs, Fs) {
-    let fs_a = Arc::new(InMemoryFs::new());
-    let fs_b = Arc::new(InMemoryFs::new());
-    let a = Vault::init(Arc::clone(&fs_a), AUTHOR_A).await.unwrap();
-    let b = Vault::init(Arc::clone(&fs_b), AUTHOR_B).await.unwrap();
-    (a, b, fs_a, fs_b)
-}
-
-/// Drive the complete three-message handshake with `a` as initiator and return
-/// `(modified_a, modified_b)` — the documents each side received.
-///
-/// A sends a SyncRequest → B answers with a SyncExchange (its response + its own
-/// request) → A applies it and replies with a final SyncResponse → B applies that.
-/// The protocol always produces the final SyncResponse, so the unwrap chain is exact.
-async fn full_sync(a: &V, b: &V) -> (Vec<DocId>, Vec<DocId>) {
-    let request = a.prepare_request().await.unwrap();
-    let exchange = b.process_message(&request).await.unwrap();
-    let after_exchange = a.process_message(&exchange.reply.unwrap()).await.unwrap();
-    let after_final = b
-        .process_message(&after_exchange.reply.unwrap())
-        .await
-        .unwrap();
-    (after_exchange.modified, after_final.modified)
-}
-
-/// Pump the handshake in BOTH directions to quiescence (A→B then B→A), so divergent
-/// edits on each side land on the other.
-async fn sync_both_ways(a: &V, b: &V) {
-    full_sync(a, b).await;
-    full_sync(b, a).await;
-}
-
-/// Write `content` to `path` on `fs` and document it into `vault` (Flow-1), then
-/// flush the Index (Flow-1 is caller-flushed). The fs-as-truth local-write path.
-async fn write_and_index(vault: &V, fs: &Fs, path: &str, content: &str) {
-    fs.write(path, content.as_bytes()).await.unwrap();
-    vault.on_file_changed(path).await.unwrap();
-    vault.save_index().await.unwrap();
-}
-
-/// Move a `.md` on disk AND in `vault`'s Index — the local move flow a real editor
-/// drives (the editor relocates the file, the watcher moves the Index node). The
-/// content `.loro` is path-independent, so it is never touched. Flushes the Index.
-///
-/// Ensures the destination directory exists first (a real `rename` into a missing
-/// directory would fail; the `InMemoryFs` `rename` does not auto-create parents, so
-/// the test creates them as the editor's move would).
-async fn move_file(vault: &V, fs: &Fs, from: &str, to: &str) {
-    if let Some((parent, _)) = to.rsplit_once('/') {
-        fs.mkdir(parent).await.unwrap();
-    }
-    fs.rename(from, to).await.unwrap();
-    vault.index().move_node(from, to).unwrap();
-    vault.save_index().await.unwrap();
-}
-
-/// The UUID a path currently resolves to in `vault`'s Index.
-fn uuid_at(vault: &V, path: &str) -> Uuid {
-    let node = vault
-        .index()
-        .node_for_path(path)
-        .unwrap_or_else(|| panic!("no Index node for {path}"));
-    vault
-        .index()
-        .node_uuid(&node)
-        .unwrap_or_else(|| panic!("node for {path} carries no UUID"))
-}
-
-/// Read a `.md` file's bytes from a filesystem (panics if absent).
-async fn read_md(fs: &Fs, path: &str) -> Vec<u8> {
-    fs.read(path).await.unwrap_or_else(|_| panic!("no file at {path}"))
-}
-
-/// Deserialize a wire payload into a `SyncMessage` for byte-level assertions.
-fn decode(bytes: &[u8]) -> SyncMessage {
-    bincode::deserialize(bytes).expect("payload is a valid SyncMessage")
-}
-
-/// The total bytes of document-content carried by a message (the sum of every
-/// `document_updates` value). Zero means no document content crossed the wire.
-fn document_content_bytes(msg: &SyncMessage) -> usize {
-    let updates: &HashMap<DocId, Vec<u8>> = match msg {
-        SyncMessage::SyncResponse { document_updates, .. } => document_updates,
-        SyncMessage::SyncExchange { response, .. } => &response.document_updates,
-        SyncMessage::DocUpdate { data, .. } => return data.len(),
-        _ => return 0,
-    };
-    updates.values().map(|v| v.len()).sum()
-}
+mod common;
+use common::*;
 
 // ========================= AC-INV-1 — identity / zero-content move =========================
 
