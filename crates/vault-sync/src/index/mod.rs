@@ -33,6 +33,7 @@ mod state;
 mod tree;
 
 pub use state::{FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId};
+pub use tree::StructuralNode;
 
 use crate::fs::FileSystem;
 use loro::LoroDoc;

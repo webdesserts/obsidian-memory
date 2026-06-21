@@ -173,6 +173,15 @@ impl<F: FileSystem> Vault<F> {
 
         let modified = self.apply_doc_updates(document_updates).await?;
 
+        // Fire the structural-conflict cascade ONCE on the fully-merged state, now that
+        // BOTH the merged Index (applied above) and the colliding content (just
+        // materialized by `apply_doc_updates`) are present — INV-5.0/5.3. A colliding
+        // peer's content lands in this same message's document updates (INV-8
+        // registry-before-documents), so firing earlier (inside `apply_index_updates`)
+        // would see the node without its body. Cheap when there is no collision (a
+        // tree-scan gate, no content load).
+        self.resolve_structural_conflicts().await?;
+
         for uuid in &modified {
             self.emit(SyncEvent::DocumentUpdated {
                 path: uuid.to_string(),

@@ -89,15 +89,34 @@ impl<F: FileSystem> Vault<F> {
         }
 
         let loro_path = Self::doc_content_path(uuid);
-        let exists_in_cache = self.documents().contains_key(&path);
+        // Decide merge-vs-materialize by THIS document's UUID, not by the path. During a
+        // distinct-UUID same-path collision, the path-keyed `documents` cache may hold a
+        // DIFFERENT document's doc, so "is the path cached?" is the wrong question —
+        // "does THIS uuid's content already exist (its `.loro` on disk, or a cached doc
+        // whose id matches)?" is the right one. Asking by path would route a brand-new
+        // colliding doc into `merge_into_existing` against the other doc's content and
+        // corrupt both `.loro`s (the body merges into the wrong document).
+        let cached_for_uuid = self.cached_doc_matches_uuid(&path, uuid);
         let exists_on_disk = self.fs().exists(&loro_path).await?;
 
-        if exists_in_cache || exists_on_disk {
+        if cached_for_uuid || exists_on_disk {
             self.merge_into_existing(uuid, &path, &loro_path, data)
                 .await
         } else {
             self.materialize_new(uuid, &path, &loro_path, data).await
         }
+    }
+
+    /// Whether the document cached at `path` is the one for `uuid` (its `doc_id`
+    /// matches). False when the path is uncached OR — the collision case — the cached
+    /// doc belongs to a different UUID that happens to share this display path.
+    fn cached_doc_matches_uuid(&self, path: &str, uuid: &DocId) -> bool {
+        self.documents()
+            .get(path)
+            .and_then(|d| d.doc_id())
+            .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+            .map(|id| id == uuid.0)
+            .unwrap_or(false)
     }
 
     /// Merge an inbound update into an existing document (the normal same-UUID CRDT
@@ -110,11 +129,17 @@ impl<F: FileSystem> Vault<F> {
         loro_path: &str,
         data: &[u8],
     ) -> Result<bool> {
-        // Load the document from cache, else from its `<uuid>.loro` on disk.
-        // Bind the cache lookup to a local so the `documents()` mutex guard is
-        // released before the `.await` below — never hold a MutexGuard across an
-        // await point (clippy::await_holding_lock; keeps the Flow-2 future Send).
-        let cached = self.documents().get(path).cloned();
+        // Load the document for THIS uuid: the path-cached doc only if its id matches
+        // (during a same-path collision the cache may hold a different document), else
+        // its own `<uuid>.loro` on disk. Loading the wrong doc here would merge the
+        // inbound body into another document and corrupt both. Bind the cache lookup to
+        // a local so the `documents()` guard is released before the `.await` below —
+        // never hold a guard across an await point (keeps the Flow-2 future Send).
+        let cached = if self.cached_doc_matches_uuid(path, uuid) {
+            self.documents().get(path).cloned()
+        } else {
+            None
+        };
         let mut doc = match cached {
             Some(doc) => doc,
             None => {

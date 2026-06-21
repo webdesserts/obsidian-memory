@@ -25,6 +25,33 @@ use loro::{LoroTree, TreeID, TreeParentId};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+/// One alive node in the merged tree, paired with its display path — the raw input
+/// the conflict resolver's view ([`crate::conflict::StructuralView`]) is built from.
+///
+/// Deliberately content-free: the resolver needs a file node's [`ContentSummary`]
+/// (which requires an async content-doc load), but the Index is fs-agnostic, so the
+/// scan returns only the node's identity and the Vault enriches files with their
+/// summary in the apply path. A folder carries only its `TreeID` (folders have no
+/// content-UUID — their survivor key is their tree-node identity).
+///
+/// [`ContentSummary`]: crate::hash::ContentSummary
+#[derive(Debug, Clone)]
+pub enum StructuralNode {
+    /// An alive file node at `path`, identified by its content `uuid`.
+    File { path: String, uuid: Uuid },
+    /// An alive folder node at `path`, identified by its loro `tree_id`.
+    Folder { path: String, tree_id: TreeID },
+}
+
+impl StructuralNode {
+    /// The node's display path — for grouping nodes by path to detect collisions.
+    pub fn path(&self) -> &str {
+        match self {
+            StructuralNode::File { path, .. } | StructuralNode::Folder { path, .. } => path,
+        }
+    }
+}
+
 impl Index {
     // ========== File tree operations (LoroTree) ==========
 
@@ -93,6 +120,58 @@ impl Index {
             self.path_to_node().len(),
             self.uuid_to_node().len()
         );
+    }
+
+    /// Scan every **alive** node in the merged tree into a flat list of
+    /// `(path, identity)` records — the raw input for the conflict resolver's view.
+    ///
+    /// Unlike the caches (which key uniquely per path, so a collision's *loser* has
+    /// no slot, and which omit folders entirely), this walks `tree.nodes()` directly,
+    /// so it surfaces EVERY alive node at a contested path — both files at a file
+    /// collision, both folders at a folder collision, and a file-and-folder pair at a
+    /// file-vs-folder collision. That completeness is exactly what the cascade needs:
+    /// the rebuilt caches can't see the nodes it must resolve.
+    ///
+    /// A file node yields its `uuid`; a folder yields its `TreeID`. The Vault enriches
+    /// each file with its [`ContentSummary`] (an async content-doc load it owns) to
+    /// build the full [`StructuralView`]. Nodes whose path or identity can't be read
+    /// are skipped (defensive — a malformed node can't participate in resolution).
+    ///
+    /// [`ContentSummary`]: crate::hash::ContentSummary
+    /// [`StructuralView`]: crate::conflict::StructuralView
+    pub fn scan_structural_nodes(&self) -> Vec<StructuralNode> {
+        let tree = self.index_tree();
+        let mut nodes = Vec::new();
+
+        for node_id in tree.nodes() {
+            if tree.is_node_deleted(&node_id).unwrap_or(true) {
+                continue;
+            }
+            let Ok(meta) = tree.get_meta(node_id) else {
+                continue;
+            };
+            let Some(path) = self.get_node_path(&node_id) else {
+                continue;
+            };
+            match Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() {
+                Some("file") => {
+                    if let Some(uuid) = Self::tree_meta_string(&meta, TREE_META_UUID)
+                        .and_then(|s| Uuid::parse_str(&s).ok())
+                    {
+                        nodes.push(StructuralNode::File { path, uuid });
+                    }
+                }
+                Some("folder") => {
+                    nodes.push(StructuralNode::Folder {
+                        path,
+                        tree_id: node_id,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        nodes
     }
 
     /// Read a string-valued tree node meta field, or `None` if absent / not a string.
@@ -407,6 +486,100 @@ impl Index {
             );
             Ok(false)
         }
+    }
+
+    /// Tombstone a SPECIFIC node by its `TreeID` — the conflict cascade's collapse
+    /// primitive.
+    ///
+    /// Unlike [`Self::delete_node`] (which resolves the node from `path_to_node`), this
+    /// targets an exact node id, because the cascade operates precisely when TWO file
+    /// nodes share one display path: there the path cache holds only ONE of them, so a
+    /// path-keyed delete could tombstone the wrong one (the survivor instead of the
+    /// loser). The caller resolves `uuid → TreeID` via [`Self::find_node_by_uuid`]
+    /// (which keys correctly per UUID) and passes that id here.
+    ///
+    /// `path` is the node's current display path (the caller already resolved it),
+    /// used to arm the deleted-paths guard and to patch the caches. In-memory only —
+    /// the caller persists via `save_index` and typically rebuilds caches afterward.
+    pub fn delete_node_by_id(&self, node_id: TreeID, path: &str) -> Result<()> {
+        let tree = self.index_tree();
+        tree.delete(node_id).map_err(|e| {
+            IndexError::TreeOperation(format!("Failed to delete file node by id: {}", e))
+        })?;
+
+        // Arm the deleted-paths guard for this path so an in-flight document update
+        // doesn't resurrect it. Note: a `rebuild_caches` with alive-wins will lift this
+        // again if the SURVIVOR still occupies the same path — which is exactly right
+        // (the path is not deleted, just the losing node).
+        self.sync_state.mark_path_deleted(path);
+
+        // Drop this node from both caches by id (the path cache may currently point at
+        // the survivor's node, so remove by VALUE, not by the path key).
+        self.path_to_node_mut().retain(|_, id| *id != node_id);
+        self.uuid_to_node_mut().retain(|_, id| *id != node_id);
+
+        tracing::info!("Deleted node from index by id: {} ({:?})", path, node_id);
+        Ok(())
+    }
+
+    /// Move a SPECIFIC node by its `TreeID` to `new_path` — the conflict cascade's
+    /// rename primitive.
+    ///
+    /// Unlike [`Self::move_node`] (which resolves the source from `path_to_node`), this
+    /// targets an exact node id, because the cascade renames a loser whose OLD path is
+    /// shared with the survivor — a path-keyed move could relocate the survivor
+    /// instead. The caller resolves `uuid → TreeID` (the correct per-UUID lookup) and
+    /// passes the id plus the node's current `old_path`.
+    ///
+    /// Errors with `MoveTargetExists` if `new_path` already has a node — the caller
+    /// (the cascade) treats that as a resolver bug and fails loudly (S1). The node's
+    /// `uuid` is untouched (identity is stable across the rename). In-memory only.
+    pub fn move_node_by_id(&self, node_id: TreeID, old_path: &str, new_path: &str) -> Result<()> {
+        Self::validate_sync_path(new_path)?;
+        if old_path == new_path {
+            return Ok(());
+        }
+        if self.find_node_by_path(new_path).is_some() {
+            return Err(IndexError::MoveTargetExists(format!(
+                "Target already exists: {}",
+                new_path
+            )));
+        }
+
+        let new_parts: Vec<&str> = new_path.split('/').collect();
+        let (new_folders, new_name) = new_parts.split_at(new_parts.len() - 1);
+
+        let mut new_parent = TreeParentId::Root;
+        for folder_name in new_folders {
+            new_parent = self.get_or_create_folder(new_parent, folder_name)?;
+        }
+
+        let tree = self.index_tree();
+        tree.mov(node_id, new_parent).map_err(|e| {
+            IndexError::TreeOperation(format!("Failed to move file node by id: {}", e))
+        })?;
+
+        let meta = tree
+            .get_meta(node_id)
+            .map_err(|e| IndexError::TreeOperation(format!("Failed to get file meta: {}", e)))?;
+        meta.insert(TREE_META_NAME, new_name[0])
+            .map_err(|e| IndexError::TreeOperation(format!("Failed to update file name: {}", e)))?;
+        meta.insert(TREE_META_PATH, new_path)
+            .map_err(|e| IndexError::TreeOperation(format!("Failed to update path meta: {}", e)))?;
+
+        // Patch the path cache: drop the old key only if it points at THIS node (the
+        // survivor may own it), and point the new key at this node.
+        self.path_to_node_mut().retain(|_, id| *id != node_id);
+        self.path_to_node_mut()
+            .insert(new_path.to_string(), node_id);
+
+        tracing::info!(
+            "Moved node in index by id: {} -> {} ({:?})",
+            old_path,
+            new_path,
+            node_id
+        );
+        Ok(())
     }
 
     /// Move/rename a node in the index — a pure-structural CRDT tree move.
