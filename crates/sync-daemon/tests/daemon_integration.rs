@@ -3598,6 +3598,96 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// A same-path create-then-delete both push in real time — the create
+    /// notification does not dedup-suppress the follow-up delete notification.
+    ///
+    /// This is the OPPOSITE of the three reseeded tests (`test_file_deletion_propagates`,
+    /// `test_local_edit_propagates_to_peer`, `lone_delete_expires_to_real_deletion`),
+    /// which seed the file via the NeighborUp full sync so the delete/edit notification
+    /// is the FIRST for its path. Here BOTH notifications go over LIVE gossip in one
+    /// seen-cache window: A creates `notes/ping.md` (broadcasts a create-notif), then
+    /// deletes the SAME path (broadcasts a delete-notif). On the un-nonced wire format
+    /// both `GossipMessage::ChangeNotification` envelopes serialize byte-identically, so
+    /// iroh-gossip's content-derived MessageId suppresses the delete-notif within its
+    /// ~90s window and B never pulls the deletion (Issue 2). The per-notification nonce
+    /// (`salt ^ seq`, distinct per broadcast) makes the bytes differ, so the delete-notif
+    /// survives dedup and B drops the file via real-time push — no full-sync reseed.
+    ///
+    /// Determinism anchor: we `wait_until` B HAS the file before A deletes it. That
+    /// guarantees the create-notif reached B's seen-cache, so the delete-notif is
+    /// genuinely tested against a populated dedup cache rather than racing ahead and
+    /// passing for the wrong reason.
+    ///
+    /// Seeds 140/141 reserved.
+    #[tokio::test]
+    async fn same_path_create_then_delete_pushes_in_realtime() -> anyhow::Result<()> {
+        let node_a = build_node(140).await?;
+        let node_b = build_node(141).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Join gossip LIVE first (A empty-bootstrap, B off A) and do NOT pre-seed the
+        // file — the create-notif must travel over live gossip so its MessageId enters
+        // iroh-gossip's seen-cache, which is what the delete-notif later collides with.
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // A creates the file → broadcasts the create-notif (nonce = salt ^ 0).
+        daemon_a.fs.write("notes/ping.md", b"v1").await?;
+        inject_modified(&daemon_a, "notes/ping.md");
+
+        // Determinism anchor: B must actually have the file before A deletes it, which
+        // proves the create-notif landed in B's seen-cache.
+        wait_until("B has notes/ping.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                let vault = vault.lock().await;
+                vault
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/ping.md".to_string())
+            }
+        })
+        .await;
+
+        // A deletes the SAME path → broadcasts the delete-notif (nonce = salt ^ 1).
+        // Un-nonced this serializes identically to the create-notif and is suppressed;
+        // with the nonce the bytes differ and B receives it.
+        inject_deleted(&daemon_a, "notes/ping.md");
+
+        // The real-time assertion: B drops the file via gossip push, with NO full-sync
+        // reseed preceding it — a pass REQUIRES the delete-notif to have survived dedup.
+        wait_until("B no longer has notes/ping.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                let vault = vault.lock().await;
+                !vault
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/ping.md".to_string())
+            }
+        })
+        .await;
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
     /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
     /// `last_attempt_ms` values land on the same clock the supervisor reads.
     fn now_ms_test() -> u64 {
