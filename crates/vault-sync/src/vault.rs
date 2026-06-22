@@ -273,11 +273,10 @@ impl<F: FileSystem> Vault<F> {
 
     /// Emit a sync event to all subscribers.
     ///
-    /// Carried from sync-core's vault as the internal emit hook. Flow-1 does not
-    /// emit (the local-write path is silent, matching the carry); the wire chunk's
-    /// inbound/outbound message handlers are the first emitters, so this is unused
-    /// until then.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    /// The internal emit hook the wire protocol drives: the inbound message
+    /// handlers (`protocol::process`) and outbound preparers (`protocol::prepare`)
+    /// call this to surface `MessageReceived`/`MessageSent`, `DocumentUpdated`,
+    /// and `FileOp` events. The local-write path stays silent and does not emit.
     pub(crate) fn emit(&self, event: SyncEvent) {
         self.events.emit(event);
     }
