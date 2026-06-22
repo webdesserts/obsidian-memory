@@ -3,11 +3,11 @@
 //!
 //! The Index is one Loro document (`.sync/index.loro`) wrapping a single movable
 //! `LoroTree`. Folder and file nodes carry meta describing their `type`, `name`,
-//! and (for file nodes) the document's `path`, its `uuid` identity, and a
-//! denormalized `content_version` fingerprint. Two in-memory caches make lookups
-//! O(1): `path_to_node` (a watcher/event resolves a path to its node) and the
-//! inverse `uuid_to_node` (an inbound wire `DocUpdate{uuid}` resolves to a
-//! node/path).
+//! and (for file nodes) the document's `path` and its `uuid` identity. Three
+//! in-memory denormalizations make lookups O(1): `path_to_node` (a watcher/event
+//! resolves a path to its node), the inverse `uuid_to_node` (an inbound wire
+//! `DocUpdate{uuid}` resolves to a node/path), and `content_versions` (the local
+//! per-document fingerprint the compare digest reads — local-only, never synced).
 //!
 //! ## UUID identity (the headline data-model change vs the old registry)
 //!
@@ -88,17 +88,6 @@ pub(crate) const TREE_META_PATH: &str = "path";
 /// Replaces the old path-hash `doc_id`. Written from the content doc's minted UUID
 /// and NEVER recomputed — in particular, a move does not touch it.
 pub(crate) const TREE_META_UUID: &str = "uuid";
-
-/// Node meta (file nodes): a denormalized fingerprint of the content doc's
-/// current version vector.
-///
-/// A **derived cache** (the authoritative source is the content doc's
-/// `state_vv()`): it lets the compare protocol digest the catalog without opening
-/// every content doc. This chunk introduces the field and sets an initial value at
-/// registration; a later chunk bumps it on each local edit, and the compare
-/// protocol consumes it. Stored as the raw 32 fingerprint bytes (a Loro binary
-/// value).
-pub(crate) const TREE_META_CONTENT_VERSION: &str = "content_version";
 
 /// The on-disk path of a document's content `.loro`, addressed by its UUID.
 ///

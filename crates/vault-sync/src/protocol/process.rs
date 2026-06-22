@@ -50,11 +50,12 @@ impl<F: FileSystem> Vault<F> {
                 document_versions,
             } => {
                 // The opener carries only a digest (no per-document VVs), so the no-op
-                // case short-circuits in O(1) wire payload (§6.2 / OQ-C1). The
-                // `ensure_consistency()` above runs FIRST so a boot-stale
-                // `content_version` is repaired before the digest can match — otherwise
-                // a divergent-but-unreconciled replica could falsely short-circuit
-                // (§6.4).
+                // case short-circuits in O(1) wire payload (§6.2 / OQ-C1). The boot
+                // reconcile (`rebuild_content_versions`, run at `Vault::load`) populates
+                // the local `content_version` table from each content doc's `.loro`
+                // before any message arrives, so the digest here reads a correct local
+                // fingerprint — the §6.4 trust precondition that keeps a
+                // divergent-but-unreconciled replica from falsely short-circuiting.
                 if catalog_digest == self.catalog_digest() {
                     // Identical merged state: nothing to transfer, the exchange ends.
                     let bytes = bincode::serialize(&SyncMessage::InSync)

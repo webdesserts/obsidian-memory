@@ -107,9 +107,9 @@ impl<F: FileSystem> Vault<F> {
 
         // Rebuild the LOCAL `content_version` table from each content doc's actual
         // `state_vv()`, so the compare digest (P3) reads a correct local cache. The
-        // table is transient (rebuilt every boot); in C1 this also keeps the dual-write
-        // meta in step, and `repaired` reflects whether any persisted meta changed.
-        let repaired = self.rebuild_content_versions().await?;
+        // table is transient (rebuilt every boot) and lives in memory, so this mutates
+        // no synced CRDT state and never affects the save gate below.
+        self.rebuild_content_versions().await?;
 
         // Recover any folder-swept orphan (EC-7/OQ-6) that persisted across this load: a
         // concurrent add a peer's folder delete tombstoned, whose own parent is still a
@@ -143,9 +143,10 @@ impl<F: FileSystem> Vault<F> {
         // Persist the Index mutations made during this pass — batched here (not per
         // adopt/register) to avoid O(n) snapshot writes when many files are indexed at
         // startup. `adopted`/`moved` register nodes that only live in memory until
-        // saved; a `content_version` repair likewise mutates node meta. Without the
-        // save the heal is illusory (it re-runs on every restart, never persisting).
-        if report.has_changes() || repaired {
+        // saved. Without the save the heal is illusory (it re-runs on every restart,
+        // never persisting). The content_version rebuild touches no CRDT state (it fills
+        // only the in-memory table), so it contributes nothing to this gate.
+        if report.has_changes() {
             self.save_index().await?;
         }
 
@@ -391,19 +392,15 @@ impl<F: FileSystem> Vault<F> {
     /// reads a fingerprint that matches the content. Runs after the per-file reindex
     /// pass, so a doc whose `.md` changed externally is already current.
     ///
+    /// Mutates NO synced CRDT state — it fills only the in-memory table, so it never
+    /// dirties the Index and contributes nothing to the `reconcile()` save gate.
+    ///
     /// Ordering note (S1): `rescue_swept_orphans` runs AFTER this rebuild, so a revived
     /// node's fingerprint is not in the table until the next boot. That is benign — the
     /// `catalog_digest`'s `filter_map` over `node_content_version` simply skips a node
     /// with no entry, and the rescued node's content syncs normally; the entry is healed
-    /// on the next boot (pre-existing behavior — the old meta repair had the same gap).
-    ///
-    /// During C1 it ALSO keeps the old `TREE_META_CONTENT_VERSION` meta in step
-    /// (dual-write via `set_content_version`), so the Index snapshot bytes are unchanged;
-    /// C2 drops the meta. Returns whether any meta was actually rewritten, which the
-    /// caller folds into the decision to persist the Index — a clean boot whose persisted
-    /// metas already match rewrites nothing (a same-value loro write is a no-op) and so
-    /// persists nothing.
-    async fn rebuild_content_versions(&self) -> Result<bool> {
+    /// on the next boot.
+    async fn rebuild_content_versions(&self) -> Result<()> {
         // Clear-then-fill: the table is transient; a stale entry from a prior Index
         // instance must not survive. In practice `load_index` constructs a fresh Index
         // (empty table), so this is defensive and matches `rebuild_caches`'s discipline.
@@ -417,7 +414,6 @@ impl<F: FileSystem> Vault<F> {
             .map(|(p, id)| (p.clone(), *id))
             .collect();
 
-        let mut repaired = false;
         for (path, node) in alive {
             let Some(uuid) = self.index().node_uuid(&node) else {
                 continue;
@@ -436,29 +432,10 @@ impl<F: FileSystem> Vault<F> {
 
             // Fill the transient table from local on-disk content (every live doc).
             self.index().content_versions_mut().insert(uuid, actual);
-
-            // C1 dual-write: keep the persisted meta in step. Gate on the PERSISTED meta
-            // (not the table just filled above) so an unchanged boot persists nothing.
-            if self.persisted_content_version_meta(&node) != Some(actual) {
-                self.index().set_content_version(&node, &actual)?;
-                debug!("Rebuilt content_version table entry for {}", path);
-                repaired = true;
-            }
+            debug!("Rebuilt content_version table entry for {}", path);
         }
 
-        Ok(repaired)
-    }
-
-    /// Read a node's persisted `TREE_META_CONTENT_VERSION` meta directly — the C1
-    /// save-gate's view of what is on disk, distinct from the now-table-backed
-    /// `Index::node_content_version`. Transitional: removed with the meta in C2.
-    fn persisted_content_version_meta(&self, node_id: &loro::TreeID) -> Option<[u8; 32]> {
-        let meta = self.index().index_tree().get_meta(*node_id).ok()?;
-        let value = meta.get(crate::index::TREE_META_CONTENT_VERSION)?;
-        let loro::ValueOrContainer::Value(loro::LoroValue::Binary(bytes)) = value else {
-            return None;
-        };
-        bytes.as_slice().try_into().ok()
+        Ok(())
     }
 
     /// Move a tombstoned disk orphan to `.trash/<path>`.

@@ -6,8 +6,9 @@
 //! Every operation here is an in-memory CRDT mutation — there is no filesystem
 //! coupling. Three deliberate departures from the port:
 //! - **UUID identity:** a file node carries a `uuid` meta (the document's minted
-//!   identity) plus a denormalized `content_version`, instead of the old
-//!   path-hash `doc_id`. The UUID is never recomputed.
+//!   identity) instead of the old path-hash `doc_id`. The UUID is never
+//!   recomputed. (The `content_version` fingerprint is NOT node meta — it lives
+//!   in the Index's local-only `content_versions` table, keyed by UUID.)
 //! - **Two-way caches:** the rebuild fills both `path_to_node` and the inverse
 //!   `uuid_to_node` in its single walk over alive file nodes.
 //! - **Pure-structural move:** `move_node` does only `tree.mov` + meta updates +
@@ -16,10 +17,7 @@
 //!   fs-level recovery fallback (reading/writing `.md` when the source isn't in the
 //!   tree) belongs to the public handle's flows, not the catalog.
 
-use super::{
-    INDEX_TREE, Index, TREE_META_CONTENT_VERSION, TREE_META_NAME, TREE_META_PATH, TREE_META_TYPE,
-    TREE_META_UUID,
-};
+use super::{INDEX_TREE, Index, TREE_META_NAME, TREE_META_PATH, TREE_META_TYPE, TREE_META_UUID};
 use crate::index::state::{IndexError, Result};
 use loro::{LoroTree, TreeID, TreeParentId};
 use std::collections::HashSet;
@@ -598,30 +596,26 @@ impl Index {
         self.content_versions().get(&uuid).copied()
     }
 
-    /// Refresh a node's denormalized `content_version` fingerprint after a local
-    /// content change — the SINGLE table-writer.
+    /// Refresh a node's `content_version` fingerprint after a local content change —
+    /// the SINGLE writer of the local `content_versions` table.
     ///
     /// Every steady-state maintenance path (registration, local edit, inbound merge,
     /// boot rebuild) routes the fingerprint through here, so "maintained ONLY from
     /// local content" is a single-method invariant. Resolves `node → uuid` and writes
-    /// the LOCAL table keyed by UUID.
-    ///
-    /// During C1 it ALSO keeps writing the old `TREE_META_CONTENT_VERSION` meta
-    /// (dual-write), so the Index snapshot bytes are unchanged and the only behavioral
-    /// change is "the digest reads the local table"; C2 drops the meta write.
+    /// the LOCAL table keyed by UUID — the fingerprint is per-replica-local state, NOT
+    /// synced Index meta (see the `content_versions` field doc).
     ///
     /// A node with no parseable UUID (unexpected — registration writes the UUID meta
-    /// first) is warned-and-skipped for the table write (Q1); the meta write still
-    /// happens as before. In-memory only — the caller persists via `save_index`.
+    /// first) is warned-and-skipped: the table is UUID-keyed, so there is no honest key
+    /// to write under, and skipping leaves the digest's `filter_map` to tolerate the
+    /// absent entry rather than poisoning the table. In-memory only — no persistence
+    /// (the table is transient, rebuilt from disk on every boot).
     pub fn set_content_version(&self, node_id: &TreeID, content_version: &[u8; 32]) -> Result<()> {
         match self.node_uuid(node_id) {
             Some(uuid) => {
                 self.content_versions_mut().insert(uuid, *content_version);
             }
             None => {
-                // The local table is keyed by UUID; with no resolvable UUID there is no
-                // honest key to write under. Skip the table (don't poison it with a
-                // wrong/empty entry) and keep going — the meta write below is unchanged.
                 tracing::warn!(
                     "set_content_version: node {:?} has no parseable UUID — skipping the \
                      local content_version table write",
@@ -629,18 +623,6 @@ impl Index {
                 );
             }
         }
-
-        // C1 dual-write: keep the meta copy in step (removed in C2).
-        let meta = self.index_tree().get_meta(*node_id).map_err(|e| {
-            IndexError::TreeOperation(format!(
-                "Failed to get file meta for content_version: {}",
-                e
-            ))
-        })?;
-        meta.insert(TREE_META_CONTENT_VERSION, content_version.as_slice())
-            .map_err(|e| {
-                IndexError::TreeOperation(format!("Failed to update content_version: {}", e))
-            })?;
         Ok(())
     }
 
@@ -751,19 +733,13 @@ impl Index {
         // renames.
         meta.insert(TREE_META_UUID, uuid.to_string())
             .map_err(|e| IndexError::TreeOperation(format!("Failed to set uuid: {}", e)))?;
-        // The denormalized version fingerprint (a derived cache; the content doc's
-        // `state_vv()` is authoritative). Stored as the raw 32 bytes.
-        meta.insert(TREE_META_CONTENT_VERSION, content_version.as_slice())
-            .map_err(|e| {
-                IndexError::TreeOperation(format!("Failed to set content_version: {}", e))
-            })?;
         // Store the full path so the node's path is recoverable after deletion.
         meta.insert(TREE_META_PATH, path)
             .map_err(|e| IndexError::TreeOperation(format!("Failed to set path meta: {}", e)))?;
 
         // Update both caches and the local content_version table (keyed by UUID —
-        // this is the registration write of the per-replica-local fingerprint, the
-        // analogue of the meta insert above but in the table the digest now reads).
+        // this is the registration write of the per-replica-local fingerprint the
+        // digest reads).
         self.path_to_node_mut().insert(path.to_string(), node_id);
         self.uuid_to_node_mut().insert(*uuid, node_id);
         self.content_versions_mut().insert(*uuid, *content_version);

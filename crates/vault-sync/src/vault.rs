@@ -298,8 +298,8 @@ impl<F: FileSystem> Vault<F> {
     /// Two replicas with identical merged state produce byte-equal digests; on a
     /// match the sync ends with zero further transfer, and on a miss the handshake
     /// falls through to the per-document version compare. Computed from the Index
-    /// alone over its structural version and each alive document's denormalized
-    /// `content_version` — no content `.loro` is opened. See
+    /// alone over its structural version and each alive document's `content_version`
+    /// (read from the Index's local-only table) — no content `.loro` is opened. See
     /// [`Index::catalog_digest`].
     pub fn catalog_digest(&self) -> [u8; 32] {
         self.index.catalog_digest()
@@ -632,9 +632,9 @@ impl<F: FileSystem> Vault<F> {
     ///
     /// Returns `true` iff the body or frontmatter actually changed (echo-safe). On a
     /// real change: commit the doc, rewrite its `<uuid>.loro`, cache it, and refresh
-    /// the node's `content_version` fingerprint (the derived digest cache). The
-    /// catalog flush (`save_index`) is the caller's call — it's batched at `init`
-    /// and a single mutation elsewhere.
+    /// the node's `content_version` fingerprint in the Index's local-only table (the
+    /// value the compare digest reads). The catalog flush (`save_index`) is the
+    /// caller's call — it's batched at `init` and a single mutation elsewhere.
     async fn apply_local_edit(
         &self,
         path: &str,

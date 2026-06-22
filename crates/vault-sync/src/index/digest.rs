@@ -9,10 +9,12 @@
 //! through to the per-document version compare.
 //!
 //! It is computed from the Index ALONE — no content `.loro` is opened. The
-//! per-document input is the denormalized `content_version` fingerprint already
-//! maintained on each file node (set at registration, bumped on edit/apply, and
-//! boot-repaired against the authoritative `state_vv()`), so the digest is a single
-//! cheap Index scan over the alive file nodes.
+//! per-document input is each document's `content_version` fingerprint, read from a
+//! local transient side-table (rebuilt on boot from each content doc's `.loro`,
+//! maintained on local merge/edit/register). That table is per-replica-LOCAL — no
+//! peer can write it — which is what keeps a peer's value from poisoning the digest
+//! (the convergence trap Resolution #2 closes). So the digest is a single cheap
+//! scan over the alive file nodes plus a local map lookup.
 
 use super::Index;
 use loro::TreeID;
@@ -49,9 +51,9 @@ impl Index {
     ///   every sync would fall through to a full-state exchange.
     ///
     /// O(alive-documents) local compute, no per-content-doc opens. The digest reads
-    /// the cheap denormalized cache; its correctness as a fast-path hint rests on
-    /// that cache being maintained + boot-repaired (a P1 guarantee), with the
-    /// per-document VV compare as the ground truth on a miss.
+    /// the cheap local `content_versions` table; its correctness as a fast-path hint
+    /// rests on that table being maintained (on local merge/edit/register) and rebuilt
+    /// from disk on boot, with the per-document VV compare as the ground truth on a miss.
     pub fn catalog_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.state_vv().encode());

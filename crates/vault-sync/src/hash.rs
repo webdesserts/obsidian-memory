@@ -17,14 +17,15 @@
 use crate::content_doc::ContentDoc;
 use loro::VersionVector;
 
-/// Fingerprint a content document's version vector for the Index's denormalized
-/// `content_version` cache.
+/// Fingerprint a content document's version vector for the Index's local-only
+/// `content_versions` table.
 ///
-/// The Index stores this 32-byte blake3 digest of the encoded version vector on
-/// each file node, so the compare protocol can digest the catalog (detect which
-/// documents changed) WITHOUT opening every content `.loro`. It is a derived cache
-/// — each content doc's `state_vv()` remains authoritative; the fingerprint is set
-/// at registration and refreshed on each local edit.
+/// The Index keeps this 32-byte blake3 digest of the encoded version vector in a
+/// per-replica-LOCAL table (keyed by UUID, never synced), so the compare protocol
+/// can digest the catalog (detect which documents changed) WITHOUT opening every
+/// content `.loro`. It is a derived cache — each content doc's `state_vv()` remains
+/// authoritative; the fingerprint is set at registration, refreshed on each local
+/// edit, and rebuilt from disk on boot.
 ///
 /// Unlike [`content_hash`] (which hashes materialized markdown to answer "same
 /// content?"), this hashes the version-vector bytes to answer "same version?". The

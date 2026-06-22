@@ -25,11 +25,11 @@ fn doc_with_identity(markdown: &str) -> (ContentDoc, Uuid, [u8; 32]) {
 mod register_document {
     use super::*;
 
-    /// Registering a document creates a file node carrying its `uuid`, `path`, and
-    /// `content_version` meta, and populates BOTH lookup caches (forward path→node
-    /// and inverse uuid→node).
+    /// Registering a document creates a file node carrying its `uuid` and `path`
+    /// meta, records the document's `content_version` in the Index's local table, and
+    /// populates BOTH lookup caches (forward path→node and inverse uuid→node).
     #[test]
-    fn writes_uuid_path_content_version_meta_and_fills_both_caches() {
+    fn writes_uuid_and_path_meta_records_content_version_and_fills_both_caches() {
         let index = Index::new(AUTHOR);
         let (_doc, uuid, fingerprint) = doc_with_identity("# Title\n\nBody.");
 
@@ -37,7 +37,8 @@ mod register_document {
             .register_document("notes/topic.md", &uuid, &fingerprint)
             .unwrap();
 
-        // Meta landed: uuid identity, denormalized content_version, recoverable path.
+        // Identity meta landed (uuid + recoverable path) and the content_version
+        // fingerprint is recorded in the local table (read back via the node).
         assert_eq!(
             index.node_uuid(&node),
             Some(uuid),
@@ -46,7 +47,7 @@ mod register_document {
         assert_eq!(
             index.node_content_version(&node),
             Some(fingerprint),
-            "node carries the denormalized content_version fingerprint"
+            "the node's content_version fingerprint is recorded in the local table"
         );
         assert_eq!(
             index.path_for_node(&node).as_deref(),
@@ -65,6 +66,38 @@ mod register_document {
             index.find_node_by_uuid(&uuid),
             Some(node),
             "inverse uuid→node cache is populated"
+        );
+    }
+
+    /// The `content_version` fingerprint is LOCAL-only: it must NEVER reach the synced
+    /// Index CRDT. A peer's value LWW-merging in ahead of the content it fingerprints is
+    /// the convergence trap Resolution #2 closes (the digest would falsely report "in
+    /// sync"), so the fingerprint lives in a per-replica-local table, not node meta.
+    ///
+    /// This pins the absence structurally: the only meta keys the Index serializes are
+    /// `type`/`name`/`path`/`uuid`, so the literal key string `content_version` must NOT
+    /// appear anywhere in an exported Index snapshot. (It WOULD appear on the pre-C2
+    /// dual-write code, which `meta.insert`ed the key — this is that removal's red guard.)
+    #[test]
+    fn content_version_is_absent_from_the_synced_index_snapshot() {
+        let index = Index::new(AUTHOR);
+        let (_doc, uuid, fingerprint) = doc_with_identity("# Title\n\nBody.");
+        index
+            .register_document("notes/topic.md", &uuid, &fingerprint)
+            .unwrap();
+
+        let snapshot = index.export_snapshot().unwrap();
+
+        // The meta key is a UTF-8 string in the serialized tree; if `register_document`
+        // (or any path) wrote it as node meta, the key bytes would be present here.
+        let key_bytes = b"content_version";
+        let contains_key = snapshot
+            .windows(key_bytes.len())
+            .any(|window| window == key_bytes);
+        assert!(
+            !contains_key,
+            "the content_version meta key must not appear in a synced Index snapshot — \
+             the fingerprint is per-replica-local, never CRDT state"
         );
     }
 
