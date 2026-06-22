@@ -254,6 +254,56 @@ impl Index {
         }
     }
 
+    /// Tombstone the FOLDER node at `path` — the library counterpart to "the user
+    /// removed a directory" (Model II, EC-7/OQ-6).
+    ///
+    /// Returns `true` if a live folder node was tombstoned, `false` if no folder node
+    /// exists at `path` (an idempotent no-op). The folder analogue of
+    /// [`Self::delete_node`], which is file-only: `delete_node` resolves through
+    /// `path_to_node` (file nodes only), so it physically cannot tombstone a folder.
+    ///
+    /// **Folder-node only — the caller per-file-deletes the genuine contents FIRST.**
+    /// This `tree.delete`s ONLY the folder node, not its descendants. A whole-folder
+    /// delete is driven as: `delete_node` each removed file (stamping it `parent ==
+    /// Deleted`, the HONOR marker the rescue pass keys on), THEN `delete_folder` the now-
+    /// empty folder node. Deleting the folder via a single subtree delete instead would
+    /// sweep the genuine deletions too — they would read `parent == Node` and be
+    /// indistinguishable from a concurrently-added child the rescue must recover. The
+    /// per-file-then-folder ordering is what makes the parent-pointer signal sound.
+    ///
+    /// If a peer concurrently added a live child under this folder and it has already
+    /// merged in, `tree.delete` sweeps it (it inherits the folder's tombstone) — that
+    /// swept child is exactly what the reactive rescue (`rescue_swept_orphans`) recovers
+    /// on the apply path, keyed on its surviving `parent == Node(folder)` edge.
+    ///
+    /// In-memory only — the caller persists via [`Self::save_index`]. Rebuilds the caches
+    /// from the now-current tree (a swept descendant's `path` meta re-derives the
+    /// deleted-paths guard correctly).
+    pub fn delete_folder(&self, path: &str) -> Result<bool> {
+        let Some(folder_node) = self.find_folder_node(path) else {
+            tracing::debug!("delete_folder: no folder node for '{}' — no-op", path);
+            return Ok(false);
+        };
+
+        let tree = self.index_tree();
+        if tree.is_node_deleted(&folder_node).unwrap_or(true) {
+            tracing::debug!("delete_folder: folder '{}' already tombstoned — no-op", path);
+            return Ok(false);
+        }
+
+        tree.delete(folder_node).map_err(|e| {
+            IndexError::TreeOperation(format!("Failed to delete folder node: {}", e))
+        })?;
+
+        // Re-derive both caches + the deleted-paths guard from the now-current tree: the
+        // folder node left the live set, and any descendant it swept must drop out of the
+        // path cache (and into the deleted-paths set via its `path` meta).
+        self.rebuild_caches();
+
+        tracing::info!("Deleted folder node from index: {} ({:?})", path, folder_node);
+        Ok(true)
+    }
+
     /// Read a string-valued tree node meta field, or `None` if absent / not a string.
     pub(crate) fn tree_meta_string(meta: &loro::LoroMap, key: &str) -> Option<String> {
         meta.get(key).and_then(|v| {
