@@ -868,3 +868,405 @@ mod ac_inv_1_5a_empty_folder_materialize {
         );
     }
 }
+
+// =================== AC-EC-7/OQ-6 — folder-delete + reactive orphan rescue ===================
+//
+// Model II (`Index::delete_folder`): a whole-folder delete is driven as per-file
+// `delete_node` for each removed file (stamping each `parent == Deleted`, the HONOR
+// marker) THEN `delete_folder` on the now-empty folder node. If a peer concurrently
+// ADDED a file under that folder, the folder-node delete sweeps it (it inherits the
+// tombstone) — its own `parent` stays `Node(folder)`, the RESCUE marker. The reactive
+// rescue (`rescue_swept_orphans`, fired inside the apply path before delete-detection)
+// revives the folder chain to live and re-homes the swept add to its original path, so
+// EC-7 holds: deleting a folder never silently loses a doc a peer concurrently put in it.
+//
+// Every test drives the REAL `process_message` apply path (via the handshake helpers),
+// checks BOTH replicas, and runs BOTH sync directions — the rescue is symmetric, no
+// locality. "Byte-identical convergence" is asserted via `assert_converged`.
+
+mod ac_ec7_folder_delete_rescue {
+    use super::*;
+
+    /// Remove a whole directory the Model-II way on `vault`+`fs`: per-file `delete_node`
+    /// each `.md` directly under `dir` (the HONOR-stamping genuine deletes), drop each on
+    /// disk, then `delete_folder(dir)` the now-empty folder node. Flushes the Index.
+    /// Mirrors what the daemon's folder-delete detection would emit in P4.
+    async fn delete_folder_with_files(vault: &V, fs: &Fs, dir: &str) {
+        let prefix = format!("{dir}/");
+        let children: Vec<String> = vault
+            .list_files()
+            .await
+            .unwrap()
+            .into_iter()
+            // Only the files DIRECTLY in `dir` (a nested file is removed when its own
+            // sub-folder is deleted; tests that need nested deletes call this per level).
+            .filter(|p| p.starts_with(&prefix) && !p[prefix.len()..].contains('/'))
+            .collect();
+        for child in &children {
+            vault.index().delete_node(child).unwrap();
+            fs.delete(child).await.ok();
+        }
+        vault.index().delete_folder(dir).unwrap();
+        vault.save_index().await.unwrap();
+    }
+
+    /// Assert A and B have CONVERGED to byte-identical materialized + catalog state: the
+    /// same set of `.md` files, byte-identical `.md` content at every path, and the same
+    /// Index version vector (the catalog-level convergence digest). This is the
+    /// "byte-identical on both replicas" guarantee the rescue's determinism rests on.
+    async fn assert_converged(a: &V, fs_a: &Fs, b: &V, fs_b: &Fs) {
+        let files_a = md_files(a).await;
+        let files_b = md_files(b).await;
+        assert_eq!(files_a, files_b, "converged: identical .md file sets");
+        for path in &files_a {
+            assert_eq!(
+                read_md_str(fs_a, path).await,
+                read_md_str(fs_b, path).await,
+                "converged: byte-identical .md at {path}"
+            );
+        }
+        assert_eq!(
+            a.index().state_vv(),
+            b.index().state_vv(),
+            "converged: identical Index version vectors"
+        );
+    }
+
+    /// A clean whole-folder delete with NO concurrent add: the folder and its files go,
+    /// the directory is removed on both replicas, NOTHING is rescued, and they converge.
+    /// (The honor-only path — every dead node reads `parent == Deleted`.)
+    #[tokio::test]
+    async fn clean_folder_delete_no_rescue() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            write_and_index(&a, &fs_a, "proj/a.md", "# a\n\nbody a").await;
+            write_and_index(&a, &fs_a, "proj/b.md", "# b\n\nbody b").await;
+            sync_both_ways(&a, &b).await;
+
+            // A removes the whole folder; no peer added anything.
+            delete_folder_with_files(&a, &fs_a, "proj").await;
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+
+            let label = if forward { "A->B" } else { "B->A" };
+            assert!(
+                md_files(&b).await.is_empty(),
+                "{label}: B's files are gone (whole folder deleted)"
+            );
+            assert!(md_files(&a).await.is_empty(), "{label}: A's files are gone");
+            assert!(
+                !fs_b.exists("proj").await.unwrap(),
+                "{label}: B's now-empty proj/ directory is removed"
+            );
+            assert_eq!(
+                folder_nodes_at(&b, "proj"),
+                0,
+                "{label}: no alive proj/ folder node on B"
+            );
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// THE HEADLINE (EC-7): A deletes `proj/`'s files + the folder while B concurrently
+    /// adds `proj/new.md`. After convergence the concurrent add is RESCUED — `proj/`
+    /// revived holding `proj/new.md` at its original path with its body intact (INV-3) —
+    /// while A's genuinely-deleted files stay deleted. Byte-identical, both directions.
+    #[tokio::test]
+    async fn delete_vs_concurrent_add_rescues_orphan() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            write_and_index(&a, &fs_a, "proj/keep.md", "# keep\n\nkeep body").await;
+            write_and_index(&a, &fs_a, "proj/gone.md", "# gone\n\ngone body").await;
+            sync_both_ways(&a, &b).await;
+
+            // CONCURRENT: A removes the whole folder; B adds a file inside it.
+            delete_folder_with_files(&a, &fs_a, "proj").await;
+            write_and_index(&b, &fs_b, "proj/new.md", "# new\n\nNEW BODY important").await;
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+            let label = if forward { "A->B" } else { "B->A" };
+
+            // The concurrent add survives at its original path on BOTH replicas, body intact.
+            for (v, fs, who) in [(&a, &fs_a, "A"), (&b, &fs_b, "B")] {
+                assert!(
+                    md_files(v).await.contains("proj/new.md"),
+                    "{label}/{who}: the rescued concurrent add proj/new.md is present"
+                );
+                assert_eq!(
+                    read_md_str(fs, "proj/new.md").await,
+                    "# new\n\nNEW BODY important",
+                    "{label}/{who}: rescued body is intact (INV-3)"
+                );
+                // A's genuinely-deleted files stay deleted.
+                assert!(
+                    !md_files(v).await.contains("proj/keep.md"),
+                    "{label}/{who}: the explicitly-deleted keep.md stays deleted"
+                );
+                assert!(
+                    !md_files(v).await.contains("proj/gone.md"),
+                    "{label}/{who}: the explicitly-deleted gone.md stays deleted"
+                );
+                // proj/ is alive (it holds a live child) and is exactly one folder node.
+                assert_eq!(
+                    folder_nodes_at(v, "proj"),
+                    1,
+                    "{label}/{who}: exactly one surviving proj/ folder node (revives merged)"
+                );
+            }
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// CRUX (PROBE C): the concurrent add is directly inside an EXPLICITLY-deleted
+    /// SUB-folder. A deletes `proj/sub/`'s file + the `sub/` folder + the `proj/` folder
+    /// while B adds `proj/sub/added.md`. The add was never itself deleted (only swept by
+    /// `sub/`'s deletion) so it is rescued — the rule keys on "was THIS node explicitly
+    /// deleted", not "is this node under a deleted folder".
+    #[tokio::test]
+    async fn concurrent_add_inside_deleted_subfolder_is_rescued() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            write_and_index(&a, &fs_a, "proj/sub/pre.md", "# pre\n\npre body").await;
+            sync_both_ways(&a, &b).await;
+
+            // A removes proj/sub/ then proj/ (each level the Model-II way), bottom-up.
+            delete_folder_with_files(&a, &fs_a, "proj/sub").await;
+            // proj/ now has no files (sub was its only child) — delete the folder node.
+            a.index().delete_folder("proj").unwrap();
+            a.save_index().await.unwrap();
+
+            // B concurrently adds a file under the sub-folder A is deleting.
+            write_and_index(&b, &fs_b, "proj/sub/added.md", "# added\n\nADDED body").await;
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+            let label = if forward { "A->B" } else { "B->A" };
+
+            for (v, fs, who) in [(&a, &fs_a, "A"), (&b, &fs_b, "B")] {
+                assert!(
+                    md_files(v).await.contains("proj/sub/added.md"),
+                    "{label}/{who}: the add inside the deleted sub-folder is rescued"
+                );
+                assert_eq!(
+                    read_md_str(fs, "proj/sub/added.md").await,
+                    "# added\n\nADDED body",
+                    "{label}/{who}: rescued sub-folder add body intact"
+                );
+                assert!(
+                    !md_files(v).await.contains("proj/sub/pre.md"),
+                    "{label}/{who}: the explicitly-deleted pre.md stays deleted"
+                );
+                assert_eq!(
+                    folder_nodes_at(v, "proj/sub"),
+                    1,
+                    "{label}/{who}: the proj/sub chain is revived to one folder node"
+                );
+            }
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// NESTED DEPTH: a swept GRANDCHILD. A deletes `a/b/orig.md` + the `a/b/` + `a/`
+    /// folders while B adds `a/b/deep.md`. The grandchild is rescued and the multi-level
+    /// `a/b/` chain is revived to live.
+    #[tokio::test]
+    async fn nested_swept_grandchild_is_rescued() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            write_and_index(&a, &fs_a, "a/b/orig.md", "# orig\n\norig body").await;
+            sync_both_ways(&a, &b).await;
+
+            // A removes a/b/ then a/ (a/b/ was a/'s only child).
+            delete_folder_with_files(&a, &fs_a, "a/b").await;
+            a.index().delete_folder("a").unwrap();
+            a.save_index().await.unwrap();
+
+            // B concurrently adds a grandchild two levels deep.
+            write_and_index(&b, &fs_b, "a/b/deep.md", "# deep\n\nDEEP body").await;
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+            let label = if forward { "A->B" } else { "B->A" };
+
+            for (v, fs, who) in [(&a, &fs_a, "A"), (&b, &fs_b, "B")] {
+                assert!(
+                    md_files(v).await.contains("a/b/deep.md"),
+                    "{label}/{who}: the swept grandchild is rescued at its original depth"
+                );
+                assert_eq!(
+                    read_md_str(fs, "a/b/deep.md").await,
+                    "# deep\n\nDEEP body",
+                    "{label}/{who}: rescued grandchild body intact"
+                );
+                assert!(
+                    !md_files(v).await.contains("a/b/orig.md"),
+                    "{label}/{who}: the explicitly-deleted orig.md stays deleted"
+                );
+                assert_eq!(
+                    folder_nodes_at(v, "a"),
+                    1,
+                    "{label}/{who}: the a/ ancestor is revived"
+                );
+                assert_eq!(
+                    folder_nodes_at(v, "a/b"),
+                    1,
+                    "{label}/{who}: the a/b/ chain is revived to live"
+                );
+            }
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// HONOR (no false rescue): an explicitly `delete_node`d file — NOT swept by a folder
+    /// delete — must NOT be rescued. A deletes a single file `notes/old.md` (its parent
+    /// folder stays alive, other files remain) while B edits a sibling; the deleted file
+    /// reads `parent == Deleted`, so the rescue leaves it deleted (it was the user's
+    /// explicit deletion, not a swept concurrent add).
+    #[tokio::test]
+    async fn explicit_file_delete_is_not_rescued() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            write_and_index(&a, &fs_a, "notes/old.md", "# old\n\nold body").await;
+            write_and_index(&a, &fs_a, "notes/stay.md", "# stay\n\nstay body").await;
+            sync_both_ways(&a, &b).await;
+
+            // A explicitly deletes ONE file (the folder + the sibling stay alive).
+            a.index().delete_node("notes/old.md").unwrap();
+            fs_a.delete("notes/old.md").await.ok();
+            a.save_index().await.unwrap();
+            // B concurrently edits the sibling, so there is genuine traffic to merge.
+            write_and_index(&b, &fs_b, "notes/stay.md", "# stay\n\nstay body EDITED").await;
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+            let label = if forward { "A->B" } else { "B->A" };
+
+            for (v, who) in [(&a, "A"), (&b, "B")] {
+                assert!(
+                    !md_files(v).await.contains("notes/old.md"),
+                    "{label}/{who}: the explicitly-deleted file is NOT resurrected by the rescue"
+                );
+                assert!(
+                    md_files(v).await.contains("notes/stay.md"),
+                    "{label}/{who}: the sibling survives"
+                );
+            }
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// RESCUE TARGET OCCUPIED: a swept orphan whose original path is concurrently taken
+    /// by a DISTINCT live file. A deletes `proj/`'s file + folder AND, before the delete,
+    /// B added `proj/new.md`; meanwhile a THIRD distinct document is also placed at
+    /// `proj/new.md` (a different UUID) so the rescue's re-home target is occupied. The
+    /// rescue re-homes the orphan and the resulting same-path collision falls to the
+    /// existing file cascade (INV-5) — no document is lost, deterministic both ways.
+    #[tokio::test]
+    async fn rescue_target_occupied_falls_to_cascade() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            write_and_index(&a, &fs_a, "proj/seed.md", "# seed\n\nseed body").await;
+            sync_both_ways(&a, &b).await;
+
+            // A removes the whole proj/ folder.
+            delete_folder_with_files(&a, &fs_a, "proj").await;
+
+            // B (concurrently) adds proj/new.md AND, also on B, a DISTINCT second document
+            // that will end up colliding at the same path post-rescue. To get two distinct
+            // UUIDs at one path we create new.md on B and a same-path doc on A's side too:
+            // A re-creates proj/new.md as its OWN distinct doc after the folder delete.
+            write_and_index(&b, &fs_b, "proj/new.md", "# new B\n\nB body").await;
+            write_and_index(&a, &fs_a, "proj/new.md", "# new A\n\nA body").await;
+
+            let uuid_a = uuid_at(&a, "proj/new.md");
+            let uuid_b = uuid_at(&b, "proj/new.md");
+            assert_ne!(
+                uuid_a, uuid_b,
+                "the two proj/new.md docs are distinct documents"
+            );
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+            let label = if forward { "A->B" } else { "B->A" };
+
+            // NEITHER document is lost: the survivor keeps proj/new.md, the loser is at the
+            // full-UUID conflict path. Both replicas agree (the cascade is deterministic).
+            let loser = uuid_a.max(uuid_b);
+            let conflict = conflict_path("proj/new.md", &loser);
+            for (v, who) in [(&a, "A"), (&b, "B")] {
+                let files = md_files(v).await;
+                assert!(
+                    files.contains("proj/new.md"),
+                    "{label}/{who}: a survivor keeps proj/new.md"
+                );
+                assert!(
+                    files.contains(&conflict),
+                    "{label}/{who}: the loser is preserved at the conflict path {conflict} (no loss)"
+                );
+            }
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// DETERMINISM under reordering: with THREE replicas, a folder delete vs a concurrent
+    /// add converges byte-identically regardless of the pump order — the rescue's
+    /// classification + placement is a pure function of merged state, so every replica
+    /// computes the same partition. Driven via `pump_to_quiescence` (every ordered pair).
+    #[tokio::test]
+    async fn rescue_is_deterministic_across_three_replicas() {
+        let (a, b, c, fs_a, fs_b, fs_c) = three_vaults().await;
+        write_and_index(&a, &fs_a, "proj/base.md", "# base\n\nbase body").await;
+        pump_to_quiescence(&[&a, &b, &c]).await;
+
+        // A removes the whole folder; C concurrently adds a file inside it.
+        delete_folder_with_files(&a, &fs_a, "proj").await;
+        write_and_index(&c, &fs_c, "proj/added.md", "# added\n\nADDED body").await;
+
+        pump_to_quiescence(&[&a, &b, &c]).await;
+
+        // All three converge: the rescued add present + intact, base gone, one proj/ node.
+        for (v, fs, who) in [(&a, &fs_a, "A"), (&b, &fs_b, "B"), (&c, &fs_c, "C")] {
+            assert!(
+                md_files(v).await.contains("proj/added.md"),
+                "{who}: the rescued add is present after quiescence"
+            );
+            assert_eq!(
+                read_md_str(fs, "proj/added.md").await,
+                "# added\n\nADDED body",
+                "{who}: rescued body intact"
+            );
+            assert!(
+                !md_files(v).await.contains("proj/base.md"),
+                "{who}: the deleted base.md stays deleted"
+            );
+            assert_eq!(
+                folder_nodes_at(v, "proj"),
+                1,
+                "{who}: one surviving proj/ node"
+            );
+        }
+        // Byte-identical across all pairs.
+        assert_converged(&a, &fs_a, &b, &fs_b).await;
+        assert_converged(&b, &fs_b, &c, &fs_c).await;
+    }
+}

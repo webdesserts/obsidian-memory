@@ -110,6 +110,14 @@ impl<F: FileSystem> Vault<F> {
         // doc's actual `state_vv()`, so the compare digest (P3) reads a correct cache.
         let repaired = self.repair_content_versions().await?;
 
+        // Recover any folder-swept orphan (EC-7/OQ-6) that persisted across this load: a
+        // concurrent add a peer's folder delete tombstoned, whose own parent is still a
+        // dead folder node. The apply path rescues these inline, but boot reconcile is the
+        // backstop for one that survived a restart (e.g. the apply was interrupted before
+        // the rescue, or the orphan's content arrived only after the apply that swept it).
+        // It revives + re-homes + re-materializes + persists internally when it acts.
+        self.rescue_swept_orphans().await?;
+
         // Materialize the folder set from the Index (INV-1.5a): a fresh clone / `reload`
         // re-creates each tracked empty directory and removes a tombstoned folder's empty
         // directory. Folders are invisible to the file passes above (which see only

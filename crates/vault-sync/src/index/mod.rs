@@ -33,7 +33,7 @@ mod state;
 mod tree;
 
 pub use state::{FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId};
-pub use tree::{FolderEntry, StructuralNode};
+pub use tree::{FolderEntry, StructuralNode, SweptOrphan};
 
 use crate::fs::FileSystem;
 use loro::LoroDoc;

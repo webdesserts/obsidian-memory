@@ -25,7 +25,7 @@ use crate::conflict::{NodeKind, StructuralOp, StructuralView, resolve_structure}
 use crate::content_doc::{ContentDoc, warn_if_pending};
 use crate::fs::FileSystem;
 use crate::hash::content_summary;
-use crate::index::StructuralNode;
+use crate::index::{StructuralNode, SweptOrphan};
 use crate::vault::Vault;
 
 use loro::TreeID;
@@ -155,6 +155,23 @@ impl<F: FileSystem> Vault<F> {
         // meta) and applies "alive wins", so a peer's legitimate re-create at a
         // previously-deleted path is not blocked.
         self.index().rebuild_caches();
+
+        // Reactive folder-orphan rescue (EC-7/OQ-6) — BEFORE delete-detection, on
+        // purpose. A peer's folder-NODE delete sweeps a concurrently-added child
+        // (`Index::delete_folder`): the child reads tombstoned yet its OWN parent is
+        // still the (dead) folder node, never `Deleted`. Running the rescue here revives
+        // each such orphan to a LIVE path, so it is alive again BEFORE the delete-
+        // detection below classifies vacated paths. That ordering is load-bearing for
+        // INV-3: a still-swept orphan's path would otherwise enter `vacated.deleted`,
+        // which both removes its `docs/<uuid>.loro` (`cleanup_vacated_paths`) AND filters
+        // its content update out of the document batch (`deleted_uuids` in
+        // `apply_response_updates`) — destroying the concurrent add's content before any
+        // post-merge pass could recover it. Reviving first keeps the node alive at its
+        // path so neither happens, and its content materializes normally (it is on disk
+        // already, or arrives in this message's document updates for the now-live node).
+        // The cascade (folder-merge) that collapses two replicas' independently-revived
+        // folder nodes still runs later (`resolve_structural_conflicts`, after content).
+        self.rescue_swept_orphans().await?;
 
         // NOTE: the structural-conflict cascade (INV-5.0/5.3) does NOT fire here.
         // It runs in `resolve_structural_conflicts`, called AFTER `apply_doc_updates`
@@ -312,6 +329,118 @@ impl<F: FileSystem> Vault<F> {
         self.apply_structural_ops(ops).await?;
         self.index().save_index(self.fs()).await?;
         self.index().sync_state.mark_index_synced();
+        Ok(())
+    }
+
+    /// Recover concurrent adds a peer's folder-NODE delete SWEPT (EC-7/OQ-6) — the
+    /// reactive folder-orphan rescue, a SEPARATE pass from the conflict cascade.
+    ///
+    /// Unlike the cascade (which resolves same-path collisions among ALIVE nodes from a
+    /// path-keyed `StructuralView`), this reads loro's deleted-node enumeration and
+    /// classifies each dead node by its OWN parent pointer — a pure merged-tree-state
+    /// signal, PROVEN deterministic and depth-independent. A dead file whose parent is
+    /// still a (dead) folder node was only swept by an ancestor folder's deletion, never
+    /// itself deleted (a genuine per-file delete reads `parent == Deleted`); it is a
+    /// concurrent add the user never removed, so EC-7 requires recovering it rather than
+    /// letting the folder delete silently subsume it.
+    ///
+    /// Each orphan is re-homed to its ORIGINAL path by reviving the folder chain to LIVE
+    /// nodes and `mov`-ing it under the live parent (see [`Index::rescue_orphan`]).
+    /// Re-homing un-deletes the node; its content `.md` is then re-materialized from its
+    /// path-independent `docs/<uuid>.loro` (present on disk already, or — for a brand-new
+    /// add whose body is still in flight — backfilled when the content update for the
+    /// now-live node arrives in this message's document batch, or by boot reconcile).
+    ///
+    /// **Where it runs.** Called from `apply_index_updates` BEFORE delete-detection
+    /// (reviving the orphan keeps its path out of the vacated set, so its `.loro` is not
+    /// deleted and its content update is not filtered) and from boot reconcile (a swept
+    /// orphan that persisted across a restart is recovered on load). When two replicas
+    /// each revive independently they mint distinct live folder nodes at one path; the
+    /// resulting folder collision is collapsed by `resolve_structural_conflicts` (which
+    /// runs later in the same `process_message`).
+    ///
+    /// Cheap when there is nothing to rescue — a single dead-node scan that returns early
+    /// when no swept orphan exists, and persists its own mutations only when it acted.
+    ///
+    /// Returns the index-layer `Result` (not the protocol `Result`) so it is callable
+    /// both from the protocol apply path (where `?` widens `IndexError` into `SyncError`)
+    /// AND from boot reconcile, whose `Result` is `IndexError`. Every error it produces —
+    /// tree mutation, fs read, content-doc decode — is already an `IndexError` variant.
+    pub(crate) async fn rescue_swept_orphans(&self) -> crate::index::Result<()> {
+        let orphans = self.index().swept_orphan_files();
+        if orphans.is_empty() {
+            return Ok(());
+        }
+
+        debug!(
+            "rescue_swept_orphans: recovering {} orphan(s)",
+            orphans.len()
+        );
+
+        // Revive each orphan in the tree (folder chain to live + re-home). Collect the
+        // (path, uuid) of each so the `.md` can be re-materialized after the caches are
+        // rebuilt to reflect the revived nodes.
+        let mut rescued: Vec<SweptOrphan> = Vec::new();
+        for orphan in orphans {
+            match self.index().rescue_orphan(&orphan) {
+                Ok(()) => rescued.push(orphan),
+                Err(e) => warn!(
+                    "rescue_swept_orphans: failed to rescue {} ({}): {} — left for reconcile",
+                    orphan.uuid, orphan.original_path, e
+                ),
+            }
+        }
+        if rescued.is_empty() {
+            return Ok(());
+        }
+
+        // Rebuild caches so the revived nodes are live in `path_to_node` and their paths
+        // are cleared from the deleted-paths guard (alive-wins), then materialize the
+        // revived folder directories and re-render each rescued `.md` from its `.loro`.
+        self.index().rebuild_caches();
+        self.materialize_folders().await?;
+        for orphan in &rescued {
+            self.rematerialize_rescued_md(orphan).await?;
+        }
+
+        // Persist the revived tree + re-mark synced (this pass runs before the
+        // `apply_index_updates` save tail, but a second save keeps the on-disk Index
+        // consistent if a later step in this apply path early-returns).
+        self.index().save_index(self.fs()).await?;
+        self.index().sync_state.mark_index_synced();
+        Ok(())
+    }
+
+    /// Re-render a rescued orphan's `.md` at its original path from its path-independent
+    /// `docs/<uuid>.loro` — the content the revived node already owns.
+    ///
+    /// The `.loro` is preserved through the rescue (the orphan was revived BEFORE the
+    /// vacated-path cleanup that would have removed it), so it is normally on disk. If it
+    /// is genuinely absent — a brand-new concurrent add whose body has not yet landed on
+    /// this replica — the `.md` is left for the content update (the node is now live, so
+    /// the update materializes it) or boot reconcile to backfill; this is warned, not
+    /// failed, mirroring the cascade's `rematerialize_owner_md`.
+    async fn rematerialize_rescued_md(&self, orphan: &SweptOrphan) -> crate::index::Result<()> {
+        let path = &orphan.original_path;
+        let loro_path = Self::doc_content_path(&DocId(orphan.uuid));
+        if !self.fs().exists(&loro_path).await.unwrap_or(false) {
+            warn!(
+                "rematerialize_rescued_md: no local .loro for rescued {} — .md at {} absent \
+                 until the content update or reconcile backstops it",
+                orphan.uuid, path
+            );
+            return Ok(());
+        }
+
+        let bytes = self.fs().read(&loro_path).await?;
+        let doc = ContentDoc::from_bytes(&bytes, self.loro_author())?;
+        self.mark_synced(path);
+        self.fs().write(path, doc.to_markdown().as_bytes()).await?;
+        self.documents_mut().insert(path.to_string(), doc);
+        debug!(
+            "rematerialize_rescued_md: rendered rescued {} at {}",
+            orphan.uuid, path
+        );
         Ok(())
     }
 

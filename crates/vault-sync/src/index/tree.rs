@@ -52,6 +52,27 @@ impl StructuralNode {
     }
 }
 
+/// A file node that a peer's folder delete SWEPT (tombstoned by inheriting an
+/// ancestor folder's deletion) without it ever being explicitly deleted — the
+/// concurrent-add the reactive rescue (`rescue_swept_orphans`, EC-7/OQ-6) recovers.
+///
+/// Classified PURELY from merged-tree state: a dead file node whose OWN immediate
+/// `parent` is still `Node(_)` was only swept (a genuine per-file delete reads
+/// `parent == Deleted`). Its `original_path` is read from the denormalized
+/// `TREE_META_PATH` meta — NOT a parent-chain walk, which severs at the first
+/// `Deleted` ancestor (an ancestor folder deleted alongside the sweep), so
+/// `get_node_path` would drop those ancestors and under-report the path.
+#[derive(Debug, Clone)]
+pub struct SweptOrphan {
+    /// The swept file node's tree id (used to `mov` it back under a revived parent).
+    pub node: TreeID,
+    /// The document UUID the node carries (its stable content identity).
+    pub uuid: Uuid,
+    /// The node's original display path, recovered from its `path` meta (reliable on
+    /// a tombstoned node; the parent-chain walk is not when ancestors are also dead).
+    pub original_path: String,
+}
+
 /// One folder node's display path and tombstone state — what the empty-folder
 /// materialization pass (INV-1.5a) needs to decide mkdir vs rmdir.
 ///
@@ -287,7 +308,10 @@ impl Index {
 
         let tree = self.index_tree();
         if tree.is_node_deleted(&folder_node).unwrap_or(true) {
-            tracing::debug!("delete_folder: folder '{}' already tombstoned — no-op", path);
+            tracing::debug!(
+                "delete_folder: folder '{}' already tombstoned — no-op",
+                path
+            );
             return Ok(false);
         }
 
@@ -300,8 +324,118 @@ impl Index {
         // path cache (and into the deleted-paths set via its `path` meta).
         self.rebuild_caches();
 
-        tracing::info!("Deleted folder node from index: {} ({:?})", path, folder_node);
+        tracing::info!(
+            "Deleted folder node from index: {} ({:?})",
+            path,
+            folder_node
+        );
         Ok(true)
+    }
+
+    /// Enumerate the file nodes a peer's folder delete SWEPT — dead nodes whose own
+    /// immediate parent is still a (dead) folder NODE, never explicitly deleted — the
+    /// orphans the reactive rescue (EC-7/OQ-6) recovers.
+    ///
+    /// The classification is a PURE function of merged-tree state (PROVEN deterministic,
+    /// depth-independent, order-independent — see the `loro_liveness_probe` module): a
+    /// dead file node reads `parent == Deleted` iff it was an explicit `tree.delete`
+    /// target (HONOR — a genuine per-file delete), and `parent == Node(_)` iff it was
+    /// only swept by an ancestor folder's deletion (RESCUE — a concurrent add the user
+    /// never deleted). Every replica computes the same partition over the same converged
+    /// tree, so the rescue's effect is replica-identical.
+    ///
+    /// Reads each orphan's `original_path` from its denormalized `TREE_META_PATH` meta
+    /// (set at register, kept current by `move_node`/`move_subtree`), which survives on a
+    /// tombstoned node — unlike a `get_node_path` parent-walk, which stops at the first
+    /// `Deleted` ancestor (a folder deleted in the same sweep) and so would under-report
+    /// the path. An orphan with no parseable `uuid` or no `path` meta is skipped (it
+    /// cannot be re-homed without both).
+    pub fn swept_orphan_files(&self) -> Vec<SweptOrphan> {
+        let tree = self.index_tree();
+        let mut orphans = Vec::new();
+
+        for node_id in tree.nodes() {
+            // Only DEAD nodes are candidates — a live node is at its path, nothing to do.
+            if !tree.is_node_deleted(&node_id).unwrap_or(false) {
+                continue;
+            }
+            // RESCUE iff the node's OWN parent is still a folder node. `Deleted` =
+            // explicitly deleted (HONOR); `Root`/absent = a deleted root-level file
+            // (HONOR — it was explicitly deleted, never swept).
+            if !matches!(tree.parent(node_id), Some(TreeParentId::Node(_))) {
+                continue;
+            }
+            let Ok(meta) = tree.get_meta(node_id) else {
+                continue;
+            };
+            // Only FILE nodes are rescued; a swept sub-folder is revived implicitly when
+            // an orphan inside it has its parent chain re-created (`create_folder`).
+            if Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() != Some("file") {
+                continue;
+            }
+            let Some(uuid) = Self::tree_meta_string(&meta, TREE_META_UUID)
+                .and_then(|s| Uuid::parse_str(&s).ok())
+            else {
+                continue;
+            };
+            let Some(original_path) = Self::tree_meta_string(&meta, TREE_META_PATH) else {
+                continue;
+            };
+            orphans.push(SweptOrphan {
+                node: node_id,
+                uuid,
+                original_path,
+            });
+        }
+
+        orphans
+    }
+
+    /// Re-home a swept orphan back to its original path by REVIVING the folder chain to
+    /// LIVE nodes and `mov`-ing the node under the live parent — the apply half of the
+    /// reactive rescue.
+    ///
+    /// Re-homing under a still-dead ancestor does NOT un-delete the node (PROVEN — see
+    /// `loro_liveness_probe`), so the parent directory is first materialized as a LIVE
+    /// folder chain via [`Self::create_folder`] (which never reuses a tombstoned folder
+    /// node — `tree.children` excludes tombstoned nodes, so it mints a fresh live one),
+    /// then `tree.mov` re-parents the orphan under it. The `mov` un-deletes the orphan;
+    /// its `path` meta is already its original path (the node itself was never moved, only
+    /// swept), so no meta rewrite is needed. Caches are rebuilt by the caller after the
+    /// batch (not per-orphan).
+    ///
+    /// When two replicas each rescue independently they mint DISTINCT live folder nodes
+    /// at one path — a folder collision the structural cascade (folder-merge, INV-1.5c)
+    /// collapses to a single survivor afterward, so the caller fires the cascade after
+    /// the rescue batch.
+    ///
+    /// In-memory only — the caller persists via [`Self::save_index`] and rebuilds caches.
+    pub fn rescue_orphan(&self, orphan: &SweptOrphan) -> Result<()> {
+        // The orphan's original path splits into its parent directory (the folder chain
+        // to revive) and its file name. A root-level orphan (no '/') has no folder chain
+        // — re-home it directly under Root.
+        let live_parent = match orphan.original_path.rsplit_once('/') {
+            Some((parent_dir, _name)) => {
+                let folder_node = self.create_folder(parent_dir)?;
+                TreeParentId::Node(folder_node)
+            }
+            None => TreeParentId::Root,
+        };
+
+        let tree = self.index_tree();
+        tree.mov(orphan.node, live_parent).map_err(|e| {
+            IndexError::TreeOperation(format!(
+                "Failed to re-home swept orphan {} to {}: {}",
+                orphan.uuid, orphan.original_path, e
+            ))
+        })?;
+
+        tracing::info!(
+            "Rescued swept orphan {} back to {}",
+            orphan.uuid,
+            orphan.original_path
+        );
+        Ok(())
     }
 
     /// Read a string-valued tree node meta field, or `None` if absent / not a string.
