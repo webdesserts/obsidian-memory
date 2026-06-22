@@ -3708,21 +3708,28 @@ mod daemon_integration {
     /// documents the exact on-disk location it asserts against.
     const PENDING_MOVES_JOURNAL: &str = ".sync/pending-moves.json";
 
-    /// Read the crash-recovery journal back THROUGH the daemon's filesystem — the
-    /// same in-memory fs the daemon writes to — and parse it as untyped JSON. The
-    /// journal's record types are `pub(crate)`, so the assertions inspect JSON
-    /// fields rather than the typed struct; what matters is that these are the bytes
-    /// the daemon actually persisted, not in-memory coalescer state. `None` when the
-    /// file is absent (a clean, fully-pruned journal leaves no file).
-    async fn read_journal(daemon: &TestDaemon) -> Option<serde_json::Value> {
-        let bytes = daemon.fs.read(PENDING_MOVES_JOURNAL).await.ok()?;
+    /// Read the crash-recovery journal back from the in-memory fs the daemon writes
+    /// to, and parse it as untyped JSON. The journal's record types are `pub(crate)`,
+    /// so the assertions inspect JSON fields rather than the typed struct; what
+    /// matters is that these are the bytes the daemon actually persisted, not
+    /// in-memory coalescer state. `None` when the file is absent (a clean,
+    /// fully-pruned journal leaves no file). Takes a bare fs handle so the
+    /// graceful-drain tests, whose post-quit assertions outlive the `TestDaemon`
+    /// (awaiting `loop_handle` consumes that field), can read it after teardown.
+    async fn read_journal_on_fs(fs: &Arc<InMemoryFs>) -> Option<serde_json::Value> {
+        let bytes = fs.read(PENDING_MOVES_JOURNAL).await.ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
     /// The `pending` array of the journal, or empty when the file is absent — the
     /// shape the prune assertions check (a committed record leaves no trace).
     async fn journal_pending(daemon: &TestDaemon) -> Vec<serde_json::Value> {
-        match read_journal(daemon).await {
+        journal_pending_on_fs(&daemon.fs).await
+    }
+
+    /// `journal_pending` against a bare fs handle (see [`read_journal_on_fs`]).
+    async fn journal_pending_on_fs(fs: &Arc<InMemoryFs>) -> Vec<serde_json::Value> {
+        match read_journal_on_fs(fs).await {
             Some(value) => value
                 .get("pending")
                 .and_then(|p| p.as_array())
@@ -3754,8 +3761,9 @@ mod daemon_integration {
             async move { uuid_of(&vault, "notes/old.md").await.is_some() }
         })
         .await;
-        let uuid_before =
-            uuid_of(&daemon.vault, "notes/old.md").await.expect("old.md should have a UUID");
+        let uuid_before = uuid_of(&daemon.vault, "notes/old.md")
+            .await
+            .expect("old.md should have a UUID");
 
         // Rename on the fs, then inject only the DELETE half — it buffers, awaiting
         // its partner create for the window.
@@ -4282,6 +4290,203 @@ mod daemon_integration {
         assert!(
             journal_pending(&daemon2).await.is_empty(),
             "the journal is cleared again after the idempotent second boot"
+        );
+
+        daemon2.shutdown.cancel();
+        let _ = daemon2.loop_handle.await;
+        Ok(())
+    }
+
+    // ── P4f-2c: graceful-shutdown drain ─────────────────────────────────────────
+    //
+    // On a clean quit the run-loop's shutdown arm drains the move-coalescer buffer
+    // BEFORE breaking: every buffered record commits standalone (lone delete →
+    // tombstone, lone create → fresh-mint doc) and the journal is rewritten empty.
+    // The drain is wait-free — pairing is eager, so the buffer holds only unpaired
+    // singletons at shutdown, with nothing to wait for. These tests drive a live
+    // daemon through `shutdown.cancel()` + `loop_handle.await`; because the drain
+    // runs in the shutdown arm before `break`, awaiting the loop guarantees the
+    // drain finished, so post-await assertions observe the drained end state.
+
+    /// A clean quit force-expires EVERY buffered record standalone and empties the
+    /// journal. Buffer a lone delete (tombstone-bound) and a lone create
+    /// (fresh-mint-bound), confirm both are journaled-but-uncommitted, then cancel:
+    /// after the loop joins, the delete's node is gone, the create's node is minted,
+    /// and the journal is empty. The end-to-end graceful-drain proof (P4f-2c).
+    #[tokio::test]
+    async fn graceful_shutdown_drains_buffered_records() -> anyhow::Result<()> {
+        let node = build_node(160).await?;
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let daemon = spawn_daemon(node, gossip);
+
+        // Track a file so the lone delete resolves to a live node + UUID.
+        daemon.fs.write("notes/keep-delete.md", b"goodbye").await?;
+        inject_modified(&daemon, "notes/keep-delete.md");
+        wait_until("notes/keep-delete.md is tracked", || {
+            let vault = daemon.vault.clone();
+            async move { uuid_of(&vault, "notes/keep-delete.md").await.is_some() }
+        })
+        .await;
+
+        // Buffer a LONE DELETE (no partner create injected) — bound to commit as a
+        // standalone tombstone at drain.
+        daemon.fs.delete("notes/keep-delete.md").await?;
+        inject_deleted(&daemon, "notes/keep-delete.md");
+
+        // Buffer a LONE CREATE for a path with no live node — bound to commit as a
+        // standalone fresh-UUID document at drain.
+        daemon
+            .fs
+            .write("notes/lone-create.md", b"# Brand new")
+            .await?;
+        inject_modified(&daemon, "notes/lone-create.md");
+
+        // Both singletons are journaled (buffered, NOT yet committed) before we quit.
+        wait_until("both lone records are journaled", || {
+            let daemon = &daemon;
+            async move { journal_pending(daemon).await.len() == 2 }
+        })
+        .await;
+
+        // Hold the vault + fs handles past the await on `loop_handle` (which consumes
+        // that field), so the post-drain assertions can inspect the drained state.
+        let vault = daemon.vault.clone();
+        let fs = daemon.fs.clone();
+
+        // Clean quit: the shutdown arm drains the buffer before breaking. Awaiting
+        // the loop guarantees the drain (and journal clear) completed.
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+
+        // The lone delete committed as a real tombstone — the node is gone.
+        assert!(
+            uuid_of(&vault, "notes/keep-delete.md").await.is_none(),
+            "the graceful drain must commit the lone delete as a standalone tombstone"
+        );
+        // The lone create committed as a fresh-UUID new document.
+        assert!(
+            uuid_of(&vault, "notes/lone-create.md").await.is_some(),
+            "the graceful drain must commit the lone create as a standalone new doc"
+        );
+        // The journal is empty — the next boot has zero recovery work.
+        assert!(
+            journal_pending_on_fs(&fs).await.is_empty(),
+            "the graceful drain must leave the journal empty"
+        );
+        Ok(())
+    }
+
+    /// The drain is wait-free: with a lone-delete buffered, the shutdown drain
+    /// commits it AND the loop joins well within a generous timeout. A drain that
+    /// blocked (waiting on a partner that never arrives) would hit the timeout.
+    /// Asserting the drain's EFFECT (the delete is tombstoned + journal emptied) on
+    /// top of the timeout is what makes this a wait-free-DRAIN proof and not merely a
+    /// "the loop exited" check — the loop joins fast even with no drain, so the
+    /// effect assertions are what pin the drain to actually having run.
+    #[tokio::test]
+    async fn graceful_shutdown_drain_is_wait_free() -> anyhow::Result<()> {
+        let node = build_node(161).await?;
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let daemon = spawn_daemon(node, gossip);
+
+        daemon.fs.write("notes/doomed.md", b"goodbye").await?;
+        inject_modified(&daemon, "notes/doomed.md");
+        wait_until("notes/doomed.md is tracked", || {
+            let vault = daemon.vault.clone();
+            async move { uuid_of(&vault, "notes/doomed.md").await.is_some() }
+        })
+        .await;
+
+        // A single buffered lone-delete — the leanest drainable state.
+        daemon.fs.delete("notes/doomed.md").await?;
+        inject_deleted(&daemon, "notes/doomed.md");
+        wait_until("the lone delete is journaled", || {
+            let daemon = &daemon;
+            async move { journal_pending(daemon).await.len() == 1 }
+        })
+        .await;
+
+        // Hold the handles past the await on `loop_handle`, which the timeout consumes.
+        let vault = daemon.vault.clone();
+        let fs = daemon.fs.clone();
+        let loop_handle = daemon.loop_handle;
+        daemon.shutdown.cancel();
+
+        // The loop must join well within 5s — the drain force-expires the singleton
+        // immediately, with no partner-wait to block on. A blocking drain would
+        // instead leave the loop running until this timeout fires.
+        let joined = tokio::time::timeout(Duration::from_secs(5), loop_handle).await;
+        assert!(
+            joined.is_ok(),
+            "the graceful drain must return without blocking (the loop joined within 5s)"
+        );
+
+        // The drain actually RAN within that window: the lone delete is committed as a
+        // standalone tombstone and the journal is empty. These pin the wait-free
+        // claim to a real, completed drain (the timeout alone passes even with no
+        // drain, since the loop exits fast regardless).
+        assert!(
+            uuid_of(&vault, "notes/doomed.md").await.is_none(),
+            "the wait-free drain must have committed the lone delete as a tombstone"
+        );
+        assert!(
+            journal_pending_on_fs(&fs).await.is_empty(),
+            "the wait-free drain must have emptied the journal"
+        );
+        Ok(())
+    }
+
+    /// After a graceful drain leaves the journal empty, the NEXT boot over the same
+    /// fs does zero recovery work: the drained standalone state stands, and the
+    /// journal stays empty. Proves the §0 guarantee — a clean quit leaves the next
+    /// boot nothing to recover.
+    #[tokio::test]
+    async fn boot_after_graceful_drain_finds_empty_journal() -> anyhow::Result<()> {
+        let node = build_node(162).await?;
+        // Hold a handle to the SAME fs the daemon persists into, to re-boot over it.
+        let fs = node.fs.clone();
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let daemon = spawn_daemon(node, gossip);
+
+        // Buffer a lone create, drain it on a clean quit (it commits standalone).
+        daemon.fs.write("notes/drained-create.md", b"# New").await?;
+        inject_modified(&daemon, "notes/drained-create.md");
+        wait_until("the lone create is journaled", || {
+            let daemon = &daemon;
+            async move { journal_pending(daemon).await.len() == 1 }
+        })
+        .await;
+        // Hold the first daemon's vault past the await on `loop_handle`.
+        let vault1 = daemon.vault.clone();
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+
+        let drained_uuid = uuid_of(&vault1, "notes/drained-create.md").await;
+        assert!(
+            drained_uuid.is_some(),
+            "the drain should have minted the lone create's node before quit"
+        );
+
+        // Re-boot a SECOND daemon over the SAME fs (same seed = re-opening the same
+        // vault after a restart). The drained empty journal means no recovery work.
+        let daemon2 = spawn_daemon_from_loaded(162, fs).await;
+        assert_eq!(
+            uuid_of(&daemon2.vault, "notes/drained-create.md").await,
+            drained_uuid,
+            "the next boot keeps the drained standalone create — no recovery churn"
+        );
+        assert!(
+            journal_pending(&daemon2).await.is_empty(),
+            "a clean quit leaves the next boot an empty journal"
         );
 
         daemon2.shutdown.cancel();
