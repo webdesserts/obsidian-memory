@@ -29,7 +29,9 @@ use crate::content_doc::ContentDoc;
 use crate::events::{EventBus, Subscription, SyncEvent};
 use crate::fs::FileSystem;
 use crate::hash::content_version_fingerprint;
-use crate::index::{Index, IndexError, Result, SyncMetadata, VaultId, content_doc_path};
+use crate::index::{
+    Index, IndexError, JournalReStitch, Result, SyncMetadata, VaultId, content_doc_path,
+};
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -201,6 +203,24 @@ impl<F: FileSystem> Vault<F> {
     /// vault to remote sync (`process_message`). Local state is fully captured before
     /// any remote delta integrates — "commit before pull."
     pub async fn load(fs: F, loro_author: u64) -> Result<Self> {
+        Self::load_with_journal(fs, loro_author, None).await
+    }
+
+    /// Load an existing vault, feeding the move-coalescer's crash-recovery journal
+    /// into boot reconcile (P4f-2b).
+    ///
+    /// Identical to [`Self::load`] except `journaled` carries the daemon's pending
+    /// native-move deletes: on boot, a journaled delete whose original UUID still has
+    /// a live node AND whose content matches an orphaned on-disk `.md` is re-stitched
+    /// (the UUID re-attached at the new path) inside reconcile, BEFORE reconcile would
+    /// mint a fresh node for that orphan. `load(fs, author)` is exactly
+    /// `load_with_journal(fs, author, None)` — `None` is byte-identical to the
+    /// pre-journal boot path. See [`crate::reconcile`] / `JournalReStitch`.
+    pub async fn load_with_journal(
+        fs: F,
+        loro_author: u64,
+        journaled: Option<&[JournalReStitch]>,
+    ) -> Result<Self> {
         if !fs.exists(SYNC_DIR).await? {
             return Err(IndexError::NotInitialized);
         }
@@ -217,7 +237,7 @@ impl<F: FileSystem> Vault<F> {
         // Reconcile the filesystem into the Index before the vault opens to remote
         // sync. The per-file work is log-and-continue inside reconcile, so only a
         // structural failure (e.g. persisting the merged Index) propagates here.
-        vault.reconcile().await?;
+        vault.reconcile(journaled).await?;
 
         Ok(vault)
     }

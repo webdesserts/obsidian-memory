@@ -49,6 +49,23 @@ use std::collections::HashSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// One journaled native-move DELETE the boot re-stitch may re-attach. The daemon
+/// builds this from its deserialized pending-move records (delete records only; a
+/// create record has no UUID to re-attach and is finalized standalone). A plain
+/// value type so vault-sync never sees the journal's on-disk serde form — the
+/// hex↔bytes conversion lives once at the daemon boundary.
+#[derive(Debug, Clone)]
+pub struct JournalReStitch {
+    /// The move's original document UUID — the lineage to re-attach at `new_path`.
+    pub uuid: Uuid,
+    /// The path the document was at when its delete buffered (the still-live node).
+    pub old_path: String,
+    /// The content hash of the buffered document, SAME domain as reconcile's own
+    /// `content_hash(&ContentDoc::from_markdown(..))` — `[u8; 32]`, NOT hex. The
+    /// daemon decodes its hex `content_hash` back to `[u8; 32]` at the boundary.
+    pub content_hash: [u8; 32],
+}
+
 impl<F: FileSystem> Vault<F> {
     /// Reconcile the filesystem with the Index — the boot pass that documents local
     /// fs state into the catalog before the vault opens to remote sync.
@@ -64,7 +81,17 @@ impl<F: FileSystem> Vault<F> {
     /// Per-file failures never abort the pass (a file race-deleted mid-scan must not
     /// fail `Vault::load`); a corrupt single content doc is contained and skipped
     /// (NFR-6). The Index is persisted once at the end if anything changed.
-    pub async fn reconcile(&self) -> Result<ReconcileReport> {
+    ///
+    /// `journaled` carries the move-coalescer's crash-recovery journal (the daemon's
+    /// pending native-move deletes, P4f-2b). When `Some`, a journaled delete whose
+    /// original UUID still has a live node AND whose content matches an orphaned
+    /// on-disk `.md` is re-stitched (the UUID re-attached at the new path) BEFORE the
+    /// per-file loop would mint a fresh node for that orphan — a pure `move_node` on a
+    /// still-live source. `None` is byte-identical to the pre-journal behavior.
+    pub async fn reconcile(
+        &self,
+        journaled: Option<&[JournalReStitch]>,
+    ) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
 
         // Every markdown file on disk, and every document UUID with a content `.loro`.
@@ -78,6 +105,22 @@ impl<F: FileSystem> Vault<F> {
             .adopt_orphans(&md_files, &doc_uuids, &mut report)
             .await?;
 
+        // Crash-recovery re-stitch (P4f-2b): re-attach the original UUID of each
+        // journaled native-move delete whose old node is STILL live and whose content
+        // matches an orphaned on-disk `.md`. Runs AFTER `adopt_orphans` but BEFORE the
+        // per-file loop, so `new_path` has no node yet and the re-attach is a single
+        // `move_node` on a live source — never a delete/tombstone, which is what makes
+        // the `{old alive, new tombstoned}` crash-intermediate structurally
+        // unconstructable. Disjoint from `adopt_orphans`: that pass acts on UUIDs with
+        // NO live node, this one only on UUIDs WITH a live node.
+        let restitched = match journaled {
+            Some(records) if !records.is_empty() => {
+                self.re_stitch_journaled(&md_files, records, &matched, &mut report)
+                    .await?
+            }
+            _ => HashSet::new(),
+        };
+
         // Second pass: reconcile each remaining `.md` against its Index/content state.
         //
         // Each file is reconciled in isolation and a per-file error never aborts the
@@ -86,7 +129,7 @@ impl<F: FileSystem> Vault<F> {
         // directory scan and this loop). NotFound (a vanished file) is benign and
         // debug-logged; other errors warn.
         for path in &md_files {
-            if matched.contains(path) {
+            if matched.contains(path) || restitched.contains(path) {
                 continue;
             }
             match self.reconcile_one_file(path, &mut report).await {
@@ -277,6 +320,18 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(matched)
+    }
+
+    /// Re-stitch the journaled native-move deletes (P4f-2b crash recovery) — stubbed
+    /// in this commit (the additive plumbing); the recovery logic lands next.
+    async fn re_stitch_journaled(
+        &self,
+        _md_files: &HashSet<String>,
+        _journaled: &[JournalReStitch],
+        _matched: &HashSet<String>,
+        _report: &mut ReconcileReport,
+    ) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
     }
 
     /// Reconcile a single `.md` file against its Index/content state.

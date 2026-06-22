@@ -483,3 +483,75 @@ mod content_version_table_rebuild {
         );
     }
 }
+
+// ========================= P4f-2b — boot journal re-stitch (crash recovery) =========================
+
+mod ac_p4f_2b_journal_restitch {
+    //! Boot crash-recovery for the move-coalescer (P4f-2b-i): a journaled native-move
+    //! DELETE whose original UUID STILL has a live node AND whose content matches an
+    //! orphaned on-disk `.md` is RE-STITCHED inside reconcile — the original UUID
+    //! re-attached at the new path via a single `move_node` on a still-live source,
+    //! BEFORE reconcile's per-file loop would mint a fresh node for that orphan.
+    //!
+    //! Every test drives the REAL `Vault::load_with_journal` (never a hand-stitched
+    //! Index — that would be a false green).
+    //!
+    //! These two tests pin the additive-param backward-compat guarantee: `None` is
+    //! byte-identical to `Vault::load`, and an empty journal slice is equally inert.
+    //! The re-stitch recovery tests (which need a live-old-node crash state) land
+    //! alongside the recovery logic itself.
+
+    use super::*;
+    use vault_sync::JournalReStitch;
+
+    /// `None` is byte-identical to `Vault::load` (the backward-compat guarantee): a
+    /// brand-new `.md` is indexed by reconcile's normal arm, exactly as the bare load
+    /// does. The cheap proof that the additive `journaled` param's `None` is the identity.
+    #[tokio::test]
+    async fn none_journal_is_byte_identical_to_load() {
+        let fs = Arc::new(InMemoryFs::new());
+        {
+            let setup = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
+            drop(setup);
+        }
+        // A brand-new `.md` on disk with no index node.
+        fs.write("fresh.md", b"# Fresh\n\nNew content.\n")
+            .await
+            .unwrap();
+
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, None)
+            .await
+            .unwrap();
+
+        // reconcile's normal new-file arm fires under `None`, just as `Vault::load` would.
+        assert!(
+            vault.index().node_for_path("fresh.md").is_some(),
+            "with None journal, reconcile indexes a brand-new file exactly as the bare load does"
+        );
+    }
+
+    /// `Some(&[])` is also a no-op for the re-stitch (distinct from `None`, but equally
+    /// inert): reconcile proceeds normally and the empty slice never invokes the
+    /// re-stitch pass. Pins that an empty journal is treated as "nothing to recover".
+    #[tokio::test]
+    async fn empty_journal_slice_is_noop() {
+        let fs = Arc::new(InMemoryFs::new());
+        {
+            let setup = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
+            drop(setup);
+        }
+        fs.write("also-fresh.md", b"# Also\n\nFresh body.\n")
+            .await
+            .unwrap();
+
+        let empty: Vec<JournalReStitch> = Vec::new();
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&empty))
+            .await
+            .unwrap();
+
+        assert!(
+            vault.index().node_for_path("also-fresh.md").is_some(),
+            "an empty journal slice is a no-op — reconcile indexes the new file normally"
+        );
+    }
+}
