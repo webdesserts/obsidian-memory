@@ -218,8 +218,20 @@ impl<F: FileSystem> Vault<F> {
 
     /// Refresh a node's denormalized `content_version` fingerprint after an inbound
     /// merge/materialize (the derived digest cache the compare protocol reads).
+    ///
+    /// Resolves the node by the doc's OWN UUID, not by `path`: during a distinct-UUID
+    /// same-path collision the path cache points at the OTHER colliding node, so a
+    /// path-keyed lookup would write the wrong UUID's local content_version entry and
+    /// leave this doc's unset (the digest reads a per-UUID local table now, so a
+    /// mis-keyed write diverges the two replicas). Falls back to the path lookup only
+    /// when the doc carries no parseable UUID (malformed — nothing to key by).
     fn bump_content_version(&self, path: &str, doc: &ContentDoc) -> Result<()> {
-        if let Some(node) = self.index().node_for_path(path) {
+        let node = doc
+            .doc_id()
+            .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+            .and_then(|uuid| self.index().find_node_by_uuid(&uuid))
+            .or_else(|| self.index().node_for_path(path));
+        if let Some(node) = node {
             let fingerprint = crate::hash::content_version_fingerprint(&doc.version());
             self.index().set_content_version(&node, &fingerprint)?;
         }

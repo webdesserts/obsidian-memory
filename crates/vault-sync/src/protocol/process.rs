@@ -245,22 +245,6 @@ impl<F: FileSystem> Vault<F> {
         // tree-scan gate, no content load).
         self.resolve_structural_conflicts().await?;
 
-        // Tactical repair (Resolution #1): `content_version` is a per-replica-local
-        // fingerprint of each doc's content, yet it is stored as meta IN the shared Index
-        // CRDT — so a peer's value can be merged in (riding the full Index snapshot) AHEAD
-        // of the content it fingerprints, when the content is withheld (the `exclude`
-        // path: a doc we just sent the peer is not echoed back, but its Index meta still
-        // ships). That leaves our cache claiming a version our local content does not yet
-        // have, and the catalog digest — which trusts the cache — would then falsely
-        // report "in sync" and trap the divergence. Recompute each touched node's
-        // `content_version` from our ACTUAL local content so the digest never trusts a
-        // lie. A fresh local write wins the loro LWW merge (its Lamport strictly exceeds
-        // any op it has observed, including the adopted value), so this is self-healing
-        // with no livelock. Root fix = move `content_version` to a local side-table out of
-        // the synced CRDT (#2, owner's call). See Reviews/Vault-Sync content_version
-        // Digest Trust.
-        self.repair_content_versions_after_apply().await?;
-
         for uuid in &modified {
             self.emit(SyncEvent::DocumentUpdated {
                 path: uuid.to_string(),
@@ -269,54 +253,6 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(modified)
-    }
-
-    /// Recompute each live file node's denormalized `content_version` from its ACTUAL
-    /// local content doc, overwriting any value adopted from a peer's Index meta ahead of
-    /// the content it fingerprints (Resolution #1; see the call site for why the drift
-    /// happens). Persists the Index only when a fingerprint actually changed.
-    ///
-    /// Runs at the apply TAIL (after the cascade settled doc states), never in
-    /// `ensure_consistency` — that runs at the top of EVERY `process_message`, including
-    /// the no-op `SyncRequest → InSync` path, where opening content per doc would defeat
-    /// the O(1) no-op the digest exists for. A no-op never reaches this apply path, so the
-    /// O(1) no-op is preserved; a digest MISS is already allowed O(documents) (§6.2).
-    ///
-    /// TODO(perf): scope this to the docs the Index delta actually touched (the lying set
-    /// ⊆ meta-changed − content-arrived) instead of all live nodes. Cheaply identifying
-    /// that set is impractical in this chunk, and recomputing for all live nodes at the
-    /// apply tail is correct — so this is the acceptable bridge until the root fix (#2)
-    /// removes `content_version` from the synced CRDT.
-    async fn repair_content_versions_after_apply(&self) -> Result<()> {
-        // Snapshot `(uuid, node)` before the awaits — `TreeID` is `Copy`, so this copies
-        // the pairs out from under the Index lock rather than holding it across `.await`.
-        let nodes = self.index().live_file_nodes();
-
-        let mut repaired = false;
-        for (uuid, node) in nodes {
-            let Some(path) = self.index().path_for_node(&node) else {
-                continue;
-            };
-            let actual = crate::hash::content_version_fingerprint(
-                &self.get_document(&path).await?.version(),
-            );
-            if self.index().node_content_version(&node) != Some(actual) {
-                self.index().set_content_version(&node, &actual)?;
-                debug!(
-                    "repair_content_versions_after_apply: corrected {} ({})",
-                    path, uuid
-                );
-                repaired = true;
-            }
-        }
-
-        // Persist only when a correction landed — the Index was already saved by
-        // `apply_index_updates` / the cascade, so an unchanged pass writes nothing.
-        if repaired {
-            self.index().save_index(self.fs()).await?;
-            self.index().sync_state.mark_index_synced();
-        }
-        Ok(())
     }
 
     /// Reconcile fs↔document drift before importing remote data.

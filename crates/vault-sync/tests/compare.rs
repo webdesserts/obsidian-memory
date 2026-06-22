@@ -143,9 +143,11 @@ mod ac_6_no_op_cheap {
         // Drive ONE direction (A→B). B now holds both edits to shared.md; A applied B's
         // Index meta for shared.md (riding the forced full snapshot) but NOT B's content
         // (the exclude path withheld it). The digests MUST NOT falsely match here — A
-        // still lacks B's line. This is the direct guard on the content_version repair:
-        // without it A's cache would lie, the digests would match, and the reverse leg
-        // would short-circuit on a false InSync and trap the divergence.
+        // still lacks B's line. This is the direct guard on content_version being a
+        // per-replica-LOCAL value (Resolution #2): because the digest reads A's local
+        // table — not the merged Index meta — B's value can't poison A's digest, so the
+        // reverse leg correctly still sees a difference instead of short-circuiting on a
+        // false InSync and trapping the divergence.
         full_sync(&a, &b).await;
         assert_ne!(
             a.catalog_digest(),
@@ -387,6 +389,81 @@ mod ac_catalog_digest {
             a.catalog_digest(),
             b.catalog_digest(),
             "two fresh empty vaults must produce equal digests"
+        );
+    }
+}
+
+/// Resolution #2 — `content_version` is a per-replica-LOCAL value, structurally
+/// immune to a peer's Index delta. This is the root-cause fix the whole effort exists
+/// for: the fingerprint backing the digest can no longer be overwritten by a peer's
+/// value riding the Index snapshot ahead of the content it fingerprints, so the
+/// convergence trap (digest falsely matches → no pull) is structurally impossible.
+mod content_version_is_local {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Applying a peer's Index delta does NOT change THIS replica's `content_version`
+    /// for a document whose CONTENT it lacks — the value is local-only and unsyncable.
+    ///
+    /// A and B converge on `shared.md`, then B edits it (B's local fingerprint for that
+    /// doc advances). A then imports ONLY B's Index — its full snapshot, carrying B's
+    /// bumped `content_version` meta for `shared.md` (in C1; nothing relevant in C2) —
+    /// with the document content WITHHELD (the exclude path: a node's meta ships without
+    /// its body). The assertion isolates the local-immunity property: A's
+    /// `node_content_version` for `shared.md` is UNCHANGED from before the import,
+    /// because the digest now reads A's LOCAL table, not the merged Index meta.
+    ///
+    /// This FAILS on the pre-fix (meta-reading) digest: B's meta LWW-wins on import, so
+    /// A's `node_content_version` would flip to B's value — the lie the digest then
+    /// trusted. It PASSES here because the value lives in a map no peer can write. (The
+    /// whole-digest is NOT asserted unchanged: importing B's structural ops legitimately
+    /// advances A's Index VV, which the digest folds in — only the per-UUID content
+    /// fingerprint is the local-immune quantity.)
+    #[tokio::test]
+    async fn peer_index_delta_does_not_change_our_local_content_version() {
+        let (a, b, fs_a, fs_b) = two_vaults().await;
+
+        // Converge both replicas on a shared document.
+        write_and_index(&a, &fs_a, "shared.md", "base shared\n").await;
+        sync_both_ways(&a, &b).await;
+        assert_converged(&a, &fs_a, &b, &fs_b).await;
+
+        // A's own local fingerprint for shared.md (its truth, derived from A's content).
+        let a_node = a.index().node_for_path("shared.md").unwrap();
+        let a_fingerprint_before = a
+            .index()
+            .node_content_version(&a_node)
+            .expect("A holds a content_version for the converged shared.md");
+
+        // B edits shared.md offline: B's local fingerprint for it advances away from A's.
+        write_and_index(&b, &fs_b, "shared.md", "base shared\nB's line\n").await;
+        let b_node = b.index().node_for_path("shared.md").unwrap();
+        let b_fingerprint = b.index().node_content_version(&b_node).unwrap();
+        assert_ne!(
+            a_fingerprint_before, b_fingerprint,
+            "precondition: B's edit moved B's fingerprint away from A's"
+        );
+
+        // A imports ONLY B's Index (the full snapshot carries B's bumped content_version
+        // meta for shared.md) with the document content WITHHELD — the exclude path in
+        // isolation: a node's meta merges in, its body does not.
+        let b_index_snapshot = b.index().export_snapshot().unwrap();
+        let exclude_content_response = SyncMessage::SyncResponse {
+            index_updates: Some(b_index_snapshot),
+            document_updates: HashMap::new(),
+        };
+        let wire = bincode::serialize(&exclude_content_response).unwrap();
+        a.process_message(&wire).await.unwrap();
+
+        // A's local fingerprint for shared.md is UNCHANGED — the merged Index meta
+        // (B's value, in C1) did NOT reach the local table the digest reads. A still
+        // lacks B's content, and its content_version honestly reflects that.
+        let a_node_after = a.index().node_for_path("shared.md").unwrap();
+        assert_eq!(
+            a.index().node_content_version(&a_node_after),
+            Some(a_fingerprint_before),
+            "a peer's Index delta must not change our local content_version for a doc \
+             whose content we lack (the value is local-only, immune to the merged meta)"
         );
     }
 }

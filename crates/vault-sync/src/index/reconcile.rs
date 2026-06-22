@@ -26,10 +26,9 @@
 //!   path) to `.trash/` — NEVER resurrecting a user's deletion.
 //! - **Reports** an alive node whose backing `.md` is gone (REPORT-ONLY: it neither
 //!   recreates the file nor tombstones the node — both are data-loss classes).
-//! - **Repairs** a stale denormalized `content_version` (S3): a crash between a
-//!   content commit and the meta update can leave the fingerprint stale; reconcile
-//!   recomputes it from the content doc's actual `state_vv()` so the compare digest
-//!   (P3) can be trusted.
+//! - **Rebuilds** the LOCAL `content_version` table: the fingerprint is a per-replica
+//!   transient cache (no peer can write it), rebuilt from each content doc's actual
+//!   `state_vv()` on every boot so the compare digest (P3) reads a correct local value.
 //!
 //! ## Boot order (INV-7 — load-bearing)
 //!
@@ -106,9 +105,11 @@ impl<F: FileSystem> Vault<F> {
         // (deletion-propagation), both data-loss classes.
         self.report_missing_files(&md_files, &mut report).await;
 
-        // S3: repair any stale denormalized `content_version` against the content
-        // doc's actual `state_vv()`, so the compare digest (P3) reads a correct cache.
-        let repaired = self.repair_content_versions().await?;
+        // Rebuild the LOCAL `content_version` table from each content doc's actual
+        // `state_vv()`, so the compare digest (P3) reads a correct local cache. The
+        // table is transient (rebuilt every boot); in C1 this also keeps the dual-write
+        // meta in step, and `repaired` reflects whether any persisted meta changed.
+        let repaired = self.rebuild_content_versions().await?;
 
         // Recover any folder-swept orphan (EC-7/OQ-6) that persisted across this load: a
         // concurrent add a peer's folder delete tombstoned, whose own parent is still a
@@ -380,16 +381,34 @@ impl<F: FileSystem> Vault<F> {
         }
     }
 
-    /// Repair stale denormalized `content_version` fingerprints (S3).
+    /// Rebuild the LOCAL `content_version` table from disk (the boot table-builder).
     ///
-    /// The fingerprint is a derived cache of each content doc's `state_vv()`; a crash
-    /// between a content commit and the meta update can leave it stale. Reconcile
-    /// recomputes it from the content doc on disk and persists any correction, so the
-    /// compare digest (P3) reads a fingerprint that actually matches the content. This
-    /// runs after the per-file reindex pass, so a doc whose `.md` changed externally is
-    /// already current. Returns whether any fingerprint was repaired (the caller folds
-    /// this into the decision to persist the Index).
-    async fn repair_content_versions(&self) -> Result<bool> {
+    /// The fingerprint is a per-replica-LOCAL transient cache (the content doc's
+    /// `state_vv()` is authoritative). It lives in an in-memory table that no peer can
+    /// write, rebuilt from each content doc's `.loro` on every boot — so there is no
+    /// persisted fingerprint to go stale. This clears the table, then re-fills it for
+    /// every alive doc from the doc's actual `state_vv()`, so the compare digest (P3)
+    /// reads a fingerprint that matches the content. Runs after the per-file reindex
+    /// pass, so a doc whose `.md` changed externally is already current.
+    ///
+    /// Ordering note (S1): `rescue_swept_orphans` runs AFTER this rebuild, so a revived
+    /// node's fingerprint is not in the table until the next boot. That is benign — the
+    /// `catalog_digest`'s `filter_map` over `node_content_version` simply skips a node
+    /// with no entry, and the rescued node's content syncs normally; the entry is healed
+    /// on the next boot (pre-existing behavior — the old meta repair had the same gap).
+    ///
+    /// During C1 it ALSO keeps the old `TREE_META_CONTENT_VERSION` meta in step
+    /// (dual-write via `set_content_version`), so the Index snapshot bytes are unchanged;
+    /// C2 drops the meta. Returns whether any meta was actually rewritten, which the
+    /// caller folds into the decision to persist the Index — a clean boot whose persisted
+    /// metas already match rewrites nothing (a same-value loro write is a no-op) and so
+    /// persists nothing.
+    async fn rebuild_content_versions(&self) -> Result<bool> {
+        // Clear-then-fill: the table is transient; a stale entry from a prior Index
+        // instance must not survive. In practice `load_index` constructs a fresh Index
+        // (empty table), so this is defensive and matches `rebuild_caches`'s discipline.
+        self.index().content_versions_mut().clear();
+
         // Snapshot the alive (path, node) pairs before the awaits.
         let alive: Vec<(String, loro::TreeID)> = self
             .index()
@@ -414,14 +433,32 @@ impl<F: FileSystem> Vault<F> {
             };
 
             let actual = content_version_fingerprint(&doc.version());
-            if self.index().node_content_version(&node) != Some(actual) {
+
+            // Fill the transient table from local on-disk content (every live doc).
+            self.index().content_versions_mut().insert(uuid, actual);
+
+            // C1 dual-write: keep the persisted meta in step. Gate on the PERSISTED meta
+            // (not the table just filled above) so an unchanged boot persists nothing.
+            if self.persisted_content_version_meta(&node) != Some(actual) {
                 self.index().set_content_version(&node, &actual)?;
-                debug!("Repaired stale content_version for {}", path);
+                debug!("Rebuilt content_version table entry for {}", path);
                 repaired = true;
             }
         }
 
         Ok(repaired)
+    }
+
+    /// Read a node's persisted `TREE_META_CONTENT_VERSION` meta directly — the C1
+    /// save-gate's view of what is on disk, distinct from the now-table-backed
+    /// `Index::node_content_version`. Transitional: removed with the meta in C2.
+    fn persisted_content_version_meta(&self, node_id: &loro::TreeID) -> Option<[u8; 32]> {
+        let meta = self.index().index_tree().get_meta(*node_id).ok()?;
+        let value = meta.get(crate::index::TREE_META_CONTENT_VERSION)?;
+        let loro::ValueOrContainer::Value(loro::LoroValue::Binary(bytes)) = value else {
+            return None;
+        };
+        bytes.as_slice().try_into().ok()
     }
 
     /// Move a tombstoned disk orphan to `.trash/<path>`.

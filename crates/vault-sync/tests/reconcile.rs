@@ -19,10 +19,7 @@
 use std::sync::Arc;
 
 use uuid::Uuid;
-use vault_sync::{
-    ContentDoc, FileSystem, InMemoryFs, IndexError, Vault, content_doc_path,
-    content_version_fingerprint,
-};
+use vault_sync::{ContentDoc, FileSystem, InMemoryFs, IndexError, Vault, content_doc_path};
 
 mod common;
 use common::*;
@@ -426,51 +423,63 @@ mod ac_section_8_edge_cases {
     }
 }
 
-// ========================= S3 — content_version boot repair =========================
+// ===================== content_version table rebuild on boot =====================
 
-mod s3_content_version_repair {
+mod content_version_table_rebuild {
     use super::*;
 
-    /// A node whose denormalized `content_version` is stale relative to its content
-    /// doc's actual `state_vv()` (a crash between a content commit and the meta update)
-    /// is REPAIRED by boot reconcile: the fingerprint is recomputed from the content
-    /// doc and persisted, so the compare digest (P3) reads a fingerprint that matches.
+    /// The `content_version` fingerprint is a per-replica-LOCAL transient table (no peer
+    /// can write it), rebuilt from each content doc's `.loro` on every boot. A fresh
+    /// `Vault::load` over the same filesystem reconstructs the table from disk, so the
+    /// reloaded vault yields the SAME catalog digest as before the drop AND the same
+    /// per-document fingerprint — proving `rebuild_content_versions` covers every live
+    /// doc and recomputes the correct value.
+    ///
+    /// This is the boot-rebuild regression guard (it replaces the S3 "stale persisted
+    /// meta" repair test — under the local-table model there is no persisted fingerprint
+    /// to go stale, so "a fresh load reproduces the table from disk" is the property that
+    /// matters). If `rebuild_content_versions` were absent or broken, the reloaded table
+    /// would be empty/partial and the digest would diverge from the pre-drop digest (the
+    /// per-document entries would be missing), failing the first assertion.
     #[tokio::test]
-    async fn stale_content_version_is_recomputed_and_persisted_on_boot() {
+    async fn boot_rebuilds_content_version_table_from_disk() {
         let fs = Arc::new(InMemoryFs::new());
-        let expected_fingerprint;
+
+        let digest_before;
+        let note_fingerprint_before;
         {
             let vault = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
             write_and_index(&vault, &fs, "note.md", "# Note\n\nBody.\n").await;
+            write_and_index(&vault, &fs, "other/deep.md", "# Deep\n\nMore.\n").await;
 
+            // The whole-vault digest and one doc's fingerprint, both derived from the
+            // table populated incrementally during the local writes.
+            digest_before = vault.catalog_digest();
             let node = vault.index().node_for_path("note.md").unwrap();
-            // The correct fingerprint, derived from the document's actual version.
-            let doc = vault.get_document("note.md").await.unwrap();
-            expected_fingerprint = content_version_fingerprint(&doc.version());
-
-            // Corrupt the denormalized cache: a stale (all-zero) fingerprint, as a
-            // crash between the content commit and the meta update would leave.
-            vault
+            note_fingerprint_before = vault
                 .index()
-                .set_content_version(&node, &[0u8; 32])
-                .unwrap();
-            vault.save_index().await.unwrap();
-
-            // Sanity: the persisted fingerprint is now genuinely stale.
-            assert_ne!(
-                vault.index().node_content_version(&node),
-                Some(expected_fingerprint),
-                "precondition: the persisted content_version is stale"
-            );
+                .node_content_version(&node)
+                .expect("a freshly-written doc has a content_version");
         }
 
-        // Reload: boot reconcile recomputes the fingerprint from the content doc.
+        // Drop the vault and load a fresh one over the same fs — the table starts empty
+        // and is rebuilt by boot reconcile from each `.loro` on disk.
         let reloaded = Vault::load(Arc::clone(&fs), AUTHOR).await.unwrap();
+
+        // The whole-vault digest is reproduced exactly: every live doc's fingerprint was
+        // rebuilt from disk (an absent/partial rebuild would drop entries and diverge).
+        assert_eq!(
+            reloaded.catalog_digest(),
+            digest_before,
+            "a fresh load rebuilds the content_version table from disk and reproduces the digest"
+        );
+
+        // A specific entry round-trips, not just the aggregate digest.
         let node = reloaded.index().node_for_path("note.md").unwrap();
         assert_eq!(
             reloaded.index().node_content_version(&node),
-            Some(expected_fingerprint),
-            "boot reconcile repaired the stale content_version to match the content doc"
+            Some(note_fingerprint_before),
+            "the rebuilt table holds the correct per-document fingerprint after reload"
         );
     }
 }

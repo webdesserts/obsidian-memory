@@ -135,6 +135,24 @@ pub struct Index {
     #[cfg(target_arch = "wasm32")]
     uuid_to_node: RefCell<HashMap<Uuid, TreeID>>,
 
+    /// UUID → `content_version` fingerprint — a LOCAL-ONLY, transient denormalization
+    /// of each document's content version vector, the third local cache alongside the
+    /// two above.
+    ///
+    /// This is per-replica-LOCAL truth ("THIS replica's content-doc VV") and is the
+    /// reason it CANNOT live in the synced Index CRDT: a peer's value would LWW-merge
+    /// in ahead of the content it fingerprints (the exclude path ships a node's meta
+    /// without its body), making the catalog digest falsely report "in sync" and
+    /// trapping a real divergence. Backing the digest with this local map makes that
+    /// trap structurally impossible — no peer can write here. It is written ONLY from
+    /// local content (registration, local edit, inbound merge, boot rebuild), never
+    /// from an inbound Index delta, and is rebuilt from disk on every boot
+    /// (`rebuild_content_versions`), so it needs no persisted format.
+    #[cfg(not(target_arch = "wasm32"))]
+    content_versions: Mutex<HashMap<Uuid, [u8; 32]>>,
+    #[cfg(target_arch = "wasm32")]
+    content_versions: RefCell<HashMap<Uuid, [u8; 32]>>,
+
     /// Echo-detection + reconciliation flags + the deleted-paths resurrection guard.
     pub(crate) sync_state: SyncState,
 }
@@ -162,6 +180,7 @@ impl Index {
             index: Mutex::new(index),
             path_to_node: Mutex::new(HashMap::new()),
             uuid_to_node: Mutex::new(HashMap::new()),
+            content_versions: Mutex::new(HashMap::new()),
             sync_state: SyncState::new(),
         };
         #[cfg(target_arch = "wasm32")]
@@ -169,6 +188,7 @@ impl Index {
             index: RefCell::new(index),
             path_to_node: RefCell::new(HashMap::new()),
             uuid_to_node: RefCell::new(HashMap::new()),
+            content_versions: RefCell::new(HashMap::new()),
             sync_state: SyncState::new(),
         };
         this
@@ -308,5 +328,27 @@ impl Index {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn uuid_to_node_mut(&self) -> std::cell::RefMut<'_, HashMap<Uuid, TreeID>> {
         self.uuid_to_node.borrow_mut()
+    }
+
+    /// Borrow the local content_version table for reads.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn content_versions(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, [u8; 32]>> {
+        self.content_versions.lock().unwrap()
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn content_versions(&self) -> std::cell::Ref<'_, HashMap<Uuid, [u8; 32]>> {
+        self.content_versions.borrow()
+    }
+
+    /// Borrow the local content_version table for writes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn content_versions_mut(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<Uuid, [u8; 32]>> {
+        self.content_versions.lock().unwrap()
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn content_versions_mut(&self) -> std::cell::RefMut<'_, HashMap<Uuid, [u8; 32]>> {
+        self.content_versions.borrow_mut()
     }
 }

@@ -667,8 +667,11 @@ impl<F: FileSystem> Vault<F> {
             .await?;
         self.documents_mut().insert(path.to_string(), doc.clone());
 
-        // Refresh the denormalized content_version on the node (if one exists).
-        if let Some(node) = self.index.node_for_path(path) {
+        // Refresh the denormalized content_version, resolving the node by the doc's UUID
+        // (the one already resolved above) rather than by path: during a same-path
+        // collision the path cache points at the OTHER node, so a path-keyed lookup would
+        // write the wrong UUID's local content_version entry (which the digest reads).
+        if let Some(node) = self.index.find_node_by_uuid(&uuid) {
             let fingerprint = content_version_fingerprint(&doc.version());
             self.index.set_content_version(&node, &fingerprint)?;
         }
