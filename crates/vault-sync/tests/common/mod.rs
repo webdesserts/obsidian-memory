@@ -16,11 +16,11 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use uuid::Uuid;
-use vault_sync::{DocId, FileSystem, InMemoryFs, SyncMessage, Vault};
+use vault_sync::{DocId, FileSystem, InMemoryFs, SyncMessage, Vault, conflict_name};
 
 /// The two sides of a two-vault handshake, as Loro author ids (Loro peer ids).
 /// `author(1)` and `author(2)` produce these; they're exposed as constants too for
@@ -61,6 +61,21 @@ pub async fn one_vault() -> (V, Fs) {
     let fs = Arc::new(InMemoryFs::new());
     let vault = Vault::init(Arc::clone(&fs), author(1)).await.unwrap();
     (vault, fs)
+}
+
+/// Build `n` empty in-memory vaults, the i-th authored by `author(i + 1)` (so each
+/// replica has a distinct device id), returning each vault paired with its retained
+/// `Arc<InMemoryFs>`. The N-replica generalization of [`two_vaults`] for the
+/// cross-replica determinism batteries (where N is 3–4); a test borrows the vaults
+/// for `pump_to_quiescence(&[&v0, &v1, ...])`.
+pub async fn n_vaults(n: u8) -> Vec<(V, Fs)> {
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let fs = Arc::new(InMemoryFs::new());
+        let vault = Vault::init(Arc::clone(&fs), author(i + 1)).await.unwrap();
+        out.push((vault, fs));
+    }
+    out
 }
 
 /// Drop `vault` and load a fresh one over the same filesystem, simulating a process
@@ -180,6 +195,79 @@ pub async fn materialized_markdown(vault: &V, path: &str) -> String {
     vault.get_document(path).await.unwrap().to_markdown()
 }
 
+// ============================ convergence assertions ============================
+
+/// The full set of `.md` files a vault currently materializes on disk — survivors,
+/// conflict files, and relocated files — as a sorted set for exact-set assertions.
+/// The single source of truth for "what paths exist" across the conflict, folder, and
+/// composition suites.
+pub async fn alive_md_paths(vault: &V) -> BTreeSet<String> {
+    vault.list_files().await.unwrap().into_iter().collect()
+}
+
+/// The conflict-file path the cascade renames a loser to — `<stem> (conflict
+/// <full-uuid>)<ext>` in the loser's parent dir (INV-5.2). Re-exports
+/// [`vault_sync::conflict_name`] so every suite derives the name from the ONE
+/// production function, never a duplicated copy of the naming rule.
+pub fn conflict_path_for(original: &str, loser: &Uuid) -> String {
+    conflict_name(original, loser)
+}
+
+/// Read a `.md` file as a UTF-8 `String` (panics if absent) — for byte-level
+/// content comparison across replicas.
+pub async fn read_md_str(fs: &Fs, path: &str) -> String {
+    String::from_utf8(read_md(fs, path).await).unwrap()
+}
+
+/// The number of ALIVE folder nodes whose display path equals `path` in `vault`'s
+/// Index. Folders aren't materialized in `list_files`, so a merged-down folder
+/// collision is observed via the same structural scan the resolver reads: exactly one
+/// surviving folder node at a path means the collision merged (INV-1.5c).
+pub fn folder_nodes_at(vault: &V, path: &str) -> usize {
+    vault
+        .index()
+        .scan_structural_nodes()
+        .iter()
+        .filter(
+            |n| matches!(n, vault_sync::index::StructuralNode::Folder { path: p, .. } if p == path),
+        )
+        .count()
+}
+
+/// Assert two replicas have CONVERGED to byte-identical materialized + catalog state:
+/// the same set of `.md` paths, byte-identical `.md` content at every path, and the
+/// same Index version vector (the catalog-level convergence digest). This is the
+/// "byte-identical on both replicas" guarantee INV-4 / INV-5.3(c) rest on, factored
+/// here as the ONE convergence assertion every suite shares.
+pub async fn assert_converged(a: &V, fs_a: &Fs, b: &V, fs_b: &Fs) {
+    let files_a = alive_md_paths(a).await;
+    let files_b = alive_md_paths(b).await;
+    assert_eq!(files_a, files_b, "converged: identical .md file sets");
+    for path in &files_a {
+        assert_eq!(
+            read_md_str(fs_a, path).await,
+            read_md_str(fs_b, path).await,
+            "converged: byte-identical .md at {path}"
+        );
+    }
+    assert_eq!(
+        a.index().state_vv(),
+        b.index().state_vv(),
+        "converged: identical Index version vectors"
+    );
+}
+
+/// Assert EVERY replica in an N-replica mesh has converged to byte-identical
+/// materialized + catalog state, by checking each against the first (convergence is
+/// transitive). `replicas` pairs each vault with its filesystem. The N-replica
+/// roll-up of [`assert_converged`] for the cross-replica determinism batteries.
+pub async fn assert_all_converged(replicas: &[(&V, &Fs)]) {
+    let (first_v, first_fs) = replicas[0];
+    for (v, fs) in &replicas[1..] {
+        assert_converged(first_v, first_fs, v, fs).await;
+    }
+}
+
 /// Deserialize a wire payload into a `SyncMessage` for byte-level assertions.
 pub fn decode(bytes: &[u8]) -> SyncMessage {
     bincode::deserialize(bytes).expect("payload is a valid SyncMessage")
@@ -241,6 +329,38 @@ pub async fn pump_to_quiescence(replicas: &[&V]) -> usize {
     }
     panic!(
         "pump_to_quiescence did not converge within {MAX_ROUNDS} rounds — \
+         a non-convergence bug, not a slow test"
+    );
+}
+
+/// Pump fault-free full-sync handshakes to quiescence like [`pump_to_quiescence`], but
+/// visit the ordered pairs in a freshly-SHUFFLED order each round (seeded by `seed`, so
+/// the run is reproducible).
+///
+/// This is the order-independence instrument for the determinism batteries: the
+/// fixed-order pump and a shuffled-order pump over the SAME starting divergence MUST
+/// reach byte-identical state. A resolution that secretly depended on which replica
+/// synced first (a locality bug, INV-5.3(c) violation) would converge to a different
+/// state under a different visit order — this lets a test pin that it does not.
+pub async fn pump_to_quiescence_shuffled(replicas: &[&V], seed: u64) -> usize {
+    const MAX_ROUNDS: usize = 100;
+    let mut rng = DeterministicRng::new(seed);
+
+    for round in 1..=MAX_ROUNDS {
+        let mut changed_this_round = false;
+        for (i, j) in shuffled_pairs(replicas.len(), &mut rng) {
+            let (modified_initiator, modified_responder) =
+                full_sync(replicas[i], replicas[j]).await;
+            if !modified_initiator.is_empty() || !modified_responder.is_empty() {
+                changed_this_round = true;
+            }
+        }
+        if !changed_this_round {
+            return round;
+        }
+    }
+    panic!(
+        "pump_to_quiescence_shuffled did not converge within {MAX_ROUNDS} rounds — \
          a non-convergence bug, not a slow test"
     );
 }

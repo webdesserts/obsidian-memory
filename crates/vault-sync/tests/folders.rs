@@ -16,7 +16,7 @@
 mod common;
 use common::*;
 
-use vault_sync::{FileSystem, InMemoryFs, IndexError, Vault, conflict_name, content_doc_path};
+use vault_sync::{FileSystem, InMemoryFs, IndexError, Vault, content_doc_path};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -315,36 +315,23 @@ mod move_subtree_edges {
 }
 
 // ===================== shared assertion helpers (folder cascade) =====================
+//
+// `alive_md_paths`, `conflict_path_for`, `read_md_str`, `folder_nodes_at`, and
+// `assert_converged` are the shared convergence/path helpers in [`common`] — used
+// here directly so there is one source of truth across the folder, conflict, and
+// composition suites.
 
 /// The set of `.md` files a vault currently materializes on disk (survivors + conflict
-/// files + relocated files), for exact-set assertions.
+/// files + relocated files), for exact-set assertions. A folder-suite-local alias for
+/// [`common::alive_md_paths`] kept for the existing call sites' readability.
 async fn md_files(vault: &V) -> BTreeSet<String> {
-    vault.list_files().await.unwrap().into_iter().collect()
+    alive_md_paths(vault).await
 }
 
-/// The conflict-file path the file cascade renames a loser to (full-UUID suffix).
+/// The conflict-file path the file cascade renames a loser to (full-UUID suffix) — a
+/// folder-suite-local alias for [`common::conflict_path_for`].
 fn conflict_path(original: &str, loser: &Uuid) -> String {
-    conflict_name(original, loser)
-}
-
-/// Read a `.md` file as a String (panics if absent).
-async fn read_md_str(fs: &Fs, path: &str) -> String {
-    String::from_utf8(read_md(fs, path).await).unwrap()
-}
-
-/// Count the ALIVE folder nodes whose display path equals `path` in `vault`'s Index —
-/// used to assert a folder collision merged down to exactly one surviving folder node
-/// (folders aren't materialized in `list_files`, so the merge is observed via the Index
-/// scan that the resolver itself reads).
-fn folder_nodes_at(vault: &V, path: &str) -> usize {
-    vault
-        .index()
-        .scan_structural_nodes()
-        .iter()
-        .filter(
-            |n| matches!(n, vault_sync::index::StructuralNode::Folder { path: p, .. } if p == path),
-        )
-        .count()
+    conflict_path_for(original, loser)
 }
 
 /// Build three empty in-memory vaults (A/B/C, authored 1/2/3) with their retained
@@ -949,28 +936,6 @@ mod ac_ec7_folder_delete_rescue {
         }
         vault.index().delete_folder(dir).unwrap();
         vault.save_index().await.unwrap();
-    }
-
-    /// Assert A and B have CONVERGED to byte-identical materialized + catalog state: the
-    /// same set of `.md` files, byte-identical `.md` content at every path, and the same
-    /// Index version vector (the catalog-level convergence digest). This is the
-    /// "byte-identical on both replicas" guarantee the rescue's determinism rests on.
-    async fn assert_converged(a: &V, fs_a: &Fs, b: &V, fs_b: &Fs) {
-        let files_a = md_files(a).await;
-        let files_b = md_files(b).await;
-        assert_eq!(files_a, files_b, "converged: identical .md file sets");
-        for path in &files_a {
-            assert_eq!(
-                read_md_str(fs_a, path).await,
-                read_md_str(fs_b, path).await,
-                "converged: byte-identical .md at {path}"
-            );
-        }
-        assert_eq!(
-            a.index().state_vv(),
-            b.index().state_vv(),
-            "converged: identical Index version vectors"
-        );
     }
 
     /// A clean whole-folder delete with NO concurrent add: the folder and its files go,
