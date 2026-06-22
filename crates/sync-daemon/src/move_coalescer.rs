@@ -284,6 +284,33 @@ impl MoveCoalescer {
         expired
     }
 
+    /// Empty BOTH pending maps unconditionally, returning every buffered record's
+    /// standalone meaning — the graceful-shutdown drain (P4f-2c). Unlike [`sweep`],
+    /// this ignores deadlines: a clean quit force-expires the whole pending set so
+    /// the buffer is empty at exit. Safe because pairing is eager — a completable
+    /// create⇄delete pair never co-resides in the buffer (the second half to arrive
+    /// fires the move immediately), so at any quiescent moment the maps hold only
+    /// unpaired singletons. The drain therefore only ever finalizes lone records;
+    /// there is nothing to wait for, so it is wait-free.
+    pub(crate) fn drain_all(&mut self) -> Vec<Expired> {
+        let mut drained = Vec::new();
+        for (_, queue) in self.pending_deletes.drain() {
+            for delete in queue {
+                drained.push(Expired::StandaloneDelete {
+                    path: delete.old_path,
+                });
+            }
+        }
+        for (_, queue) in self.pending_creates.drain() {
+            for create in queue {
+                drained.push(Expired::StandaloneCreate {
+                    path: create.new_path,
+                });
+            }
+        }
+        drained
+    }
+
     /// Serialize the current pending set into journal records (a pure read).
     ///
     /// The daemon calls this after every buffer mutation and writes the result to
@@ -501,6 +528,64 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The graceful-shutdown drain force-expires BOTH buffered singletons to their
+    /// standalone meanings and leaves the buffer empty — a clean quit resolves every
+    /// pending record (P4f-2c).
+    #[test]
+    fn drain_all_empties_both_maps_to_standalone() {
+        let mut c = MoveCoalescer::new();
+        assert_eq!(
+            c.on_delete(HASH_A, "old.md", uuid_a()),
+            MoveDecision::Buffered
+        );
+        assert_eq!(c.on_create(HASH_B, "new.md"), MoveDecision::Buffered);
+
+        let mut drained = c.drain_all();
+        drained.sort_by_key(|e| format!("{e:?}"));
+        assert_eq!(
+            drained,
+            vec![
+                Expired::StandaloneCreate {
+                    path: "new.md".to_string()
+                },
+                Expired::StandaloneDelete {
+                    path: "old.md".to_string()
+                },
+            ]
+        );
+        // Both maps emptied — nothing remains for a follow-up snapshot or sweep.
+        assert!(c.snapshot().is_empty());
+        assert!(c.sweep().is_empty());
+    }
+
+    /// The drain is deadline-INDEPENDENT: a just-buffered record whose window has
+    /// NOT elapsed still drains immediately. This is the wait-free property at the
+    /// unit level — the drain never waits for a deadline (contrast `sweep`, which
+    /// leaves the same fresh record buffered).
+    #[test]
+    fn drain_all_ignores_deadlines() {
+        let mut c = MoveCoalescer::new();
+        c.on_delete(HASH_A, "fresh.md", uuid_a());
+        // Sanity: the window has not elapsed, so a sweep would NOT touch this record.
+        // (No `expire_all_for_test` call — the deadline is genuinely in the future.)
+
+        let drained = c.drain_all();
+        assert_eq!(
+            drained,
+            vec![Expired::StandaloneDelete {
+                path: "fresh.md".to_string()
+            }]
+        );
+    }
+
+    /// A clean quit with nothing buffered drains to an empty result — guards the
+    /// common no-pending-records shutdown path.
+    #[test]
+    fn drain_all_on_empty_is_noop() {
+        let mut c = MoveCoalescer::new();
+        assert_eq!(c.drain_all(), vec![]);
     }
 
     /// `snapshot()` mirrors the live pending set into the serializable journal

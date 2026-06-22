@@ -596,6 +596,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
                 _ = self.shutdown.cancelled() => {
                     info!("Shutting down");
+                    // Drain the move-coalescer buffer BEFORE break: `select!` never
+                    // re-polls `file_event_rx` once this arm runs, so no new event
+                    // mutates the buffer after the drain. Runs here (not after the
+                    // loop) so the vault + gossip handles are still alive when the
+                    // standalone sinks fire (P4f-2c).
+                    self.drain_pending_moves().await;
                     break;
                 }
             }
@@ -1514,6 +1520,35 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // standalone), so rewrite the journal from the now-smaller snapshot — the
         // post-commit prune for the expiry path (P4f-2).
         self.persist_pending_moves().await;
+    }
+
+    /// Graceful-shutdown drain (P4f-2c): force-expire EVERY buffered move record to
+    /// its standalone meaning, then clear the journal — so a clean quit leaves nothing
+    /// pending and the next boot has zero recovery work (OQ-A). Reuses the exact
+    /// standalone sinks the sweep and 2b boot-finalize use (`on_file_deleted` /
+    /// `on_file_modified` via `commit_expired`).
+    ///
+    /// Wait-free: pairing is eager, so the buffer holds only unpaired singletons at
+    /// shutdown — there is no partner to wait for, so the drain is bounded by the
+    /// commit work, not a timer. Layered on 2b's safety net: a crash mid-drain leaves
+    /// the un-cleared journal, which 2b recovers on the next boot to the SAME end
+    /// state — so 2c is a graceful-path optimization, not a data-safety requirement.
+    ///
+    /// The journal clear is ONE write AFTER the full drain (never incremental): a
+    /// crash before it re-runs the whole idempotent pass from the intact journal.
+    pub async fn drain_pending_moves(&mut self) {
+        let drained = self.move_coalescer.drain_all();
+        if !drained.is_empty() {
+            self.commit_expired(drained).await;
+        }
+        // Rewrite the journal empty now that the buffer is drained, so the next boot
+        // recovers nothing. `clear_pending_journal` is the 2b helper (re-exported from
+        // `daemon`); it writes a well-formed empty journal via the daemon's wired fs.
+        // Mirrors `persist_pending_moves`'s guard — an unwired fs degrades to "drained
+        // standalone but journal not re-cleared," which 2b then handles on next boot.
+        if let Some(fs) = self.fs.clone() {
+            move_recovery::clear_pending_journal(fs.as_ref()).await;
+        }
     }
 
     /// Dispatch each expired record to its standalone sink (the same handlers the
