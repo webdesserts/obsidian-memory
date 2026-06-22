@@ -13,27 +13,32 @@
 //!
 //! [`Index`]: crate::index::Index
 //!
-//! ## Why one fixpoint instead of four passes
+//! ## Why one fixpoint instead of three passes
 //!
-//! The spec defines four structural rules — file cascade, folder-merge,
-//! file-vs-folder, folder-revive — that all read the merged tree and all *mutate
-//! paths*, so each rule's output is another rule's input (a folder-merge can
-//! surface a same-name file collision; a revive can surface a folder-merge). Run
-//! as separate passes that call each other, the order they fire at interacting
-//! paths would affect the relocation/conflict targets, and two replicas applying
-//! the inbound ops in different valid orders could land on *different* final
-//! states even though the CRDT tree converges. So they are folded into one
-//! fixpoint with a **pinned canonical order** and a **strictly-decreasing
-//! lexicographic termination measure** (INV-5.3(a)/(b)). This is the same
-//! convergence discipline the file cascade already needs internally (fire once on
-//! the fully-merged state, whole-group, never iterative-pairwise — INV-5.0/5.1),
-//! lifted up one level to operate *between* rule families.
+//! The spec defines three structural rules — folder-merge, file-vs-folder, file
+//! cascade — that all read the merged tree and all *mutate paths*, so each rule's
+//! output is another rule's input (a folder-merge can surface a same-name file
+//! collision). Run as separate passes that call each other, the order they fire
+//! at interacting paths would affect the relocation/conflict targets, and two
+//! replicas applying the inbound ops in different valid orders could land on
+//! *different* final states even though the CRDT tree converges. So they are
+//! folded into one fixpoint with a **pinned canonical order** and a
+//! **strictly-decreasing lexicographic termination measure** (INV-5.3(a)/(b)).
+//! This is the same convergence discipline the file cascade already needs
+//! internally (fire once on the fully-merged state, whole-group, never
+//! iterative-pairwise — INV-5.0/5.1), lifted up one level to operate *between*
+//! rule families.
 //!
 //! Chunk P2a builds the fixpoint skeleton + the termination measure + the
-//! **file-cascade** case only; the folder cases (`MergeFolder`, `RelocateFile`,
-//! `ReviveFolderChain`) are added into the *same* function in P2d/P2e. The full
-//! [`StructuralOp`] vocabulary and [`StructuralView`] shape are defined now so
-//! those chunks slot in without churning the types or the apply side.
+//! **file-cascade** case only; the folder cases (`MergeFolder`, `RelocateFile`)
+//! are added into the *same* function in P2d. The full [`StructuralOp`]
+//! vocabulary and [`StructuralView`] shape are defined now so those chunks slot
+//! in without churning the types or the apply side.
+//!
+//! Folder-orphan rescue (a concurrent add swept by a peer's folder delete) is
+//! deliberately NOT a resolver case: it reads loro's deleted-node enumeration,
+//! not the path-keyed alive-node [`StructuralView`] this pass operates on, so it
+//! lives in a separate post-merge pass ([`crate::protocol`]'s `rescue_swept_orphans`).
 
 use crate::hash::ContentSummary;
 use loro::TreeID;
@@ -91,9 +96,6 @@ pub enum StructuralOp {
     /// A file and a folder collide at one path; the folder wins, the file relocates
     /// to `<folder>/<filename>`. (P2d.)
     RelocateFile { uuid: Uuid, to: String },
-    /// Revive a deleted folder (and its deleted ancestor chain) to hold a live
-    /// descendant a peer concurrently added. (P2e.)
-    ReviveFolderChain { path: String },
 }
 
 /// Resolve every structural collision in `view` into a deterministic plan of ops.
@@ -106,11 +108,10 @@ pub enum StructuralOp {
 /// new collision the next iteration resolves (the transitive resolution IS the
 /// fixpoint; there is no separate recursion).
 ///
-/// The cases, in pinned precedence (INV-5.3(a)): **folder-merge** (slot 2) →
-/// **file-vs-folder** (slot 3) → the **file cascade** (slot 4). The shape rules (2,3)
+/// The cases, in pinned precedence (INV-5.3(a)): **folder-merge** (slot 1) →
+/// **file-vs-folder** (slot 2) → the **file cascade** (slot 3). The shape rules (1,2)
 /// settle the tree to a fixpoint — ≤1 node-type per path — before the cascade resolves
-/// the document-level collisions the now-stable shape exposes. Folder-revive (slot 1)
-/// is added ahead of all of these in P2e.
+/// the document-level collisions the now-stable shape exposes.
 ///
 /// ## Determinism (INV-5.3(c))
 ///
@@ -124,7 +125,7 @@ pub enum StructuralOp {
 /// ## Termination (INV-5.3(b))
 ///
 /// The measure is the precedence-ordered **lexicographic tuple**
-/// `(revive_sites, folder_collision_sites, file_vs_folder_sites, file_collision_sites)`
+/// `(folder_collision_sites, file_vs_folder_sites, file_collision_sites)`
 /// (see [`Measure`]). Each rule strictly decreases its OWN component while only ever
 /// raising a strictly-less-significant one, so the tuple strictly decreases
 /// lexicographically every step and the fixpoint provably terminates. A
@@ -193,44 +194,38 @@ pub fn conflict_name(path: &str, loser_uuid: &Uuid) -> String {
 
 /// The kind of unresolved collision at a path, in pinned-precedence order.
 ///
-/// The structural-SHAPE sites (`FolderMerge` slot 2, `FileVsFolder` slot 3) outrank
-/// the document-level `FileCollision` (slot 4): the tree's shape must be resolved to a
+/// The structural-SHAPE sites (`FolderMerge` slot 1, `FileVsFolder` slot 2) outrank
+/// the document-level `FileCollision` (slot 3): the tree's shape must be resolved to a
 /// fixpoint — ≤1 node-type per path — before file collisions are settled, because a
 /// folder-merge or a file-vs-folder relocate can CREATE or DISSOLVE a file collision,
 /// so file collisions must be resolved against the FINAL shape, never an intermediate
-/// one (the between-families analogue of INV-5.0). Slot 1 (folder-revive) is added in
-/// P2e ahead of all of these.
+/// one (the between-families analogue of INV-5.0).
 enum Site {
-    /// ≥2 folder nodes at one path (slot 2) → merge into the min-TreeID survivor.
+    /// ≥2 folder nodes at one path (slot 1) → merge into the min-TreeID survivor.
     FolderMerge { path: String },
-    /// A file node and a folder node at one path (slot 3) → folder wins, file relocates.
+    /// A file node and a folder node at one path (slot 2) → folder wins, file relocates.
     FileVsFolder { path: String },
-    /// ≥2 file nodes at one path (slot 4) → the file cascade (INV-5.1).
+    /// ≥2 file nodes at one path (slot 3) → the file cascade (INV-5.1).
     FileCollision { path: String },
 }
 
 /// The strictly-decreasing lexicographic termination measure (INV-5.3(b)).
 ///
 /// The components are ordered most-significant first, matching the resolver's
-/// pinned precedence (1)→(4): a higher-precedence rule may only ever surface a
+/// pinned precedence (1)→(3): a higher-precedence rule may only ever surface a
 /// strictly-lower-precedence site, never a higher one, so each step strictly
 /// decreases this tuple in dictionary order. A flat *sum* of the components is NOT
-/// strictly decreasing (a revive that surfaces a folder collision, or a relocate
-/// onto an occupied path, is net-zero on a sum) — that was the B1 plan-review
-/// finding; the lexicographic tuple is what makes termination provable. P2a only
-/// populates `file_collision_sites`; the full tuple is encoded now so the measure
-/// is stable as P2d/P2e add the higher components.
+/// strictly decreasing (a relocate onto an occupied path is net-zero on a sum) —
+/// that was the B1 plan-review finding; the lexicographic tuple is what makes
+/// termination provable.
 ///
 /// The production `resolve_structure` loop bounds itself with the cheaper
 /// `MAX_STEPS` step count rather than recomputing this measure each iteration — the
 /// measure is the termination *proof obligation* (asserted in tests), not the
-/// runtime mechanism. So it is constructed only in test code today; P2d/P2e's
-/// folder-case resolution will populate the higher components.
+/// runtime mechanism. So it is constructed only in test code today.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Measure {
-    /// # alive nodes whose ancestor chain contains a deleted folder (P2e).
-    revive_sites: usize,
     /// # paths with ≥2 alive folder nodes (P2d).
     folder_collision_sites: usize,
     /// # paths holding BOTH a file node and a folder node (P2d).
@@ -249,10 +244,9 @@ impl StructuralView {
     /// file collision. The resolver then settles that site and re-scans, which is what
     /// drives the shape rules to a fixpoint before the cascade runs. Within each slot,
     /// sites are visited in the `occupants` `BTreeMap`'s ordered iteration, so the choice
-    /// is content-independent and identical on every replica. Slot 1 (folder-revive) is
-    /// inserted ahead of these in P2e.
+    /// is content-independent and identical on every replica.
     fn next_unresolved_site(&self) -> Option<Site> {
-        // Slot 2 — folder collision (≥2 folder nodes at one path). Scanned first so the
+        // Slot 1 — folder collision (≥2 folder nodes at one path). Scanned first so the
         // tree's folder shape settles before file-vs-folder and the file cascade.
         for (path, occupants) in &self.occupants {
             if occupants.iter().filter(|n| n.is_folder()).count() >= 2 {
@@ -260,7 +254,7 @@ impl StructuralView {
             }
         }
 
-        // Slot 3 — file-vs-folder (a file node AND a folder node at one path). Reached
+        // Slot 2 — file-vs-folder (a file node AND a folder node at one path). Reached
         // only once no path has ≥2 folders, so a matching path has exactly one folder.
         for (path, occupants) in &self.occupants {
             let has_file = occupants.iter().any(|n| n.is_file());
@@ -270,7 +264,7 @@ impl StructuralView {
             }
         }
 
-        // Slot 4 — file collision (≥2 file nodes at one path).
+        // Slot 3 — file collision (≥2 file nodes at one path).
         for (path, occupants) in &self.occupants {
             if occupants.iter().filter(|n| n.is_file()).count() >= 2 {
                 return Some(Site::FileCollision { path: path.clone() });
@@ -286,7 +280,6 @@ impl StructuralView {
     #[cfg(test)]
     fn measure(&self) -> Measure {
         let mut m = Measure {
-            revive_sites: 0,
             folder_collision_sites: 0,
             file_vs_folder_sites: 0,
             file_collision_sites: 0,
@@ -1145,7 +1138,6 @@ mod tests {
         assert_eq!(
             m0,
             Measure {
-                revive_sites: 0,
                 folder_collision_sites: 1,
                 file_vs_folder_sites: 1,
                 file_collision_sites: 0,
@@ -1159,7 +1151,6 @@ mod tests {
         assert_eq!(
             resolved.measure(),
             Measure {
-                revive_sites: 0,
                 folder_collision_sites: 0,
                 file_vs_folder_sites: 0,
                 file_collision_sites: 0,
@@ -1219,7 +1210,6 @@ mod tests {
         assert_eq!(
             prev,
             Measure {
-                revive_sites: 0,
                 folder_collision_sites: 0,
                 file_vs_folder_sites: 0,
                 file_collision_sites: 0,
@@ -1333,7 +1323,6 @@ mod tests {
         assert_eq!(
             view.measure(),
             Measure {
-                revive_sites: 0,
                 folder_collision_sites: 0,
                 file_vs_folder_sites: 0,
                 file_collision_sites: 1,
@@ -1370,29 +1359,25 @@ mod tests {
 
     /// The B1 fix's load-bearing property: the termination measure is compared
     /// **lexicographically** (dictionary order, most-significant component first),
-    /// NOT as a flat sum. P2a only populates `file_collision_sites`, but the full
-    /// tuple is encoded now so P2d/P2e's higher components order correctly — this
-    /// pins that ordering. A more-significant component dominates regardless of the
+    /// NOT as a flat sum. A more-significant component dominates regardless of the
     /// lower ones, and a flat sum would mis-rank these pairs.
     #[test]
     fn measure_orders_lexicographically_not_by_flat_sum() {
-        let m = |revive, folder, fvf, file| Measure {
-            revive_sites: revive,
+        let m = |folder, fvf, file| Measure {
             folder_collision_sites: folder,
             file_vs_folder_sites: fvf,
             file_collision_sites: file,
         };
 
-        // Most-significant component dominates: one revive site outranks any number
-        // of lower-component sites (a flat sum would rank the second one higher).
-        assert!(m(0, 9, 9, 9) < m(1, 0, 0, 0));
-        // Ties on the top component fall through to the next (folder collisions).
-        assert!(m(1, 0, 9, 9) < m(1, 1, 0, 0));
+        // Most-significant component dominates: one folder-collision site outranks any
+        // number of lower-component sites (a flat sum would rank the second one higher).
+        assert!(m(0, 9, 9) < m(1, 0, 0));
+        // Ties on the top component fall through to the next (file-vs-folder).
+        assert!(m(1, 0, 9) < m(1, 1, 0));
         // …and so on down the precedence chain to the file-collision component.
-        assert!(m(1, 1, 0, 9) < m(1, 1, 1, 0));
-        assert!(m(1, 1, 1, 0) < m(1, 1, 1, 1));
+        assert!(m(1, 1, 0) < m(1, 1, 1));
         // The zero tuple is the minimum (a fully-resolved view).
-        assert!(m(0, 0, 0, 0) < m(0, 0, 0, 1));
+        assert!(m(0, 0, 0) < m(0, 0, 1));
     }
 
     // --- conflict_name unit cases ---
@@ -1454,9 +1439,8 @@ mod tests {
                 StructuralOp::RelocateFile { uuid, to } => {
                     by_uuid.insert(*uuid, to.clone());
                 }
-                // A folder merge moves no files; folder-revive is a P2e shape op. Neither
-                // changes file placement.
-                StructuralOp::MergeFolder { .. } | StructuralOp::ReviveFolderChain { .. } => {}
+                // A folder merge moves no files, so it does not change file placement.
+                StructuralOp::MergeFolder { .. } => {}
             }
         }
 
@@ -1517,8 +1501,6 @@ mod tests {
                     }
                     occupants.retain(|_, nodes| !nodes.is_empty());
                 }
-                // P2e shape op — not produced by the P2d resolver.
-                StructuralOp::ReviveFolderChain { .. } => {}
             }
         }
 

@@ -1040,14 +1040,26 @@ impl Index {
 
 #[cfg(test)]
 mod loro_liveness_probe {
-    //! DP-3 — does loro's movable tree keep a deleted ANCESTOR folder alive when a
-    //! peer concurrently puts a live node under it?
+    //! DP-3 — how does loro's movable tree treat a node when an ANCESTOR folder is
+    //! deleted, and how does that interact with a peer's concurrent add under it?
     //!
-    //! This is the gating question for the folder-revive case (P2e). The answer
-    //! determines whether `resolve_structure` must EMIT a `ReviveFolderChain` op (loro
-    //! leaves the ancestor tombstoned) or whether revive is a structural no-op (loro
-    //! un-deletes the ancestor automatically). The probe is kept as a regression so the
-    //! revive design's premise can't silently drift if we ever bump the loro version.
+    //! These probes pin the loro facts the folder-delete + reactive-rescue model (P2e,
+    //! Model II) is built on. Two facts matter:
+    //!
+    //! 1. **Per-file delete vs sweep are distinguishable by the node's own parent edge.**
+    //!    The library deletes a removed directory's contents file-by-file
+    //!    ([`Index::delete_node`] → `tree.delete(file_node)`), which stamps each
+    //!    explicitly-deleted file `parent == Deleted`; a child a peer concurrently added
+    //!    keeps its real `parent == Node(folder)`. That parent-pointer split is the pure
+    //!    merged-state signal the rescue pass classifies on (HONOR vs RESCUE).
+    //! 2. **A swept child is tombstoned and re-homing it under a still-dead ancestor does
+    //!    NOT un-delete it.** When a folder NODE is deleted (the Model-II whole-folder
+    //!    delete) any concurrently-added child under it inherits the tombstone, so the
+    //!    rescue must revive the folder chain to LIVE nodes before `mov`-ing the orphan
+    //!    back — these probes are why.
+    //!
+    //! Kept as regressions so the rescue design's premises can't silently drift if we
+    //! ever bump the loro version.
 
     use super::*;
     use crate::index::Index;
@@ -1140,22 +1152,21 @@ mod loro_liveness_probe {
         );
     }
 
-    /// The HARDER probe — A explicitly deletes the `proj/` FOLDER NODE itself (a subtree
-    /// `tree.delete`, which is what tombstones the folder so it would need reviving),
-    /// while B concurrently adds a live child under it. This is the shape that decides
-    /// whether `ReviveFolderChain` is a structural no-op or a real op — AND it surfaces a
-    /// hard loro property: a subtree-delete tombstones the concurrently-added child too.
+    /// A explicitly deletes the `proj/` FOLDER NODE itself (a `tree.delete` on the folder
+    /// — the Model-II whole-folder delete that makes the directory disappear), while B
+    /// concurrently adds a live child under it. Pins the loro property the reactive rescue
+    /// must compensate for: deleting the folder node tombstones the concurrently-added
+    /// child too.
     ///
     /// **Outcome (pinned):** loro leaves the folder TOMBSTONED after merge AND the
-    /// concurrently-created child is ALSO tombstoned (the subtree delete subsumes it).
-    /// So a naive "scan ALIVE file nodes, revive their tombstoned ancestors" finds NO
-    /// live node under `proj/` to trigger a revive — the child is dead. This is why the
-    /// resolver's revive trigger must look at whether a *would-be-alive* descendant
-    /// exists, and why the daemon must NOT model a folder delete as a node-subtree
-    /// delete (it would eat concurrent additions — an INV-3 violation). The revive case
-    /// (P2e) is therefore driven by the FILE-delete shape above, where children that are
-    /// concurrently added stay alive; an explicit folder-node subtree-delete is a
-    /// separate, more aggressive operation the library's own delete path does not emit.
+    /// concurrently-created child is ALSO tombstoned (it inherits the folder's tombstone).
+    /// This is precisely the orphan the reactive rescue recovers: the swept child reads
+    /// `is_node_deleted` yet its OWN `parent` is still `Node(proj)` (not `Deleted`) — the
+    /// RESCUE classification — so the rescue pass revives the `proj/` chain to live and
+    /// `mov`s the child back. (The genuine per-file deletes, by contrast, each read
+    /// `parent == Deleted` and are HONORED.) Re-homing the child under the STILL-dead
+    /// folder would not un-delete it, which is why the rescue revives the chain to live
+    /// first (see `empty_folder_node_deleted_after_files_subsumes_concurrent_child`).
     #[test]
     fn folder_node_subtree_delete_subsumes_concurrent_child() {
         let (a, b, proj) = two_replicas_sharing_proj();
@@ -1198,25 +1209,29 @@ mod loro_liveness_probe {
         );
         assert!(
             !child_alive,
-            "a subtree tree.delete TOMBSTONES the concurrently-added child too — which is \
-             exactly why the library models a folder delete as per-file deletes (above), \
-             NOT a folder-node subtree delete that would eat concurrent additions (INV-3)"
+            "deleting the folder node TOMBSTONES the concurrently-added child too — it \
+             inherits the folder's tombstone. This is the orphan the reactive rescue \
+             recovers: the swept child reads deleted yet its own parent is still \
+             Node(proj), the RESCUE classification (a genuine per-file delete would read \
+             parent == Deleted and be honored)."
         );
     }
 
-    /// The "remove the directory the thorough way" shape: A deletes the child files AND
-    /// THEN tombstones the now-EMPTY `proj/` folder node, while B concurrently adds a live
-    /// child. One might expect that, because the folder is empty at A's delete-moment, the
-    /// subtree-delete has nothing live to subsume and B's child survives under a
-    /// tombstoned ancestor (the classic "revive me" state).
+    /// The Model-II whole-folder delete (the shape [`Index::delete_folder`] drives): A
+    /// per-file-deletes the children AND THEN tombstones the now-EMPTY `proj/` folder
+    /// node, while B concurrently adds a live child. Pins that, even with the folder empty
+    /// at A's delete-moment, B's concurrently-added child still inherits the folder's
+    /// tombstone.
     ///
-    /// **It does NOT.** loro tombstones B's concurrently-created child anyway
-    /// (`child_alive=false`): the delete targets the folder NODE, and in the merged state
-    /// B's child is parented to that tombstoned node, so it inherits the tombstone — the
-    /// emptiness-at-delete-moment on A is irrelevant. So even this path does not produce a
-    /// surviving live node under a dead ancestor; instead it SILENTLY LOSES B's child,
-    /// which is exactly the INV-3 violation EC-7 forbids. This is the core reason a
-    /// folder-node subtree-delete must NOT be how the library models a folder delete.
+    /// **`child_alive=false`:** the delete targets the folder NODE, and in the merged
+    /// state B's child is parented to that tombstoned node, so it reads deleted — the
+    /// emptiness-at-delete-moment on A is irrelevant. WITHOUT the reactive rescue this
+    /// would be the silent loss EC-7 forbids; WITH it, the child is recovered (its own
+    /// parent is still `Node(proj)`, the RESCUE classification, so the rescue revives the
+    /// `proj/` chain to live and `mov`s the child back to its original path). The genuine
+    /// per-file deletes read `parent == Deleted` and are honored. The rescue must revive
+    /// the chain to LIVE before the `mov`, because re-homing under the still-dead folder
+    /// would leave the child deleted — this probe is the proof of that necessity.
     #[test]
     fn empty_folder_node_deleted_after_files_subsumes_concurrent_child() {
         let (a, b, proj) = two_replicas_sharing_proj();
@@ -1248,13 +1263,14 @@ mod loro_liveness_probe {
              new_node={new_node:?}"
         );
 
-        // Pinned: the child is SUBSUMED (not a surviving live node under a dead ancestor),
-        // and the folder reads tombstoned. So this path yields silent loss, not a
-        // revive-able state — the design must avoid folder-node subtree-deletes entirely.
+        // Pinned: the child is swept (reads deleted) and the folder reads tombstoned. The
+        // reactive rescue is what turns this from silent loss into recovery — keyed on the
+        // child's own parent still being Node(proj), not Deleted.
         assert!(
             !child_alive,
-            "loro subsumes the concurrently-created child even when the folder was empty at \
-             A's delete-moment — emptiness-at-delete does not save a concurrent add"
+            "loro tombstones the concurrently-created child even when the folder was empty \
+             at A's delete-moment — emptiness-at-delete does not save a concurrent add; the \
+             reactive rescue recovers it"
         );
         assert!(ancestor_deleted, "the proj/ folder node stays tombstoned");
     }

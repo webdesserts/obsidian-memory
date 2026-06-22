@@ -442,7 +442,9 @@ impl<F: FileSystem> Vault<F> {
     /// `Err` rather than `warn!`+skip, because a silently-skipped move drops the file's
     /// conflict/relocation = INV-3 content loss.
     ///
-    /// `ReviveFolderChain` (slot 1) lands in P2e; the P2d resolver never emits it.
+    /// Folder-orphan rescue (a concurrent add swept by a peer's folder delete) is NOT a
+    /// structural op — it is a separate post-merge pass (`rescue_swept_orphans`) that
+    /// reads loro's deleted-node enumeration, not the resolver's path-keyed plan.
     async fn apply_structural_ops(&self, ops: Vec<StructuralOp>) -> Result<()> {
         // Partition the plan. Folder merges (shape) apply first; collapses next; file
         // moves (conflict renames AND file-vs-folder relocates — both a pure file move
@@ -469,11 +471,6 @@ impl<F: FileSystem> Vault<F> {
                     if final_target.insert(uuid, to).is_none() {
                         move_order.push(uuid);
                     }
-                }
-                StructuralOp::ReviveFolderChain { .. } => {
-                    // Folder-revive (slot 1) is added in P2e; the P2d resolver never emits
-                    // it, so reaching one here is a forward-compat gap, not a runtime path.
-                    debug!("apply_structural_ops: ReviveFolderChain not yet supported, skipping");
                 }
             }
         }
