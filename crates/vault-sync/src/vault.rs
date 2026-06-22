@@ -349,6 +349,16 @@ impl<F: FileSystem> Vault<F> {
         self.index.save_index(&self.fs).await
     }
 
+    /// Read the raw on-disk bytes at a vault-relative path.
+    ///
+    /// A thin read-only passthrough to the bound filesystem — no parse, no cache,
+    /// no node resolution. The move-coalescer uses it to hash a not-yet-tracked
+    /// `.md` (one whose create it is buffering): there is no node or `.loro` to
+    /// load yet, so the file's own bytes are the only source of its content.
+    pub async fn read_raw(&self, path: &str) -> Result<Vec<u8>> {
+        Ok(self.fs.read(path).await?)
+    }
+
     /// List every markdown file in the vault (excluding `.sync` and hidden files).
     pub async fn list_files(&self) -> Result<Vec<String>> {
         let mut files = Vec::new();

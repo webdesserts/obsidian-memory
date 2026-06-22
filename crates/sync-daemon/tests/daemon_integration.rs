@@ -622,12 +622,36 @@ mod daemon_integration {
     /// daemon's `on_file_deleted` handler calls `vault.delete_file()` and broadcasts
     /// via gossip. B receives the notification, pulls the updated registry state
     /// from A, and removes the file from its own vault.
+    ///
+    /// The file is seeded via the NeighborUp full sync rather than a `Modified`
+    /// event so the deletion's gossip `ChangeNotification{path}` is the FIRST
+    /// notification for that path. A `Modified`-seeded create broadcasts an
+    /// IDENTICAL `ChangeNotification{path}`, and iroh-gossip suppresses a
+    /// byte-identical message within a 90s window by its content-derived id — so a
+    /// create-notification followed by a same-path delete-notification collides and
+    /// the deletion is dropped at the receiver. That fragility is pre-existing and
+    /// orthogonal to coalescing (a manual ~500ms delay before a `Modified`-seeded
+    /// create + delete reproduces it on the pre-coalescer engine); the move-coalescer's
+    /// intended buffering delay (P4f-1) merely makes the collision window reliable
+    /// rather than timing-lucky. Seeding via full sync isolates the delete-propagation
+    /// contract this test owns from that notification-layer issue (Issue 2 / anti-entropy).
     #[tokio::test]
     async fn test_file_deletion_propagates() -> anyhow::Result<()> {
         let node_a = build_node(24).await?;
         let node_b = build_node(25).await?;
 
         connect_nodes(&node_a, &node_b).await?;
+
+        // Seed the file into A's vault BEFORE gossip forms so B receives it via the
+        // NeighborUp full sync (no create `ChangeNotification` broadcast).
+        node_a
+            .fs
+            .write("notes/delete-me.md", b"to be deleted")
+            .await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/delete-me.md").await?;
+        }
 
         let gossip_a = node_a
             .sync_node
@@ -640,13 +664,6 @@ mod daemon_integration {
 
         let daemon_a = spawn_daemon(node_a, gossip_a);
         let daemon_b = spawn_daemon(node_b, gossip_b);
-
-        // Step 1: Sync the file from A to B via the daemon's normal file-change path.
-        daemon_a
-            .fs
-            .write("notes/delete-me.md", b"to be deleted")
-            .await?;
-        inject_modified(&daemon_a, "notes/delete-me.md");
 
         wait_until("B has notes/delete-me.md before deletion", || {
             let vault = daemon_b.vault.clone();
@@ -1537,6 +1554,17 @@ mod daemon_integration {
     /// re-broadcast of an inbound-sync echo); the daemon no longer consults any path-keyed
     /// sync flag, so there is nothing to "arm" — a real edit always applies and broadcasts.
     ///
+    /// The initial file is seeded via the NeighborUp full sync (not a `Modified` event) so
+    /// the EDIT's gossip `ChangeNotification{path}` is the FIRST notification for that path.
+    /// A `Modified`-seeded create broadcasts an IDENTICAL `ChangeNotification{path}`, and
+    /// iroh-gossip's content-id dedup drops a same-path follow-up within its 90s window once
+    /// the create's broadcast is delayed — so an edit shortly after a create would be
+    /// suppressed at the receiver. That fragility is pre-existing and orthogonal to coalescing
+    /// (it reproduces on the pre-coalescer engine with a manual delay before the create); the
+    /// move-coalescer's create-buffering (P4f-1) makes the window reliable. The edit itself is
+    /// NOT buffered — it dispatches immediately (the edit fast-path); only the create-seed's
+    /// notification timing is at issue, which the full-sync seeding removes. (Issue 2.)
+    ///
     /// Seeds 70/71 reserved.
     #[tokio::test]
     async fn test_local_edit_propagates_to_peer() -> anyhow::Result<()> {
@@ -1544,6 +1572,14 @@ mod daemon_integration {
         let node_b = build_node(71).await?;
 
         connect_nodes(&node_a, &node_b).await?;
+
+        // Seed the initial file into A's vault BEFORE gossip forms so B receives it via
+        // the NeighborUp full sync (no create `ChangeNotification` broadcast).
+        node_a.fs.write("notes/flag-edit.md", b"# Original").await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/flag-edit.md").await?;
+        }
 
         let gossip_a = node_a
             .sync_node
@@ -1556,13 +1592,6 @@ mod daemon_integration {
 
         let daemon_a = spawn_daemon(node_a, gossip_a);
         let daemon_b = spawn_daemon(node_b, gossip_b);
-
-        // Create the initial file on A and let it sync to B so B is primed.
-        daemon_a
-            .fs
-            .write("notes/flag-edit.md", b"# Original")
-            .await?;
-        inject_modified(&daemon_a, "notes/flag-edit.md");
 
         wait_until("B has initial notes/flag-edit.md", || {
             let vault = daemon_b.vault.clone();
@@ -1616,6 +1645,13 @@ mod daemon_integration {
     /// (returns `false` for an already-absent path) and the daemon broadcasts only when it
     /// returns `true`; there is no path-keyed sync flag to "arm" anymore.
     ///
+    /// The file is seeded via the NeighborUp full sync (not a `Modified` event) so the
+    /// deletion's gossip `ChangeNotification{path}` is the FIRST notification for that
+    /// path — see `test_file_deletion_propagates` for why a `Modified`-seeded create's
+    /// identical notification collides with it in iroh-gossip's content-id dedup once
+    /// the create's broadcast is delayed (a pre-existing fragility the move-coalescer's
+    /// buffering reliably surfaces; Issue 2 / anti-entropy).
+    ///
     /// Seeds 72/73 reserved.
     #[tokio::test]
     async fn test_local_delete_propagates_to_peer() -> anyhow::Result<()> {
@@ -1623,6 +1659,17 @@ mod daemon_integration {
         let node_b = build_node(73).await?;
 
         connect_nodes(&node_a, &node_b).await?;
+
+        // Seed the file into A's vault BEFORE gossip forms so B receives it via the
+        // NeighborUp full sync (no create `ChangeNotification` broadcast).
+        node_a
+            .fs
+            .write("notes/flag-delete.md", b"# To be deleted")
+            .await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/flag-delete.md").await?;
+        }
 
         let gossip_a = node_a
             .sync_node
@@ -1635,13 +1682,6 @@ mod daemon_integration {
 
         let daemon_a = spawn_daemon(node_a, gossip_a);
         let daemon_b = spawn_daemon(node_b, gossip_b);
-
-        // Create a file on A and let it sync to B so both have it.
-        daemon_a
-            .fs
-            .write("notes/flag-delete.md", b"# To be deleted")
-            .await?;
-        inject_modified(&daemon_a, "notes/flag-delete.md");
 
         wait_until("B has notes/flag-delete.md", || {
             let vault = daemon_b.vault.clone();
@@ -2976,6 +3016,585 @@ mod daemon_integration {
             daemon.peer_relays_snapshot_for_test()
         );
 
+        Ok(())
+    }
+
+    // ── native-move coalescing (P4f-1) ──────────────────────────────────────
+    //
+    // A native rename surfaces to the daemon as an unlinked `Deleted(old)` +
+    // `Modified(new)` (the watcher has no rename linkage — see `watcher.rs`).
+    // These tests drive that pair through the live event loop and assert the
+    // coalescer collapses it into ONE same-UUID move instead of a tombstone plus a
+    // fresh-UUID create. They use the same two-daemon convergence harness as the
+    // sync tests above, with simulated `FileEvent`s and in-memory vaults.
+
+    /// The document UUID the index currently records for `path` (as a string), if
+    /// any. The headline property of a move is that this UUID is unchanged across
+    /// the rename, so the tests read it before and after. Returned as a `String`
+    /// purely so the assertions need no `uuid` dependency.
+    async fn uuid_of(vault: &Arc<Mutex<Vault<Arc<InMemoryFs>>>>, path: &str) -> Option<String> {
+        let vault = vault.lock().await;
+        let node = vault.index().node_for_path(path)?;
+        vault.index().node_uuid(&node).map(|u| u.to_string())
+    }
+
+    /// Simulate a native rename on a daemon's filesystem: the OS atomically moves
+    /// `old` → `new`, so afterward `new` holds the content and `old` is gone. The
+    /// caller injects the resulting `Deleted(old)` + `Modified(new)` events.
+    async fn rename_on_fs(daemon: &TestDaemon, old: &str, new: &str, content: &[u8]) {
+        daemon.fs.write(new, content).await.unwrap();
+        daemon.fs.delete(old).await.unwrap();
+    }
+
+    /// A native rename converges to B with the SAME UUID (delete arrives first —
+    /// the common case). The move re-parents the existing node; B detects the
+    /// `tree.mov`, re-materializes at the new path, and removes the old one — all
+    /// under the document's original UUID, re-transferring zero content.
+    #[tokio::test]
+    async fn native_rename_delete_first_converges_same_uuid() -> anyhow::Result<()> {
+        let node_a = build_node(120).await?;
+        let node_b = build_node(121).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Sync the original file A → B.
+        daemon_a.fs.write("notes/old.md", b"# Movable").await?;
+        inject_modified(&daemon_a, "notes/old.md");
+        wait_until("B has notes/old.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/old.md".to_string())
+            }
+        })
+        .await;
+
+        // Capture the original UUID on both replicas — they must match end-to-end.
+        let uuid_before = uuid_of(&daemon_a.vault, "notes/old.md").await;
+        assert!(uuid_before.is_some(), "A should have a node for old.md");
+        assert_eq!(
+            uuid_of(&daemon_b.vault, "notes/old.md").await,
+            uuid_before,
+            "B's pre-rename UUID should equal A's"
+        );
+
+        // Rename on A's fs, then inject the delete-then-create halves of the move.
+        rename_on_fs(&daemon_a, "notes/old.md", "notes/new.md", b"# Movable").await;
+        inject_deleted(&daemon_a, "notes/old.md");
+        inject_modified(&daemon_a, "notes/new.md");
+
+        // B converges: new path present, old path gone.
+        wait_until("B has notes/new.md and not notes/old.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                let files = vault.lock().await.list_files().await.unwrap_or_default();
+                files.contains(&"notes/new.md".to_string())
+                    && !files.contains(&"notes/old.md".to_string())
+            }
+        })
+        .await;
+
+        // The headline property: the UUID is preserved across the move on both
+        // sides — a coalesced rename, NOT a delete + fresh-UUID create.
+        assert_eq!(
+            uuid_of(&daemon_a.vault, "notes/new.md").await,
+            uuid_before,
+            "A must keep the original UUID at the new path (move, not re-create)"
+        );
+        assert_eq!(
+            uuid_of(&daemon_b.vault, "notes/new.md").await,
+            uuid_before,
+            "B must converge to the SAME UUID at the new path"
+        );
+
+        // Content intact on B.
+        assert_eq!(daemon_b.fs.read("notes/new.md").await?, b"# Movable");
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+        Ok(())
+    }
+
+    /// The symmetry proof: the create half can arrive BEFORE the delete half and
+    /// still coalesce into the same same-UUID move. This is the case the old
+    /// (delete-keyed) design could not express.
+    #[tokio::test]
+    async fn native_rename_create_first_converges_same_uuid() -> anyhow::Result<()> {
+        let node_a = build_node(122).await?;
+        let node_b = build_node(123).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        daemon_a.fs.write("notes/before.md", b"# Reordered").await?;
+        inject_modified(&daemon_a, "notes/before.md");
+        wait_until("B has notes/before.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/before.md".to_string())
+            }
+        })
+        .await;
+
+        let uuid_before = uuid_of(&daemon_a.vault, "notes/before.md").await;
+        assert!(uuid_before.is_some());
+
+        // Rename on fs, then inject the CREATE half first, then the delete half.
+        rename_on_fs(
+            &daemon_a,
+            "notes/before.md",
+            "notes/after.md",
+            b"# Reordered",
+        )
+        .await;
+        inject_modified(&daemon_a, "notes/after.md");
+        inject_deleted(&daemon_a, "notes/before.md");
+
+        wait_until("B has notes/after.md and not notes/before.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                let files = vault.lock().await.list_files().await.unwrap_or_default();
+                files.contains(&"notes/after.md".to_string())
+                    && !files.contains(&"notes/before.md".to_string())
+            }
+        })
+        .await;
+
+        assert_eq!(
+            uuid_of(&daemon_a.vault, "notes/after.md").await,
+            uuid_before,
+            "create-first must still coalesce to a same-UUID move on A"
+        );
+        assert_eq!(
+            uuid_of(&daemon_b.vault, "notes/after.md").await,
+            uuid_before,
+            "create-first must converge to the same UUID on B"
+        );
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+        Ok(())
+    }
+
+    /// A `Deleted` with no content-matching create within the window is a REAL
+    /// deletion: on window expiry the sweep commits a tombstone and broadcasts, so
+    /// B drops the file. Proves the coalescer never swallows a genuine delete.
+    ///
+    /// The file is seeded to B via the NeighborUp full sync rather than a
+    /// `Modified` event, so the deletion's gossip `ChangeNotification{path}` is the
+    /// FIRST notification broadcast for that path. (iroh-gossip suppresses a
+    /// byte-identical message within a 90s window; a create-notification followed
+    /// by a same-path delete-notification collides on its content-derived id — a
+    /// pre-existing notification-layer fragility, unrelated to coalescing, that
+    /// Issue 2's anti-entropy layer addresses. Seeding via full sync sidesteps it
+    /// so this test isolates the coalescer's lone-delete-expiry behavior.)
+    #[tokio::test]
+    async fn lone_delete_expires_to_real_deletion() -> anyhow::Result<()> {
+        let node_a = build_node(124).await?;
+        let node_b = build_node(125).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Seed the file into A's vault BEFORE gossip forms, so B receives it via the
+        // NeighborUp full sync (no create `ChangeNotification` is broadcast).
+        node_a.fs.write("notes/doomed.md", b"goodbye").await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/doomed.md").await?;
+        }
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        wait_until("B has notes/doomed.md via full sync", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/doomed.md".to_string())
+            }
+        })
+        .await;
+
+        // Delete with no partner create. The sweep expires it to a tombstone after
+        // the window, and the deletion propagates to B.
+        daemon_a.fs.delete("notes/doomed.md").await?;
+        inject_deleted(&daemon_a, "notes/doomed.md");
+
+        wait_until("B no longer has notes/doomed.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                !vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/doomed.md".to_string())
+            }
+        })
+        .await;
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+        Ok(())
+    }
+
+    /// A `Modified` at a fresh path with no content-matching delete is a REAL new
+    /// document: on window expiry the sweep mints a fresh UUID and broadcasts, so
+    /// B gains the new file. Proves an unpaired create is never lost.
+    #[tokio::test]
+    async fn lone_create_expires_to_new_document() -> anyhow::Result<()> {
+        let node_a = build_node(126).await?;
+        let node_b = build_node(127).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // A genuinely new file (no prior delete in the window).
+        daemon_a.fs.write("notes/brand-new.md", b"# Hello").await?;
+        inject_modified(&daemon_a, "notes/brand-new.md");
+
+        wait_until("B has notes/brand-new.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/brand-new.md".to_string())
+            }
+        })
+        .await;
+
+        // It materialized as a normal new document with a real UUID.
+        assert!(
+            uuid_of(&daemon_a.vault, "notes/brand-new.md")
+                .await
+                .is_some(),
+            "an unpaired create must commit as a real new document with a UUID"
+        );
+        assert_eq!(daemon_b.fs.read("notes/brand-new.md").await?, b"# Hello");
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+        Ok(())
+    }
+
+    /// The EC-8 ancient-coincidence non-adopt: a same-content file appearing LONG
+    /// after a deletion (its window already expired) is a NEW document, NOT an
+    /// adoption of the dead lineage. Drives the window expiry through the live loop.
+    #[tokio::test]
+    async fn same_content_after_window_is_new_document_not_adopt() -> anyhow::Result<()> {
+        let node_a = build_node(128).await?;
+        let node_b = build_node(129).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        daemon_a
+            .fs
+            .write("notes/original.md", b"identical body")
+            .await?;
+        inject_modified(&daemon_a, "notes/original.md");
+        wait_until("B has notes/original.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/original.md".to_string())
+            }
+        })
+        .await;
+        let dead_uuid = uuid_of(&daemon_a.vault, "notes/original.md").await;
+        assert!(dead_uuid.is_some());
+
+        // Delete it and let the window fully expire (tombstone commits).
+        daemon_a.fs.delete("notes/original.md").await?;
+        inject_deleted(&daemon_a, "notes/original.md");
+        wait_until("A tombstoned notes/original.md", || {
+            let vault = daemon_a.vault.clone();
+            async move { uuid_of(&vault, "notes/original.md").await.is_none() }
+        })
+        .await;
+
+        // A same-content file appears under a different name well after the window.
+        // Nothing remains pending to adopt onto → it is a fresh-UUID new document.
+        daemon_a
+            .fs
+            .write("notes/coincidence.md", b"identical body")
+            .await?;
+        inject_modified(&daemon_a, "notes/coincidence.md");
+        wait_until("A has notes/coincidence.md", || {
+            let vault = daemon_a.vault.clone();
+            async move { uuid_of(&vault, "notes/coincidence.md").await.is_some() }
+        })
+        .await;
+
+        let new_uuid = uuid_of(&daemon_a.vault, "notes/coincidence.md").await;
+        assert!(new_uuid.is_some());
+        assert_ne!(
+            new_uuid, dead_uuid,
+            "a same-content file after the window must be a NEW UUID, not an adoption of the dead lineage"
+        );
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+        Ok(())
+    }
+
+    /// An in-place edit of an already-tracked file is NOT coalesced — it dispatches
+    /// immediately, before any window elapses.
+    ///
+    /// The proof is A-side and timing-tight: an edit applies SYNCHRONOUSLY in
+    /// `on_file_modified`, so A's own document content reflects the edit within a
+    /// budget far below the 500ms coalescing window. A buffered edit could not — it
+    /// would sit in the window until the sweep (~500-750ms) before applying. Asserting
+    /// A's local state (rather than B's converged state) isolates the no-latency
+    /// property from QUIC round-trip time, which can itself exceed a few hundred ms.
+    #[tokio::test]
+    async fn edit_of_tracked_file_is_not_buffered() -> anyhow::Result<()> {
+        let node_a = build_node(130).await?;
+        let node_b = build_node(131).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Seed v1 into A's vault before gossip forms (no create `ChangeNotification`).
+        node_a.fs.write("notes/live.md", b"# v1").await?;
+        {
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed("notes/live.md").await?;
+        }
+        let uuid_v1 = uuid_of(&node_a.vault, "notes/live.md").await;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // Edit in place (the path keeps a live node). This must skip the coalescer and
+        // apply on A immediately.
+        daemon_a.fs.write("notes/live.md", b"# v2 edited").await?;
+        inject_modified(&daemon_a, "notes/live.md");
+
+        // A's own document must reflect the edit well inside one coalescing window. A
+        // buffered edit would not apply until the sweep — 250ms is a deliberately tight
+        // budget below the 500ms window, and A applies with no network in the path.
+        let applied = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Ok(doc) = daemon_a
+                    .vault
+                    .lock()
+                    .await
+                    .get_document("notes/live.md")
+                    .await
+                    && doc.body().to_string().contains("v2 edited")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            applied.is_ok(),
+            "an in-place edit must apply immediately on A (not wait for the coalescing window)"
+        );
+
+        // Same document — the edit did not mint a new identity (it was never treated as
+        // a create-candidate).
+        assert_eq!(
+            uuid_of(&daemon_a.vault, "notes/live.md").await,
+            uuid_v1,
+            "an edit keeps the document's UUID"
+        );
+
+        // And it still converges to B (the edit's notification is the first for this
+        // path, so it is not deduped — see `test_local_edit_propagates_to_peer`).
+        wait_until("B has the edited content of notes/live.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .get_document("notes/live.md")
+                    .await
+                    .map(|d| d.body().to_string().contains("v2 edited"))
+                    .unwrap_or(false)
+            }
+        })
+        .await;
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+        Ok(())
+    }
+
+    /// OQ-D — a re-create at a JUST-deleted path with identical content. The delete
+    /// is still buffered (the node not yet tombstoned), so the matching create
+    /// resolves to a same-path move: a no-op that leaves the document alive under
+    /// its original UUID, NOT a tombstone-then-fresh-create.
+    #[tokio::test]
+    async fn recreate_at_deleted_path_keeps_uuid_alive() -> anyhow::Result<()> {
+        let node_a = build_node(132).await?;
+        let node_b = build_node(133).await?;
+        connect_nodes(&node_a, &node_b).await?;
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        daemon_a
+            .fs
+            .write("notes/churn.md", b"steady content")
+            .await?;
+        inject_modified(&daemon_a, "notes/churn.md");
+        wait_until("B has notes/churn.md", || {
+            let vault = daemon_b.vault.clone();
+            async move {
+                vault
+                    .lock()
+                    .await
+                    .list_files()
+                    .await
+                    .unwrap_or_default()
+                    .contains(&"notes/churn.md".to_string())
+            }
+        })
+        .await;
+        let uuid_before = uuid_of(&daemon_a.vault, "notes/churn.md").await;
+        assert!(uuid_before.is_some());
+
+        // Delete then immediately re-create the SAME path with the SAME content —
+        // within the window, so the delete is still buffered when the create lands.
+        daemon_a.fs.delete("notes/churn.md").await?;
+        inject_deleted(&daemon_a, "notes/churn.md");
+        daemon_a
+            .fs
+            .write("notes/churn.md", b"steady content")
+            .await?;
+        inject_modified(&daemon_a, "notes/churn.md");
+
+        // Let the window pass so a (wrongly) un-cancelled delete would have
+        // tombstoned by now — then assert the doc is still alive with its UUID.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            uuid_of(&daemon_a.vault, "notes/churn.md").await,
+            uuid_before,
+            "a same-path re-create must cancel the buffered delete and keep the document alive under its UUID"
+        );
+        assert!(
+            daemon_a
+                .vault
+                .lock()
+                .await
+                .list_files()
+                .await
+                .unwrap_or_default()
+                .contains(&"notes/churn.md".to_string()),
+            "the re-created path must still be present (not tombstoned)"
+        );
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
         Ok(())
     }
 

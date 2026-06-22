@@ -20,6 +20,7 @@ use sync_exchange::{SyncExchangeKind, spawn_sync_exchange};
 // pumped inbound handler production uses (see `sync_stream`).
 pub use sync_stream::PumpedSyncHandler;
 
+use crate::move_coalescer::{Expired, MoveCoalescer, MoveDecision};
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::relay_class::relay_is_offlan_reachable;
 use crate::watcher::{FileEvent, FileEventKind};
@@ -306,6 +307,18 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// reconcile within `wait_until`'s budget — same test-seam rationale as
     /// [`Daemon::set_reconnect_interval`].
     roster_reconcile_interval_ms: u64,
+
+    // ── native-move coalescing (P4f-1) ──────────────────────────────────────
+    /// Buffers not-yet-tracked create/delete events for a short window so a native
+    /// rename (which the watcher delivers as an unlinked delete+create — see
+    /// `move_coalescer`) collapses into one same-UUID move instead of a tombstone
+    /// plus a fresh-UUID create. Pure (no vault handle); `on_file_changed` computes
+    /// the content hashes and executes the decisions it returns.
+    move_coalescer: MoveCoalescer,
+    /// Drives the coalescer's window-expiry sweep on a steady cadence — a buffered
+    /// event whose partner never arrived commits to its standalone meaning (a real
+    /// tombstone or a real new doc) once its window passes.
+    move_sweep_tick: tokio::time::Interval,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -337,6 +350,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let mut reconnect_tick =
             tokio::time::interval(scaled(std::time::Duration::from_millis(RECONNECT_BASE_MS)));
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // The move-coalescer sweep wakes on a fraction of the pairing window so an
+        // unpaired event's standalone commit is caught promptly. `Delay` skips
+        // missed ticks rather than bursting after a slow turn.
+        let mut move_sweep_tick = tokio::time::interval(MoveCoalescer::sweep_interval());
+        move_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         Self {
             vault,
@@ -373,6 +392,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             bootstrap_connect_inflight: Arc::new(Mutex::new(HashSet::new())),
             last_roster_reconcile_ms: None,
             roster_reconcile_interval_ms: scaled_ms(ROSTER_RECONCILE_MS),
+            move_coalescer: MoveCoalescer::new(),
+            move_sweep_tick,
         }
     }
 
@@ -542,6 +563,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
                 _ = self.reconnect_tick.tick() => {
                     self.on_reconnect_tick().await;
+                }
+
+                _ = self.move_sweep_tick.tick() => {
+                    self.sweep_pending_moves().await;
                 }
 
                 _ = self.shutdown.cancelled() => {
@@ -1284,14 +1309,163 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
-    /// Handle a file change event from the watcher.
+    /// Handle a file change event from the watcher, routing through the
+    /// move-coalescer so a native rename (delivered as an unlinked delete+create —
+    /// see [`crate::move_coalescer`]) collapses into one same-UUID move rather than
+    /// a tombstone plus a fresh-UUID create.
+    ///
+    /// Only events that COULD be half of a move enter the window:
+    /// - a `Modified` at a path with a still-live node and NO buffered delete is an
+    ///   edit — dispatched immediately, the no-latency common case;
+    /// - a `Modified` at a not-yet-tracked path (or a path whose deletion is
+    ///   currently buffered — the re-create-at-a-just-deleted-path edge, OQ-D) is a
+    ///   create-candidate;
+    /// - a `Deleted` is always a move-candidate (its standalone meaning on expiry is
+    ///   a real tombstone).
     async fn on_file_changed(&mut self, event: FileEvent) {
         match event.kind {
             FileEventKind::Modified => {
-                self.on_file_modified(&event.path).await;
+                // An in-place edit of an already-tracked file is NOT a move
+                // candidate — dispatch it immediately so the common case adds zero
+                // latency. The buffered-delete check keeps OQ-D (a re-create at a
+                // path whose deletion we are deliberately holding) on the create
+                // path: the node still reads "live" only because the buffer has not
+                // tombstoned it yet.
+                let is_create = !self.path_has_live_node(&event.path).await
+                    || self.move_coalescer.has_pending_delete(&event.path);
+                if !is_create {
+                    self.on_file_modified(&event.path).await;
+                    return;
+                }
+                self.on_create_candidate(&event.path).await;
             }
             FileEventKind::Deleted => {
-                self.on_file_deleted(&event.path).await;
+                self.on_delete_candidate(&event.path).await;
+            }
+        }
+    }
+
+    /// Whether the index currently has a live node at `path`.
+    async fn path_has_live_node(&self, path: &str) -> bool {
+        let vault = self.vault.lock().await;
+        vault.index().node_for_path(path).is_some()
+    }
+
+    /// Feed a create-candidate `Modified` into the coalescer and act on its
+    /// decision: pair it into a move now, or buffer it for the window.
+    async fn on_create_candidate(&mut self, path: &str) {
+        let Some(hash) = self.hash_new_file(path).await else {
+            // Couldn't read/parse the new file — fall back to the standalone create
+            // path rather than buffering an event we can't pair.
+            self.on_file_modified(path).await;
+            return;
+        };
+        match self.move_coalescer.on_create(hash, path) {
+            MoveDecision::Move { old_path, new_path } => {
+                self.emit_file_move(&old_path, &new_path).await;
+            }
+            MoveDecision::Buffered => {}
+        }
+    }
+
+    /// Feed a delete-candidate `Deleted` into the coalescer and act on its
+    /// decision: pair it into a move now, or buffer it for the window.
+    ///
+    /// The doc's content hash is captured from its still-present `ContentDoc`
+    /// BEFORE any tombstone (the buffer holds the event; nothing is deleted until
+    /// the window resolves).
+    async fn on_delete_candidate(&mut self, path: &str) {
+        let Some(hash) = self.hash_tracked_doc(path).await else {
+            // No content doc resolves for this path (an unknown/already-gone path) —
+            // it can't be the old half of a move; commit it standalone.
+            self.on_file_deleted(path).await;
+            return;
+        };
+        match self.move_coalescer.on_delete(hash, path) {
+            MoveDecision::Move { old_path, new_path } => {
+                self.emit_file_move(&old_path, &new_path).await;
+            }
+            MoveDecision::Buffered => {}
+        }
+    }
+
+    /// Content hash of a tracked document at `path`, in the same domain as
+    /// [`Self::hash_new_file`] (both hash the canonical materialized markdown).
+    /// `None` if no node resolves for the path.
+    async fn hash_tracked_doc(&self, path: &str) -> Option<[u8; 32]> {
+        let vault = self.vault.lock().await;
+        vault.index().node_for_path(path)?;
+        let doc = vault.get_document(path).await.ok()?;
+        Some(vault_sync::content_hash(&doc))
+    }
+
+    /// Content hash of a not-yet-tracked `.md` on disk, built from its markdown so
+    /// it lands in the same hash domain as the delete side. The author is
+    /// irrelevant — [`vault_sync::content_hash`] is taken over the document's
+    /// materialized markdown, not its peer id.
+    async fn hash_new_file(&self, path: &str) -> Option<[u8; 32]> {
+        let vault = self.vault.lock().await;
+        let bytes = vault.read_raw(path).await.ok()?;
+        let content = String::from_utf8_lossy(&bytes);
+        let doc = vault_sync::ContentDoc::from_markdown(&content, 0).ok()?;
+        Some(vault_sync::content_hash(&doc))
+    }
+
+    /// Execute a matched move: re-parent the existing node (preserving its UUID and
+    /// content — `move_node` re-transfers nothing, INV-1), persist the index, and
+    /// broadcast the new path so peers apply the structural `tree.mov`.
+    ///
+    /// A same-path move (the OQ-D re-create) is a no-op in the index — the doc
+    /// stays alive under its UUID and no broadcast is needed.
+    async fn emit_file_move(&mut self, old_path: &str, new_path: &str) {
+        if old_path == new_path {
+            info!("Move coalesced to a same-path no-op: {}", old_path);
+            return;
+        }
+
+        let vault = self.vault.lock().await;
+        if let Err(e) = vault.index().move_node(old_path, new_path) {
+            error!(
+                "Failed to coalesce move {} -> {}: {}",
+                old_path, new_path, e
+            );
+            return;
+        }
+        if let Err(e) = vault.save_index().await {
+            error!(
+                "Failed to persist index after move {} -> {}: {}",
+                old_path, new_path, e
+            );
+            return;
+        }
+        drop(vault);
+
+        info!("Coalesced native move: {} -> {}", old_path, new_path);
+
+        let has_peers = self.peer_registry.lock().await.alive_count() > 0;
+        if has_peers && let Err(e) = self.vault_gossip.broadcast_change(new_path).await {
+            error!("Failed to broadcast move of {}: {}", new_path, e);
+        }
+    }
+
+    /// Sweep the coalescer for events whose window expired with no partner and
+    /// commit each to its standalone meaning. Driven by `move_sweep_tick`.
+    async fn sweep_pending_moves(&mut self) {
+        let expired = self.move_coalescer.sweep();
+        self.commit_expired(expired).await;
+    }
+
+    /// Dispatch each expired record to its standalone sink (the same handlers the
+    /// immediate-dispatch path used before coalescing).
+    async fn commit_expired(&mut self, expired: Vec<Expired>) {
+        for record in expired {
+            match record {
+                Expired::StandaloneDelete { path } => {
+                    self.on_file_deleted(&path).await;
+                }
+                Expired::StandaloneCreate { path } => {
+                    self.on_file_modified(&path).await;
+                }
             }
         }
     }

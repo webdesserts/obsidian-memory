@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod daemon_lock;
 pub mod http;
 pub mod key_storage;
+pub mod move_coalescer;
 pub mod native_fs;
 pub mod pair;
 pub mod pair_api;
