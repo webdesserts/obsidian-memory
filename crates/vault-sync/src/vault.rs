@@ -291,6 +291,20 @@ impl<F: FileSystem> Vault<F> {
         &self.index
     }
 
+    /// A compact whole-vault digest the compare protocol exchanges to decide whether
+    /// two replicas are fully in sync in one round-trip (the P3 fast-path
+    /// discriminator).
+    ///
+    /// Two replicas with identical merged state produce byte-equal digests; on a
+    /// match the sync ends with zero further transfer, and on a miss the handshake
+    /// falls through to the per-document version compare. Computed from the Index
+    /// alone over its structural version and each alive document's denormalized
+    /// `content_version` — no content `.loro` is opened. See
+    /// [`Index::catalog_digest`].
+    pub fn catalog_digest(&self) -> [u8; 32] {
+        self.index.catalog_digest()
+    }
+
     /// Read and parse a content doc by current path, loading it into the cache if
     /// absent.
     ///

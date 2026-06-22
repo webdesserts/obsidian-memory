@@ -28,6 +28,7 @@
 //! fs-agnostic. The public `Vault<F>` handle (a later chunk) owns the fs, the
 //! content docs, and the flows that tie them to the Index.
 
+mod digest;
 mod reconcile;
 mod state;
 mod tree;
