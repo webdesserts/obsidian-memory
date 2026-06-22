@@ -3695,6 +3695,153 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// The move-coalescer's crash-recovery journal path, relative to the vault
+    /// root. Kept as a literal here (rather than importing the daemon's `pub(crate)`
+    /// const, which an external integration-test crate can't see) so the test
+    /// documents the exact on-disk location it asserts against.
+    const PENDING_MOVES_JOURNAL: &str = ".sync/pending-moves.json";
+
+    /// Read the crash-recovery journal back THROUGH the daemon's filesystem — the
+    /// same in-memory fs the daemon writes to — and parse it as untyped JSON. The
+    /// journal's record types are `pub(crate)`, so the assertions inspect JSON
+    /// fields rather than the typed struct; what matters is that these are the bytes
+    /// the daemon actually persisted, not in-memory coalescer state. `None` when the
+    /// file is absent (a clean, fully-pruned journal leaves no file).
+    async fn read_journal(daemon: &TestDaemon) -> Option<serde_json::Value> {
+        let bytes = daemon.fs.read(PENDING_MOVES_JOURNAL).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// The `pending` array of the journal, or empty when the file is absent — the
+    /// shape the prune assertions check (a committed record leaves no trace).
+    async fn journal_pending(daemon: &TestDaemon) -> Vec<serde_json::Value> {
+        match read_journal(daemon).await {
+            Some(value) => value
+                .get("pending")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// A buffered move is journaled to `.sync/pending-moves.json` (carrying the
+    /// moved doc's UUID, the lineage crash recovery re-stitches) while it sits in the
+    /// window, and the record is PRUNED the moment the move commits — proving the
+    /// persist-after-commit / prune-from-snapshot contract against the actually
+    /// persisted bytes, read back through the daemon's fs.
+    #[tokio::test]
+    async fn pending_move_is_journaled_then_pruned() -> anyhow::Result<()> {
+        let node = build_node(142).await?;
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let daemon = spawn_daemon(node, gossip);
+
+        // Track a file so the delete half resolves to a live node (and a UUID).
+        daemon.fs.write("notes/old.md", b"# Movable").await?;
+        inject_modified(&daemon, "notes/old.md");
+        wait_until("notes/old.md is tracked", || {
+            let vault = daemon.vault.clone();
+            async move { uuid_of(&vault, "notes/old.md").await.is_some() }
+        })
+        .await;
+        let uuid_before =
+            uuid_of(&daemon.vault, "notes/old.md").await.expect("old.md should have a UUID");
+
+        // Rename on the fs, then inject only the DELETE half — it buffers, awaiting
+        // its partner create for the window.
+        rename_on_fs(&daemon, "notes/old.md", "notes/new.md", b"# Movable").await;
+        inject_deleted(&daemon, "notes/old.md");
+
+        // The buffered delete is journaled, carrying the doc's UUID.
+        wait_until("the buffered delete is journaled with its UUID", || {
+            let daemon = &daemon;
+            let uuid_before = uuid_before.clone();
+            async move {
+                let pending = journal_pending(daemon).await;
+                pending.len() == 1
+                    && pending[0]["kind"] == "delete"
+                    && pending[0]["path"] == "notes/old.md"
+                    && pending[0]["uuid"] == serde_json::json!(uuid_before)
+            }
+        })
+        .await;
+
+        // Inject the create half — it pairs into a move, committing the record.
+        inject_modified(&daemon, "notes/new.md");
+
+        // The committed record is pruned: the journal's pending set is empty.
+        wait_until("the committed move is pruned from the journal", || {
+            let daemon = &daemon;
+            async move { journal_pending(daemon).await.is_empty() }
+        })
+        .await;
+
+        // The move preserved the UUID at the new path (not a fresh-UUID re-create).
+        assert_eq!(
+            uuid_of(&daemon.vault, "notes/new.md").await,
+            Some(uuid_before),
+            "the coalesced move must keep the original UUID at the new path"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
+    /// A lone delete (no partner create) is journaled while it waits, then PRUNED
+    /// once its window expires and the sweep commits it standalone (a real
+    /// tombstone). Proves the sweep path also persists the post-commit snapshot, so
+    /// a standalone-committed record never lingers in the journal to be re-committed
+    /// on boot.
+    #[tokio::test]
+    async fn journal_survives_lone_delete_until_expiry_then_prunes() -> anyhow::Result<()> {
+        let node = build_node(143).await?;
+        let gossip = node
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let daemon = spawn_daemon(node, gossip);
+
+        daemon.fs.write("notes/doomed.md", b"goodbye").await?;
+        inject_modified(&daemon, "notes/doomed.md");
+        wait_until("notes/doomed.md is tracked", || {
+            let vault = daemon.vault.clone();
+            async move { uuid_of(&vault, "notes/doomed.md").await.is_some() }
+        })
+        .await;
+
+        // Delete with no partner create — it buffers and is journaled.
+        daemon.fs.delete("notes/doomed.md").await?;
+        inject_deleted(&daemon, "notes/doomed.md");
+        wait_until("the lone delete is journaled", || {
+            let daemon = &daemon;
+            async move {
+                let pending = journal_pending(daemon).await;
+                pending.len() == 1 && pending[0]["path"] == "notes/doomed.md"
+            }
+        })
+        .await;
+
+        // The window expires; the sweep commits the delete standalone (the node is
+        // tombstoned) AND rewrites the journal from the now-empty snapshot.
+        wait_until("the expired delete is pruned from the journal", || {
+            let daemon = &daemon;
+            async move { journal_pending(daemon).await.is_empty() }
+        })
+        .await;
+        assert!(
+            uuid_of(&daemon.vault, "notes/doomed.md").await.is_none(),
+            "the lone delete must commit as a real tombstone once its window expires"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
     /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
     /// `last_attempt_ms` values land on the same clock the supervisor reads.
     fn now_ms_test() -> u64 {

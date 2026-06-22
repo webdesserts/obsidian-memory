@@ -20,7 +20,9 @@ use sync_exchange::{SyncExchangeKind, spawn_sync_exchange};
 // pumped inbound handler production uses (see `sync_stream`).
 pub use sync_stream::PumpedSyncHandler;
 
-use crate::move_coalescer::{Expired, MoveCoalescer, MoveDecision};
+use crate::move_coalescer::{
+    Expired, MoveCoalescer, MoveDecision, PENDING_MOVES_FILE, PENDING_MOVES_VERSION, PendingMovesFile,
+};
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::relay_class::relay_is_offlan_reachable;
 use crate::watcher::{FileEvent, FileEventKind};
@@ -1385,7 +1387,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_create_candidate(&mut self, path: &str) {
         let Some(hash) = self.hash_new_file(path).await else {
             // Couldn't read/parse the new file — fall back to the standalone create
-            // path rather than buffering an event we can't pair.
+            // path rather than buffering an event we can't pair. The coalescer is
+            // untouched, so the journal needs no rewrite here.
             self.on_file_modified(path).await;
             return;
         };
@@ -1395,6 +1398,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
             MoveDecision::Buffered => {}
         }
+        // Persist AFTER the mutation (a buffered create added a record, or a paired
+        // move popped both halves) so the journal reflects the post-commit state —
+        // the persist-after-commit invariant that makes pruning automatic (P4f-2).
+        self.persist_pending_moves().await;
     }
 
     /// Feed a delete-candidate `Deleted` into the coalescer and act on its
@@ -1406,7 +1413,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_delete_candidate(&mut self, path: &str) {
         let Some((hash, uuid)) = self.hash_tracked_doc(path).await else {
             // No content doc resolves for this path (an unknown/already-gone path) —
-            // it can't be the old half of a move; commit it standalone.
+            // it can't be the old half of a move; commit it standalone. The
+            // coalescer is untouched, so the journal needs no rewrite here.
             self.on_file_deleted(path).await;
             return;
         };
@@ -1416,6 +1424,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
             MoveDecision::Buffered => {}
         }
+        // Persist AFTER the mutation (a buffered delete added a record, or a paired
+        // move popped both halves) — the post-commit snapshot (P4f-2).
+        self.persist_pending_moves().await;
     }
 
     /// Content hash AND document UUID of a tracked document at `path`. The hash is
@@ -1486,7 +1497,17 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// commit each to its standalone meaning. Driven by `move_sweep_tick`.
     async fn sweep_pending_moves(&mut self) {
         let expired = self.move_coalescer.sweep();
+        if expired.is_empty() {
+            // The common idle tick: nothing expired, so the pending set is
+            // unchanged and the journal needs no rewrite. Skipping the write here
+            // keeps the sweep off the journal's hot path.
+            return;
+        }
         self.commit_expired(expired).await;
+        // The sweep removed expired records (and `commit_expired` finalized them
+        // standalone), so rewrite the journal from the now-smaller snapshot — the
+        // post-commit prune for the expiry path (P4f-2).
+        self.persist_pending_moves().await;
     }
 
     /// Dispatch each expired record to its standalone sink (the same handlers the
@@ -1501,6 +1522,51 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     self.on_file_modified(&path).await;
                 }
             }
+        }
+    }
+
+    /// Rewrite the move-coalescer's crash-recovery journal
+    /// (`.sync/pending-moves.json`) from the coalescer's current pending set, so a
+    /// move buffered in-memory survives a daemon crash within its window (P4f-2).
+    ///
+    /// **Persist-after-commit:** callers invoke this AFTER a buffer mutation
+    /// completes — a committed record has already left the coalescer's maps, so the
+    /// snapshot omits it and the rewrite prunes it. The full-rewrite-from-snapshot
+    /// (rather than an incremental shrink) makes pruning fall out for free and
+    /// avoids the partial-update bug class (a stale committed record that boot would
+    /// re-commit).
+    ///
+    /// **Durability — `atomic_write`, NOT fsync:** the temp+rename write fixes the
+    /// torn-file bug (a plain `write` crashed mid-flight could leave half-written
+    /// JSON the next boot mis-parses) AND survives a process crash (the kernel page
+    /// cache outlives process death). A per-mutation fsync is deliberately omitted:
+    /// it only buys power-loss durability, whose consequence here is benign (an
+    /// in-flight move degrades to delete+create — UUID churn, NO data loss) and
+    /// whose cost is an fsync per buffer mutation on every folder-move burst.
+    ///
+    /// No-op (with a `warn!`) if the fs handle was never wired — degrades to the
+    /// crash-tail rather than silently swallowing the journal.
+    async fn persist_pending_moves(&self) {
+        // Borrow discipline (NFR-1): take an owned snapshot and clone the fs handle
+        // out of `&self` BEFORE the write `.await` — never hold a coalescer borrow
+        // across it.
+        let Some(fs) = self.fs.clone() else {
+            warn!("Move-coalescer journal fs unwired; pending moves are not persisted");
+            return;
+        };
+        let file = PendingMovesFile {
+            version: PENDING_MOVES_VERSION,
+            pending: self.move_coalescer.snapshot(),
+        };
+        let bytes = match serde_json::to_vec(&file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize pending-moves journal: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = fs.atomic_write(PENDING_MOVES_FILE, &bytes).await {
+            error!("Failed to write pending-moves journal: {}", e);
         }
     }
 

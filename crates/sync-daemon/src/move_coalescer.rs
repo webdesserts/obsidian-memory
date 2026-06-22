@@ -65,9 +65,6 @@ const MOVE_WINDOW: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone)]
 struct PendingDelete {
     old_path: String,
-    // Read only by `snapshot()` (journal serialization), which has no production
-    // caller until P4f-2a Commit 3 — so the field reads as dead until then.
-    #[allow(dead_code)]
     uuid: Uuid,
     deadline: Instant,
 }
@@ -107,10 +104,11 @@ pub(crate) enum Expired {
     StandaloneCreate { path: String },
 }
 
-// The journal schema + `snapshot()` are exercised by unit tests in this commit but
-// not yet wired to a production caller — the daemon's `persist_pending_moves` that
-// reads `snapshot()` and writes the file lands in the next commit (P4f-2a Commit
-// 3). The `allow(dead_code)` below is removed once that caller exists.
+/// Path of the move-coalescer's crash-recovery journal, relative to the vault
+/// root. Mirrors `persistence.rs`'s `.sync/` path consts; the daemon writes it
+/// through the vault's `FileSystem` (NOT `std::fs`), and JSON matches the design
+/// (`known_peers.json` already establishes JSON-in-`.sync/`).
+pub(crate) const PENDING_MOVES_FILE: &str = ".sync/pending-moves.json";
 
 /// Schema version of the on-disk journal (`.sync/pending-moves.json`).
 ///
@@ -120,13 +118,11 @@ pub(crate) enum Expired {
 /// is a cheap guard so a future format change is detectable. On load, a `version`
 /// mismatch means "discard the journal (treat as empty)" rather than mis-parse —
 /// degrading to the crash-tail the design already accepts. (P4f-2 §1.1.)
-#[allow(dead_code)]
 pub(crate) const PENDING_MOVES_VERSION: u32 = 1;
 
 /// Which pending map a [`JournaledMove`] mirrors. A categorical value, serialized
 /// via serde rename rather than a bare string so the kind can never be a stray
 /// free-text reference.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum PendingKind {
     #[serde(rename = "delete")]
@@ -140,7 +136,6 @@ pub(crate) enum PendingKind {
 /// within its window (P4f-2). The journal is written by the daemon observing the
 /// coalescer's [`MoveCoalescer::snapshot`] — the coalescer itself stays pure and
 /// performs no I/O.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct JournaledMove {
     /// Which pending map this came from.
@@ -160,7 +155,6 @@ pub(crate) struct JournaledMove {
 }
 
 /// The on-disk journal file shape: a versioned wrapper around the pending set.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PendingMovesFile {
     pub(crate) version: u32,
@@ -170,7 +164,6 @@ pub(crate) struct PendingMovesFile {
 /// Lowercase-hex encode a 32-byte content hash for the journal's `content_hash`
 /// field — the same per-byte `{:02x}` convention the crate uses elsewhere (e.g.
 /// `PeerId`'s `Display`).
-#[allow(dead_code)]
 fn hex_lower(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -297,7 +290,6 @@ impl MoveCoalescer {
     /// write omits it (§1.4). A delete record carries its UUID — the lineage the
     /// boot re-stitch re-attaches; a create carries `None` (the coalescer holds no
     /// UUID for an unpaired create).
-    #[allow(dead_code)]
     pub(crate) fn snapshot(&self) -> Vec<JournaledMove> {
         let mut records = Vec::new();
         for (hash, queue) in &self.pending_deletes {
