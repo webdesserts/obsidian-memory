@@ -271,6 +271,47 @@ mod move_subtree_edges {
             "an identical-prefix move leaves the subtree untouched"
         );
     }
+
+    /// S2 (fail-loud): `delete_folder` on a folder that still has an ALIVE child is
+    /// REFUSED with an `Err`, never silently tombstoned. The whole-folder-delete contract
+    /// is to per-file-`delete_node` the contents FIRST (HONORING each) and only then
+    /// `delete_folder` the empty node; tombstoning a folder with a live file child would
+    /// sweep that child into the RESCUE class (its `parent` stays `Node(folder)`), so the
+    /// reactive rescue would resurrect a file the user meant to delete. The guard turns
+    /// that future-daemon bug (skipping the per-file deletes) into a loud failure instead
+    /// of silent data loss — and the folder stays alive (the refused delete is a no-op).
+    #[tokio::test]
+    async fn delete_folder_refuses_a_folder_with_a_live_child() {
+        let (a, fs_a) = one_vault().await;
+        // `proj/` holds a live file — the daemon has NOT per-file-deleted it.
+        write_and_index(&a, &fs_a, "proj/keep.md", "# keep\n\nstill here").await;
+
+        let err = a.index().delete_folder("proj").unwrap_err();
+        assert!(
+            matches!(err, IndexError::TreeOperation(_)),
+            "deleting a folder with a live child fails loud (S2), got {err:?}"
+        );
+
+        // The folder and its live child are untouched — the refused delete is a no-op.
+        assert_eq!(
+            folder_nodes_at(&a, "proj"),
+            1,
+            "the folder stays alive after the refused delete"
+        );
+        assert!(
+            a.index().node_for_path("proj/keep.md").is_some(),
+            "the live child is untouched by the refused delete"
+        );
+
+        // After the contract is honored — per-file-delete the child first — `delete_folder`
+        // succeeds and tombstones the now-empty folder.
+        a.index().delete_node("proj/keep.md").unwrap();
+        a.index().rebuild_caches();
+        assert!(
+            a.index().delete_folder("proj").unwrap(),
+            "with the contents per-file-deleted first, delete_folder tombstones the empty folder"
+        );
+    }
 }
 
 // ===================== shared assertion helpers (folder cascade) =====================
@@ -1222,6 +1263,72 @@ mod ac_ec7_folder_delete_rescue {
                 assert!(
                     files.contains(&conflict),
                     "{label}/{who}: the loser is preserved at the conflict path {conflict} (no loss)"
+                );
+            }
+            assert_converged(&a, &fs_a, &b, &fs_b).await;
+        }
+    }
+
+    /// MOVE-THEN-SWEPT (S4): the swept concurrent change is a MOVE, not a fresh add. B
+    /// moves an existing file `loose.md` INTO `proj/` (→ `proj/loose.md`) while A deletes
+    /// the whole `proj/` folder. After convergence the moved file is RESCUED at its NEW
+    /// path `proj/loose.md` — the rescue reads `original_path` from the node's
+    /// `TREE_META_PATH`, which the move rewrote to the destination, so a moved-then-swept
+    /// orphan re-homes to where it was moved TO (not its pre-move path). Body intact, both
+    /// replicas, both directions.
+    #[tokio::test]
+    async fn moved_into_deleted_folder_is_rescued_at_new_path() {
+        for forward in [true, false] {
+            let (a, b, fs_a, fs_b) = two_vaults().await;
+            // `proj/` exists (via an anchor file A will delete) and `loose.md` lives at root.
+            write_and_index(&a, &fs_a, "proj/anchor.md", "# anchor\n\nanchor body").await;
+            write_and_index(&a, &fs_a, "loose.md", "# loose\n\nLOOSE body").await;
+            sync_both_ways(&a, &b).await;
+
+            let loose_uuid = uuid_at(&a, "loose.md");
+
+            // CONCURRENT: A removes the whole proj/ folder; B moves loose.md INTO proj/.
+            delete_folder_with_files(&a, &fs_a, "proj").await;
+            move_file(&b, &fs_b, "loose.md", "proj/loose.md").await;
+
+            if forward {
+                sync_both_ways(&a, &b).await;
+            } else {
+                sync_both_ways(&b, &a).await;
+            }
+            let label = if forward { "A->B" } else { "B->A" };
+
+            for (v, fs, who) in [(&a, &fs_a, "A"), (&b, &fs_b, "B")] {
+                // The moved file is rescued at its NEW path (where B moved it TO), under its
+                // stable UUID, with its body intact.
+                assert!(
+                    md_files(v).await.contains("proj/loose.md"),
+                    "{label}/{who}: the moved-then-swept file is rescued at its new path"
+                );
+                assert_eq!(
+                    uuid_at(v, "proj/loose.md"),
+                    loose_uuid,
+                    "{label}/{who}: the rescued move keeps its stable UUID"
+                );
+                assert_eq!(
+                    read_md_str(fs, "proj/loose.md").await,
+                    "# loose\n\nLOOSE body",
+                    "{label}/{who}: rescued moved body is intact (INV-3)"
+                );
+                // The old root path is vacated (the file moved away), and A's genuinely
+                // deleted anchor stays deleted.
+                assert!(
+                    !md_files(v).await.contains("loose.md"),
+                    "{label}/{who}: the pre-move root path is vacated"
+                );
+                assert!(
+                    !md_files(v).await.contains("proj/anchor.md"),
+                    "{label}/{who}: the explicitly-deleted anchor stays deleted"
+                );
+                assert_eq!(
+                    folder_nodes_at(v, "proj"),
+                    1,
+                    "{label}/{who}: proj/ is revived to exactly one folder node"
                 );
             }
             assert_converged(&a, &fs_a, &b, &fs_b).await;

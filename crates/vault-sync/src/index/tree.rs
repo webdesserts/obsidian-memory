@@ -283,19 +283,31 @@ impl Index {
     /// [`Self::delete_node`], which is file-only: `delete_node` resolves through
     /// `path_to_node` (file nodes only), so it physically cannot tombstone a folder.
     ///
-    /// **Folder-node only — the caller per-file-deletes the genuine contents FIRST.**
-    /// This `tree.delete`s ONLY the folder node, not its descendants. A whole-folder
-    /// delete is driven as: `delete_node` each removed file (stamping it `parent ==
-    /// Deleted`, the HONOR marker the rescue pass keys on), THEN `delete_folder` the now-
-    /// empty folder node. Deleting the folder via a single subtree delete instead would
-    /// sweep the genuine deletions too — they would read `parent == Node` and be
-    /// indistinguishable from a concurrently-added child the rescue must recover. The
+    /// **Folder-node only — the caller per-file-deletes the genuine contents FIRST, and
+    /// this REFUSES a folder that still has any alive child (S2).** This `tree.delete`s
+    /// ONLY the folder node, not its descendants. A whole-folder delete is driven as:
+    /// `delete_node` each removed file (stamping it `parent == Deleted`, the HONOR marker
+    /// the rescue pass keys on), THEN `delete_folder` the now-empty folder node. Deleting
+    /// the folder while a genuine file child is still alive would SWEEP that deletion —
+    /// the swept node reads `parent == Node`, the RESCUE marker, so the reactive rescue
+    /// would resurrect a file the user meant to delete (silent data loss). To make that
+    /// impossible, this returns `Err` if the folder has any alive child at call time,
+    /// forcing the per-file-first contract loudly rather than corrupting silently. The
     /// per-file-then-folder ordering is what makes the parent-pointer signal sound.
     ///
-    /// If a peer concurrently added a live child under this folder and it has already
-    /// merged in, `tree.delete` sweeps it (it inherits the folder's tombstone) — that
-    /// swept child is exactly what the reactive rescue (`rescue_swept_orphans`) recovers
-    /// on the apply path, keyed on its surviving `parent == Node(folder)` edge.
+    /// A truly concurrent add (a peer added a child this replica had NOT yet seen when the
+    /// local folder delete ran) is NOT an alive child here — it merges in LATER, and the
+    /// sweep happens at MERGE time (`import_updates`), where the reactive rescue
+    /// (`rescue_swept_orphans`) recovers it, keyed on its surviving `parent == Node(folder)`
+    /// edge. Conversely, an add that HAD already merged in before the delete is a child the
+    /// user is visibly deleting too — the daemon must per-file-`delete_node` it (HONOR), so
+    /// this guard refusing is correct: the rescue is for never-seen concurrent adds, not for
+    /// files present at delete time.
+    ///
+    /// Returns `true` if a live folder node was tombstoned, `false` if no folder node
+    /// exists at `path` (an idempotent no-op). The folder analogue of [`Self::delete_node`],
+    /// which is file-only: `delete_node` resolves through `path_to_node` (file nodes only),
+    /// so it physically cannot tombstone a folder.
     ///
     /// In-memory only — the caller persists via [`Self::save_index`]. Rebuilds the caches
     /// from the now-current tree (a swept descendant's `path` meta re-derives the
@@ -313,6 +325,25 @@ impl Index {
                 path
             );
             return Ok(false);
+        }
+
+        // S2 (fail-loud): refuse a folder that still has any ALIVE child. The contract is
+        // per-file-`delete_node` the contents FIRST (each → `parent == Deleted`, HONORED),
+        // then `delete_folder` the now-empty node. Tombstoning a folder with a live child
+        // would sweep that child (it inherits the folder's tombstone) into the RESCUE
+        // class (`parent == Node`), so the reactive rescue would resurrect a file the user
+        // meant to delete. `tree.children` returns DIRECT children and excludes tombstoned
+        // nodes in loro 1.13.1, so a non-empty result is exactly an alive direct child.
+        let live_children = tree.children(folder_node).unwrap_or_default();
+        if let Some(child) = live_children
+            .iter()
+            .find(|c| !tree.is_node_deleted(c).unwrap_or(true))
+        {
+            return Err(IndexError::TreeOperation(format!(
+                "delete_folder: folder '{path}' still has an alive child ({child:?}) — \
+                 per-file-delete the contents first (the per-file-then-folder contract); \
+                 refusing to sweep it into a silent rescue-resurrection"
+            )));
         }
 
         tree.delete(folder_node).map_err(|e| {
@@ -423,6 +454,13 @@ impl Index {
         };
 
         let tree = self.index_tree();
+        // `mov` un-deletes the orphan and re-parents it under the revived live folder. No
+        // `path`/`name` meta rewrite follows: `orphan.original_path` IS the node's current
+        // `TREE_META_PATH` by construction (`swept_orphan_files` reads `original_path` from
+        // that exact meta), so re-homing under a same-named live parent leaves the path
+        // unchanged. This is also why a MOVE-then-swept orphan re-homes to where it was
+        // moved TO: a concurrent `move_node`/`move_subtree` already rewrote `TREE_META_PATH`
+        // to the destination before the sweep, so `original_path` carries the new path.
         tree.mov(orphan.node, live_parent).map_err(|e| {
             IndexError::TreeOperation(format!(
                 "Failed to re-home swept orphan {} to {}: {}",
@@ -1199,7 +1237,16 @@ impl Index {
                     Self::tree_meta_string(&meta, TREE_META_TYPE).as_deref() == Some("folder");
                 let child_name = Self::tree_meta_string(&meta, TREE_META_NAME);
 
-                if is_folder && child_name.as_deref() == Some(name) {
+                // S3 (defensive): never reuse a TOMBSTONED folder node. Re-homing a rescued
+                // orphan under a dead folder does NOT un-delete it (proven by the
+                // `loro_liveness_probe` tests), so the rescue depends on this minting a FRESH
+                // live folder when the only same-name node is tombstoned. `tree.children` /
+                // `tree.roots` exclude tombstoned nodes in loro 1.13.1, so this skip is
+                // belt-and-suspenders today — but making the aliveness check explicit keeps
+                // the "never reuse a tombstoned folder" invariant robust to a loro change.
+                let is_alive = !tree.is_node_deleted(&child_id).unwrap_or(true);
+
+                if is_folder && is_alive && child_name.as_deref() == Some(name) {
                     return Ok(TreeParentId::Node(child_id));
                 }
             }

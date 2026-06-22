@@ -194,6 +194,15 @@ impl<F: FileSystem> Vault<F> {
         // delete a live file (the re-create-after-delete / swap case). Pair each
         // surviving deleted path with the UUID it held pre-import (the tombstoned
         // node's UUID is no longer cache-resolvable).
+        //
+        // This `!rebuilt.contains_key` filter has a SECOND role that depends on the
+        // `rescue_swept_orphans` call ABOVE running first: a just-revived swept orphan is
+        // ALIVE at its original path after the rescue's `rebuild_caches`, so it is excluded
+        // from `vacated.deleted` here. Were the rescue ordered AFTER this, the orphan would
+        // still read swept (tombstoned) and its path would enter `deleted` — removing its
+        // `docs/<uuid>.loro` and (via `deleted_uuids` in `apply_response_updates`) filtering
+        // its content update out of the batch, destroying the concurrent add (INV-3). The
+        // rescue-before-delete-detection ordering is what makes this filter cover that case.
         let deleted: Vec<(String, uuid::Uuid)> = {
             let rebuilt = self.index().path_to_node();
             deleted_paths
@@ -302,7 +311,16 @@ impl<F: FileSystem> Vault<F> {
     /// here. The cascade's own fs cleanup (collapsed/renamed losers) is intentionally
     /// SEPARATE from `cleanup_vacated_paths` (which keys on the import's deletes/moves)
     /// — see [`Self::apply_structural_ops`].
-    pub(super) async fn resolve_structural_conflicts(&self) -> Result<()> {
+    ///
+    /// Returns the index-layer `Result` (not the protocol `Result`) so it is callable
+    /// both from the protocol apply path (where `?` widens `IndexError` into `SyncError`)
+    /// AND from boot reconcile, whose `Result` is `IndexError` — mirroring the sibling
+    /// [`Self::rescue_swept_orphans`]. Boot reconcile needs it because a swept-orphan
+    /// rescue mints a fresh folder node that can collide with an existing folder node at
+    /// the same path; only this cascade collapses that two-folder collision. Every error
+    /// it produces — tree mutation, fs read/write, content-doc decode — is already an
+    /// `IndexError` variant (or converts via `#[from]`).
+    pub(crate) async fn resolve_structural_conflicts(&self) -> crate::index::Result<()> {
         // Cheap collision gate: group alive nodes by path; a path with ≥2 nodes is a
         // collision. No content is loaded for this check.
         let nodes = self.index().scan_structural_nodes();
@@ -574,7 +592,11 @@ impl<F: FileSystem> Vault<F> {
     /// Folder-orphan rescue (a concurrent add swept by a peer's folder delete) is NOT a
     /// structural op — it is a separate post-merge pass (`rescue_swept_orphans`) that
     /// reads loro's deleted-node enumeration, not the resolver's path-keyed plan.
-    async fn apply_structural_ops(&self, ops: Vec<StructuralOp>) -> Result<()> {
+    ///
+    /// Returns the index-layer `Result` so the whole cascade chain is `IndexError`-typed
+    /// (see [`Self::resolve_structural_conflicts`]); every error it raises is a tree
+    /// mutation, an fs op, or a content-doc decode — all `IndexError` variants.
+    async fn apply_structural_ops(&self, ops: Vec<StructuralOp>) -> crate::index::Result<()> {
         // Partition the plan. Folder merges (shape) apply first; collapses next; file
         // moves (conflict renames AND file-vs-folder relocates — both a pure file move
         // keyed by UUID) last, in dependency order. The resolver's fixpoint can emit
@@ -681,8 +703,7 @@ impl<F: FileSystem> Vault<F> {
                 );
                 return Err(crate::index::IndexError::MoveTargetExists(format!(
                     "structural move deadlock: {blocked:?}"
-                ))
-                .into());
+                )));
             }
             pending = still_pending;
         }
@@ -705,7 +726,7 @@ impl<F: FileSystem> Vault<F> {
     /// in place — the survivor keeps both, and the collapsed loser's content is
     /// identical to, or empty against, the survivor (INV-3-safe). Only the loser's
     /// own `docs/<loser-uuid>.loro` is removed.
-    async fn collapse_loser_node(&self, loser: uuid::Uuid) -> Result<Option<String>> {
+    async fn collapse_loser_node(&self, loser: uuid::Uuid) -> crate::index::Result<Option<String>> {
         let Some(node) = self.index().find_node_by_uuid(&loser) else {
             debug!("collapse_loser_node: no node for {loser} — already resolved");
             return Ok(None);
@@ -741,7 +762,7 @@ impl<F: FileSystem> Vault<F> {
     /// could relocate the survivor instead. No `.md` is written or removed here — phase 2
     /// re-materializes both the old path and the new path from their resolved owners. A
     /// `MoveTargetExists` fails loudly (S1).
-    fn move_file_node(&self, uuid: uuid::Uuid, to: &str) -> Result<Option<String>> {
+    fn move_file_node(&self, uuid: uuid::Uuid, to: &str) -> crate::index::Result<Option<String>> {
         let Some(node) = self.index().find_node_by_uuid(&uuid) else {
             debug!("move_file_node: no node for {uuid} — already resolved");
             return Ok(None);
@@ -759,7 +780,7 @@ impl<F: FileSystem> Vault<F> {
                  plan is inconsistent (a measure bug); failing loudly rather than dropping \
                  the file (INV-3)"
             );
-            return Err(e.into());
+            return Err(e);
         }
 
         debug!("move_file_node: moved {uuid} ({from} -> {to})");
@@ -775,7 +796,7 @@ impl<F: FileSystem> Vault<F> {
     /// first (echo detection) and refreshes the in-memory document cache. If no node
     /// owns `path` (defensive — the cascade should always leave a survivor), the stale
     /// `.md` is removed instead of left dangling.
-    async fn rematerialize_owner_md(&self, path: &str) -> Result<()> {
+    async fn rematerialize_owner_md(&self, path: &str) -> crate::index::Result<()> {
         let Some(uuid) = self.uuid_for_path(path) else {
             // No owner: the path was fully vacated (not expected for the file cascade,
             // which always leaves a survivor). Remove the stale `.md` rather than leave
@@ -905,7 +926,6 @@ mod tests {
     use crate::conflict::StructuralOp;
     use crate::fs::{FileSystem, InMemoryFs};
     use crate::index::IndexError;
-    use crate::protocol::SyncError;
     use crate::vault::Vault;
     use std::sync::Arc;
 
@@ -962,10 +982,7 @@ mod tests {
         let result = vault.apply_structural_ops(plan).await;
 
         assert!(
-            matches!(
-                result,
-                Err(SyncError::Index(IndexError::MoveTargetExists(_)))
-            ),
+            matches!(result, Err(IndexError::MoveTargetExists(_))),
             "a move onto a folder-occupied target must fail loud (S1), got {result:?}"
         );
     }

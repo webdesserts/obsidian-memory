@@ -118,6 +118,20 @@ impl<F: FileSystem> Vault<F> {
         // It revives + re-homes + re-materializes + persists internally when it acts.
         self.rescue_swept_orphans().await?;
 
+        // Collapse any structural collision (folder-merge / file cascade) the merged tree
+        // holds — B1. The apply path always fires this cascade after its rescue (so a
+        // rescue's freshly-minted folder node that collides with another at the same path
+        // is collapsed within the same `process_message`), but boot reconcile has its own
+        // rescue above and must mirror that. Two replicas can independently rescue the
+        // same swept orphan, each minting a DISTINCT live folder node at one path; once
+        // their Indexes merge, that two-folder collision persists across a restart. Without
+        // this call reconcile would leave two live folder nodes (and two directories) at
+        // one path until the next sync. Cheap when there is no collision (a tree-scan gate,
+        // no content load); at boot the `.loro` files are on disk, so any surfaced file
+        // collision resolves here too. Runs BEFORE `materialize_folders` so the on-disk
+        // directories reflect the collapsed (single-survivor) folder set.
+        self.resolve_structural_conflicts().await?;
+
         // Materialize the folder set from the Index (INV-1.5a): a fresh clone / `reload`
         // re-creates each tracked empty directory and removes a tombstoned folder's empty
         // directory. Folders are invisible to the file passes above (which see only
@@ -504,5 +518,166 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(uuids)
+    }
+}
+
+#[cfg(test)]
+mod b1_boot_cascade {
+    //! B1: boot reconcile must run the structural-conflict cascade after its swept-orphan
+    //! rescue, so a persisted two-folder collision is collapsed on load — not left as two
+    //! live folder nodes (and two on-disk directories) at one path until the next sync.
+    //!
+    //! How the collision is reached in the field: a peer's whole-folder delete sweeps a
+    //! concurrently-added child (EC-7). TWO replicas can each rescue that same swept orphan
+    //! independently, and `Index::rescue_orphan` mints a FRESH live folder node for the
+    //! revived parent chain (it never reuses the tombstoned one). Once those two replicas'
+    //! Indexes merge, two DISTINCT live folder nodes sit at one path. The apply path always
+    //! fires `resolve_structural_conflicts` right after its rescue, collapsing this within
+    //! the same `process_message`; boot reconcile must mirror that. This test stages exactly
+    //! that merged collision in a vault's persisted Index and asserts a `Vault::load` (which
+    //! runs reconcile) collapses it to ONE folder node.
+    //!
+    //! Built from the `pub(crate)` Index seam (`import_updates`/`index_tree`) because the
+    //! public `Vault` API cannot construct an *un-collapsed* collision — every inbound apply
+    //! collapses it. It is therefore an in-crate test of the reconcile boot invariant, with
+    //! a clear user-facing effect (two folders at one path on disk after a restart).
+
+    use crate::content_doc::ContentDoc;
+    use crate::fs::{FileSystem, InMemoryFs};
+    use crate::hash::content_version_fingerprint;
+    use crate::index::{Index, content_doc_path};
+    use crate::vault::Vault;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const AUTHOR_A: u64 = 0x0101_0101_0101_0101;
+    const AUTHOR_B: u64 = 0x0202_0202_0202_0202;
+
+    /// Count the ALIVE folder nodes whose display path equals `path` in `index`.
+    fn alive_folder_nodes_at(index: &Index, path: &str) -> usize {
+        index
+            .scan_structural_nodes()
+            .iter()
+            .filter(
+                |n| matches!(n, crate::index::StructuralNode::Folder { path: p, .. } if p == path),
+            )
+            .count()
+    }
+
+    /// Independently rescue every swept orphan on `index` (each mints its own fresh live
+    /// folder node for the revived parent chain) and rebuild caches — one replica's half
+    /// of the two-independent-rescue race.
+    fn rescue_all(index: &Index) {
+        for orphan in index.swept_orphan_files() {
+            index.rescue_orphan(&orphan).unwrap();
+        }
+        index.rebuild_caches();
+    }
+
+    /// Stage a vault whose PERSISTED Index holds an un-collapsed two-folder collision at
+    /// `proj/` (two distinct live folder nodes), reached via two independent EC-7 rescues
+    /// of the same swept orphan, then merged. Returns the retained filesystem so the caller
+    /// can `Vault::load` it. The orphan's content `.loro` + `.md` are on disk so the file
+    /// survives reconcile intact.
+    async fn stage_persisted_two_folder_collision() -> Arc<InMemoryFs> {
+        let fs = Arc::new(InMemoryFs::new());
+        let vault = Vault::init(Arc::clone(&fs), AUTHOR_A).await.unwrap();
+
+        // V (= replica A) starts with proj/seed.md — this creates the shared proj/ folder.
+        fs.write("proj/seed.md", b"# seed\n\nseed body")
+            .await
+            .unwrap();
+        vault.on_file_changed("proj/seed.md").await.unwrap();
+        vault.save_index().await.unwrap();
+
+        // The concurrent add proj/new.md: mint its content doc (so its `.loro` carries the
+        // matching doc_id) and stage it on disk. Its UUID is the lineage we register under.
+        let new_doc = ContentDoc::from_markdown("# new\n\nNEW BODY important", AUTHOR_B).unwrap();
+        let new_uuid = Uuid::parse_str(&new_doc.doc_id().unwrap()).unwrap();
+        let new_fp = content_version_fingerprint(&new_doc.version());
+        fs.atomic_write(
+            &content_doc_path(&new_uuid),
+            &new_doc.export_snapshot().unwrap(),
+        )
+        .await
+        .unwrap();
+        fs.write("proj/new.md", new_doc.to_markdown().as_bytes())
+            .await
+            .unwrap();
+
+        // Replica B: seed from V so both share the proj/ folder node, then B adds proj/new.md.
+        let b = Index::new(AUTHOR_B);
+        b.import_updates(&vault.index().export_snapshot().unwrap())
+            .unwrap();
+        b.rebuild_caches();
+        b.register_document("proj/new.md", &new_uuid, &new_fp)
+            .unwrap();
+
+        // A (= V's Index) deletes the whole proj/ folder Model-II style: the file, then the
+        // now-empty folder node.
+        let proj_node = vault.index().find_folder_node("proj").unwrap();
+        vault.index().delete_node("proj/seed.md").unwrap();
+        vault.index().rebuild_caches();
+        {
+            let tree = vault.index().index_tree();
+            tree.delete(proj_node).unwrap();
+        }
+        vault.index().rebuild_caches();
+
+        // Merge B's add into A and A's delete into B (Index level, NO cascade) — now B's add
+        // is SWEPT on both (dead file, parent still the dead proj/ folder node).
+        let a_snap = vault.index().export_snapshot().unwrap();
+        let b_snap = b.export_snapshot().unwrap();
+        vault.index().import_updates(&b_snap).unwrap();
+        b.import_updates(&a_snap).unwrap();
+        vault.index().rebuild_caches();
+        b.rebuild_caches();
+
+        // Each replica rescues the swept orphan INDEPENDENTLY — each mints its OWN fresh
+        // live proj/ folder node (distinct TreeIDs).
+        rescue_all(vault.index());
+        rescue_all(&b);
+
+        // Merge B's independently-rescued state into V → two distinct live proj/ folder
+        // nodes now coexist in V's Index: the un-collapsed collision, persisted below.
+        vault
+            .index()
+            .import_updates(&b.export_snapshot().unwrap())
+            .unwrap();
+        vault.index().rebuild_caches();
+        assert_eq!(
+            alive_folder_nodes_at(vault.index(), "proj"),
+            2,
+            "precondition: the persisted Index holds the un-collapsed two-folder collision"
+        );
+
+        vault.save_index().await.unwrap();
+        fs
+    }
+
+    /// Boot reconcile collapses a persisted two-folder collision to a SINGLE survivor folder
+    /// node — the structural cascade fires on load, after the swept-orphan rescue.
+    ///
+    /// Without the `resolve_structural_conflicts()` call in `reconcile`, the two live `proj/`
+    /// folder nodes survive the load (the rescue alone does not collapse them) and this fails
+    /// with two folder nodes — the B1 RED. The concurrent add `proj/new.md` must survive
+    /// either way (the collision is between FOLDER nodes; the file is not lost).
+    #[tokio::test]
+    async fn boot_reconcile_collapses_persisted_folder_collision() {
+        let fs = stage_persisted_two_folder_collision().await;
+
+        let reloaded = Vault::load(Arc::clone(&fs), AUTHOR_A).await.unwrap();
+
+        assert_eq!(
+            alive_folder_nodes_at(reloaded.index(), "proj"),
+            1,
+            "boot reconcile collapses the two-folder collision to exactly one survivor node"
+        );
+        // The rescued concurrent add survives the collapse (the collision was folder-vs-
+        // folder; merging the folders never drops the file living under them).
+        assert!(
+            reloaded.index().node_for_path("proj/new.md").is_some(),
+            "the concurrently-added proj/new.md survives the folder-collision collapse"
+        );
     }
 }
