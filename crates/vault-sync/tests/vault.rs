@@ -341,3 +341,149 @@ mod init_load_round_trip {
         );
     }
 }
+
+mod delete_file {
+    use super::*;
+
+    /// Create a `.md` document and return the UUID it was minted under.
+    async fn seed_doc(fs: &Arc<InMemoryFs>, vault: &Vault<Arc<InMemoryFs>>, path: &str) -> Uuid {
+        fs.write(path, b"some body").await.unwrap();
+        vault.on_file_changed(path).await.unwrap();
+        uuid_at(vault, path)
+    }
+
+    /// Deleting a live document tombstones its node, removes the content `.loro`,
+    /// arms the resurrection guard, and reports `true` (so the daemon broadcasts).
+    #[tokio::test]
+    async fn deletes_live_document_tombstones_and_cleans_loro() {
+        let (fs, vault) = empty_vault().await;
+        let uuid = seed_doc(&fs, &vault, "notes/topic.md").await;
+        assert!(
+            fs.exists(&content_doc_path(&uuid)).await.unwrap(),
+            "precondition: the content .loro exists before the delete"
+        );
+
+        let removed = vault.delete_file("notes/topic.md").await.unwrap();
+
+        assert!(removed, "deleting a live document returns true");
+        assert!(
+            vault.index().node_for_path("notes/topic.md").is_none(),
+            "the index node is gone after the delete"
+        );
+        assert!(
+            vault.index().is_path_deleted("notes/topic.md"),
+            "the deleted-path resurrection guard is armed after the delete"
+        );
+        assert!(
+            !fs.exists(&content_doc_path(&uuid)).await.unwrap(),
+            "the content .loro is reclaimed (no leaked docs/<uuid>.loro)"
+        );
+    }
+
+    /// A second delete of the same path is an idempotent no-op: it returns `false`
+    /// (the daemon must NOT re-broadcast) and never panics. The already-gone `.loro`
+    /// stays gone — a no-op delete must not touch the filesystem.
+    #[tokio::test]
+    async fn is_idempotent_second_delete_returns_false() {
+        let (fs, vault) = empty_vault().await;
+        let uuid = seed_doc(&fs, &vault, "note.md").await;
+
+        assert!(vault.delete_file("note.md").await.unwrap());
+
+        let second = vault.delete_file("note.md").await.unwrap();
+        assert!(
+            !second,
+            "a redundant delete of an already-tombstoned path is false"
+        );
+        assert!(
+            !fs.exists(&content_doc_path(&uuid)).await.unwrap(),
+            "the .loro stays gone across the redundant delete"
+        );
+    }
+
+    /// Deleting a path that was never registered returns `false` and records no
+    /// tombstone (nothing to propagate) — it warns but does not error or panic.
+    #[tokio::test]
+    async fn never_registered_path_returns_false() {
+        let (_fs, vault) = empty_vault().await;
+
+        let removed = vault.delete_file("ghost.md").await.unwrap();
+
+        assert!(!removed, "deleting a never-registered path returns false");
+        assert!(
+            !vault.index().is_path_deleted("ghost.md"),
+            "no tombstone is recorded for a genuinely unknown path"
+        );
+    }
+
+    /// The deleted node no longer appears in the catalog the compare digest reads:
+    /// after a delete the catalog_digest changes (the tombstone is reflected) and
+    /// the path resolves to no node.
+    #[tokio::test]
+    async fn deleted_document_drops_out_of_the_catalog() {
+        let (fs, vault) = empty_vault().await;
+        seed_doc(&fs, &vault, "dir/gone.md").await;
+        let digest_before = vault.catalog_digest();
+
+        vault.delete_file("dir/gone.md").await.unwrap();
+
+        assert!(
+            vault.index().node_for_path("dir/gone.md").is_none(),
+            "the deleted path resolves to no node"
+        );
+        assert_ne!(
+            digest_before,
+            vault.catalog_digest(),
+            "the catalog digest reflects the tombstone (the delete changed catalog truth)"
+        );
+    }
+
+    /// The tombstone is persisted immediately, so it survives a restart before any
+    /// inbound sync records it. Reload a fresh handle on the same `InMemoryFs` and
+    /// the path is still guarded (proving `delete_file` flushed the index, and
+    /// `rebuild_caches` re-derived the guard from persisted truth).
+    #[tokio::test]
+    async fn tombstone_survives_reload() {
+        let fs = Arc::new(InMemoryFs::new());
+        {
+            let vault = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
+            fs.write("dir/doomed.md", b"body").await.unwrap();
+            vault.on_file_changed("dir/doomed.md").await.unwrap();
+            vault.delete_file("dir/doomed.md").await.unwrap();
+        }
+
+        let reloaded = Vault::load(Arc::clone(&fs), AUTHOR).await.unwrap();
+        assert!(
+            reloaded.index().is_path_deleted("dir/doomed.md"),
+            "the tombstone survives the reload — delete_file flushed the index"
+        );
+        assert!(
+            reloaded.index().node_for_path("dir/doomed.md").is_none(),
+            "the deleted node does not reappear after the reload"
+        );
+    }
+
+    /// Risk #1 leak-guard: the content `.loro` is addressed by the document's UUID,
+    /// which `delete_file` MUST resolve BEFORE `delete_node` strips the uuid cache.
+    /// Capturing the UUID up front and asserting `docs/<uuid>.loro` is gone pins the
+    /// ordering: a resolve-AFTER-tombstone regression cannot find the UUID, leaks the
+    /// `.loro`, and fails this assertion.
+    #[tokio::test]
+    async fn resolves_uuid_before_tombstone_so_loro_does_not_leak() {
+        let (fs, vault) = empty_vault().await;
+        let uuid = seed_doc(&fs, &vault, "leak/check.md").await;
+        let loro_path = content_doc_path(&uuid);
+        assert!(
+            fs.exists(&loro_path).await.unwrap(),
+            "precondition: the content .loro for the captured UUID exists"
+        );
+
+        vault.delete_file("leak/check.md").await.unwrap();
+
+        assert!(
+            !fs.exists(&loro_path).await.unwrap(),
+            "docs/<uuid>.loro is reclaimed — proves the UUID was resolved before the \
+             tombstone stripped the uuid cache (Risk #1)"
+        );
+    }
+}
