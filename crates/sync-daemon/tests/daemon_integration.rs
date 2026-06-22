@@ -29,10 +29,17 @@ mod daemon_integration {
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
     use sync_core::network::{SyncNode, gossip::VaultGossip};
     use sync_core::peer_id::{PeerId, VaultId};
+    use uuid::Uuid;
     use vault_sync::fs::{FileSystem, InMemoryFs};
-    use vault_sync::{SyncMetadata, Vault};
+    use vault_sync::{ContentDoc, SyncMetadata, Vault, content_hash};
 
     use sync_daemon::daemon::Daemon;
+    // Boot-recovery helpers shared with `startup_inner` (P4f-2b-ii) — the
+    // `spawn_daemon_from_loaded` harness runs the SAME sequence as production.
+    use sync_daemon::daemon::{clear_pending_journal, read_pending_journal, restitch_inputs};
+    use sync_daemon::move_coalescer::{
+        JournaledMove, PENDING_MOVES_VERSION, PendingKind, PendingMovesFile, hex_lower,
+    };
     use sync_daemon::watcher::{FileEvent, FileEventKind};
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -3849,5 +3856,436 @@ mod daemon_integration {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    // ── P4f-2b-ii: boot move crash-recovery ─────────────────────────────────────
+    //
+    // The recovery path runs at BOOT, inside `startup_inner`, before the event loop.
+    // `build_node`/`spawn_daemon` have no boot-from-disk path (they `Vault::init` a
+    // fresh fs), so these tests need a harness that boots a daemon from a pre-staged
+    // `InMemoryFs`. `spawn_daemon_from_loaded` runs the EXACT recovery sequence
+    // `startup_inner` runs — the same free helpers (`read_pending_journal`,
+    // `restitch_inputs`, `clear_pending_journal`) and the same
+    // `Daemon::finalize_recovered_journal` — so production and test cannot diverge.
+    // The only thing it omits is the network scaffolding (relay/mDNS/watcher) the
+    // recovery logic never touches.
+
+    /// Boot a daemon from a PRE-STAGED `InMemoryFs`, running the production recovery
+    /// sequence: read journal → build re-stitch inputs → `Vault::load_with_journal`
+    /// → `Daemon::new` → `finalize_recovered_journal` → `clear_pending_journal`. The
+    /// caller stages `.sync/` + `.loro` + journal + disk into `fs` before calling.
+    /// This is `startup_inner`'s recovery path minus relay/mDNS/watcher.
+    async fn spawn_daemon_from_loaded(seed_byte: u8, fs: Arc<InMemoryFs>) -> TestDaemon {
+        let author = PeerId::from_secret_bytes(super::common::seed(seed_byte));
+
+        // The recovery sequence, identical to `startup_inner`.
+        let records = read_pending_journal(fs.as_ref()).await;
+        let restitch = restitch_inputs(&records);
+        let vault = Vault::load_with_journal(fs.clone(), author.as_u64(), Some(&restitch))
+            .await
+            .expect("load_with_journal should boot the staged vault");
+        let vault = Arc::new(Mutex::new(vault));
+
+        // Build a real SyncNode + gossip exactly as `build_node` does, so the daemon
+        // is production-shaped (the recovery broadcast is a real no-op at boot).
+        let allowlist = Arc::new(InMemoryAllowlist::new());
+        let (inbound_seen_tx, inbound_seen_rx) = mpsc::unbounded_channel();
+        let sync_handler = sync_daemon::daemon::PumpedSyncHandler::new(
+            vault.clone(),
+            allowlist.clone(),
+            inbound_seen_tx,
+        );
+        let sync_node = SyncNode::new_with_sync_handler(
+            super::common::seed(seed_byte),
+            &[],
+            allowlist.clone(),
+            sync_handler,
+        )
+        .await
+        .expect("sync node should build");
+        let memory_lookup = MemoryLookup::new();
+        sync_node
+            .endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup);
+
+        let gossip = sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await
+            .expect("gossip join should succeed");
+
+        let (file_event_tx, file_event_rx) = mpsc::unbounded_channel::<FileEvent>();
+        let shutdown = CancellationToken::new();
+
+        let mut daemon = Daemon::new(
+            vault.clone(),
+            sync_node,
+            gossip,
+            file_event_rx,
+            None, // no mDNS discovery in tests
+            allowlist.clone(),
+            "test-device".to_string(),
+            None,
+            "/test-vault".into(),
+            shutdown.clone(),
+        );
+        daemon.set_inbound_seen_rx(inbound_seen_rx);
+        // The daemon's journal fs MUST be the same stateful `InMemoryFs` the vault
+        // uses, so the clear lands where `read_pending_journal` read from.
+        daemon.set_fs(Arc::new(fs.clone()));
+
+        // Finish recovery before the loop spawns — finalize the unmatched remainder,
+        // then clear the journal in one write (the production ordering).
+        daemon.finalize_recovered_journal(&records).await;
+        clear_pending_journal(fs.as_ref()).await;
+
+        let loop_handle = tokio::spawn(async move {
+            daemon.run_loop().await;
+        });
+
+        TestDaemon {
+            vault,
+            fs,
+            allowlist,
+            file_event_tx,
+            shutdown,
+            loop_handle,
+        }
+    }
+
+    /// Write a crash-recovery journal carrying `records` to a staged `InMemoryFs`,
+    /// simulating "the daemon crashed with these moves still buffered."
+    async fn stage_crash_journal(fs: &Arc<InMemoryFs>, records: Vec<JournaledMove>) {
+        let file = PendingMovesFile {
+            version: PENDING_MOVES_VERSION,
+            pending: records,
+        };
+        let bytes = serde_json::to_vec(&file).expect("journal serializes");
+        fs.atomic_write(PENDING_MOVES_JOURNAL, &bytes)
+            .await
+            .expect("stage journal write");
+    }
+
+    /// Stage the on-disk shape of a native move that crashed mid-window: track `old`
+    /// (minting a node + its `<uuid>.loro`), then rename it on disk so `new` holds the
+    /// content with NO node, the OLD node is still LIVE in the persisted index, and
+    /// `docs/<uuid>.loro` is present. Crucially does NOT tombstone the old node — the
+    /// crash window has the delete buffered, not committed. Returns the doc's UUID.
+    /// This is the integration sibling of 2b-i's `stage_buffered_move_crash`.
+    async fn stage_tracked_then_renamed_on_disk(
+        fs: &Arc<InMemoryFs>,
+        author: u64,
+        old: &str,
+        new: &str,
+        content: &[u8],
+    ) -> Uuid {
+        let vault = Vault::init(fs.clone(), author)
+            .await
+            .expect("staging vault init");
+        fs.write(old, content).await.expect("write old");
+        vault.on_file_changed(old).await.expect("index old");
+        let node = vault
+            .index()
+            .node_for_path(old)
+            .expect("old should have a node after indexing");
+        let uuid = vault
+            .index()
+            .node_uuid(&node)
+            .expect("old's node should have a UUID");
+        // The disk rename: `new` gets the content, `old` is removed.
+        fs.write(new, content).await.expect("write new");
+        fs.delete(old).await.expect("delete old");
+        // Persist the index so the loaded vault sees the still-live old node.
+        vault.save_index().await.expect("save index");
+        uuid
+    }
+
+    /// Build a fresh `JournaledMove` DELETE record for a staged crash journal, using
+    /// the journal's own `hex_lower` encoder so the persisted `content_hash` exactly
+    /// matches what the daemon wrote pre-crash (and what the re-stitch will decode).
+    fn delete_record(uuid: Uuid, path: &str, hash: [u8; 32]) -> JournaledMove {
+        JournaledMove {
+            kind: PendingKind::Delete,
+            content_hash: hex_lower(&hash),
+            path: path.to_string(),
+            uuid: Some(uuid.to_string()),
+        }
+    }
+
+    /// The content hash a move's `.md` lands in reconcile's hash domain under — the
+    /// SAME domain the re-stitch matches against (`content_hash(&ContentDoc::from_markdown)`).
+    /// The headline test's re-stitch match depends on this exact domain.
+    fn hash_of(content: &str, author: u64) -> [u8; 32] {
+        content_hash(&ContentDoc::from_markdown(content, author).expect("content doc"))
+    }
+
+    /// The HEADLINE end-to-end proof: a native move buffered when the daemon crashed
+    /// is re-stitched on the next boot. The boot path reads the journal, feeds the
+    /// DELETE record's lineage into load, re-attaches the original UUID at the new
+    /// path (NOT a fresh-UUID re-create), and empties the journal.
+    #[tokio::test]
+    async fn crash_recovery_restitches_buffered_move_on_boot() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFs::new());
+        let author = PeerId::from_secret_bytes(super::common::seed(200)).as_u64();
+
+        let uuid = stage_tracked_then_renamed_on_disk(
+            &fs,
+            author,
+            "notes/old.md",
+            "notes/new.md",
+            b"# Movable",
+        )
+        .await;
+        stage_crash_journal(
+            &fs,
+            vec![delete_record(
+                uuid,
+                "notes/old.md",
+                hash_of("# Movable", author),
+            )],
+        )
+        .await;
+
+        let daemon = spawn_daemon_from_loaded(200, fs).await;
+
+        // Re-stitched: the original UUID is now at the new path, not a fresh mint.
+        assert_eq!(
+            uuid_of(&daemon.vault, "notes/new.md").await,
+            Some(uuid.to_string()),
+            "the buffered move must re-stitch the original UUID at the new path"
+        );
+        assert!(
+            uuid_of(&daemon.vault, "notes/old.md").await.is_none(),
+            "the old path must be vacated by the re-stitch"
+        );
+        // The boot path emptied the journal after recovery.
+        assert!(
+            journal_pending(&daemon).await.is_empty(),
+            "the journal must be cleared after boot recovery"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
+    /// An unmatched DELETE — a REAL deletion with no content-matching `.md` anywhere —
+    /// is finalized as a tombstone by `finalize_recovered_journal`. Reconcile leaves
+    /// the still-live old node alone (it never tombstones), so the daemon must commit
+    /// the deletion via `on_file_deleted`.
+    #[tokio::test]
+    async fn boot_finalizes_unmatched_delete_as_tombstone() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFs::new());
+        let author = PeerId::from_secret_bytes(super::common::seed(201)).as_u64();
+
+        // Track `doomed`, then delete it with NO matching new path — a real deletion.
+        let vault = Vault::init(fs.clone(), author).await?;
+        fs.write("notes/doomed.md", b"goodbye").await?;
+        vault.on_file_changed("notes/doomed.md").await?;
+        let uuid = vault
+            .index()
+            .node_uuid(&vault.index().node_for_path("notes/doomed.md").unwrap())
+            .unwrap();
+        fs.delete("notes/doomed.md").await?;
+        vault.save_index().await?;
+        drop(vault);
+
+        stage_crash_journal(
+            &fs,
+            vec![delete_record(
+                uuid,
+                "notes/doomed.md",
+                hash_of("goodbye", author),
+            )],
+        )
+        .await;
+
+        let daemon = spawn_daemon_from_loaded(201, fs).await;
+
+        assert!(
+            uuid_of(&daemon.vault, "notes/doomed.md").await.is_none(),
+            "the unmatched delete's still-live node must be tombstoned on boot"
+        );
+        assert!(
+            journal_pending(&daemon).await.is_empty(),
+            "the journal must be cleared after boot recovery"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
+    /// An unmatched CREATE — an orphaned `.md` with no node and ONLY a create record
+    /// (uuid `None`) in the journal — is minted a fresh-UUID node by reconcile's
+    /// per-file loop, NOT by any daemon finalize. Proves creates are reconcile's job
+    /// (§1): the daemon ignores create records after building the re-stitch inputs.
+    #[tokio::test]
+    async fn boot_finalizes_unmatched_create_as_new_doc() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFs::new());
+        let author = PeerId::from_secret_bytes(super::common::seed(202)).as_u64();
+
+        // A vault that exists but has an orphaned `.md` on disk with no node.
+        let vault = Vault::init(fs.clone(), author).await?;
+        vault.save_index().await?;
+        drop(vault);
+        fs.write("notes/fresh.md", b"# Fresh").await?;
+
+        // Journal carries ONLY a create record (uuid None — its partner delete never
+        // arrived). The daemon should take no explicit action for it.
+        stage_crash_journal(
+            &fs,
+            vec![JournaledMove {
+                kind: PendingKind::Create,
+                content_hash: hex_lower(&hash_of("# Fresh", author)),
+                path: "notes/fresh.md".to_string(),
+                uuid: None,
+            }],
+        )
+        .await;
+
+        let daemon = spawn_daemon_from_loaded(202, fs).await;
+
+        assert!(
+            uuid_of(&daemon.vault, "notes/fresh.md").await.is_some(),
+            "reconcile must mint a fresh-UUID node for the unmatched create"
+        );
+        assert!(
+            journal_pending(&daemon).await.is_empty(),
+            "the journal must be cleared after boot recovery"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
+    /// A corrupt journal must NOT abort boot. `read_pending_journal` is tolerant —
+    /// garbage parses to an empty set — so the daemon boots, a normal file reconciles
+    /// to a live node, and the clear rewrites the garbage to a clean empty journal.
+    #[tokio::test]
+    async fn corrupt_journal_does_not_abort_boot() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFs::new());
+        let author = PeerId::from_secret_bytes(super::common::seed(203)).as_u64();
+
+        // A normal trackable file plus a garbage journal.
+        let vault = Vault::init(fs.clone(), author).await?;
+        fs.write("notes/keeper.md", b"# Keeper").await?;
+        vault.on_file_changed("notes/keeper.md").await?;
+        vault.save_index().await?;
+        drop(vault);
+        fs.write(PENDING_MOVES_JOURNAL, b"{ this is not json ]]")
+            .await?;
+
+        // Boots without panic despite the garbage journal.
+        let daemon = spawn_daemon_from_loaded(203, fs).await;
+
+        assert!(
+            uuid_of(&daemon.vault, "notes/keeper.md").await.is_some(),
+            "the normal file must reconcile to a live node despite a corrupt journal"
+        );
+        assert!(
+            journal_pending(&daemon).await.is_empty(),
+            "the clear must rewrite the garbage journal to a clean empty file"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
+    /// An absent journal (clean boot) is a no-op: the daemon boots, the tracked file
+    /// is unchanged, and no recovery action is taken. The clear still writes an empty
+    /// journal even when none existed (harmless).
+    #[tokio::test]
+    async fn clean_boot_empty_journal_is_noop() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFs::new());
+        let author = PeerId::from_secret_bytes(super::common::seed(204)).as_u64();
+
+        let vault = Vault::init(fs.clone(), author).await?;
+        fs.write("notes/stable.md", b"# Stable").await?;
+        vault.on_file_changed("notes/stable.md").await?;
+        let uuid_before = vault
+            .index()
+            .node_for_path("notes/stable.md")
+            .and_then(|node| vault.index().node_uuid(&node))
+            .map(|u| u.to_string());
+        vault.save_index().await?;
+        drop(vault);
+        // NO journal staged at all.
+
+        let daemon = spawn_daemon_from_loaded(204, fs).await;
+
+        assert_eq!(
+            uuid_of(&daemon.vault, "notes/stable.md").await,
+            uuid_before,
+            "a clean boot must leave the tracked file's UUID unchanged"
+        );
+        assert!(
+            journal_pending(&daemon).await.is_empty(),
+            "a clean boot leaves an empty journal"
+        );
+
+        daemon.shutdown.cancel();
+        let _ = daemon.loop_handle.await;
+        Ok(())
+    }
+
+    /// Crash-after-restitch-before-clear convergence: a second boot over the same fs
+    /// with the SAME delete record re-staged is a clean no-op. The first boot
+    /// re-stitched and cleared; re-staging the journal simulates "crashed after
+    /// re-stitch, before the clear." The second boot's `finalize_recovered_journal`
+    /// finds `old_path` already vacated (no live node) and skips — no double-move, no
+    /// error (the §3.1 finalize idempotency).
+    #[tokio::test]
+    async fn boot_twice_recovery_is_idempotent() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFs::new());
+        let author = PeerId::from_secret_bytes(super::common::seed(205)).as_u64();
+
+        let uuid = stage_tracked_then_renamed_on_disk(
+            &fs,
+            author,
+            "notes/old.md",
+            "notes/new.md",
+            b"# Movable",
+        )
+        .await;
+        let record = delete_record(uuid, "notes/old.md", hash_of("# Movable", author));
+        stage_crash_journal(&fs, vec![record.clone()]).await;
+
+        // First boot: re-stitches AND clears the journal.
+        let daemon1 = spawn_daemon_from_loaded(205, fs.clone()).await;
+        assert_eq!(
+            uuid_of(&daemon1.vault, "notes/new.md").await,
+            Some(uuid.to_string()),
+            "first boot re-stitches the move"
+        );
+        daemon1.shutdown.cancel();
+        let _ = daemon1.loop_handle.await;
+
+        // Simulate "crashed after re-stitch, before clear": re-stage the SAME record
+        // onto the now-mutated fs (the node already sits at new.md).
+        stage_crash_journal(&fs, vec![record]).await;
+
+        // Second boot over the same fs: a clean no-op.
+        let daemon2 = spawn_daemon_from_loaded(205, fs).await;
+        assert_eq!(
+            uuid_of(&daemon2.vault, "notes/new.md").await,
+            Some(uuid.to_string()),
+            "second boot must NOT double-move — the UUID stays at the new path"
+        );
+        assert!(
+            uuid_of(&daemon2.vault, "notes/old.md").await.is_none(),
+            "old path stays vacated on the second boot"
+        );
+        assert!(
+            journal_pending(&daemon2).await.is_empty(),
+            "the journal is cleared again after the idempotent second boot"
+        );
+
+        daemon2.shutdown.cancel();
+        let _ = daemon2.loop_handle.await;
+        Ok(())
     }
 }
