@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 sync-core = { path = "../sync-core", features = ["native"] }
+# vault-sync has no Cargo features — its native/wasm fork is `cfg(target_arch)`,
+# so this dep line is bare (a `features = [...]` spec would fail to resolve).
+vault-sync = { path = "../vault-sync" }
 memory-common = { path = "../memory-common" }
 tokio.workspace = true
 bincode.workspace = true

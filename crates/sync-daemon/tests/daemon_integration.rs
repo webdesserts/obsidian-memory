@@ -27,10 +27,10 @@ mod daemon_integration {
     use tokio_util::sync::CancellationToken;
 
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
-    use sync_core::fs::{FileSystem, InMemoryFs};
     use sync_core::network::{SyncNode, gossip::VaultGossip};
     use sync_core::peer_id::{PeerId, VaultId};
-    use sync_core::{SyncMetadata, Vault};
+    use vault_sync::fs::{FileSystem, InMemoryFs};
+    use vault_sync::{SyncMetadata, Vault};
 
     use sync_daemon::daemon::Daemon;
     use sync_daemon::watcher::{FileEvent, FileEventKind};
@@ -38,6 +38,10 @@ mod daemon_integration {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// Shared gossip topic so all test daemons join the same swarm.
+    ///
+    /// Returns a `sync_core::VaultId` — the iroh gossip layer (`join_vault_gossip`)
+    /// speaks sync-core's VaultId. The vault's own `vault_id()` returns a
+    /// `vault_sync::VaultId`; the two are bridged through `u64` at the gossip boundary.
     fn shared_vault_id() -> VaultId {
         "cafebabecafebabe".parse().unwrap()
     }
@@ -64,22 +68,45 @@ mod daemon_integration {
         allowlist: Arc<InMemoryAllowlist>,
         sync_node: SyncNode,
         node_id: PeerId,
+        /// The inbound-sync freshness receiver paired with the pumped handler's
+        /// sender. Wired into the daemon (`set_inbound_seen_rx`) by `spawn_daemon`
+        /// so inbound-only peers are stamped alive (S2). Tests building a `Daemon`
+        /// inline can take it too, or drop it (the handler's `send` then fails
+        /// quietly — inert, since those tests don't assert inbound-only liveness).
+        inbound_seen_rx: mpsc::UnboundedReceiver<PeerId>,
     }
 
     /// Build an iroh node with vault and allowlist, but do NOT join gossip yet.
     ///
     /// Gossip is joined separately (after connectivity is wired) so each node
     /// has exactly one subscription per topic, matching the daemon's production behavior.
+    ///
+    /// The node is built with the daemon's PUMPED inbound handler (via
+    /// `new_with_sync_handler`), not the default one-shot `SyncStreamHandler` —
+    /// the convergence tests exercise the multi-message vault-sync handshake, so
+    /// the inbound side must pump exactly as production does.
     async fn build_node(seed_byte: u8) -> anyhow::Result<NodeBundle> {
         let fs = Arc::new(InMemoryFs::new());
         // Author Loro ops under a per-device PeerId derived from this node's
         // secret seed, so each node is a distinct Loro replica.
         let author = PeerId::from_secret_bytes(super::common::seed(seed_byte));
-        let vault = Vault::init(fs.clone(), author).await?;
+        let vault = Vault::init(fs.clone(), author.as_u64()).await?;
         let vault = Arc::new(Mutex::new(vault));
 
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let sync_node = SyncNode::new(super::common::seed(seed_byte), &[], allowlist.clone()).await?;
+        let (inbound_seen_tx, inbound_seen_rx) = mpsc::unbounded_channel();
+        let sync_handler = sync_daemon::daemon::PumpedSyncHandler::new(
+            vault.clone(),
+            allowlist.clone(),
+            inbound_seen_tx,
+        );
+        let sync_node = SyncNode::new_with_sync_handler(
+            super::common::seed(seed_byte),
+            &[],
+            allowlist.clone(),
+            sync_handler,
+        )
+        .await?;
 
         let memory_lookup = MemoryLookup::new();
         sync_node.endpoint.address_lookup()?.add(memory_lookup);
@@ -92,6 +119,7 @@ mod daemon_integration {
             allowlist,
             sync_node,
             node_id,
+            inbound_seen_rx,
         })
     }
 
@@ -125,6 +153,7 @@ mod daemon_integration {
         let vault = node.vault.clone();
         let fs = node.fs.clone();
         let allowlist = node.allowlist.clone();
+        let inbound_seen_rx = node.inbound_seen_rx;
 
         let mut daemon = Daemon::new(
             vault.clone(),
@@ -138,6 +167,9 @@ mod daemon_integration {
             "/test-vault".into(),
             shutdown.clone(),
         );
+        // Wire the pumped handler's freshness receiver so inbound-only peers are
+        // stamped alive (S2) — mirrors `startup.rs`.
+        daemon.set_inbound_seen_rx(inbound_seen_rx);
 
         let loop_handle = tokio::spawn(async move {
             daemon.run_loop().await;
@@ -320,6 +352,133 @@ mod daemon_integration {
         Ok(())
     }
 
+    /// The daemon drives the variable-length vault-sync handshake to termination
+    /// over a single QUIC bi-stream — the pumped exchange (X), not a one-shot
+    /// request/reply/half-close.
+    ///
+    /// Two scenarios in one test (shared two-daemon setup):
+    ///
+    /// 1. **Diverged pair converges through the full pump.** A holds a note B
+    ///    lacks, so the digests differ. B's `NeighborUp` opens a sync to A; the
+    ///    exchange pumps `SyncRequest → DigestMismatch → SyncExchange →
+    ///    SyncResponse`. We assert BOTH sides end byte-identical — not just that B
+    ///    received A's note, but that the pumped responder converged in-exchange
+    ///    too (A and B share the same `.md` set and the same content at each path).
+    ///
+    /// 2. **Converged pair settles in a no-op without corruption.** After step 1
+    ///    the vaults are identical. A fresh NeighborUp (driven by a spurious
+    ///    same-content edit on B) exchanges `SyncRequest → InSync` and transfers no
+    ///    content — observed as: both vaults keep the identical note set with
+    ///    byte-identical content, no spurious churn.
+    ///
+    /// The byte-level "zero content on a no-op" proof lives in vault-sync's
+    /// `ByteCounter`/`full_sync_counting` at the lib layer; this daemon-level test
+    /// proves the DAEMON drives the pump to a clean terminus over real QUIC.
+    #[tokio::test]
+    async fn test_daemon_pumps_variable_length_handshake() -> anyhow::Result<()> {
+        let node_a = build_node(30).await?;
+        let node_b = build_node(31).await?;
+
+        connect_nodes(&node_a, &node_b).await?;
+
+        // Scenario 1 — diverged: A has two notes B lacks (offline edits).
+        for (path, body) in [
+            ("notes/alpha.md", b"# Alpha".as_slice()),
+            ("notes/beta.md", b"# Beta".as_slice()),
+        ] {
+            node_a.fs.write(path, body).await?;
+            let vault = node_a.vault.lock().await;
+            vault.on_file_changed(path).await?;
+        }
+
+        let gossip_a = node_a
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![])
+            .await?;
+        let gossip_b = node_b
+            .sync_node
+            .join_vault_gossip(&shared_vault_id(), vec![node_a.sync_node.node_id()])
+            .await?;
+
+        let daemon_a = spawn_daemon(node_a, gossip_a);
+        let daemon_b = spawn_daemon(node_b, gossip_b);
+
+        // The pumped exchange must converge BOTH sides to byte-identical state:
+        // same `.md` set + same content at every path. A bidirectional pump (each
+        // side initiates on NeighborUp) settles the responder in-exchange too, so
+        // we assert full convergence, not merely "B received A's notes".
+        wait_until("A and B converge to byte-identical state", || {
+            let vault_a = daemon_a.vault.clone();
+            let vault_b = daemon_b.vault.clone();
+            let fs_a = daemon_a.fs.clone();
+            let fs_b = daemon_b.fs.clone();
+            async move {
+                let files_a = vault_a.lock().await.list_files().await.unwrap_or_default();
+                let files_b = vault_b.lock().await.list_files().await.unwrap_or_default();
+                let mut a_sorted = files_a.clone();
+                let mut b_sorted = files_b.clone();
+                a_sorted.sort();
+                b_sorted.sort();
+                if a_sorted != b_sorted
+                    || !a_sorted.contains(&"notes/alpha.md".to_string())
+                    || !a_sorted.contains(&"notes/beta.md".to_string())
+                {
+                    return false;
+                }
+                // Byte-identical content at every shared path.
+                for path in &a_sorted {
+                    let ca = fs_a.read(path).await.ok();
+                    let cb = fs_b.read(path).await.ok();
+                    if ca.is_none() || ca != cb {
+                        return false;
+                    }
+                }
+                true
+            }
+        })
+        .await;
+
+        // Snapshot the converged content so scenario 2 can prove the no-op pump
+        // left it untouched.
+        let alpha_before = daemon_b.fs.read("notes/alpha.md").await?;
+
+        // Scenario 2 — converged no-op: a spurious same-content Modified on B.
+        // vault-sync's diff-and-merge yields no change (content matches the stored
+        // Loro state), so this re-exercises the digest fast-path on the next
+        // exchange. The pumped `SyncRequest → InSync` transfers no content; we
+        // observe that the converged state is preserved with no corruption.
+        inject_modified(&daemon_b, "notes/alpha.md");
+
+        // Let the spurious event and any resulting exchange settle.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let alpha_after = daemon_b.fs.read("notes/alpha.md").await?;
+        assert_eq!(
+            alpha_before, alpha_after,
+            "a converged-pair no-op exchange must not alter materialized content"
+        );
+        // A still has both notes unchanged — no spurious content churn from the no-op.
+        let files_a = daemon_a
+            .vault
+            .lock()
+            .await
+            .list_files()
+            .await
+            .unwrap_or_default();
+        assert!(
+            files_a.contains(&"notes/alpha.md".to_string())
+                && files_a.contains(&"notes/beta.md".to_string()),
+            "A's note set must be intact after the no-op exchange"
+        );
+
+        daemon_a.shutdown.cancel();
+        daemon_b.shutdown.cancel();
+        let _ = daemon_a.loop_handle.await;
+        let _ = daemon_b.loop_handle.await;
+
+        Ok(())
+    }
+
     /// A pairing initiator adopts the mesh's VaultId, re-joins its gossip topic,
     /// and pulls the mesh's existing notes — the core of feature (b) pair-and-pull.
     ///
@@ -365,11 +524,11 @@ mod daemon_integration {
         let a_node_endpoint = node_a.sync_node.node_id();
         let gossip_a = node_a
             .sync_node
-            .join_vault_gossip(&a_vault_id, vec![])
+            .join_vault_gossip(&VaultId::from(a_vault_id.as_u64()), vec![])
             .await?;
         let gossip_b = node_b
             .sync_node
-            .join_vault_gossip(&b_vault_id, vec![])
+            .join_vault_gossip(&VaultId::from(b_vault_id.as_u64()), vec![])
             .await?;
 
         let daemon_a = spawn_daemon(node_a, gossip_a);
@@ -394,9 +553,11 @@ mod daemon_integration {
         );
 
         // Adopt A's VaultId and re-join its gossip topic, bootstrapping off A.
+        // `adopt_and_rejoin` speaks the iroh layer's `sync_core::VaultId`; bridge
+        // A's vault-sync VaultId through `u64`.
         daemon_b
             .adopt_and_rejoin(
-                a_vault_id,
+                VaultId::from(a_vault_id.as_u64()),
                 vec![PeerId::from_bytes(*a_node_endpoint.as_bytes())],
             )
             .await?;
@@ -879,7 +1040,10 @@ mod daemon_integration {
 
         let a_vault_id = node_a.vault.lock().await.vault_id();
         let b_vault_id = node_b.vault.lock().await.vault_id();
-        assert_ne!(a_vault_id, b_vault_id, "test requires distinct initial VaultIds");
+        assert_ne!(
+            a_vault_id, b_vault_id,
+            "test requires distinct initial VaultIds"
+        );
 
         // Seed a note into A's vault so B can prove it pulled via full sync.
         node_a
@@ -895,11 +1059,11 @@ mod daemon_integration {
         let a_endpoint_id = node_a.sync_node.node_id();
         let gossip_a = node_a
             .sync_node
-            .join_vault_gossip(&a_vault_id, vec![])
+            .join_vault_gossip(&VaultId::from(a_vault_id.as_u64()), vec![])
             .await?;
         let gossip_b = node_b
             .sync_node
-            .join_vault_gossip(&b_vault_id, vec![])
+            .join_vault_gossip(&VaultId::from(b_vault_id.as_u64()), vec![])
             .await?;
 
         // Build daemon A (responder) with DaemonControl so we can intercept
@@ -998,8 +1162,8 @@ mod daemon_integration {
             }
         );
 
-        let responder_device_name = connect_result
-            .expect("RequestPairing should succeed with Ok(device_name)");
+        let responder_device_name =
+            connect_result.expect("RequestPairing should succeed with Ok(device_name)");
         assert_eq!(
             responder_device_name, "device-a",
             "connect_reply should carry A's device name"
@@ -1182,7 +1346,10 @@ mod daemon_integration {
 
         let a_vault_id = node_a.vault.lock().await.vault_id();
         let b_vault_id = node_b.vault.lock().await.vault_id();
-        assert_ne!(a_vault_id, b_vault_id, "test requires distinct initial VaultIds");
+        assert_ne!(
+            a_vault_id, b_vault_id,
+            "test requires distinct initial VaultIds"
+        );
 
         // Start a relay for A so the daemon wiring is realistic, but advertise a
         // PUBLIC (domain) URL over the pairing wire: only an off-LAN-reachable URL
@@ -1208,11 +1375,11 @@ mod daemon_integration {
 
         let gossip_a = node_a
             .sync_node
-            .join_vault_gossip(&a_vault_id, vec![])
+            .join_vault_gossip(&VaultId::from(a_vault_id.as_u64()), vec![])
             .await?;
         let gossip_b = node_b
             .sync_node
-            .join_vault_gossip(&b_vault_id, vec![])
+            .join_vault_gossip(&VaultId::from(b_vault_id.as_u64()), vec![])
             .await?;
 
         // Build daemon A (responder) — pass A's relay URL so `PairingResult.relay_urls`
@@ -1330,13 +1497,11 @@ mod daemon_integration {
         let hint = b_peer_lookup
             .get_endpoint_info(a_endpoint_id)
             .expect("B's peer_lookup should have A's relay hint after pairing");
-        let hint_relay_urls: Vec<_> = hint
-            .into_endpoint_addr()
-            .relay_urls()
-            .cloned()
-            .collect();
+        let hint_relay_urls: Vec<_> = hint.into_endpoint_addr().relay_urls().cloned().collect();
         assert!(
-            hint_relay_urls.iter().any(|u| u.to_string() == relay_url_str),
+            hint_relay_urls
+                .iter()
+                .any(|u| u.to_string() == relay_url_str),
             "B's live peer_lookup hint should contain A's relay URL, got: {:?}",
             hint_relay_urls,
         );
@@ -1364,20 +1529,17 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// A real local edit propagates to a peer even when the sync flag is armed for that path.
+    /// A real local edit propagates to a peer.
     ///
-    /// Background: `mark_synced` simulates the lingering-flag window that arises when an
-    /// inbound sync write triggers a watcher event that is processed after the TTL — or
-    /// simply when the flag is stale. Before the fix, `on_file_modified` consumed the flag
-    /// and returned early, skipping both `vault.on_file_changed` and the gossip broadcast.
-    /// The peer would never receive the edit; the next full sync would revert it.
-    ///
-    /// After the fix the daemon always calls `vault.on_file_changed`, which is echo-safe
-    /// (returns false for unchanged content), and gates the broadcast on the returned bool.
+    /// This guards the daemon's `on_file_modified` → `on_file_changed` (true) → gossip
+    /// broadcast path end-to-end: an edit on A reaches B. Echo-safety is a content-diff in
+    /// `on_file_changed` (it returns `false` only for unchanged content, suppressing the
+    /// re-broadcast of an inbound-sync echo); the daemon no longer consults any path-keyed
+    /// sync flag, so there is nothing to "arm" — a real edit always applies and broadcasts.
     ///
     /// Seeds 70/71 reserved.
     #[tokio::test]
-    async fn test_local_edit_during_armed_flag_propagates_to_peer() -> anyhow::Result<()> {
+    async fn test_local_edit_propagates_to_peer() -> anyhow::Result<()> {
         let node_a = build_node(70).await?;
         let node_b = build_node(71).await?;
 
@@ -1416,29 +1578,22 @@ mod daemon_integration {
         })
         .await;
 
-        // Arm the sync flag on A for this path — simulates the lingering-flag window
-        // after an inbound sync write where the watcher event arrives late.
-        {
-            let vault = daemon_a.vault.lock().await;
-            vault.mark_synced("notes/flag-edit.md");
-        }
-
         // Make a real local edit to the file on A's filesystem.
         daemon_a
             .fs
-            .write("notes/flag-edit.md", b"# Edited after sync flag armed")
+            .write("notes/flag-edit.md", b"# Edited content")
             .await?;
 
         // Inject the modification event — this is what the OS watcher would deliver.
         inject_modified(&daemon_a, "notes/flag-edit.md");
 
-        // B must receive the updated content despite the armed flag on A.
+        // B must receive the updated content.
         wait_until("B has the edited content of notes/flag-edit.md", || {
             let vault = daemon_b.vault.clone();
             async move {
                 let vault = vault.lock().await;
                 if let Ok(content) = vault.get_document("notes/flag-edit.md").await {
-                    content.body().to_string().contains("Edited after sync flag armed")
+                    content.body().to_string().contains("Edited content")
                 } else {
                     false
                 }
@@ -1454,18 +1609,16 @@ mod daemon_integration {
         Ok(())
     }
 
-    /// A real local delete tombstones the registry and propagates to a peer even
-    /// when the sync flag is armed for that path.
+    /// A real local delete tombstones the registry and propagates to a peer.
     ///
-    /// Before the fix, `on_file_deleted` consumed the flag and returned early,
-    /// producing no tombstone and no broadcast. On the next full sync the peer
-    /// would re-deliver the file, resurrecting it. After the fix the daemon always
-    /// calls `vault.delete_file`, which is idempotent (returns false for an
-    /// already-absent path) and only broadcasts when it returns true.
+    /// This guards the daemon's `on_file_deleted` → `delete_file` (true) → gossip broadcast
+    /// path end-to-end: a delete on A tombstones B's copy. `delete_file` is idempotent
+    /// (returns `false` for an already-absent path) and the daemon broadcasts only when it
+    /// returns `true`; there is no path-keyed sync flag to "arm" anymore.
     ///
     /// Seeds 72/73 reserved.
     #[tokio::test]
-    async fn test_local_delete_during_armed_flag_propagates_to_peer() -> anyhow::Result<()> {
+    async fn test_local_delete_propagates_to_peer() -> anyhow::Result<()> {
         let node_a = build_node(72).await?;
         let node_b = build_node(73).await?;
 
@@ -1504,17 +1657,11 @@ mod daemon_integration {
         })
         .await;
 
-        // Arm the sync flag on A — simulates the lingering-flag window.
-        {
-            let vault = daemon_a.vault.lock().await;
-            vault.mark_synced("notes/flag-delete.md");
-        }
-
         // Delete the file on A's filesystem and inject the Deleted event.
         daemon_a.fs.delete("notes/flag-delete.md").await?;
         inject_deleted(&daemon_a, "notes/flag-delete.md");
 
-        // B must tombstone the file despite the armed flag on A.
+        // B must tombstone the file.
         wait_until("B no longer has notes/flag-delete.md", || {
             let vault = daemon_b.vault.clone();
             async move {
@@ -1815,12 +1962,13 @@ mod daemon_integration {
         // is well inside its backoff window (not due). The due hint has never been
         // attempted, so it is due immediately.
         let now = now_ms_test();
-        let mut throttled_hint =
-            PeerRelay::new(throttled_id.to_string(), "http://example.com:3340/".to_string());
+        let mut throttled_hint = PeerRelay::new(
+            throttled_id.to_string(),
+            "http://example.com:3340/".to_string(),
+        );
         throttled_hint.failure_count = 6;
         throttled_hint.last_attempt_ms = Some(now);
-        let due_hint =
-            PeerRelay::new(due_id.to_string(), "http://example.com:3340/".to_string());
+        let due_hint = PeerRelay::new(due_id.to_string(), "http://example.com:3340/".to_string());
 
         // A joins gossip with no bootstrap — it stays partitioned at zero
         // neighbors, so the supervisor acts every tick.
@@ -2050,8 +2198,7 @@ mod daemon_integration {
         wait_until("both throttled hints evicted from lookup", || {
             let lookup = lookup.clone();
             async move {
-                lookup.get_endpoint_info(x_id).is_none()
-                    && lookup.get_endpoint_info(y_id).is_none()
+                lookup.get_endpoint_info(x_id).is_none() && lookup.get_endpoint_info(y_id).is_none()
             }
         })
         .await;
@@ -2284,18 +2431,21 @@ mod daemon_integration {
 
         // The fix's proof: the net-change reset makes B's hint due, the next
         // supervisor tick re-dials B, NeighborUp fires, and A pulls B's note.
-        wait_until("A pulled notes/after-net-change.md after the net change", || {
-            let vault = a_vault.clone();
-            async move {
-                vault
-                    .lock()
-                    .await
-                    .list_files()
-                    .await
-                    .unwrap_or_default()
-                    .contains(&"notes/after-net-change.md".to_string())
-            }
-        })
+        wait_until(
+            "A pulled notes/after-net-change.md after the net change",
+            || {
+                let vault = a_vault.clone();
+                async move {
+                    vault
+                        .lock()
+                        .await
+                        .list_files()
+                        .await
+                        .unwrap_or_default()
+                        .contains(&"notes/after-net-change.md".to_string())
+                }
+            },
+        )
         .await;
 
         a_shutdown.cancel();
@@ -2817,10 +2967,10 @@ mod daemon_integration {
         // Supervisor snapshot gained the (B, new_relay) reconnect target so a future
         // tick dials B through server2's relay.
         assert!(
-            daemon.peer_relays_snapshot_for_test().iter().any(|h| h
-                .endpoint_id
-                == b_hex
-                && h.relay_url == relay_str),
+            daemon
+                .peer_relays_snapshot_for_test()
+                .iter()
+                .any(|h| h.endpoint_id == b_hex && h.relay_url == relay_str),
             "supervisor snapshot should gain a (peer, new_relay) cross-product entry; \
              snapshot was {:?}",
             daemon.peer_relays_snapshot_for_test()

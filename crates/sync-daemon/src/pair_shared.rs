@@ -10,11 +10,14 @@
 use std::path::Path;
 
 use iroh::{EndpointId, RelayUrl};
-use sync_core::SyncMetadata;
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::network::SyncNode;
 use sync_core::peer_id::{PeerId, VaultId};
 use tracing::warn;
+// The on-disk `.sync/metadata.toml` is owned by the vault-sync engine; `NativeFs`
+// implements vault-sync's `FileSystem`, so the metadata round-trip goes through
+// `vault_sync::SyncMetadata` (the format is byte-identical to the old sync-core one).
+use vault_sync::SyncMetadata;
 
 use crate::native_fs::NativeFs;
 
@@ -60,6 +63,10 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
 /// sync; this on-disk variant is the equivalent for the exit-then-restart CLI.
 pub async fn adopt_vault_id_on_disk(vault_path: &Path, new_id: VaultId) -> anyhow::Result<()> {
     let fs = NativeFs::new(vault_path.to_path_buf());
+    // `new_id` is the mesh's `sync_core::VaultId` recovered from the gossip topic;
+    // bridge it through `u64` to the `vault_sync::VaultId` the metadata file speaks
+    // (both newtypes wrap the same u64 and serialize to identical hex).
+    let new_id = vault_sync::VaultId::from(new_id.as_u64());
     let existing = SyncMetadata::load_or_migrate(&fs).await?;
     if existing.vault_id == new_id {
         return Ok(());

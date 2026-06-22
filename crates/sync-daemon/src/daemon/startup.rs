@@ -13,19 +13,17 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use sync_core::fs::FileSystem;
+use sync_core::allowlist::AllowlistStorage;
 use sync_core::network::SyncNode;
 use sync_core::network::discovery::MeshMetadata;
-use sync_core::allowlist::AllowlistStorage;
-use sync_core::Vault;
+use vault_sync::Vault;
+use vault_sync::fs::FileSystem;
 
 use crate::allowlist::FileAllowlistStorage;
 use crate::daemon_lock::DaemonLock;
 use crate::http;
 use crate::native_fs::NativeFs;
-use crate::pair_api::{
-    DaemonControl, DaemonStatus, PAIRING_BROADCAST_CAPACITY,
-};
+use crate::pair_api::{DaemonControl, DaemonStatus, PAIRING_BROADCAST_CAPACITY};
 use crate::persistence::{DaemonConfig, PeerRelay};
 use crate::relay::EmbeddedRelay;
 use crate::watcher::FileWatcher;
@@ -152,7 +150,10 @@ pub async fn run_with_shutdown_controlled(
 /// to return cleanly. Delegates to [`run_with_shutdown_controlled`]; the returned
 /// [`DaemonControl`] handle is dropped immediately (no tray or UI consumer in the
 /// headless path).
-pub async fn run_with_shutdown(config: super::DaemonRunConfig, shutdown: CancellationToken) -> Result<()> {
+pub async fn run_with_shutdown(
+    config: super::DaemonRunConfig,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let (_control, handle) = run_with_shutdown_controlled(config, shutdown).await?;
     // Drop _control: its receivers/sender have no consumer in the headless path.
     // Sends in the run loop are fire-and-forget (watch::Sender and broadcast::Sender
@@ -239,7 +240,8 @@ async fn startup_inner(
 
     info!("Daemon PeerId: {}", daemon_config.peer_id);
 
-    let author = identity_key.peer_id();
+    // vault-sync authors Loro ops under a bare u64; derive it from this device's PeerId.
+    let author = identity_key.peer_id().as_u64();
     let vault = if fs.exists(".sync").await? {
         info!("Loading existing vault");
         Vault::load(fs, author).await?
@@ -248,8 +250,18 @@ async fn startup_inner(
         Vault::init(fs, author).await?
     };
 
-    let vault_id = vault.vault_id();
+    // `vault.vault_id()` is a `vault_sync::VaultId`, but the iroh layer
+    // (`join_vault_gossip`, `MeshMetadata.vid`) speaks `sync_core::VaultId`. Bridge
+    // through `u64` here at the network boundary (both newtypes wrap the same u64 and
+    // produce identical hex), leaving the iroh layer's type untouched.
+    let vault_id = sync_core::VaultId::from(vault.vault_id().as_u64());
     info!("Vault loaded, vault ID: {}", vault_id);
+
+    // Wrap the vault in its shared handle NOW, before the SyncNode is built: the
+    // pumped inbound handler (registered on `SYNC_ALPN` at SyncNode construction)
+    // needs this exact Arc to process inbound syncs inline. The same Arc is later
+    // handed to `Daemon::new`, so the daemon and the handler share one vault.
+    let vault = Arc::new(Mutex::new(vault));
 
     if daemon_config.relay_url.is_some() {
         info!("Clearing stale relay URL from previous run");
@@ -312,7 +324,10 @@ async fn startup_inner(
         // dedups, so this is a no-op once the public domain is already present.
         daemon_config.add_known_public_relay(&url.to_string());
         if let Err(e) = daemon_config.save(&config.vault) {
-            warn!("Failed to persist own relay into known_public_relays: {}", e);
+            warn!(
+                "Failed to persist own relay into known_public_relays: {}",
+                e
+            );
         }
     }
 
@@ -351,9 +366,28 @@ async fn startup_inner(
         Some(own) => vec![own.clone()],
         None => public_relays.clone(),
     };
-    let sync_node = SyncNode::new(secret_key_bytes, &home_relays, allowlist.clone())
-        .await
-        .context("Failed to create iroh SyncNode")?;
+    // The daemon runs the variable-length vault-sync handshake, which needs a
+    // PUMPED inbound path (multiple process_message turns over one bi-stream), not
+    // the default one-shot SyncStreamHandler. Build our own handler holding the
+    // shared vault + allowlist and register it on `SYNC_ALPN` via the additive
+    // `new_with_sync_handler`. The handler stamps allowlist freshness inline and
+    // fires the peer id on `inbound_seen_tx`; the run-loop drains the matching
+    // receiver to stamp peer_registry liveness (S2). sync-wasm keeps the default
+    // one-shot handler — this seam is opt-in.
+    let (inbound_seen_tx, inbound_seen_rx) = mpsc::unbounded_channel();
+    let sync_handler = crate::daemon::sync_stream::PumpedSyncHandler::new(
+        vault.clone(),
+        allowlist.clone(),
+        inbound_seen_tx,
+    );
+    let sync_node = SyncNode::new_with_sync_handler(
+        secret_key_bytes,
+        &home_relays,
+        allowlist.clone(),
+        sync_handler,
+    )
+    .await
+    .context("Failed to create iroh SyncNode")?;
 
     info!(node_id = %sync_node.node_id(), "Iroh node started");
 
@@ -515,7 +549,7 @@ async fn startup_inner(
     let (file_event_rx, watcher) = watcher.into_event_rx();
 
     let mut daemon = Daemon::new(
-        Arc::new(Mutex::new(vault)),
+        vault,
         sync_node,
         vault_gossip,
         file_event_rx,
@@ -526,6 +560,11 @@ async fn startup_inner(
         config.vault.clone(),
         shutdown,
     );
+
+    // Drain the inbound-sync freshness channel (the other half of the one the
+    // pumped handler sends on) so the run-loop stamps peer_registry liveness for
+    // inbound-only peers (S2).
+    daemon.set_inbound_seen_rx(inbound_seen_rx);
 
     // Give the reconnect supervisor its starting address book — the same
     // cross-product `(allowlist × known_public_relays)` the live lookup was just

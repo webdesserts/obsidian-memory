@@ -7,18 +7,20 @@
 //!   `InitiatorPairOutcome`, `run_initiator_pairing_parked`, and the five
 //!   `impl Daemon` initiator methods).
 
-mod startup;
 mod initiator;
+mod startup;
 mod sync_exchange;
+mod sync_stream;
 
 // Re-export public names so `sync_daemon::daemon::X` paths stay byte-identical.
-pub use startup::{run, run_with_shutdown, run_with_shutdown_controlled};
 use initiator::{InitiatorPairOutcome, InitiatorSession};
+pub use startup::{run, run_with_shutdown, run_with_shutdown_controlled};
 use sync_exchange::{SyncExchangeKind, spawn_sync_exchange};
+// Re-exported for the integration-test harness, which builds nodes with the same
+// pumped inbound handler production uses (see `sync_stream`).
+pub use sync_stream::PumpedSyncHandler;
 
-use crate::pair_api::{
-    ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary,
-};
+use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::relay_class::relay_is_offlan_reachable;
 use crate::watcher::{FileEvent, FileEventKind};
 use iroh::{EndpointAddr, EndpointId};
@@ -31,16 +33,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
-use sync_core::fs::FileSystem;
 use sync_core::network::{
     GOSSIP_ALPN, SyncNode,
     gossip::{GossipEvent, GossipMessage, MAX_GOSSIP_MESSAGE_SIZE, VaultGossip},
     pairing::{InboundPairingExchange, PairingApproval, PairingEvent},
-    streams::InboundSyncRequest,
 };
 use sync_core::pairing::{PairingChallenge, PairingSession};
 use sync_core::time_scale::{scaled, scaled_ms};
-use sync_core::{PeerId, PeerRegistry, Vault};
+use sync_core::{PeerId, PeerRegistry};
+// The vault/sync-engine layer is vault-sync; the iroh half stays on sync-core.
+// `Daemon<FS>` and `Vault<FS>` are both generic over vault-sync's `FileSystem`.
+use vault_sync::Vault;
+use vault_sync::fs::FileSystem;
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -204,6 +208,16 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// change needs a restart." `None` in tests that don't exercise reconnect,
     /// and on any build where `watch_addr` isn't wired.
     net_change_rx: Option<mpsc::Receiver<()>>,
+    /// Inbound-sync freshness signal. The pumped inbound handler
+    /// (`sync_stream::PumpedSyncHandler`) processes a peer's sync inline and
+    /// fires that peer's id here on completion; the run-loop drains it and stamps
+    /// `peer_registry.update_last_seen`. The handler can't touch `peer_registry`
+    /// directly — it's built before `Daemon` exists — so this fire-and-forget
+    /// channel carries the inbound liveness stamp instead (S2). It is the
+    /// inbound-only-peer liveness path that the `alive_count` broadcast gate
+    /// reads. `None` (inert) until wired post-construction by `startup.rs` or a
+    /// test; an undrained channel is harmless (the handler's `send` fails quietly).
+    inbound_seen_rx: Option<mpsc::UnboundedReceiver<PeerId>>,
     /// Tracks liveness state of all peers observed in the gossip swarm.
     ///
     /// Wrapped in `Arc<Mutex<...>>` so spawned tasks (QUIC sync exchanges) can
@@ -320,9 +334,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // The reconnect supervisor wakes on a steady cadence; backoff (tracked in
         // the fields below) gates whether a wake actually re-dials. `Delay` skips
         // missed ticks rather than bursting to catch up after a slow turn.
-        let mut reconnect_tick = tokio::time::interval(scaled(std::time::Duration::from_millis(
-            RECONNECT_BASE_MS,
-        )));
+        let mut reconnect_tick =
+            tokio::time::interval(scaled(std::time::Duration::from_millis(RECONNECT_BASE_MS)));
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         Self {
@@ -335,6 +348,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             // tests via `set_net_change_rx`); `None` means net-change reconnect
             // is inert, exactly like an unwired `discovery_rx`.
             net_change_rx: None,
+            // Wired post-construction (startup.rs / tests via `set_inbound_seen_rx`);
+            // `None` means inbound freshness stamping is inert, like an unwired
+            // `net_change_rx`.
+            inbound_seen_rx: None,
             peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
             allowlist,
             active_pairing: None,
@@ -456,8 +473,17 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     }
                 }
 
-                Some(inbound) = self.sync_node.inbound_sync_rx.recv() => {
-                    self.on_inbound_sync(inbound).await;
+                Some(remote_id) = async {
+                    match self.inbound_seen_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    // A peer completed an inbound sync (handled inline by the pumped
+                    // handler). Stamp its liveness so the broadcast `alive_count`
+                    // gate counts an inbound-only peer (S2) — the inbound handler
+                    // can't reach `peer_registry`, so it routes the stamp here.
+                    self.peer_registry.lock().await.update_last_seen(&remote_id);
                 }
 
                 Some(pairing_event) = self.sync_node.inbound_pairing_rx.recv() => {
@@ -1066,8 +1092,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 continue;
             }
             self.sync_node.add_peer_relay(endpoint_id, &url);
-            self.peer_relays
-                .push(crate::persistence::PeerRelay::new(endpoint_hex, url_str.clone()));
+            self.peer_relays.push(crate::persistence::PeerRelay::new(
+                endpoint_hex,
+                url_str.clone(),
+            ));
         }
     }
 
@@ -1095,6 +1123,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// `#[cfg(test)]` gate would break them). Not a public production API.
     pub fn set_net_change_rx(&mut self, rx: mpsc::Receiver<()>) {
         self.net_change_rx = Some(rx);
+    }
+
+    /// Wire the inbound-sync freshness receiver — the other half of the channel
+    /// the pumped inbound handler sends on (built alongside the `SyncNode` in
+    /// `startup.rs` / `build_node`). The run-loop drains it to stamp
+    /// `peer_registry.update_last_seen` for peers that synced inbound, so a peer
+    /// that only ever connects inbound still counts as alive (S2). `pub` for
+    /// integration-test access — same seam rationale as [`Daemon::set_net_change_rx`].
+    pub fn set_inbound_seen_rx(&mut self, rx: mpsc::UnboundedReceiver<PeerId>) {
+        self.inbound_seen_rx = Some(rx);
     }
 
     /// Populate the in-memory peer-relay snapshot the supervisor re-dials from.
@@ -1310,7 +1348,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         // Always update vault state so .loro files stay current for future sync exchanges.
         // Without this, edits made while no peers are connected would be silently lost
-        // when a peer connects — prepare_sync_request trusts .loro state, with no fallback.
+        // when a peer connects — prepare_request trusts .loro state, with no fallback.
         let changed = match vault.on_file_changed(path).await {
             Ok(v) => v,
             Err(e) => {
@@ -1323,8 +1361,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // on_file_changed is sync-agnostic (called from both the watcher and reconcile
         // paths); the caller owns the flush decision. Reconcile batches to one save;
         // watcher events each flush here so a restart doesn't lose newly-created file nodes.
-        if let Err(e) = vault.save_registry().await {
-            error!("Failed to persist registry after file change for {}: {}", path, e);
+        if let Err(e) = vault.save_index().await {
+            error!(
+                "Failed to persist registry after file change for {}: {}",
+                path, e
+            );
             return;
         }
 
@@ -1369,7 +1410,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let vault = self.vault.lock().await;
-        let request_bytes = match vault.prepare_sync_request().await {
+        let request_bytes = match vault.prepare_request().await {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Failed to prepare sync request for {}: {}", node_id, e);
@@ -1426,7 +1467,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let vault = self.vault.lock().await;
-        let request_bytes = match vault.prepare_sync_request().await {
+        let request_bytes = match vault.prepare_request().await {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Failed to prepare sync request for change pull: {}", e);
@@ -1701,55 +1742,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         self.active_pairing = None;
         warn!("Pairing failed for {}: {}", peer_id, reason);
     }
-
-    /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
-    async fn on_inbound_sync(&mut self, inbound: InboundSyncRequest) {
-        if !self.is_peer_allowed(&inbound.remote_id).await {
-            warn!(peer = %inbound.remote_id, "Inbound sync from non-allowlisted peer, dropping");
-            // Dropping reply_tx closes the QUIC stream without a response.
-            drop(inbound.reply_tx);
-            return;
-        }
-
-        let vault = self.vault.lock().await;
-        match vault.process_sync_message(&inbound.message_bytes).await {
-            Ok((response_bytes_opt, modified_paths)) => {
-                if !modified_paths.is_empty() {
-                    info!("Applied {} file(s) from inbound sync", modified_paths.len());
-                }
-
-                self.peer_registry
-                    .lock()
-                    .await
-                    .update_last_seen(&inbound.remote_id);
-                if let Err(e) = self
-                    .allowlist
-                    .update_last_seen(&inbound.remote_id, now_ms())
-                    .await
-                {
-                    warn!(
-                        "Failed to update allowlist last_seen for {}: {}",
-                        inbound.remote_id, e
-                    );
-                }
-
-                if let Some(resp_bytes) = response_bytes_opt {
-                    // reply_tx being dropped closes the stream without a response — that's fine.
-                    let _ = inbound.reply_tx.send(resp_bytes);
-                }
-            }
-            Err(e) => {
-                error!("Failed to process inbound sync message: {}", e);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod backoff_tests {
-    use super::{
-        HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, hint_attempt_due, per_hint_backoff,
-    };
+    use super::{HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, hint_attempt_due, per_hint_backoff};
     use crate::persistence::PeerRelay;
 
     // A failure count comfortably past the shift ceiling, to prove the clamp.

@@ -1,19 +1,21 @@
 //! Background QUIC sync-exchange helper shared by `on_neighbor_up` and
 //! `on_change_received`.
 //!
-//! Both handlers follow the same tail: connect to a peer, send a SyncRequest,
-//! process the response, and update last-seen timestamps. Only the log messages
-//! and a `path` argument (present only for change-pull) differ.
+//! Both handlers follow the same tail: open a bi-stream to a peer, drive the
+//! variable-length vault-sync handshake to termination (via the outbound pump in
+//! `sync_stream`), and update last-seen timestamps. Only the log messages and a
+//! `path` argument (present only for change-pull) differ.
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use iroh::EndpointId;
 use sync_core::allowlist::AllowlistStorage;
-use sync_core::fs::FileSystem;
-use sync_core::{PeerId, PeerRegistry, Vault};
+use sync_core::{PeerId, PeerRegistry};
+use vault_sync::Vault;
+use vault_sync::fs::FileSystem;
 
 use super::{ExchangeLearned, now_ms};
 
@@ -75,21 +77,27 @@ pub(super) fn spawn_sync_exchange<FS, AL>(
     AL: AllowlistStorage + 'static,
 {
     tokio::spawn(async move {
-        let response_bytes = match sync_core::network::streams::connect_and_sync_raw(
+        // Drive the variable-length vault-sync handshake to termination over one
+        // bi-stream (digest opener → … → terminal `reply: None`), processing each
+        // leg on the local vault. The pump scopes the vault lock to each
+        // `process_message` (never across a wire await) so a concurrent
+        // reverse-initiated sync can't deadlock against it.
+        let modified = match super::sync_stream::pump_outbound(
             &endpoint,
             target,
             &request_bytes,
+            &vault,
         )
         .await
         {
-            Ok(bytes) => bytes,
+            Ok(modified) => modified,
             Err(e) => {
                 match &kind {
                     SyncExchangeKind::NeighborUp => {
                         // NeighborUp fires before the peer's QUIC listener is ready on some
                         // OS configurations. Log a warning and move on — the peer will
                         // initiate a sync in the other direction.
-                        warn!("Failed to connect for sync with {}: {}", target, e);
+                        warn!("Failed to sync with {}: {}", target, e);
                     }
                     SyncExchangeKind::ChangePull { .. } => {
                         warn!("Failed to pull change from {}: {}", target, e);
@@ -99,42 +107,17 @@ pub(super) fn spawn_sync_exchange<FS, AL>(
             }
         };
 
-        // Process the response under the vault lock, capturing only the result
-        // we need afterward so the lock drops before the relay-learn query.
-        let process_result = {
-            let vault = vault.lock().await;
-            vault.process_sync_message(&response_bytes).await
-        };
-
-        let modified_paths = match process_result {
-            Ok((_, modified_paths)) => modified_paths,
-            Err(e) => {
-                match &kind {
-                    SyncExchangeKind::NeighborUp => {
-                        error!("Failed to process sync response from {}: {}", target, e);
-                    }
-                    SyncExchangeKind::ChangePull { .. } => {
-                        error!("Failed to process pulled change from {}: {}", target, e);
-                    }
-                }
-                return;
-            }
-        };
-
         peer_registry.lock().await.update_last_seen(&peer_id);
         if let Err(e) = allowlist.update_last_seen(&peer_id, now_ms()).await {
-            warn!(
-                "Failed to update allowlist last_seen for {}: {}",
-                target, e
-            );
+            warn!("Failed to update allowlist last_seen for {}: {}", target, e);
         }
 
         match &kind {
             SyncExchangeKind::NeighborUp => {
-                if !modified_paths.is_empty() {
+                if !modified.is_empty() {
                     info!(
                         "Synced {} file(s) from {} on NeighborUp",
-                        modified_paths.len(),
+                        modified.len(),
                         target
                     );
                 } else {
@@ -142,10 +125,10 @@ pub(super) fn spawn_sync_exchange<FS, AL>(
                 }
             }
             SyncExchangeKind::ChangePull { path } => {
-                if !modified_paths.is_empty() {
+                if !modified.is_empty() {
                     info!(
                         "Pulled {} file(s) from {} after change notification on {}",
-                        modified_paths.len(),
+                        modified.len(),
                         target,
                         path
                     );

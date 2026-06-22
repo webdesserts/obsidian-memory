@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use std::io;
 use std::path::PathBuf;
-use sync_core::fs::{FileEntry, FileStat, FileSystem, FsError, Result};
 use tokio::fs;
+use vault_sync::fs::{FileEntry, FileStat, FileSystem, FsError, Result};
 
 /// Map a tokio/std io error to FsError, preserving NotFound so callers
 /// (e.g. the reconcile skip-deleted guard) can match on it. The `InMemoryFs`
@@ -157,8 +157,8 @@ impl FileSystem for NativeFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sync_core::fs::conformance;
     use tempfile::tempdir;
+    use vault_sync::fs::conformance;
 
     /// Verify that `NativeFs` upholds the full `FileSystem` error contract.
     ///

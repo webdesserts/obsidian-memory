@@ -145,7 +145,63 @@ impl SyncNode {
         relays: &[RelayUrl],
         allowlist: Arc<A>,
     ) -> Result<Self> {
-        Self::build(secret_key_bytes, relays, allowlist, false).await
+        // The default `SyncStreamHandler` is the one-shot inbound path (one
+        // message in, one reply out over a oneshot). `inbound_sync_rx` carries
+        // those requests to the caller for processing.
+        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+        Self::build(
+            secret_key_bytes,
+            relays,
+            allowlist,
+            false,
+            sync_handler,
+            inbound_sync_rx,
+        )
+        .await
+    }
+
+    /// Create a SyncNode whose `SYNC_ALPN` connections are dispatched to a
+    /// caller-supplied `ProtocolHandler` instead of the default one-shot
+    /// [`SyncStreamHandler`].
+    ///
+    /// This is the seam the daemon uses to run its multi-message *pumped*
+    /// handshake: the daemon supplies a handler that drives the variable-length
+    /// vault-sync exchange (digest → mismatch → exchange → response) inline over
+    /// one bi-stream, rather than the one-message-in / one-reply-out the default
+    /// handler does. The default [`SyncNode::new`] is unchanged, so sync-wasm —
+    /// which constructs its node via `new` and drains `inbound_sync_rx` — is
+    /// byte-identical.
+    ///
+    /// `inbound_sync_rx` is still populated (S1): the field is a non-optional
+    /// `InboundSyncRx` that sync-wasm reads, so it must always be present and the
+    /// right type. A pumped node produces no inbound channel (the supplied handler
+    /// owns the inbound path entirely), so we store a DISCONNECTED receiver — its
+    /// `.recv()` returns `None` forever, which the daemon never drains anyway.
+    #[cfg(feature = "native")]
+    pub async fn new_with_sync_handler<A, H>(
+        secret_key_bytes: [u8; 32],
+        relays: &[RelayUrl],
+        allowlist: Arc<A>,
+        sync_handler: H,
+    ) -> Result<Self>
+    where
+        A: AllowlistStorage + std::fmt::Debug + 'static,
+        H: iroh::protocol::ProtocolHandler,
+    {
+        // S1: keep `inbound_sync_rx` present and the right type even though the
+        // pumped handler produces no inbound channel. A disconnected receiver
+        // (sender dropped immediately) is inert and type-correct.
+        let (tx, inbound_sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx);
+        Self::build(
+            secret_key_bytes,
+            relays,
+            allowlist,
+            false,
+            sync_handler,
+            inbound_sync_rx,
+        )
+        .await
     }
 
     /// Create a SyncNode whose endpoint has **no IP transports** — relay-only.
@@ -164,7 +220,48 @@ impl SyncNode {
         relays: &[RelayUrl],
         allowlist: Arc<A>,
     ) -> Result<Self> {
-        Self::build(secret_key_bytes, relays, allowlist, true).await
+        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
+        Self::build(
+            secret_key_bytes,
+            relays,
+            allowlist,
+            true,
+            sync_handler,
+            inbound_sync_rx,
+        )
+        .await
+    }
+
+    /// Relay-only [`SyncNode::new_relay_only`] with a caller-supplied `SYNC_ALPN`
+    /// handler — the off-LAN/NAT counterpart to [`SyncNode::new_with_sync_handler`].
+    ///
+    /// The daemon's relay-path convergence tests need BOTH the relay-only topology
+    /// (so the relay is the genuine sole route) AND the pumped inbound handler (so
+    /// the responder drives the multi-message handshake), which neither single
+    /// constructor provides. Test-only, behind `test-util`.
+    #[cfg(all(feature = "native", feature = "test-util"))]
+    pub async fn new_relay_only_with_sync_handler<A, H>(
+        secret_key_bytes: [u8; 32],
+        relays: &[RelayUrl],
+        allowlist: Arc<A>,
+        sync_handler: H,
+    ) -> Result<Self>
+    where
+        A: AllowlistStorage + std::fmt::Debug + 'static,
+        H: iroh::protocol::ProtocolHandler,
+    {
+        // S1: keep a present, correctly-typed (disconnected) `inbound_sync_rx`.
+        let (tx, inbound_sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx);
+        Self::build(
+            secret_key_bytes,
+            relays,
+            allowlist,
+            true,
+            sync_handler,
+            inbound_sync_rx,
+        )
+        .await
     }
 
     /// Shared constructor body for [`SyncNode::new`] and (test-only)
@@ -174,12 +271,18 @@ impl SyncNode {
     /// path is a relay. The production callers always pass `false`; only the
     /// `test-util` relay-only constructor passes `true`.
     #[cfg(feature = "native")]
-    async fn build<A: AllowlistStorage + std::fmt::Debug + 'static>(
+    async fn build<A, H>(
         secret_key_bytes: [u8; 32],
         relays: &[RelayUrl],
         allowlist: Arc<A>,
         relay_only: bool,
-    ) -> Result<Self> {
+        sync_handler: H,
+        inbound_sync_rx: InboundSyncRx,
+    ) -> Result<Self>
+    where
+        A: AllowlistStorage + std::fmt::Debug + 'static,
+        H: iroh::protocol::ProtocolHandler,
+    {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
@@ -228,10 +331,7 @@ impl SyncNode {
             let bound = endpoint.bound_sockets();
             let (port, ips) = socket_addrs_to_port_addrs(&bound);
             // Only advertise IPv4 sockets (V4Only mDNS scope).
-            let v4_ips: Vec<std::net::IpAddr> = ips
-                .into_iter()
-                .filter(|ip| ip.is_ipv4())
-                .collect();
+            let v4_ips: Vec<std::net::IpAddr> = ips.into_iter().filter(|ip| ip.is_ipv4()).collect();
             let rt = tokio::runtime::Handle::current();
             match MeshMdns::new(endpoint.id(), MDNS_SERVICE_NAME, port, v4_ips, &rt) {
                 Ok(mdns) => {
@@ -276,7 +376,6 @@ impl SyncNode {
         }
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
 
         let (pairing_handler, inbound_pairing_rx) = PairingStreamHandler::new();
 
@@ -395,7 +494,10 @@ impl SyncNode {
     #[cfg(feature = "native")]
     pub async fn add_home_relay(&self, relay_url: &RelayUrl) {
         self.endpoint
-            .insert_relay(relay_url.clone(), Arc::new(RelayConfig::from(relay_url.clone())))
+            .insert_relay(
+                relay_url.clone(),
+                Arc::new(RelayConfig::from(relay_url.clone())),
+            )
             .await;
         tracing::info!(relay_url = %relay_url, "Added learned public relay to live RelayMap");
     }
@@ -612,8 +714,9 @@ impl SyncNode {
     #[cfg(feature = "native")]
     pub async fn subscribe_discovery(
         &self,
-    ) -> Option<impl n0_future::Stream<Item = crate::network::discovery::DiscoveryEvent> + Unpin + use<>>
-    {
+    ) -> Option<
+        impl n0_future::Stream<Item = crate::network::discovery::DiscoveryEvent> + Unpin + use<>,
+    > {
         let mdns = self.mdns.as_ref()?;
         Some(mdns.subscribe().await)
     }

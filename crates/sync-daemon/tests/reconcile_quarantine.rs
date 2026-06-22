@@ -13,15 +13,15 @@
 mod reconcile_quarantine {
     use std::sync::Arc;
 
-    use sync_core::Vault;
-    use sync_core::fs::FileSystem;
     use sync_core::peer_id::PeerId;
     use sync_daemon::NativeFs;
     use tempfile::tempdir;
+    use vault_sync::Vault;
+    use vault_sync::fs::FileSystem;
 
-    /// Deterministic author seed.
-    fn test_author() -> PeerId {
-        PeerId::from_secret_bytes([42u8; 32])
+    /// Deterministic author seed. vault-sync authors Loro ops under a bare u64.
+    fn test_author() -> u64 {
+        PeerId::from_secret_bytes([42u8; 32]).as_u64()
     }
 
     /// A historical orphan strand — a `.md` file on disk whose registry node was
@@ -87,11 +87,11 @@ mod reconcile_quarantine {
             "the quarantined orphan must not appear in list_files"
         );
         // Registry-truth check: quarantine never resurrected a node, so the path has
-        // no live document. get_document_info returns None when no .loro doc exists
-        // for the path (delete_file removed it; quarantine never creates one).
+        // no live node in the Index tree (delete_file tombstoned it; quarantine never
+        // creates one).
         assert!(
-            vault.get_document_info("dupe.md").await.unwrap().is_none(),
-            "the quarantined orphan must have no live document in the registry"
+            vault.index().node_for_path("dupe.md").is_none(),
+            "the quarantined orphan must have no live node in the registry"
         );
         drop(vault);
 
