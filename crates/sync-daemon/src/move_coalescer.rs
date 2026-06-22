@@ -108,7 +108,7 @@ pub(crate) enum Expired {
 /// root. Mirrors `persistence.rs`'s `.sync/` path consts; the daemon writes it
 /// through the vault's `FileSystem` (NOT `std::fs`), and JSON matches the design
 /// (`known_peers.json` already establishes JSON-in-`.sync/`).
-pub(crate) const PENDING_MOVES_FILE: &str = ".sync/pending-moves.json";
+pub const PENDING_MOVES_FILE: &str = ".sync/pending-moves.json";
 
 /// Schema version of the on-disk journal (`.sync/pending-moves.json`).
 ///
@@ -118,13 +118,13 @@ pub(crate) const PENDING_MOVES_FILE: &str = ".sync/pending-moves.json";
 /// is a cheap guard so a future format change is detectable. On load, a `version`
 /// mismatch means "discard the journal (treat as empty)" rather than mis-parse —
 /// degrading to the crash-tail the design already accepts. (P4f-2 §1.1.)
-pub(crate) const PENDING_MOVES_VERSION: u32 = 1;
+pub const PENDING_MOVES_VERSION: u32 = 1;
 
 /// Which pending map a [`JournaledMove`] mirrors. A categorical value, serialized
 /// via serde rename rather than a bare string so the kind can never be a stray
 /// free-text reference.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum PendingKind {
+pub enum PendingKind {
     #[serde(rename = "delete")]
     Delete,
     #[serde(rename = "create")]
@@ -137,34 +137,38 @@ pub(crate) enum PendingKind {
 /// coalescer's [`MoveCoalescer::snapshot`] — the coalescer itself stays pure and
 /// performs no I/O.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct JournaledMove {
+pub struct JournaledMove {
     /// Which pending map this came from.
-    pub(crate) kind: PendingKind,
+    pub kind: PendingKind,
     /// The doc's content hash, lowercase hex (32 bytes → 64-char hex) for
     /// JSON-friendliness — `[u8; 32]` has no clean compact JSON form, and hex is
     /// the crate's established convention for byte-array identifiers.
-    pub(crate) content_hash: String,
+    pub content_hash: String,
     /// `old_path` for a delete, `new_path` for a create.
-    pub(crate) path: String,
+    pub path: String,
     /// The original doc UUID — the lineage 2b's boot re-stitch re-attaches.
     /// `Some` and REQUIRED on a delete (the move's source, the identity to
     /// re-attach). `None` on a create whose partner delete had not arrived when the
     /// snapshot was taken (so its UUID was unknown); the re-stitch keys off the
     /// delete record's UUID, so a `None` here is acceptable.
-    pub(crate) uuid: Option<String>,
+    pub uuid: Option<String>,
 }
 
 /// The on-disk journal file shape: a versioned wrapper around the pending set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PendingMovesFile {
-    pub(crate) version: u32,
-    pub(crate) pending: Vec<JournaledMove>,
+pub struct PendingMovesFile {
+    pub version: u32,
+    pub pending: Vec<JournaledMove>,
 }
 
 /// Lowercase-hex encode a 32-byte content hash for the journal's `content_hash`
 /// field — the same per-byte `{:02x}` convention the crate uses elsewhere (e.g.
 /// `PeerId`'s `Display`).
-fn hex_lower(bytes: &[u8; 32]) -> String {
+///
+/// `pub` so the boot-recovery round-trip test and the integration harness can build
+/// a faithful journal record using the journal's own encoder (its inverse is
+/// `move_recovery::hex_to_bytes32`).
+pub fn hex_lower(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -478,7 +482,10 @@ mod tests {
     #[test]
     fn different_content_does_not_pair() {
         let mut c = MoveCoalescer::new();
-        assert_eq!(c.on_delete(HASH_A, "a.md", uuid_a()), MoveDecision::Buffered);
+        assert_eq!(
+            c.on_delete(HASH_A, "a.md", uuid_a()),
+            MoveDecision::Buffered
+        );
         assert_eq!(c.on_create(HASH_B, "b.md"), MoveDecision::Buffered);
         c.expire_all_for_test();
         let mut expired = c.sweep();

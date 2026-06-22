@@ -8,6 +8,7 @@
 //!   `impl Daemon` initiator methods).
 
 mod initiator;
+mod move_recovery;
 mod startup;
 mod sync_exchange;
 mod sync_stream;
@@ -19,9 +20,14 @@ use sync_exchange::{SyncExchangeKind, spawn_sync_exchange};
 // Re-exported for the integration-test harness, which builds nodes with the same
 // pumped inbound handler production uses (see `sync_stream`).
 pub use sync_stream::PumpedSyncHandler;
+// Re-exported for the boot-recovery integration harness (`spawn_daemon_from_loaded`),
+// which runs the SAME journal-read → restitch → clear sequence as `startup_inner` so
+// production and test cannot diverge (P4f-2b-ii §0.1).
+pub use move_recovery::{clear_pending_journal, read_pending_journal, restitch_inputs};
 
 use crate::move_coalescer::{
-    Expired, MoveCoalescer, MoveDecision, PENDING_MOVES_FILE, PENDING_MOVES_VERSION, PendingMovesFile,
+    Expired, JournaledMove, MoveCoalescer, MoveDecision, PENDING_MOVES_FILE, PENDING_MOVES_VERSION,
+    PendingKind, PendingMovesFile,
 };
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::relay_class::relay_is_offlan_reachable;
@@ -1567,6 +1573,40 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         };
         if let Err(e) = fs.atomic_write(PENDING_MOVES_FILE, &bytes).await {
             error!("Failed to write pending-moves journal: {}", e);
+        }
+    }
+
+    /// Standalone-finalize the journaled records that boot re-stitch did NOT resolve
+    /// (P4f-2b-ii). Run once at boot AFTER `Vault::load_with_journal`, before the
+    /// run-loop spawns.
+    ///
+    /// A journaled DELETE whose `old_path` STILL has a live node after load is one the
+    /// re-stitch left alone — no content-matching orphan was found, so it was a real
+    /// deletion, not a move. Reconcile never tombstones a live node (that is a
+    /// data-loss class it refuses), so the daemon commits the deletion here via the
+    /// idempotent `on_file_deleted` sink. CREATE records need no finalize: reconcile's
+    /// per-file loop already minted a fresh-UUID node for any unmatched create (§1), so
+    /// the daemon ignores them.
+    ///
+    /// Idempotent on a re-boot (crash after re-stitch, before the journal was cleared):
+    /// a successful re-stitch vacated `old_path` and a prior finalize tombstoned it, so
+    /// `path_has_live_node(old_path)` is `false` either way and this skips. Even a stale
+    /// check is safe — `on_file_deleted` early-returns when `delete_file` reports the
+    /// path was already absent. At boot no peer is alive yet (`alive_count() == 0`), so
+    /// `on_file_deleted`'s broadcast is a structural no-op; the tombstone lands locally
+    /// and peers learn it on their next normal sync (correct CRDT behavior — §3.3).
+    pub async fn finalize_recovered_journal(&mut self, records: &[JournaledMove]) {
+        for record in records {
+            if record.kind != PendingKind::Delete {
+                continue; // creates are reconcile's job (§1)
+            }
+            if self.path_has_live_node(&record.path).await {
+                info!(
+                    "Boot finalize: unmatched journaled delete -> tombstone {}",
+                    record.path
+                );
+                self.on_file_deleted(&record.path).await;
+            }
         }
     }
 

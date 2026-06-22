@@ -29,6 +29,7 @@ use crate::relay::EmbeddedRelay;
 use crate::watcher::FileWatcher;
 
 use super::Daemon;
+use super::move_recovery;
 
 /// Start the daemon and return a control handle before the event loop begins.
 ///
@@ -242,9 +243,23 @@ async fn startup_inner(
 
     // vault-sync authors Loro ops under a bare u64; derive it from this device's PeerId.
     let author = identity_key.peer_id().as_u64();
+
+    // Move crash-recovery (P4f-2b-ii): a previous run may have crashed with a native
+    // move buffered in the coalescer journal (`.sync/pending-moves.json`). Read it
+    // BEFORE `fs` is moved into the load, map its DELETE records into re-stitch inputs,
+    // and feed them to boot reconcile so a buffered move's lineage is re-attached at
+    // the new path. The full `records` set (creates included) is retained for the
+    // post-`Daemon::new` finalize. A fresh vault has no `.sync/`, so no journal.
+    let recovery_records = if fs.exists(".sync").await? {
+        move_recovery::read_pending_journal(&fs).await
+    } else {
+        Vec::new()
+    };
+    let restitch = move_recovery::restitch_inputs(&recovery_records);
+
     let vault = if fs.exists(".sync").await? {
         info!("Loading existing vault");
-        Vault::load(fs, author).await?
+        Vault::load_with_journal(fs, author, Some(&restitch)).await?
     } else {
         info!("Initializing new vault");
         Vault::init(fs, author).await?
@@ -571,7 +586,19 @@ async fn startup_inner(
     // `Vault::load`/`init`, and `NativeFs` is a stateless path-wrapper, so a fresh
     // instance over the same vault path is equivalent — both resolve to the same
     // on-disk `.sync/` directory.
-    daemon.set_fs(Arc::new(NativeFs::new(config.vault.clone())));
+    let daemon_fs = Arc::new(NativeFs::new(config.vault.clone()));
+    daemon.set_fs(daemon_fs.clone());
+
+    // Finish move crash-recovery (P4f-2b-ii) BEFORE the run-loop spawns: re-stitch
+    // already ran inside `load_with_journal`, so finalize the unmatched remainder (a
+    // journaled delete whose old node is still live → a real tombstone via the
+    // idempotent `on_file_deleted`), THEN clear the journal in one write so the next
+    // boot recovers nothing. Order matters: a crash between finalize and clear leaves
+    // the journal intact and the next boot re-runs the idempotent pass. At this point
+    // no peer is alive (`alive_count() == 0`), so the finalize's broadcast is a no-op
+    // and no half-recovered state reaches peers (§3.3).
+    daemon.finalize_recovered_journal(&recovery_records).await;
+    move_recovery::clear_pending_journal(daemon_fs.as_ref()).await;
 
     // Give the reconnect supervisor its starting address book — the same
     // cross-product `(allowlist × known_public_relays)` the live lookup was just
