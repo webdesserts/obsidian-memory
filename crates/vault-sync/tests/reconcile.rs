@@ -494,15 +494,313 @@ mod ac_p4f_2b_journal_restitch {
     //! BEFORE reconcile's per-file loop would mint a fresh node for that orphan.
     //!
     //! Every test drives the REAL `Vault::load_with_journal` (never a hand-stitched
-    //! Index — that would be a false green).
+    //! Index — that would be a false green). The crash state is staged with
+    //! [`stage_buffered_move_crash`], the sibling of `stage_native_move` that leaves
+    //! the OLD node LIVE (the distinguishing input: the move's delete buffered but
+    //! never committed, so the `.loro` is NOT orphaned and `adopt_orphans` cannot see
+    //! it — exactly the gap the journal fills).
     //!
-    //! These two tests pin the additive-param backward-compat guarantee: `None` is
-    //! byte-identical to `Vault::load`, and an empty journal slice is equally inert.
-    //! The re-stitch recovery tests (which need a live-old-node crash state) land
-    //! alongside the recovery logic itself.
+    //! The structural reason in-reconcile recovery has no data-loss window: the
+    //! recovery path contains NO `delete_file(new_path)`, so the `{old alive, new
+    //! tombstoned}` crash-intermediate the rejected post-load reclaim would persist is
+    //! unconstructable here. `mid_reclaim_crash_does_not_lose_file` pins that.
 
     use super::*;
-    use vault_sync::JournalReStitch;
+    use vault_sync::{JournalReStitch, content_hash};
+
+    /// Stage the exact mid-window crash state the move-coalescer leaves on disk: a
+    /// document materialized at `old` whose native-move delete BUFFERED (the node stays
+    /// LIVE — the delete never committed) while the `.md` already relocated to `new` on
+    /// disk. The old `.md` is gone; a byte-identical `.md` is at `new`; the content
+    /// `docs/<uuid>.loro` survives (a move never touches the path-independent content).
+    ///
+    /// The key difference from `stage_native_move`: it does NOT `delete_node(old)`. The
+    /// old node remains live, so its content `.loro` is NOT an orphan and `adopt_orphans`
+    /// structurally cannot re-attach it — only the journal-driven re-stitch can. Returns
+    /// the moved document's `(uuid, content_hash)` so the test builds the
+    /// `JournalReStitch` record the daemon would.
+    async fn stage_buffered_move_crash(
+        fs: &Fs,
+        old: &str,
+        new: &str,
+        content: &str,
+    ) -> (Uuid, [u8; 32]) {
+        let setup = Vault::init(Arc::clone(fs), AUTHOR).await.unwrap();
+        write_and_index(&setup, fs, old, content).await;
+        let uuid = uuid_at(&setup, old);
+
+        // The content hash in the journal's domain: `content_hash(ContentDoc)` over the
+        // document's materialized markdown — the SAME expression the re-stitch hashes the
+        // on-disk orphan with, and the same the daemon journaled at delete-buffer time.
+        let rendered = materialized_markdown(&setup, old).await;
+        let doc = ContentDoc::from_markdown(&rendered, AUTHOR).unwrap();
+        let hash = content_hash(&doc);
+
+        // The mid-window crash: the OLD node stays LIVE (no delete_node — the delete
+        // buffered but never committed), the old `.md` is gone, a byte-identical `.md`
+        // is at `new`. The content `.loro` is untouched (path-independent).
+        fs.delete(old).await.unwrap();
+        fs.write(new, rendered.as_bytes()).await.unwrap();
+
+        (uuid, hash)
+    }
+
+    /// HEADLINE: a buffered-move crash re-stitches the SAME UUID at the new path on
+    /// boot — the move's lineage is recovered, not re-minted as a fresh document.
+    ///
+    /// This is the journal-augmented counterpart of
+    /// `same_content_create_without_delete_is_not_adopted_window_bound`: identical disk
+    /// shape (a live old node + a content-matching new `.md`), but the journal flips the
+    /// outcome from "fresh UUID" to "same-UUID move". It must pass for the RIGHT
+    /// structural reason — reconcile re-attached the UUID via `move_node` BEFORE any
+    /// fresh mint, with zero content re-transfer (the `.loro` is byte-identical).
+    #[tokio::test]
+    async fn crash_then_boot_restitches_move_same_uuid() {
+        let fs = Arc::new(InMemoryFs::new());
+        let (uuid, hash) = stage_buffered_move_crash(
+            &fs,
+            "inbox/draft.md",
+            "archive/draft.md",
+            "# Draft\n\nProse.\n",
+        )
+        .await;
+        let loro_before = fs.read(&content_doc_path(&uuid)).await.unwrap();
+
+        let journaled = vec![JournalReStitch {
+            uuid,
+            old_path: "inbox/draft.md".to_string(),
+            content_hash: hash,
+        }];
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+
+        // The new path carries the ORIGINAL UUID — re-stitched, not freshly minted.
+        assert_eq!(
+            uuid_at(&vault, "archive/draft.md"),
+            uuid,
+            "the buffered move re-stitches its original UUID at the new path"
+        );
+        // The old path is not resurrected.
+        assert!(
+            vault.index().node_for_path("inbox/draft.md").is_none(),
+            "the move source path is not left live after the re-stitch"
+        );
+        // The destination content survives intact.
+        assert_eq!(
+            read_md_str(&fs, "archive/draft.md").await,
+            "# Draft\n\nProse.\n",
+            "the relocated content is intact at the new path"
+        );
+        // Zero content re-transfer: the content `.loro` was never rewritten (a move
+        // re-attaches lineage structurally; the content doc is path-independent).
+        let loro_after = fs.read(&content_doc_path(&uuid)).await.unwrap();
+        assert_eq!(
+            loro_before, loro_after,
+            "the re-stitch re-attaches lineage WITHOUT rewriting the content doc (zero content)"
+        );
+    }
+
+    /// The review's data-loss proof: the rejected post-load reclaim's `{old alive, new
+    /// tombstoned}` intermediate is UNREACHABLE under in-reconcile recovery, so the
+    /// renamed file is never lost.
+    ///
+    /// The rejected design (mint-at-`new` then `delete_file(new)` + `move_node`) could
+    /// crash between its two sub-steps, persisting `{old node alive, new node
+    /// tombstoned, renamed .md on disk at new}`. The NEXT boot would then quarantine the
+    /// `.md` at `new` (its first match arm is `(_, _, true)` -> `quarantine_orphan`,
+    /// moving the user's file to `.trash/`) AND tombstone the live old node — the file
+    /// vanishes from its live location and a spurious deletion propagates.
+    ///
+    /// Under in-reconcile recovery this state CANNOT exist: the recovery path contains
+    /// NO `delete_file(new)` — it is a single `move_node(old -> new)` on a live source
+    /// while `new` has no node yet. With nothing that tombstones `new`, the quarantine
+    /// arm that loses the file can never fire on `new`. This test stages precisely the
+    /// crash input (live old node, journal listing the delete, `.md` at `new`) and
+    /// asserts the file is NOT quarantined, the old node is NOT spuriously tombstoned,
+    /// and the file survives at `new` with its UUID.
+    #[tokio::test]
+    async fn mid_reclaim_crash_does_not_lose_file() {
+        let fs = Arc::new(InMemoryFs::new());
+        let (uuid, hash) = stage_buffered_move_crash(
+            &fs,
+            "notes/recipe.md",
+            "recipes/recipe.md",
+            "# Recipe\n\nMix and bake.\n",
+        )
+        .await;
+
+        let journaled = vec![JournalReStitch {
+            uuid,
+            old_path: "notes/recipe.md".to_string(),
+            content_hash: hash,
+        }];
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+
+        // The file is NOT lost to `.trash/` — the quarantine arm never fires on `new`
+        // because nothing in the recovery path tombstones `new` (no `delete_file(new)`).
+        assert!(
+            !fs.exists(".trash/recipes/recipe.md").await.unwrap(),
+            "the renamed file is never quarantined — the data-loss intermediate is unreachable"
+        );
+        // The file survives at its live location with its original UUID.
+        assert_eq!(
+            uuid_at(&vault, "recipes/recipe.md"),
+            uuid,
+            "the file survives at the new path with its original UUID"
+        );
+        assert_eq!(
+            read_md_str(&fs, "recipes/recipe.md").await,
+            "# Recipe\n\nMix and bake.\n",
+            "the file content is preserved, not lost"
+        );
+        // The old path is vacated by the move, not left as a live duplicate.
+        assert!(
+            vault.index().node_for_path("notes/recipe.md").is_none(),
+            "the old path is vacated by the move, not left as a live duplicate"
+        );
+    }
+
+    /// MANDATORY idempotency: booting twice over the same `.sync/`+journal+disk (2b-i
+    /// does not empty the journal) makes no further change on the second run — a
+    /// mid-recovery crash converges from the intact journal.
+    ///
+    /// On the second boot the old node has already MOVED to `new`, so the re-stitch's
+    /// live-node guard resolves the UUID to a node whose path is now `new != old` and
+    /// skips it (and even absent that guard, no orphaned `.md` remains at a different
+    /// path with no node). Both reasons make the second run a no-op.
+    #[tokio::test]
+    async fn boot_runs_twice_is_idempotent() {
+        let fs = Arc::new(InMemoryFs::new());
+        let (uuid, hash) =
+            stage_buffered_move_crash(&fs, "a/one.md", "b/one.md", "# One\n\nFirst body.\n").await;
+
+        let journaled = vec![JournalReStitch {
+            uuid,
+            old_path: "a/one.md".to_string(),
+            content_hash: hash,
+        }];
+
+        // First boot: re-stitch fires. The journal is intentionally NOT emptied (that is
+        // 2b-ii) — the SAME records are replayed on the second boot.
+        let first = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+        assert_eq!(uuid_at(&first, "b/one.md"), uuid);
+        drop(first);
+
+        // Second boot over the now-mutated `.sync`+disk with the SAME journal: a no-op.
+        let second = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+        assert_eq!(
+            uuid_at(&second, "b/one.md"),
+            uuid,
+            "the second boot leaves the re-stitched UUID in place (idempotent)"
+        );
+        assert!(
+            second.index().node_for_path("a/one.md").is_none(),
+            "the old path stays vacated on the second boot (no double-move resurrection)"
+        );
+        assert_eq!(
+            read_md_str(&fs, "b/one.md").await,
+            "# One\n\nFirst body.\n",
+            "content unchanged across the idempotent second boot"
+        );
+    }
+
+    /// The live-node gate (step 1): a journaled record whose UUID has NO live node
+    /// (its delete already committed — the node is tombstoned) is SKIPPED. The re-stitch
+    /// never acts on a tombstoned UUID.
+    ///
+    /// Here the old node is tombstoned (simulating "the delete already finalized on a
+    /// prior boot"). `find_node_by_uuid` excludes tombstones, so step 1 resolves `None`
+    /// and skips. The `.md` at `new` is then handled by the normal reconcile path —
+    /// adopted by `adopt_orphans` (its `.loro` IS now orphaned, since the node is
+    /// tombstoned), which is the EC-8 native-move-adopt, NOT the journal re-stitch. The
+    /// point of this test is that the re-stitch did not error or mis-act on the
+    /// tombstoned UUID, not which arm ultimately re-homes the file.
+    #[tokio::test]
+    async fn restitch_skips_when_uuid_has_no_live_node() {
+        // A clean crash state, then tombstone the old node directly (the delete already
+        // committed on a prior boot), so the journaled UUID has no live node.
+        let fs = Arc::new(InMemoryFs::new());
+        let setup = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
+        write_and_index(&setup, &fs, "src/note.md", "# Note\n\nBody here.\n").await;
+        let uuid = uuid_at(&setup, "src/note.md");
+        let rendered = materialized_markdown(&setup, "src/note.md").await;
+        let hash = content_hash(&ContentDoc::from_markdown(&rendered, AUTHOR).unwrap());
+        // Tombstone (delete) the old node — the delete is now committed.
+        setup.index().delete_node("src/note.md").unwrap();
+        setup.save_index().await.unwrap();
+        fs.delete("src/note.md").await.unwrap();
+        fs.write("dst/note.md", rendered.as_bytes()).await.unwrap();
+        drop(setup);
+
+        let journaled = vec![JournalReStitch {
+            uuid,
+            old_path: "src/note.md".to_string(),
+            content_hash: hash,
+        }];
+        // Boot must not panic/error on the tombstoned UUID — the re-stitch skips it.
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+
+        // The tombstoned old path stays tombstoned (no live node re-created there) — the
+        // re-stitch did not act on the dead UUID. The file at `dst` is re-homed by the
+        // normal path (adopt_orphans, since the `.loro` is now a genuine orphan) — EC-8,
+        // not the journal re-stitch.
+        assert!(
+            vault.index().node_for_path("src/note.md").is_none(),
+            "the tombstoned old path stays tombstoned — the re-stitch did not act on it"
+        );
+    }
+
+    /// No-disk-evidence (step 3): a journaled delete whose old node is live but with NO
+    /// content-matching `.md` at any orphaned path leaves the old node LIVE and untouched
+    /// — the lib re-stitch never tombstones (the "no move completed -> commit the delete"
+    /// decision is the daemon's, 2b-ii).
+    ///
+    /// The create half never landed on disk, so there is nothing to re-attach to. The
+    /// re-stitch must do NOTHING: the old node stays live at `old_path` (reconcile's
+    /// report-only "alive node, missing `.md`" arm covers the now-fileless live node;
+    /// the lib never deletes it).
+    #[tokio::test]
+    async fn restitch_no_match_leaves_old_node_live() {
+        let fs = Arc::new(InMemoryFs::new());
+        let setup = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
+        write_and_index(&setup, &fs, "keep/orig.md", "# Orig\n\nThe body.\n").await;
+        let uuid = uuid_at(&setup, "keep/orig.md");
+        let rendered = materialized_markdown(&setup, "keep/orig.md").await;
+        let hash = content_hash(&ContentDoc::from_markdown(&rendered, AUTHOR).unwrap());
+        // The old node stays LIVE (delete buffered, never committed), the old `.md` is
+        // gone — but NO matching `.md` ever landed at any new path (the create half was
+        // lost in the crash).
+        fs.delete("keep/orig.md").await.unwrap();
+        setup.save_index().await.unwrap();
+        drop(setup);
+
+        let journaled = vec![JournalReStitch {
+            uuid,
+            old_path: "keep/orig.md".to_string(),
+            content_hash: hash,
+        }];
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+
+        // No disk evidence of the move -> the lib re-stitch did nothing: the old node is
+        // STILL LIVE at its original path (the lib never tombstones — finalize is the
+        // daemon's job in 2b-ii).
+        assert_eq!(
+            uuid_at(&vault, "keep/orig.md"),
+            uuid,
+            "with no matching .md, the old node stays live and keeps its UUID (lib never finalizes)"
+        );
+    }
 
     /// `None` is byte-identical to `Vault::load` (the backward-compat guarantee): a
     /// brand-new `.md` is indexed by reconcile's normal arm, exactly as the bare load

@@ -46,7 +46,7 @@ use crate::index::{
 use crate::vault::Vault;
 
 use std::collections::HashSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// One journaled native-move DELETE the boot re-stitch may re-attach. The daemon
@@ -322,16 +322,124 @@ impl<F: FileSystem> Vault<F> {
         Ok(matched)
     }
 
-    /// Re-stitch the journaled native-move deletes (P4f-2b crash recovery) — stubbed
-    /// in this commit (the additive plumbing); the recovery logic lands next.
+    /// Re-stitch the move-coalescer's journaled native-move deletes (P4f-2b crash
+    /// recovery): re-attach the original UUID of each in-flight move whose delete
+    /// buffered but never committed, so a crash mid-move does not degrade the move into
+    /// a fresh-UUID delete+create. Returns the new `.md` paths it re-stitched so the
+    /// per-file loop skips them.
+    ///
+    /// Runs AFTER `adopt_orphans` but BEFORE the per-file loop — the load-bearing
+    /// ordering. At this point reconcile has NOT reached `new_path` in the per-file
+    /// pass, so `new_path` has no node and the re-attach is a single `move_node` on a
+    /// still-LIVE source: no `MoveTargetExists`, hence NO `delete_file(new_path)` is
+    /// ever needed. Because the recovery contains no tombstone of `new_path`, the
+    /// `{old alive, new tombstoned}` crash-intermediate (the data-loss window of the
+    /// rejected post-load reclaim) is structurally unconstructable by this path.
+    ///
+    /// Disjoint from `adopt_orphans`: that pass acts on UUIDs with NO live node (an
+    /// orphaned `.loro`); this one acts ONLY on UUIDs WITH a live node (step 1's
+    /// guard) — the crash class where the delete buffered, so the node is still live
+    /// and its `.loro` was never an orphan candidate. The same UUID can never satisfy
+    /// both passes.
+    ///
+    /// Idempotent: on a second boot an already-re-stitched record's UUID resolves to a
+    /// node now at `new_path != old_path`, so the live-node guard skips it; a record
+    /// whose delete was finalized standalone (2b-ii) has a tombstoned UUID that
+    /// `find_node_by_uuid` excludes → also skipped. Every branch is a no-op the second
+    /// time.
+    ///
+    /// The lib pass only ever does the SAFE `move_node`. A record with no content
+    /// matching on-disk `.md` (the create half never landed) is left untouched for the
+    /// daemon's standalone-finalize (2b-ii) to commit — the lib never tombstones.
     async fn re_stitch_journaled(
         &self,
-        _md_files: &HashSet<String>,
-        _journaled: &[JournalReStitch],
-        _matched: &HashSet<String>,
-        _report: &mut ReconcileReport,
+        md_files: &HashSet<String>,
+        journaled: &[JournalReStitch],
+        matched: &HashSet<String>,
+        report: &mut ReconcileReport,
     ) -> Result<HashSet<String>> {
-        Ok(HashSet::new())
+        let mut restitched: HashSet<String> = HashSet::new();
+
+        // Hash every orphaned new `.md` once (no live node, not already adopted by
+        // `adopt_orphans`), exactly as `adopt_orphans` does its candidate scan: read
+        // each once; an unreadable/un-parseable file is skipped (it cannot be a
+        // re-stitch target). Computed up front so multiple records don't re-read disk.
+        let mut candidates: Vec<(String, [u8; 32])> = Vec::new();
+        for path in md_files {
+            if matched.contains(path) || self.index().node_for_path(path).is_some() {
+                continue;
+            }
+            if let Ok(bytes) = self.fs().read(path).await {
+                let content = String::from_utf8_lossy(&bytes);
+                if let Ok(doc) = ContentDoc::from_markdown(&content, self.loro_author()) {
+                    candidates.push((path.clone(), content_hash(&doc)));
+                }
+            }
+        }
+
+        for record in journaled {
+            let JournalReStitch {
+                uuid,
+                old_path,
+                content_hash: hash,
+            } = record;
+
+            // Step 1 — live-node guard (the distinguishing input). `find_node_by_uuid`
+            // reads the live cache (excludes tombstones), so a hit is a genuinely live
+            // node. `None` ⇒ the UUID has no live node (already re-stitched on a prior
+            // boot, or its delete already committed) → skip (the idempotency arm).
+            let Some(node) = self.index().find_node_by_uuid(uuid) else {
+                continue;
+            };
+            // Defensive: the live node must still sit at `old_path`. If it has already
+            // moved (a prior boot re-stitched it), skip — this is the primary
+            // idempotency guard on a second run.
+            if self.index().path_for_node(&node).as_deref() != Some(old_path.as_str()) {
+                continue;
+            }
+
+            // Step 2 — find a content-matching orphaned `.md` at a DIFFERENT path that
+            // no other record has already claimed this pass.
+            let target = candidates
+                .iter()
+                .find(|(p, h)| h == hash && p != old_path && !restitched.contains(p.as_str()));
+            let Some((new_path, _)) = target else {
+                // Step 3 — no disk evidence the move completed (the create half never
+                // landed, or its content diverged). The lib pass does NOTHING: the old
+                // node stays live, no fresh mint, no tombstone. The daemon's
+                // standalone-finalize (2b-ii) decides whether to commit the delete.
+                continue;
+            };
+            let new_path = new_path.clone();
+
+            // Step 4 — re-stitch: re-parent the SAME live node to the new path. UUID and
+            // content `.loro` are untouched (INV-1, zero content), exactly as the live
+            // move path's `move_node` does. Under the in-reconcile ordering neither
+            // `move_node` error can fire (the source is live — step 1; `new_path` has no
+            // node yet — the per-file loop hasn't run). If one DOES fire it is a logic
+            // bug: log loudly and skip the record (reconcile's log-and-continue
+            // discipline), but do NOT attempt a delete-then-retry — that would
+            // reintroduce the two-sub-step data-loss window this design exists to kill.
+            match self.index().move_node(old_path, &new_path) {
+                Ok(()) => {
+                    info!("Journal re-stitch: {} -> {} ({})", old_path, new_path, uuid);
+                    report.moved.push(FileMove {
+                        from: old_path.clone(),
+                        to: new_path.clone(),
+                    });
+                    restitched.insert(new_path);
+                }
+                Err(e) => {
+                    error!(
+                        "Journal re-stitch move_node failed ({} -> {}, {}): {} — \
+                         skipping this record, deferring to the daemon finalize",
+                        old_path, new_path, uuid, e
+                    );
+                }
+            }
+        }
+
+        Ok(restitched)
     }
 
     /// Reconcile a single `.md` file against its Index/content state.
