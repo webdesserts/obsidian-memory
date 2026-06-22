@@ -320,6 +320,18 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// event whose partner never arrived commits to its standalone meaning (a real
     /// tombstone or a real new doc) once its window passes.
     move_sweep_tick: tokio::time::Interval,
+    /// Filesystem handle for writing the move-coalescer's crash-recovery journal
+    /// (`.sync/pending-moves.json`, P4f-2). The daemon writes the journal — NOT the
+    /// coalescer (which stays pure) and NOT `persistence.rs` (which writes through
+    /// `std::fs` against the real OS path, bypassing the vault's `FileSystem` and so
+    /// unusable in the in-memory test harness). Routing through the SAME
+    /// `FileSystem` the vault uses keeps the crash/boot tests hermetic — the journal
+    /// lands in the same fs as the `.loro`/`.md`. Wired post-construction (mirrors
+    /// `inbound_seen_rx` / `net_change_rx`) via [`Daemon::set_fs`]; `None` means
+    /// journal persistence is inert (the write logs a `warn!` and skips, degrading
+    /// to the crash-tail — never silently no-ops). `FileSystem` is impl'd for
+    /// `Arc<T>`, so an `Arc<FS>` is itself a usable filesystem.
+    fs: Option<Arc<FS>>,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -395,6 +407,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             roster_reconcile_interval_ms: scaled_ms(ROSTER_RECONCILE_MS),
             move_coalescer: MoveCoalescer::new(),
             move_sweep_tick,
+            // Wired post-construction (startup.rs / tests via `set_fs`); `None`
+            // means the crash-recovery journal write is inert, like an unwired
+            // `inbound_seen_rx`.
+            fs: None,
         }
     }
 
@@ -1159,6 +1175,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// integration-test access — same seam rationale as [`Daemon::set_net_change_rx`].
     pub fn set_inbound_seen_rx(&mut self, rx: mpsc::UnboundedReceiver<PeerId>) {
         self.inbound_seen_rx = Some(rx);
+    }
+
+    /// Wire the filesystem handle used to write the move-coalescer's crash-recovery
+    /// journal (`.sync/pending-moves.json`, P4f-2). Pass the SAME `Arc<FS>` the
+    /// vault uses so the journal lands in the same filesystem as the vault's
+    /// `.loro`/`.md` — in the in-memory test harness this means sharing the one
+    /// stateful `InMemoryFs` instance (a separate instance would not see the
+    /// journal, making the crash/boot tests meaningless). Called post-construction
+    /// by `startup.rs` and the test harness; `pub` for integration-test access —
+    /// same seam rationale as [`Daemon::set_inbound_seen_rx`].
+    pub fn set_fs(&mut self, fs: Arc<FS>) {
+        self.fs = Some(fs);
     }
 
     /// Populate the in-memory peer-relay snapshot the supervisor re-dials from.

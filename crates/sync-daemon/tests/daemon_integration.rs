@@ -170,6 +170,13 @@ mod daemon_integration {
         // Wire the pumped handler's freshness receiver so inbound-only peers are
         // stamped alive (S2) — mirrors `startup.rs`.
         daemon.set_inbound_seen_rx(inbound_seen_rx);
+        // Wire the SAME in-memory fs the vault uses so the move-coalescer's
+        // crash-recovery journal (`.sync/pending-moves.json`, P4f-2) lands in the
+        // same stateful `InMemoryFs` as the vault's `.loro`/`.md`. `InMemoryFs` is
+        // stateful, so this MUST be `node.fs`, not a fresh instance. The daemon's
+        // `FS` is `Arc<InMemoryFs>`, so the handle is double-Arc'd — harmless, the
+        // `FileSystem for Arc<T>` blanket impl makes it a usable filesystem.
+        daemon.set_fs(Arc::new(fs.clone()));
 
         let loop_handle = tokio::spawn(async move {
             daemon.run_loop().await;

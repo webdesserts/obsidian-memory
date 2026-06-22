@@ -566,6 +566,13 @@ async fn startup_inner(
     // inbound-only peers (S2).
     daemon.set_inbound_seen_rx(inbound_seen_rx);
 
+    // Wire the filesystem handle for the move-coalescer's crash-recovery journal
+    // (`.sync/pending-moves.json`, P4f-2). The earlier `fs` was moved into
+    // `Vault::load`/`init`, and `NativeFs` is a stateless path-wrapper, so a fresh
+    // instance over the same vault path is equivalent — both resolve to the same
+    // on-disk `.sync/` directory.
+    daemon.set_fs(Arc::new(NativeFs::new(config.vault.clone())));
+
     // Give the reconnect supervisor its starting address book — the same
     // cross-product `(allowlist × known_public_relays)` the live lookup was just
     // seeded with. After a partition, the supervisor re-bootstraps gossip from this
