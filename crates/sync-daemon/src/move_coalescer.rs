@@ -38,7 +38,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use sync_core::time_scale::scaled;
+use uuid::Uuid;
 
 /// How long a not-yet-tracked create/delete waits for its partner before it
 /// commits standalone.
@@ -55,9 +57,18 @@ const MOVE_WINDOW: Duration = Duration::from_millis(500);
 /// A delete event awaiting a possible partner create. The node is NOT yet
 /// tombstoned — the buffer holds the event so a later [`MoveDecision::Move`] can
 /// re-parent the still-live node via `move_node`.
+///
+/// Carries the document's `uuid` so a crash-recovery journal ([`JournaledMove`])
+/// can re-stitch the move's lineage on the next boot — the delete half is the
+/// move's source, so its UUID is the identity the re-stitch re-attaches at the
+/// new path (P4f-2).
 #[derive(Debug, Clone)]
 struct PendingDelete {
     old_path: String,
+    // Read only by `snapshot()` (journal serialization), which has no production
+    // caller until P4f-2a Commit 3 — so the field reads as dead until then.
+    #[allow(dead_code)]
+    uuid: Uuid,
     deadline: Instant,
 }
 
@@ -94,6 +105,79 @@ pub(crate) enum Expired {
     /// A lone create past its window — a real new document. Dispatch to the
     /// standalone create sink (`on_file_modified` → mint fresh UUID + broadcast).
     StandaloneCreate { path: String },
+}
+
+// The journal schema + `snapshot()` are exercised by unit tests in this commit but
+// not yet wired to a production caller — the daemon's `persist_pending_moves` that
+// reads `snapshot()` and writes the file lands in the next commit (P4f-2a Commit
+// 3). The `allow(dead_code)` below is removed once that caller exists.
+
+/// Schema version of the on-disk journal (`.sync/pending-moves.json`).
+///
+/// The journal is **ephemeral, single-writer, same-version** — written and read by
+/// the SAME daemon binary across a crash/restart, never synced and never read by a
+/// peer or an older binary. So strict forward-compat is not required; the version
+/// is a cheap guard so a future format change is detectable. On load, a `version`
+/// mismatch means "discard the journal (treat as empty)" rather than mis-parse —
+/// degrading to the crash-tail the design already accepts. (P4f-2 §1.1.)
+#[allow(dead_code)]
+pub(crate) const PENDING_MOVES_VERSION: u32 = 1;
+
+/// Which pending map a [`JournaledMove`] mirrors. A categorical value, serialized
+/// via serde rename rather than a bare string so the kind can never be a stray
+/// free-text reference.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum PendingKind {
+    #[serde(rename = "delete")]
+    Delete,
+    #[serde(rename = "create")]
+    Create,
+}
+
+/// A serializable mirror of ONE buffered create/delete, persisted to the
+/// crash-recovery journal so a move buffered in-memory survives a daemon crash
+/// within its window (P4f-2). The journal is written by the daemon observing the
+/// coalescer's [`MoveCoalescer::snapshot`] — the coalescer itself stays pure and
+/// performs no I/O.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct JournaledMove {
+    /// Which pending map this came from.
+    pub(crate) kind: PendingKind,
+    /// The doc's content hash, lowercase hex (32 bytes → 64-char hex) for
+    /// JSON-friendliness — `[u8; 32]` has no clean compact JSON form, and hex is
+    /// the crate's established convention for byte-array identifiers.
+    pub(crate) content_hash: String,
+    /// `old_path` for a delete, `new_path` for a create.
+    pub(crate) path: String,
+    /// The original doc UUID — the lineage 2b's boot re-stitch re-attaches.
+    /// `Some` and REQUIRED on a delete (the move's source, the identity to
+    /// re-attach). `None` on a create whose partner delete had not arrived when the
+    /// snapshot was taken (so its UUID was unknown); the re-stitch keys off the
+    /// delete record's UUID, so a `None` here is acceptable.
+    pub(crate) uuid: Option<String>,
+}
+
+/// The on-disk journal file shape: a versioned wrapper around the pending set.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PendingMovesFile {
+    pub(crate) version: u32,
+    pub(crate) pending: Vec<JournaledMove>,
+}
+
+/// Lowercase-hex encode a 32-byte content hash for the journal's `content_hash`
+/// field — the same per-byte `{:02x}` convention the crate uses elsewhere (e.g.
+/// `PeerId`'s `Display`).
+#[allow(dead_code)]
+fn hex_lower(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
 }
 
 /// Bounded, in-memory create⇄delete pairing buffer (P4f-1).
@@ -137,10 +221,12 @@ impl MoveCoalescer {
     /// Feed a delete event (the old half of a possible move).
     ///
     /// `hash` is the content hash of the doc at `path`, computed by the caller
-    /// from its still-present `ContentDoc` BEFORE any tombstone. If a buffered
-    /// create already matches that hash, the pair fires now (the create-arrived-
-    /// first case); otherwise the delete is buffered for one window.
-    pub(crate) fn on_delete(&mut self, hash: [u8; 32], path: &str) -> MoveDecision {
+    /// from its still-present `ContentDoc` BEFORE any tombstone. `uuid` is the
+    /// doc's identity, captured in the same vault lock that hashed it — held so the
+    /// crash-recovery journal can re-stitch the move's lineage on boot (P4f-2). If a
+    /// buffered create already matches that hash, the pair fires now (the create-
+    /// arrived-first case); otherwise the delete is buffered for one window.
+    pub(crate) fn on_delete(&mut self, hash: [u8; 32], path: &str, uuid: Uuid) -> MoveDecision {
         if let Some(create) = self.pop_pending_create(&hash) {
             return MoveDecision::Move {
                 old_path: path.to_string(),
@@ -152,6 +238,7 @@ impl MoveCoalescer {
             .or_default()
             .push_back(PendingDelete {
                 old_path: path.to_string(),
+                uuid,
                 deadline: Instant::now() + scaled(MOVE_WINDOW),
             });
         MoveDecision::Buffered
@@ -198,6 +285,44 @@ impl MoveCoalescer {
         });
 
         expired
+    }
+
+    /// Serialize the current pending set into journal records (a pure read).
+    ///
+    /// The daemon calls this after every buffer mutation and writes the result to
+    /// `.sync/pending-moves.json` (the daemon owns all I/O — the coalescer stays
+    /// pure). Because every persist rewrites the WHOLE file from this snapshot,
+    /// pruning a committed record is automatic: a record that has left the maps
+    /// (paired into a move, expired, or drained) is simply absent here, so the next
+    /// write omits it (§1.4). A delete record carries its UUID — the lineage the
+    /// boot re-stitch re-attaches; a create carries `None` (the coalescer holds no
+    /// UUID for an unpaired create).
+    #[allow(dead_code)]
+    pub(crate) fn snapshot(&self) -> Vec<JournaledMove> {
+        let mut records = Vec::new();
+        for (hash, queue) in &self.pending_deletes {
+            let content_hash = hex_lower(hash);
+            for delete in queue {
+                records.push(JournaledMove {
+                    kind: PendingKind::Delete,
+                    content_hash: content_hash.clone(),
+                    path: delete.old_path.clone(),
+                    uuid: Some(delete.uuid.to_string()),
+                });
+            }
+        }
+        for (hash, queue) in &self.pending_creates {
+            let content_hash = hex_lower(hash);
+            for create in queue {
+                records.push(JournaledMove {
+                    kind: PendingKind::Create,
+                    content_hash: content_hash.clone(),
+                    path: create.new_path.clone(),
+                    uuid: None,
+                });
+            }
+        }
+        records
     }
 
     /// Pop the oldest buffered create for `hash`, removing the bucket if it empties.
@@ -266,12 +391,22 @@ mod tests {
     const HASH_A: [u8; 32] = [0xAA; 32];
     const HASH_B: [u8; 32] = [0xBB; 32];
 
+    /// A stable test UUID for the delete half of a move. The coalescer only
+    /// carries it through to [`MoveCoalescer::snapshot`]; the pairing logic never
+    /// inspects it, so any fixed value exercises the path.
+    fn uuid_a() -> Uuid {
+        Uuid::from_u128(0xA)
+    }
+
     /// The common case: a delete buffers, then a content-matching create pairs
     /// with it into a single move (delete-arrived-first).
     #[test]
     fn delete_then_matching_create_emits_move() {
         let mut c = MoveCoalescer::new();
-        assert_eq!(c.on_delete(HASH_A, "old.md"), MoveDecision::Buffered);
+        assert_eq!(
+            c.on_delete(HASH_A, "old.md", uuid_a()),
+            MoveDecision::Buffered
+        );
         assert_eq!(
             c.on_create(HASH_A, "new.md"),
             MoveDecision::Move {
@@ -290,7 +425,7 @@ mod tests {
         let mut c = MoveCoalescer::new();
         assert_eq!(c.on_create(HASH_A, "new.md"), MoveDecision::Buffered);
         assert_eq!(
-            c.on_delete(HASH_A, "old.md"),
+            c.on_delete(HASH_A, "old.md", uuid_a()),
             MoveDecision::Move {
                 old_path: "old.md".to_string(),
                 new_path: "new.md".to_string(),
@@ -303,7 +438,7 @@ mod tests {
     #[test]
     fn lone_delete_expires_to_standalone_delete() {
         let mut c = MoveCoalescer::new();
-        c.on_delete(HASH_A, "gone.md");
+        c.on_delete(HASH_A, "gone.md", uuid_a());
         c.expire_all_for_test();
         assert_eq!(
             c.sweep(),
@@ -333,7 +468,7 @@ mod tests {
     #[test]
     fn matching_create_after_window_does_not_pair() {
         let mut c = MoveCoalescer::new();
-        c.on_delete(HASH_A, "old.md");
+        c.on_delete(HASH_A, "old.md", uuid_a());
         // The delete's window elapses and it commits standalone.
         c.expire_all_for_test();
         assert_eq!(
@@ -351,7 +486,7 @@ mod tests {
     #[test]
     fn different_content_does_not_pair() {
         let mut c = MoveCoalescer::new();
-        assert_eq!(c.on_delete(HASH_A, "a.md"), MoveDecision::Buffered);
+        assert_eq!(c.on_delete(HASH_A, "a.md", uuid_a()), MoveDecision::Buffered);
         assert_eq!(c.on_create(HASH_B, "b.md"), MoveDecision::Buffered);
         c.expire_all_for_test();
         let mut expired = c.sweep();
@@ -369,6 +504,78 @@ mod tests {
         );
     }
 
+    /// `snapshot()` mirrors the live pending set into the serializable journal
+    /// records, and those records survive a JSON round-trip unchanged — the
+    /// property the crash-recovery journal rests on. The delete record MUST carry
+    /// its UUID (the lineage 2b's boot re-stitch re-attaches); a create with no
+    /// known partner carries `None`.
+    #[test]
+    fn snapshot_round_trips_pending_records() {
+        let mut c = MoveCoalescer::new();
+        c.on_delete(HASH_A, "old.md", uuid_a());
+        c.on_create(HASH_B, "new.md");
+
+        let snapshot = c.snapshot();
+        assert_eq!(snapshot.len(), 2, "both pending halves should be journaled");
+
+        let delete = snapshot
+            .iter()
+            .find(|m| m.kind == PendingKind::Delete)
+            .expect("the buffered delete should be in the snapshot");
+        assert_eq!(delete.path, "old.md");
+        assert_eq!(delete.content_hash, hex_lower(&HASH_A));
+        assert_eq!(
+            delete.uuid.as_deref(),
+            Some(uuid_a().to_string().as_str()),
+            "a delete record carries the moved doc's UUID (the 2b lineage)"
+        );
+
+        let create = snapshot
+            .iter()
+            .find(|m| m.kind == PendingKind::Create)
+            .expect("the buffered create should be in the snapshot");
+        assert_eq!(create.path, "new.md");
+        assert_eq!(create.content_hash, hex_lower(&HASH_B));
+        assert_eq!(
+            create.uuid, None,
+            "a create with no paired delete has no known UUID"
+        );
+
+        // The on-disk shape is the `{version, pending}` wrapper — round-trip it.
+        let file = PendingMovesFile {
+            version: PENDING_MOVES_VERSION,
+            pending: snapshot.clone(),
+        };
+        let json = serde_json::to_string(&file).expect("serialize");
+        let restored: PendingMovesFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.version, PENDING_MOVES_VERSION);
+        assert_eq!(restored.pending, snapshot);
+    }
+
+    /// A record that has been committed (here: a delete paired into a move, so both
+    /// halves are popped) is absent from the next snapshot. This is what makes
+    /// pruning fall out of the full-rewrite-from-snapshot persist (§1.4): a
+    /// committed record can never linger in the journal to be re-committed on boot.
+    #[test]
+    fn snapshot_excludes_committed_records() {
+        let mut c = MoveCoalescer::new();
+        c.on_delete(HASH_A, "old.md", uuid_a());
+        assert!(
+            !c.snapshot().is_empty(),
+            "the buffered delete is journaled before it pairs"
+        );
+
+        // Pairing consumes both halves.
+        assert!(matches!(
+            c.on_create(HASH_A, "new.md"),
+            MoveDecision::Move { .. }
+        ));
+        assert!(
+            c.snapshot().is_empty(),
+            "a committed (paired) record must not remain in the snapshot"
+        );
+    }
+
     /// `has_pending_delete` reports a buffered delete by path — the signal the
     /// router uses to route a re-create-at-a-just-deleted-path (OQ-D) to the
     /// create branch instead of the edit fast-path.
@@ -376,7 +583,7 @@ mod tests {
     fn has_pending_delete_tracks_buffered_deletes() {
         let mut c = MoveCoalescer::new();
         assert!(!c.has_pending_delete("p.md"));
-        c.on_delete(HASH_A, "p.md");
+        c.on_delete(HASH_A, "p.md", uuid_a());
         assert!(c.has_pending_delete("p.md"));
         // Pairing it consumes the pending delete.
         c.on_create(HASH_A, "p.md");

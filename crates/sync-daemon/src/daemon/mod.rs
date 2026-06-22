@@ -44,6 +44,7 @@ use sync_core::time_scale::{scaled, scaled_ms};
 use sync_core::{PeerId, PeerRegistry};
 // The vault/sync-engine layer is vault-sync; the iroh half stays on sync-core.
 // `Daemon<FS>` and `Vault<FS>` are both generic over vault-sync's `FileSystem`.
+use uuid::Uuid;
 use vault_sync::Vault;
 use vault_sync::fs::FileSystem;
 
@@ -1375,13 +1376,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// BEFORE any tombstone (the buffer holds the event; nothing is deleted until
     /// the window resolves).
     async fn on_delete_candidate(&mut self, path: &str) {
-        let Some(hash) = self.hash_tracked_doc(path).await else {
+        let Some((hash, uuid)) = self.hash_tracked_doc(path).await else {
             // No content doc resolves for this path (an unknown/already-gone path) —
             // it can't be the old half of a move; commit it standalone.
             self.on_file_deleted(path).await;
             return;
         };
-        match self.move_coalescer.on_delete(hash, path) {
+        match self.move_coalescer.on_delete(hash, path, uuid) {
             MoveDecision::Move { old_path, new_path } => {
                 self.emit_file_move(&old_path, &new_path).await;
             }
@@ -1389,14 +1390,19 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
-    /// Content hash of a tracked document at `path`, in the same domain as
-    /// [`Self::hash_new_file`] (both hash the canonical materialized markdown).
-    /// `None` if no node resolves for the path.
-    async fn hash_tracked_doc(&self, path: &str) -> Option<[u8; 32]> {
+    /// Content hash AND document UUID of a tracked document at `path`. The hash is
+    /// in the same domain as [`Self::hash_new_file`] (both hash the canonical
+    /// materialized markdown); the UUID is the node's identity, carried through the
+    /// coalescer into the crash-recovery journal so a buffered move's lineage can be
+    /// re-stitched on boot (P4f-2). Both are read under ONE vault lock so they
+    /// describe the same snapshot of the node. `None` if no node resolves for the
+    /// path.
+    async fn hash_tracked_doc(&self, path: &str) -> Option<([u8; 32], Uuid)> {
         let vault = self.vault.lock().await;
-        vault.index().node_for_path(path)?;
+        let node = vault.index().node_for_path(path)?;
+        let uuid = vault.index().node_uuid(&node)?;
         let doc = vault.get_document(path).await.ok()?;
-        Some(vault_sync::content_hash(&doc))
+        Some((vault_sync::content_hash(&doc), uuid))
     }
 
     /// Content hash of a not-yet-tracked `.md` on disk, built from its markdown so
