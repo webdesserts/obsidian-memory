@@ -32,8 +32,11 @@
 
 mod apply_doc;
 mod apply_index;
+mod manifest;
 mod prepare;
 mod process;
+
+pub use manifest::{ChangeManifest, DocComparison, StructuralComparison};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

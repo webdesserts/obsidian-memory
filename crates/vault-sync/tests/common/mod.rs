@@ -273,6 +273,26 @@ pub fn decode(bytes: &[u8]) -> SyncMessage {
     bincode::deserialize(bytes).expect("payload is a valid SyncMessage")
 }
 
+/// A peer's version summary (its Index VV + per-document VVs) — the input
+/// `Vault::compare` classifies against. Derived from the PUBLIC `prepare_request`
+/// (the exact bytes the peer would open a handshake with), decoded back into the
+/// `SyncRequestData` the compare surface consumes. Keeps the compare suite on the
+/// public API: a test takes `b`'s summary with `request_data(&b).await` and asks
+/// `a.compare(&summary)`.
+pub async fn request_data(vault: &V) -> vault_sync::SyncRequestData {
+    let bytes = vault.prepare_request().await.unwrap();
+    match decode(&bytes) {
+        SyncMessage::SyncRequest {
+            index_version,
+            document_versions,
+        } => vault_sync::SyncRequestData {
+            index_version,
+            document_versions,
+        },
+        other => panic!("prepare_request produced a non-SyncRequest message: {other:?}"),
+    }
+}
+
 /// The total bytes of document-content carried by a message (the sum of every
 /// `document_updates` value). Zero means no document content crossed the wire — the
 /// assertion the INV-1 zero-content-on-move guarantee is checked against.

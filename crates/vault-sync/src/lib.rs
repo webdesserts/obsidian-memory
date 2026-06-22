@@ -35,5 +35,8 @@ pub use index::{
     content_doc_path,
 };
 pub use markdown::ParsedMarkdown;
-pub use protocol::{DocId, SyncError, SyncMessage, SyncOutcome};
+pub use protocol::{
+    ChangeManifest, DocComparison, DocId, StructuralComparison, SyncError, SyncMessage,
+    SyncOutcome, SyncRequestData,
+};
 pub use vault::Vault;
