@@ -87,23 +87,41 @@ pub async fn reload(vault: V, fs: &Fs) -> V {
     Vault::load(Arc::clone(fs), author(1)).await.unwrap()
 }
 
-/// Drive the complete three-message handshake with `a` as initiator and return
+/// Drive the complete handshake with `a` as initiator to termination and return
 /// `(modified_a, modified_b)` — the documents each side received.
 ///
-/// A sends a SyncRequest → B answers with a SyncExchange (its response + its own
-/// request) → A applies it and replies with a final SyncResponse → B applies that.
-/// The protocol always produces the final SyncResponse, so the unwrap chain is exact;
-/// getting this order wrong is the latent "pass-by-luck" risk this helper removes.
-/// Tests that assert on the intermediate messages keep the manual form.
+/// The handshake is variable-length since the digest fast-path (§6.2): a converged
+/// pair settles in TWO messages (`SyncRequest → InSync`, O(1) no-op), while a real
+/// change-sync runs FOUR (`SyncRequest → DigestMismatch → SyncExchange →
+/// SyncResponse`). So this pumps generically: A opens, then each `reply` is fed back
+/// to the OTHER side in turn until a side returns no reply (the terminal message —
+/// `InSync` or a final `SyncResponse`). The receivers alternate B, A, B, …; `modified`
+/// is accumulated per side. Tests that assert on the intermediate wire messages keep
+/// the manual form.
 pub async fn full_sync(a: &V, b: &V) -> (Vec<DocId>, Vec<DocId>) {
-    let request = a.prepare_request().await.unwrap();
-    let exchange = b.process_message(&request).await.unwrap();
-    let after_exchange = a.process_message(&exchange.reply.unwrap()).await.unwrap();
-    let after_final = b
-        .process_message(&after_exchange.reply.unwrap())
-        .await
-        .unwrap();
-    (after_exchange.modified, after_final.modified)
+    let mut modified_a: Vec<DocId> = Vec::new();
+    let mut modified_b: Vec<DocId> = Vec::new();
+
+    let mut payload = a.prepare_request().await.unwrap();
+    // The opener goes to B; thereafter the receiver alternates each leg.
+    let mut receiver_is_b = true;
+    loop {
+        let receiver = if receiver_is_b { b } else { a };
+        let outcome = receiver.process_message(&payload).await.unwrap();
+        if receiver_is_b {
+            modified_b.extend(outcome.modified);
+        } else {
+            modified_a.extend(outcome.modified);
+        }
+        match outcome.reply {
+            Some(next) => {
+                payload = next;
+                receiver_is_b = !receiver_is_b;
+            }
+            None => break,
+        }
+    }
+    (modified_a, modified_b)
 }
 
 /// Pump the handshake in BOTH directions to quiescence (A→B then B→A), so divergent
@@ -274,23 +292,15 @@ pub fn decode(bytes: &[u8]) -> SyncMessage {
 }
 
 /// A peer's version summary (its Index VV + per-document VVs) — the input
-/// `Vault::compare` classifies against. Derived from the PUBLIC `prepare_request`
-/// (the exact bytes the peer would open a handshake with), decoded back into the
-/// `SyncRequestData` the compare surface consumes. Keeps the compare suite on the
-/// public API: a test takes `b`'s summary with `request_data(&b).await` and asks
-/// `a.compare(&summary)`.
+/// `Vault::compare` classifies against. Taken from the PUBLIC `Vault::request_data`
+/// (the full per-UUID VV summary a peer reveals to be compared — the same data a
+/// digest-miss handshake surfaces in a `DigestMismatch`). The O(1) `prepare_request`
+/// opener deliberately carries no per-document VVs (the digest stands in for them),
+/// so the summary comes from `request_data`, not the opener. Keeps the compare suite
+/// on the public API: a test takes `b`'s summary with `request_data(&b).await` and
+/// asks `a.compare(&summary)`.
 pub async fn request_data(vault: &V) -> vault_sync::SyncRequestData {
-    let bytes = vault.prepare_request().await.unwrap();
-    match decode(&bytes) {
-        SyncMessage::SyncRequest {
-            index_version,
-            document_versions,
-        } => vault_sync::SyncRequestData {
-            index_version,
-            document_versions,
-        },
-        other => panic!("prepare_request produced a non-SyncRequest message: {other:?}"),
-    }
+    vault.request_data().await.unwrap()
 }
 
 /// The total bytes of document-content carried by a message (the sum of every
@@ -529,31 +539,30 @@ fn shuffled_pairs(n: usize, rng: &mut DeterministicRng) -> Vec<(usize, usize)> {
 }
 
 /// Run ONE handshake over the lossy channel, injecting drops and duplicates per
-/// `profile`. Every payload is fed through [`maybe_deliver`]; a dropped payload aborts
-/// the rest of THIS handshake (the lib recovers on a later round), a duplicated payload
-/// is re-fed to the same receiver (it must tolerate re-delivery without corruption —
-/// INV-10). The outcome is intentionally not reported: a lossy handshake drives
-/// convergence but the clean settling round is what proves quiescence.
+/// `profile`. Pumps the variable-length handshake (§6.2: 2 messages for a no-op, 4 for
+/// a real change-sync) feeding each `reply` to the alternating receiver. Every payload
+/// is fed through [`maybe_deliver`]; a dropped payload aborts the rest of THIS handshake
+/// (the lib recovers on a later round), a duplicated payload is re-fed to the same
+/// receiver (it must tolerate re-delivery without corruption — INV-10). The outcome is
+/// intentionally not reported: a lossy handshake drives convergence but the clean
+/// settling round is what proves quiescence.
 async fn lossy_full_sync(a: &V, b: &V, rng: &mut DeterministicRng, profile: LossProfile) {
-    // A→B: the opening request.
-    let request = a.prepare_request().await.unwrap();
-    let Some(exchange) = maybe_deliver(b, &request, rng, profile).await else {
-        return;
-    };
-    let Some(exchange_reply) = exchange.reply else {
-        return;
-    };
-
-    // B→A: the exchange reply.
-    let Some(after_exchange) = maybe_deliver(a, &exchange_reply, rng, profile).await else {
-        return;
-    };
-    let Some(final_reply) = after_exchange.reply else {
-        return;
-    };
-
-    // A→B: the final response.
-    let _ = maybe_deliver(b, &final_reply, rng, profile).await;
+    let mut payload = a.prepare_request().await.unwrap();
+    // The opener goes to B; thereafter the receiver alternates each leg.
+    let mut receiver_is_b = true;
+    loop {
+        let receiver = if receiver_is_b { b } else { a };
+        let Some(outcome) = maybe_deliver(receiver, &payload, rng, profile).await else {
+            return; // dropped: abort this handshake, recover on a later round
+        };
+        match outcome.reply {
+            Some(next) => {
+                payload = next;
+                receiver_is_b = !receiver_is_b;
+            }
+            None => return,
+        }
+    }
 }
 
 /// Deliver `payload` to `receiver` under the loss profile: with probability
@@ -602,23 +611,36 @@ impl ByteCounter {
     }
 
     /// Run a full handshake A→B, recording the document-content byte total of EVERY
-    /// payload (the request carries none, but the exchange and final response can), so
-    /// a test can assert e.g. "this whole sync moved zero document content" after a
-    /// pure move. Returns `(modified_a, modified_b)` like [`full_sync`].
+    /// payload, so a test can assert e.g. "this whole sync moved zero document content"
+    /// after a pure move, or "a converged pair transferred zero content" (the §6.2
+    /// no-op). The opener and any `InSync`/`DigestMismatch` leg carry no document
+    /// content; the exchange and final response can. Pumps the variable-length
+    /// handshake to termination like [`full_sync`]. Returns `(modified_a, modified_b)`.
     pub async fn full_sync_counting(&mut self, a: &V, b: &V) -> (Vec<DocId>, Vec<DocId>) {
-        let request = a.prepare_request().await.unwrap();
-        self.record(&request);
+        let mut modified_a: Vec<DocId> = Vec::new();
+        let mut modified_b: Vec<DocId> = Vec::new();
 
-        let exchange = b.process_message(&request).await.unwrap();
-        let exchange_reply = exchange.reply.unwrap();
-        self.record(&exchange_reply);
-
-        let after_exchange = a.process_message(&exchange_reply).await.unwrap();
-        let final_reply = after_exchange.reply.unwrap();
-        self.record(&final_reply);
-
-        let after_final = b.process_message(&final_reply).await.unwrap();
-        (after_exchange.modified, after_final.modified)
+        let mut payload = a.prepare_request().await.unwrap();
+        self.record(&payload);
+        let mut receiver_is_b = true;
+        loop {
+            let receiver = if receiver_is_b { b } else { a };
+            let outcome = receiver.process_message(&payload).await.unwrap();
+            if receiver_is_b {
+                modified_b.extend(outcome.modified);
+            } else {
+                modified_a.extend(outcome.modified);
+            }
+            match outcome.reply {
+                Some(next) => {
+                    self.record(&next);
+                    payload = next;
+                    receiver_is_b = !receiver_is_b;
+                }
+                None => break,
+            }
+        }
+        (modified_a, modified_b)
     }
 
     /// Decode `payload` and record its document-content byte total.

@@ -48,39 +48,60 @@ mod ac_inv_1_zero_content_move {
         // A moves the document: a pure-structural Index op plus the on-disk rename.
         move_file(&a, &fs_a, "notes/topic.md", "archive/topic.md").await;
 
-        // Sync the move and inspect the actual wire payloads.
+        // Sync the move and inspect the actual wire payloads. The move changed A's
+        // catalog digest, so the handshake takes the four-message digest-MISS path
+        // (§6.2): A opens with its digest → B replies DigestMismatch (its VVs) → A
+        // answers with a SyncExchange that CARRIES the move (A→B) → B replies a final
+        // SyncResponse (B→A). The move now rides the SyncExchange, one leg later than the
+        // old three-message flow, so the zero-content assertions move onto that leg.
         let request = a.prepare_request().await.unwrap();
-        let exchange_bytes = b.process_message(&request).await.unwrap().reply.unwrap();
+        let mismatch_bytes = b.process_message(&request).await.unwrap().reply.unwrap();
+        assert!(
+            matches!(decode(&mismatch_bytes), SyncMessage::DigestMismatch { .. }),
+            "the move changed A's digest, so B replies DigestMismatch, got {:?}",
+            decode(&mismatch_bytes)
+        );
+
+        // A→B: the SyncExchange that carries the move (the leg the move now rides).
+        let exchange_bytes = a
+            .process_message(&mismatch_bytes)
+            .await
+            .unwrap()
+            .reply
+            .unwrap();
         let exchange = decode(&exchange_bytes);
-        let final_bytes = a
+
+        // B→A: B applies the move and replies the final SyncResponse.
+        let final_bytes = b
             .process_message(&exchange_bytes)
             .await
             .unwrap()
             .reply
             .unwrap();
         let final_msg = decode(&final_bytes);
-        b.process_message(&final_bytes).await.unwrap();
+        a.process_message(&final_bytes).await.unwrap();
 
-        // The move rides the Index delta, not as document content. NEITHER the
-        // exchange (B→A) nor A's final response (A→B) carries any document-content
-        // bytes for the moved doc — the headline INV-1 guarantee.
+        // The move rides the Index delta, not as document content. NEITHER the exchange
+        // carrying the move (A→B) nor B's final response (B→A) carries any
+        // document-content bytes for the moved doc — the headline INV-1 guarantee.
         assert_eq!(
             document_content_bytes(&exchange),
             0,
-            "the exchange carries zero document-content bytes for a pure move"
+            "the exchange carrying the move sends zero document-content bytes"
         );
         assert_eq!(
             document_content_bytes(&final_msg),
             0,
-            "A's final response carries zero document-content bytes for a pure move"
+            "B's final response carries zero document-content bytes for a pure move"
         );
-        // The Index move-op DID cross (the move is non-empty work).
-        match &final_msg {
-            SyncMessage::SyncResponse { index_updates, .. } => assert!(
-                index_updates.is_some(),
-                "the move ships an Index delta (the tree.mov op)"
+        // The Index move-op DID cross — on the SyncExchange (A→B), the leg that carries
+        // the move under the four-message flow.
+        match &exchange {
+            SyncMessage::SyncExchange { response, .. } => assert!(
+                response.index_updates.is_some(),
+                "the move ships an Index delta (the tree.mov op) on the exchange"
             ),
-            other => panic!("expected a final SyncResponse, got {other:?}"),
+            other => panic!("expected a SyncExchange carrying the move, got {other:?}"),
         }
 
         // B converged on the move with the SAME UUID — identity is stable.

@@ -408,12 +408,11 @@ mod ac_section_8_edge_cases {
             .unwrap();
 
         // A full re-sync delivers the document (idempotent re-delivery) and B converges.
-        let request = b.prepare_request().await.unwrap();
-        let exchange = a.process_message(&request).await.unwrap().reply.unwrap();
-        let after = b.process_message(&exchange).await.unwrap();
-        if let Some(reply) = after.reply {
-            a.process_message(&reply).await.unwrap();
-        }
+        // Driven to termination through the complete handshake: with the digest
+        // fast-path (§6.2) a real change-sync runs four messages — the content B needs
+        // rides A's FINAL SyncResponse, one leg later than the old three-message flow —
+        // so the full pump (not a fixed-leg hand-drive) is what delivers it.
+        full_sync(&b, &a).await;
 
         assert!(
             fs_b.exists("doc.md").await.unwrap(),

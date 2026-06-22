@@ -80,12 +80,47 @@ impl std::fmt::Display for DocId {
 /// resolution is content-based (INV-5), never machine-local-clock-based.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncMessage {
-    /// Open a sync: send our version vectors so the peer can compute what we lack.
+    /// Open a sync: carry our whole-vault catalog digest so the peer can short-circuit
+    /// a no-op exchange in O(1) wire payload (§6.2 / OQ-C1 = C1-ii).
+    ///
+    /// The opener deliberately carries ZERO per-document version vectors
+    /// (`document_versions` is always empty): enumerating them would make the common
+    /// steady-state no-op cost O(document-count), which is exactly what the digest
+    /// fast-path exists to avoid. The `index_version` stays populated — it is a single
+    /// VV, so it is O(1), and it lets a digest-MISS path skip re-sending Index state the
+    /// peer already has. On a digest match the peer replies [`SyncMessage::InSync`] and
+    /// the exchange ends; on a miss it replies [`SyncMessage::DigestMismatch`] (revealing
+    /// ITS version vectors), and the proven three-message handshake resumes from there.
     SyncRequest {
-        /// Version vector of the Index CRDT.
+        /// Whole-vault catalog digest ([`crate::Index::catalog_digest`]) — the no-op
+        /// discriminator. Byte-equal to the peer's digest ⇒ both replicas hold identical
+        /// merged state ⇒ nothing to transfer.
+        catalog_digest: [u8; 32],
+        /// Version vector of the Index CRDT (a single VV, so O(1) payload).
         index_version: Vec<u8>,
-        /// Per-document version vectors, keyed by document UUID.
+        /// Per-document version vectors, keyed by document UUID. ALWAYS EMPTY on the
+        /// opener — the digest stands in for them. A real (digest-miss) sync gets the
+        /// peer's VVs via the [`SyncMessage::DigestMismatch`] reply instead.
         document_versions: HashMap<DocId, Vec<u8>>,
+    },
+
+    /// The digests matched: the two replicas already hold identical merged state, so
+    /// there is nothing to transfer and the exchange terminates here (the O(1) no-op
+    /// reply, §6.2). The receiver of an `InSync` sends no reply and modifies nothing.
+    InSync,
+
+    /// The digests differ: here are MY version vectors — send me a full exchange.
+    ///
+    /// A digest-only opener cannot let the responder compute minimal per-document
+    /// deltas (it lacks the opener's per-document VVs), so on a miss the responder
+    /// reveals its own VVs and asks the opener to drive the exchange. The opener answers
+    /// with a [`SyncMessage::SyncExchange`] built from these VVs — the same computation
+    /// the responder would have done on a VV-carrying `SyncRequest` in the old
+    /// three-message flow — and the proven handshake resumes unchanged from there.
+    DigestMismatch {
+        /// The responder's version vectors (same shape as a `SyncRequest`'s VV half),
+        /// so the opener can compute and send exactly what the responder is missing.
+        request: SyncRequestData,
     },
 
     /// Updates the requester is missing (the tail of the handshake).

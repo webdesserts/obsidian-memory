@@ -20,14 +20,17 @@ use super::{DocId, Result, SyncError, SyncMessage, SyncRequestData, SyncResponse
 impl<F: FileSystem> Vault<F> {
     /// Prepare a sync request to open a handshake with a peer.
     ///
-    /// Serializes a `SyncRequest` carrying our Index version vector plus a per-
-    /// document version vector keyed by UUID. The peer answers with a
-    /// `SyncExchange` (its updates for us + its own request).
+    /// Serializes a `SyncRequest` carrying our whole-vault catalog digest plus our Index
+    /// version vector, and DELIBERATELY no per-document version vectors — the digest is
+    /// the no-op discriminator (§6.2 / OQ-C1), so the common steady-state opener stays
+    /// O(1) wire payload instead of O(document-count). The peer answers with `InSync`
+    /// (digests matched — done) or `DigestMismatch` (revealing its VVs so we can drive
+    /// the exchange).
     pub async fn prepare_request(&self) -> Result<Vec<u8>> {
-        let request = self.prepare_request_data().await?;
         let msg = SyncMessage::SyncRequest {
-            index_version: request.index_version,
-            document_versions: request.document_versions,
+            catalog_digest: self.catalog_digest(),
+            index_version: self.index_version(),
+            document_versions: HashMap::new(),
         };
 
         let bytes =
@@ -141,7 +144,11 @@ impl<F: FileSystem> Vault<F> {
     }
 
     /// Prepare our request data (our version vectors), keyed by document UUID.
-    async fn prepare_request_data(&self) -> Result<SyncRequestData> {
+    ///
+    /// Enumerates per-document VVs, so it is O(document-count) — used by the
+    /// digest-MISS path (`DigestMismatch` reveals these so the opener can compute
+    /// minimal deltas) and inside `prepare_sync_exchange`, NOT by the O(1) opener.
+    pub(super) async fn prepare_request_data(&self) -> Result<SyncRequestData> {
         let index_version = self.index_version();
         let mut document_versions = HashMap::new();
 

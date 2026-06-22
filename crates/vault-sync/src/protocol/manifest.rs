@@ -129,6 +129,18 @@ use crate::vault::Vault;
 use super::Result;
 
 impl<F: FileSystem> Vault<F> {
+    /// Our full version summary: our Index VV plus every live document's per-UUID VV.
+    ///
+    /// This is the [`SyncRequestData`] a peer feeds to [`Vault::compare`] — the
+    /// "version summary a peer reveals to be compared." It is the SAME data the
+    /// digest-MISS handshake reveals in a [`SyncMessage::DigestMismatch`]; exposing it
+    /// directly lets a consumer (or a test) produce its own comparison summary without
+    /// driving a handshake leg. It is O(document-count) — NOT the O(1) no-op opener
+    /// (that carries only the digest, §6.2).
+    pub async fn request_data(&self) -> Result<SyncRequestData> {
+        self.prepare_request_data().await
+    }
+
     /// Classify what differs between us and a peer, from the peer's version summary
     /// (its Index VV + per-document VVs). The §6.1 change-manifest / FR-6.
     ///

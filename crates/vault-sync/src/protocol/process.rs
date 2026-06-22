@@ -45,14 +45,62 @@ impl<F: FileSystem> Vault<F> {
 
         match msg {
             SyncMessage::SyncRequest {
+                catalog_digest,
                 index_version,
                 document_versions,
             } => {
-                // Answer a request with a SyncExchange (the symmetric protocol):
-                // our updates for them + our version vectors so they can send us
-                // theirs.
+                // The opener carries only a digest (no per-document VVs), so the no-op
+                // case short-circuits in O(1) wire payload (§6.2 / OQ-C1). The
+                // `ensure_consistency()` above runs FIRST so a boot-stale
+                // `content_version` is repaired before the digest can match — otherwise
+                // a divergent-but-unreconciled replica could falsely short-circuit
+                // (§6.4).
+                if catalog_digest == self.catalog_digest() {
+                    // Identical merged state: nothing to transfer, the exchange ends.
+                    let bytes = bincode::serialize(&SyncMessage::InSync)
+                        .map_err(|e| SyncError::Serialization(e.to_string()))?;
+                    return Ok(SyncOutcome {
+                        reply: Some(bytes),
+                        modified: vec![],
+                    });
+                }
+
+                // Digests differ. The opener gave us no per-document VVs, so we can't
+                // compute its minimal deltas yet — and calling the response builder with
+                // the opener's EMPTY VVs would dump a FULL snapshot of every document.
+                // Instead reveal OUR version vectors and let the opener drive the
+                // exchange: it answers with a `SyncExchange` built from these VVs, and
+                // the proven three-message handshake resumes unchanged.
+                //
+                // (`index_version` is intentionally unused here: the opener carries it
+                // for symmetry/forward-use, but on a miss the opener — not us — drives
+                // the first delta computation off the VVs we send back.)
+                let _ = index_version;
+                debug_assert!(
+                    document_versions.is_empty(),
+                    "the O(1) opener must carry no per-document VVs; the digest stands in for them"
+                );
+                let request = self.prepare_request_data().await?;
+                let bytes = bincode::serialize(&SyncMessage::DigestMismatch { request })
+                    .map_err(|e| SyncError::Serialization(e.to_string()))?;
+                Ok(SyncOutcome {
+                    reply: Some(bytes),
+                    modified: vec![],
+                })
+            }
+
+            SyncMessage::InSync => {
+                // The peer reports our digests matched: nothing to apply, no reply.
+                Ok(SyncOutcome::default())
+            }
+
+            SyncMessage::DigestMismatch { request } => {
+                // The responder revealed its VVs after a digest miss. Build the normal
+                // `SyncExchange` from them — exactly what the responder does today on a
+                // VV-carrying `SyncRequest`: our updates for them + our own VVs so they
+                // send us what we lack. NO digest re-check here (that would loop).
                 let exchange = self
-                    .prepare_sync_exchange(&index_version, document_versions)
+                    .prepare_sync_exchange(&request.index_version, request.document_versions)
                     .await?;
                 let bytes = bincode::serialize(&exchange)
                     .map_err(|e| SyncError::Serialization(e.to_string()))?;
@@ -197,6 +245,22 @@ impl<F: FileSystem> Vault<F> {
         // tree-scan gate, no content load).
         self.resolve_structural_conflicts().await?;
 
+        // Tactical repair (Resolution #1): `content_version` is a per-replica-local
+        // fingerprint of each doc's content, yet it is stored as meta IN the shared Index
+        // CRDT — so a peer's value can be merged in (riding the full Index snapshot) AHEAD
+        // of the content it fingerprints, when the content is withheld (the `exclude`
+        // path: a doc we just sent the peer is not echoed back, but its Index meta still
+        // ships). That leaves our cache claiming a version our local content does not yet
+        // have, and the catalog digest — which trusts the cache — would then falsely
+        // report "in sync" and trap the divergence. Recompute each touched node's
+        // `content_version` from our ACTUAL local content so the digest never trusts a
+        // lie. A fresh local write wins the loro LWW merge (its Lamport strictly exceeds
+        // any op it has observed, including the adopted value), so this is self-healing
+        // with no livelock. Root fix = move `content_version` to a local side-table out of
+        // the synced CRDT (#2, owner's call). See Reviews/Vault-Sync content_version
+        // Digest Trust.
+        self.repair_content_versions_after_apply().await?;
+
         for uuid in &modified {
             self.emit(SyncEvent::DocumentUpdated {
                 path: uuid.to_string(),
@@ -205,6 +269,54 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(modified)
+    }
+
+    /// Recompute each live file node's denormalized `content_version` from its ACTUAL
+    /// local content doc, overwriting any value adopted from a peer's Index meta ahead of
+    /// the content it fingerprints (Resolution #1; see the call site for why the drift
+    /// happens). Persists the Index only when a fingerprint actually changed.
+    ///
+    /// Runs at the apply TAIL (after the cascade settled doc states), never in
+    /// `ensure_consistency` — that runs at the top of EVERY `process_message`, including
+    /// the no-op `SyncRequest → InSync` path, where opening content per doc would defeat
+    /// the O(1) no-op the digest exists for. A no-op never reaches this apply path, so the
+    /// O(1) no-op is preserved; a digest MISS is already allowed O(documents) (§6.2).
+    ///
+    /// TODO(perf): scope this to the docs the Index delta actually touched (the lying set
+    /// ⊆ meta-changed − content-arrived) instead of all live nodes. Cheaply identifying
+    /// that set is impractical in this chunk, and recomputing for all live nodes at the
+    /// apply tail is correct — so this is the acceptable bridge until the root fix (#2)
+    /// removes `content_version` from the synced CRDT.
+    async fn repair_content_versions_after_apply(&self) -> Result<()> {
+        // Snapshot `(uuid, node)` before the awaits — `TreeID` is `Copy`, so this copies
+        // the pairs out from under the Index lock rather than holding it across `.await`.
+        let nodes = self.index().live_file_nodes();
+
+        let mut repaired = false;
+        for (uuid, node) in nodes {
+            let Some(path) = self.index().path_for_node(&node) else {
+                continue;
+            };
+            let actual = crate::hash::content_version_fingerprint(
+                &self.get_document(&path).await?.version(),
+            );
+            if self.index().node_content_version(&node) != Some(actual) {
+                self.index().set_content_version(&node, &actual)?;
+                debug!(
+                    "repair_content_versions_after_apply: corrected {} ({})",
+                    path, uuid
+                );
+                repaired = true;
+            }
+        }
+
+        // Persist only when a correction landed — the Index was already saved by
+        // `apply_index_updates` / the cascade, so an unchanged pass writes nothing.
+        if repaired {
+            self.index().save_index(self.fs()).await?;
+            self.index().sync_state.mark_index_synced();
+        }
+        Ok(())
     }
 
     /// Reconcile fs↔document drift before importing remote data.
