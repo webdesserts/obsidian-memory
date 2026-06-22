@@ -400,6 +400,12 @@ impl<F: FileSystem> Vault<F> {
 
             // Step 2 — find a content-matching orphaned `.md` at a DIFFERENT path that
             // no other record has already claimed this pass.
+            //
+            // Accepted limitation: if two orphans share this content hash, `.find` takes
+            // the FIRST from an unordered scan (HashSet iteration order) — a
+            // non-deterministic winner. This deliberately MIRRORS `adopt_orphans`'s own
+            // content-pairing; a deterministic sort here would diverge from that
+            // adopt-consistent behavior, so it is left as-is.
             let target = candidates
                 .iter()
                 .find(|(p, h)| h == hash && p != old_path && !restitched.contains(p.as_str()));

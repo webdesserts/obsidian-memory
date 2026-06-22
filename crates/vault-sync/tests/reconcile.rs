@@ -545,6 +545,47 @@ mod ac_p4f_2b_journal_restitch {
         (uuid, hash)
     }
 
+    /// Stage TWO independent buffered-move crashes against a SINGLE Index — the state a
+    /// crash leaves when two distinct moves had buffered their deletes. Both old nodes
+    /// stay LIVE in the one persisted Index (so the re-stitch sees both as live sources),
+    /// both old `.md`s are gone, and a byte-identical `.md` for each is at its new path.
+    ///
+    /// Cannot be expressed as two `stage_buffered_move_crash` calls on the same fs: that
+    /// helper re-runs `Vault::init`, which builds a FRESH Index and overwrites
+    /// `.sync/index.loro`, wiping the first move's live node. The two moves must be
+    /// indexed into ONE Index, then crashed together. Returns each move's
+    /// `(uuid, content_hash)` for the journal records.
+    #[allow(clippy::type_complexity)]
+    async fn stage_two_buffered_move_crashes(
+        fs: &Fs,
+        a: (&str, &str, &str),
+        b: (&str, &str, &str),
+    ) -> ((Uuid, [u8; 32]), (Uuid, [u8; 32])) {
+        let (a_old, a_new, a_content) = a;
+        let (b_old, b_new, b_content) = b;
+
+        let setup = Vault::init(Arc::clone(fs), AUTHOR).await.unwrap();
+        write_and_index(&setup, fs, a_old, a_content).await;
+        write_and_index(&setup, fs, b_old, b_content).await;
+
+        let a_uuid = uuid_at(&setup, a_old);
+        let b_uuid = uuid_at(&setup, b_old);
+
+        let a_rendered = materialized_markdown(&setup, a_old).await;
+        let b_rendered = materialized_markdown(&setup, b_old).await;
+        let a_hash = content_hash(&ContentDoc::from_markdown(&a_rendered, AUTHOR).unwrap());
+        let b_hash = content_hash(&ContentDoc::from_markdown(&b_rendered, AUTHOR).unwrap());
+
+        // Both deletes buffered (nodes stay LIVE), both old `.md`s gone, both new `.md`s
+        // on disk. The persisted Index from the writes above carries both live nodes.
+        fs.delete(a_old).await.unwrap();
+        fs.delete(b_old).await.unwrap();
+        fs.write(a_new, a_rendered.as_bytes()).await.unwrap();
+        fs.write(b_new, b_rendered.as_bytes()).await.unwrap();
+
+        ((a_uuid, a_hash), (b_uuid, b_hash))
+    }
+
     /// HEADLINE: a buffered-move crash re-stitches the SAME UUID at the new path on
     /// boot — the move's lineage is recovered, not re-minted as a fresh document.
     ///
@@ -756,6 +797,132 @@ mod ac_p4f_2b_journal_restitch {
         assert!(
             vault.index().node_for_path("src/note.md").is_none(),
             "the tombstoned old path stays tombstoned — the re-stitch did not act on it"
+        );
+        // The moved file is still re-homed: even though the re-stitch SKIPPED the
+        // tombstoned UUID, `adopt_orphans` adopts the now-genuinely-orphaned `.loro` at
+        // `dst`, so the file is not quarantined or lost — the skip is a hand-off, not a
+        // dropped file.
+        assert!(
+            vault.index().node_for_path("dst/note.md").is_some(),
+            "moved file is re-homed by adopt_orphans even when re-stitch skips the tombstoned UUID"
+        );
+    }
+
+    /// C-S1 — content-hash collision: when TWO orphaned `.md` files share the journaled
+    /// move's content hash, EXACTLY ONE inherits the journaled (original) UUID and the
+    /// OTHER gets a fresh, distinct UUID. The re-stitch claims a single winner and never
+    /// double-attaches the lineage onto both, nor leaves both un-homed.
+    ///
+    /// WHICH of the two wins is NOT asserted — selection among equal-hash candidates is
+    /// non-deterministic by design (the scan is over an unordered `HashSet`, mirroring
+    /// `adopt_orphans`). The invariant under test is structural: one and only one node
+    /// carries the journaled UUID, both paths end up live, and the two UUIDs differ (no
+    /// duplicate lineage minted). The non-winner is indexed as a brand-new file by the
+    /// per-file loop, so it has its OWN UUID.
+    #[tokio::test]
+    async fn restitch_two_equal_content_orphans_exactly_one_gets_uuid() {
+        let fs = Arc::new(InMemoryFs::new());
+        let (uuid, hash) = stage_buffered_move_crash(
+            &fs,
+            "inbox/note.md",
+            "a/note.md",
+            "# Note\n\nIdentical body.\n",
+        )
+        .await;
+
+        // A SECOND orphaned `.md` at a DIFFERENT path with byte-identical content (so the
+        // same `content_hash`) and no node — a second equal-hash candidate competing for
+        // the single journaled lineage.
+        fs.write("b/note.md", "# Note\n\nIdentical body.\n".as_bytes())
+            .await
+            .unwrap();
+
+        let journaled = vec![JournalReStitch {
+            uuid,
+            old_path: "inbox/note.md".to_string(),
+            content_hash: hash,
+        }];
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+
+        // Both equal-content paths end up with live nodes — neither orphan is dropped or
+        // quarantined.
+        let uuid_a = uuid_at(&vault, "a/note.md");
+        let uuid_b = uuid_at(&vault, "b/note.md");
+
+        // Exactly one of the two inherits the journaled UUID — never both, never neither.
+        let a_won = uuid_a == uuid;
+        let b_won = uuid_b == uuid;
+        assert!(
+            a_won ^ b_won,
+            "exactly one equal-content orphan inherits the journaled UUID \
+             (a_won={a_won}, b_won={b_won}, journaled={uuid})"
+        );
+        // The two nodes carry DISTINCT UUIDs — the lineage was not minted twice. The
+        // non-winner is a fresh document indexed by the per-file loop.
+        assert_ne!(
+            uuid_a, uuid_b,
+            "the two equal-content orphans get distinct UUIDs (no duplicate lineage)"
+        );
+    }
+
+    /// C-S2 — multi-record: TWO distinct journaled moves (distinct content) in ONE
+    /// `journaled` slice each re-stitch INDEPENDENTLY to their own content-matching
+    /// orphan — A's UUID lands at A's new path, B's at B's, with no duplicate nodes and
+    /// both old paths vacated. Pins that the per-record loop re-stitches every record,
+    /// not just the first.
+    #[tokio::test]
+    async fn restitch_multi_record_each_move_restitched() {
+        let fs = Arc::new(InMemoryFs::new());
+        // Two buffered-move crashes with DISTINCT content, staged into ONE Index (a single
+        // `Vault::init`) so BOTH old nodes are live when reconcile runs — see the helper.
+        let ((uuid_a, hash_a), (uuid_b, hash_b)) = stage_two_buffered_move_crashes(
+            &fs,
+            ("x.md", "a/x.md", "# X\n\nAlpha body.\n"),
+            ("y.md", "b/y.md", "# Y\n\nBravo body.\n"),
+        )
+        .await;
+
+        // Distinct content means distinct UUIDs and distinct hashes — the two records do
+        // not compete for the same orphan.
+        assert_ne!(uuid_a, uuid_b, "precondition: the two moves are distinct documents");
+
+        let journaled = vec![
+            JournalReStitch {
+                uuid: uuid_a,
+                old_path: "x.md".to_string(),
+                content_hash: hash_a,
+            },
+            JournalReStitch {
+                uuid: uuid_b,
+                old_path: "y.md".to_string(),
+                content_hash: hash_b,
+            },
+        ];
+        let vault = Vault::load_with_journal(Arc::clone(&fs), AUTHOR, Some(&journaled))
+            .await
+            .unwrap();
+
+        // Each record re-stitched its OWN move: the original UUID lands at the new path.
+        assert_eq!(
+            uuid_at(&vault, "a/x.md"),
+            uuid_a,
+            "record A re-stitches its original UUID at a/x.md"
+        );
+        assert_eq!(
+            uuid_at(&vault, "b/y.md"),
+            uuid_b,
+            "record B re-stitches its original UUID at b/y.md"
+        );
+        // Both old paths are vacated by their moves — no live duplicate left behind.
+        assert!(
+            vault.index().node_for_path("x.md").is_none(),
+            "record A's old path is vacated"
+        );
+        assert!(
+            vault.index().node_for_path("y.md").is_none(),
+            "record B's old path is vacated"
         );
     }
 
