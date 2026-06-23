@@ -151,6 +151,10 @@ pub struct JournaledMove {
     /// re-attach). `None` on a create whose partner delete had not arrived when the
     /// snapshot was taken (so its UUID was unknown); the re-stitch keys off the
     /// delete record's UUID, so a `None` here is acceptable.
+    ///
+    /// Stored as the hyphenated `Uuid::to_string` form (not the hex `content_hash`
+    /// convention above) — the recovery boundary decodes it back via
+    /// `Uuid::parse_str`, so the round-trip is intact.
     pub uuid: Option<String>,
 }
 

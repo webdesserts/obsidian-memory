@@ -96,6 +96,7 @@ pub(super) async fn pump_outbound<FS: FileSystem>(
 
     let mut modified: Vec<vault_sync::DocId> = Vec::new();
 
+    let mut hit_cap = true;
     for _ in 0..MAX_PUMP_MESSAGES {
         let reply_bytes = match read_frame(&mut recv).await? {
             Some(bytes) => bytes,
@@ -103,7 +104,10 @@ pub(super) async fn pump_outbound<FS: FileSystem>(
             // continuing. For a well-behaved peer the loop ends via `reply: None`
             // below; reaching here means the responder closed early, which is a
             // benign end (we simply have nothing more to process).
-            None => break,
+            None => {
+                hit_cap = false;
+                break;
+            }
         };
 
         // Scope the lock to `process_message` ONLY — drop the guard before the
@@ -122,9 +126,22 @@ pub(super) async fn pump_outbound<FS: FileSystem>(
                 // Terminal leg: we have nothing more to send. Finish the send
                 // half so the peer's next read sees a clean EOF and ends its loop.
                 send.finish()?;
+                hit_cap = false;
                 break;
             }
         }
+    }
+
+    if hit_cap {
+        // Ran the full leg budget without a terminal reply or EOF: the handshake
+        // did not converge. Stopping here is the safety bound (never an unbounded
+        // loop), but a healthy exchange settles in ≤4 legs, so reaching the cap
+        // points at a protocol bug or a misbehaving peer worth surfacing.
+        warn!(
+            %target,
+            max = MAX_PUMP_MESSAGES,
+            "Outbound sync pump hit the leg cap without terminating — handshake did not converge"
+        );
     }
 
     Ok(modified)
@@ -211,6 +228,7 @@ where
 
         let mut total_modified = 0usize;
 
+        let mut hit_cap = true;
         for _ in 0..MAX_PUMP_MESSAGES {
             // Bound each read so a peer stalling mid-pump can't hang the handler.
             let frame = match tokio::time::timeout(idle_read_timeout(), read_frame(&mut recv)).await
@@ -218,10 +236,14 @@ where
                 Ok(Ok(Some(bytes))) => bytes,
                 // Clean EOF: the initiator finished its send half after the
                 // terminal leg. Normal completion of a pumped exchange.
-                Ok(Ok(None)) => break,
+                Ok(Ok(None)) => {
+                    hit_cap = false;
+                    break;
+                }
                 Ok(Err(e)) => return Err(AcceptError::from_boxed(e.into())),
                 Err(_) => {
                     debug!(peer = %remote_endpoint_id, "Inbound sync idle past timeout — closing");
+                    hit_cap = false;
                     break;
                 }
             };
@@ -251,9 +273,22 @@ where
                     // Terminal leg processed (e.g. a final `SyncResponse`): nothing
                     // more to send. Finish so the peer's read ends cleanly.
                     send.finish().map_err(AcceptError::from_err)?;
+                    hit_cap = false;
                     break;
                 }
             }
+        }
+
+        if hit_cap {
+            // Ran the full leg budget without a terminal reply, EOF, or idle close:
+            // the handshake did not converge. The cap is the safety bound against an
+            // unbounded loop, but a healthy exchange settles in ≤4 legs, so reaching
+            // it points at a protocol bug or a misbehaving peer worth surfacing.
+            warn!(
+                peer = %remote_endpoint_id,
+                max = MAX_PUMP_MESSAGES,
+                "Inbound sync pump hit the leg cap without terminating — handshake did not converge"
+            );
         }
 
         if total_modified > 0 {
