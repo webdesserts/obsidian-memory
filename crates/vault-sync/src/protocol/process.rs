@@ -256,15 +256,16 @@ impl<F: FileSystem> Vault<F> {
         Ok(modified)
     }
 
-    /// Reconcile fs↔document drift before importing remote data.
+    /// Per-message fs↔document consistency hook, called before importing remote data.
     ///
-    /// The full reconcile (re-reading each pending `.md` and re-diffing it into its
-    /// content doc so a merge lands on a document that matches its on-disk file) is
-    /// the boot/consistency work that lands in the reconcile chunk (1g). In Phase 1
-    /// the seam tests drive every local edit through `on_file_changed`, which keeps
-    /// the cache in step with disk, so there is no out-of-band drift to reconcile and
-    /// this is a no-op. It exists as the seam's documented hook so the call site and
-    /// ordering (consistency BEFORE import) are in place for 1g to fill in.
+    /// Currently a no-op. The fs↔loro divergence heal that was once anticipated here
+    /// instead landed as the BOOT reconcile ([`Vault::reconcile`], run once at
+    /// `Vault::load` before the vault opens to remote — the "commit before pull"
+    /// order, INV-7), not as per-message work: every local edit flows through
+    /// `on_file_changed`, which keeps the cache in step with disk, so there is no
+    /// out-of-band drift for an inbound message to reconcile. The hook is retained as
+    /// the seam's documented call site so the ordering (consistency BEFORE import) is
+    /// already in place should per-message reconciliation ever be needed.
     async fn ensure_consistency(&self) -> Result<()> {
         Ok(())
     }

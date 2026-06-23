@@ -55,6 +55,15 @@ impl From<Args> for DaemonRunConfig {
     }
 }
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    memory_common::init_tracing(args.verbose, "sync_daemon");
+
+    sync_daemon::daemon::run(args.into()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,13 +94,4 @@ mod tests {
         let config: DaemonRunConfig = args.into();
         assert_eq!(config.advertised_relay_url, None);
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
-    memory_common::init_tracing(args.verbose, "sync_daemon");
-
-    sync_daemon::daemon::run(args.into()).await
 }

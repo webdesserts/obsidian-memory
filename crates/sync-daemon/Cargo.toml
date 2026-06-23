@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 sync-core = { path = "../sync-core", features = ["native"] }
+# vault-sync has no Cargo features — its native/wasm fork is `cfg(target_arch)`,
+# so this dep line is bare (a `features = [...]` spec would fail to resolve).
+vault-sync = { path = "../vault-sync" }
 memory-common = { path = "../memory-common" }
 tokio.workspace = true
 bincode.workspace = true
@@ -42,6 +45,10 @@ gethostname = "0.4"
 # Ed25519 keypairs for peer identity
 ed25519-dalek.workspace = true
 getrandom.workspace = true
+
+# Document UUIDs — captured on the delete half of a move so the move-coalescer
+# journal can re-stitch lineage on crash recovery (P4f-2).
+uuid = { workspace = true, features = ["serde"] }
 
 # Iroh node IDs (for EndpointId parsing)
 iroh = { version = "1.0.0-rc.1", default-features = false }

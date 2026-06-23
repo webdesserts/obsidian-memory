@@ -29,7 +29,9 @@ use crate::content_doc::ContentDoc;
 use crate::events::{EventBus, Subscription, SyncEvent};
 use crate::fs::FileSystem;
 use crate::hash::content_version_fingerprint;
-use crate::index::{Index, IndexError, Result, SyncMetadata, VaultId, content_doc_path};
+use crate::index::{
+    Index, IndexError, JournalReStitch, Result, SyncMetadata, VaultId, content_doc_path,
+};
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -201,6 +203,24 @@ impl<F: FileSystem> Vault<F> {
     /// vault to remote sync (`process_message`). Local state is fully captured before
     /// any remote delta integrates — "commit before pull."
     pub async fn load(fs: F, loro_author: u64) -> Result<Self> {
+        Self::load_with_journal(fs, loro_author, None).await
+    }
+
+    /// Load an existing vault, feeding the move-coalescer's crash-recovery journal
+    /// into boot reconcile (P4f-2b).
+    ///
+    /// Identical to [`Self::load`] except `journaled` carries the daemon's pending
+    /// native-move deletes: on boot, a journaled delete whose original UUID still has
+    /// a live node AND whose content matches an orphaned on-disk `.md` is re-stitched
+    /// (the UUID re-attached at the new path) inside reconcile, BEFORE reconcile would
+    /// mint a fresh node for that orphan. `load(fs, author)` is exactly
+    /// `load_with_journal(fs, author, None)` — `None` is byte-identical to the
+    /// pre-journal boot path. See [`crate::reconcile`] / `JournalReStitch`.
+    pub async fn load_with_journal(
+        fs: F,
+        loro_author: u64,
+        journaled: Option<&[JournalReStitch]>,
+    ) -> Result<Self> {
         if !fs.exists(SYNC_DIR).await? {
             return Err(IndexError::NotInitialized);
         }
@@ -217,7 +237,7 @@ impl<F: FileSystem> Vault<F> {
         // Reconcile the filesystem into the Index before the vault opens to remote
         // sync. The per-file work is log-and-continue inside reconcile, so only a
         // structural failure (e.g. persisting the merged Index) propagates here.
-        vault.reconcile().await?;
+        vault.reconcile(journaled).await?;
 
         Ok(vault)
     }
@@ -273,11 +293,10 @@ impl<F: FileSystem> Vault<F> {
 
     /// Emit a sync event to all subscribers.
     ///
-    /// Carried from sync-core's vault as the internal emit hook. Flow-1 does not
-    /// emit (the local-write path is silent, matching the carry); the wire chunk's
-    /// inbound/outbound message handlers are the first emitters, so this is unused
-    /// until then.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    /// The internal emit hook the wire protocol drives: the inbound message
+    /// handlers (`protocol::process`) and outbound preparers (`protocol::prepare`)
+    /// call this to surface `MessageReceived`/`MessageSent`, `DocumentUpdated`,
+    /// and `FileOp` events. The local-write path stays silent and does not emit.
     pub(crate) fn emit(&self, event: SyncEvent) {
         self.events.emit(event);
     }
@@ -347,6 +366,16 @@ impl<F: FileSystem> Vault<F> {
     /// the caller decides when to flush — once per mutation, or once after a batch.
     pub async fn save_index(&self) -> Result<()> {
         self.index.save_index(&self.fs).await
+    }
+
+    /// Read the raw on-disk bytes at a vault-relative path.
+    ///
+    /// A thin read-only passthrough to the bound filesystem — no parse, no cache,
+    /// no node resolution. The move-coalescer uses it to hash a not-yet-tracked
+    /// `.md` (one whose create it is buffering): there is no node or `.loro` to
+    /// load yet, so the file's own bytes are the only source of its content.
+    pub async fn read_raw(&self, path: &str) -> Result<Vec<u8>> {
+        Ok(self.fs.read(path).await?)
     }
 
     /// List every markdown file in the vault (excluding `.sync` and hidden files).
@@ -536,6 +565,58 @@ impl<F: FileSystem> Vault<F> {
     fn resolve_uuid(&self, path: &str, doc: &ContentDoc) -> Option<Uuid> {
         self.uuid_for_path(path)
             .or_else(|| doc.doc_id().and_then(|s| Uuid::parse_str(&s).ok()))
+    }
+
+    /// Flow-1 — handle a local file deletion (the fs-as-truth delete path, FR-4).
+    ///
+    /// Tombstones the node, reclaims its content `.loro`, evicts the cached doc, and
+    /// flushes the index. Returns `true` iff a live node was actually removed — the
+    /// daemon gates its delete broadcast on this, so an idempotent no-op (an unknown
+    /// or already-tombstoned path) reports `false` and never re-broadcasts.
+    ///
+    /// **Ordering (Risk #1, the leak-guard):** the content `.loro` is addressed by
+    /// the document's UUID, but [`Index::delete_node`] strips the uuid cache as part
+    /// of the tombstone. So the UUID is resolved FIRST, before the tombstone, or a
+    /// post-tombstone lookup would miss and leak `docs/<uuid>.loro`.
+    ///
+    /// The resurrection guard comes from `delete_node`'s synchronous
+    /// `mark_path_deleted` — not `mark_synced`, which is the opposite (inbound-apply)
+    /// echo direction. The immediate `save_index` persists the tombstone so it
+    /// survives a restart before the next inbound sync would record it.
+    pub async fn delete_file(&self, path: &str) -> Result<bool> {
+        // Resolve the UUID BEFORE the tombstone — `delete_node` strips the uuid cache,
+        // so a lookup after it would fail and the content `.loro` would leak (Risk #1).
+        // `Option<Uuid>` is `Copy`, so this snapshot survives the awaits below with no
+        // borrow held (NFR-1 / `await_holding_refcell_ref`).
+        let uuid = self.uuid_for_path(path);
+
+        // Tombstone via the Index: tree delete + synchronous `mark_path_deleted`
+        // (guards the live-session window against a resurrecting inbound `DocUpdate`,
+        // INV-3) + cache cleanup. Returns the idempotent bool.
+        let tombstoned = self.index.delete_node(path)?;
+
+        if tombstoned {
+            // Reclaim the on-disk content `.loro`. This is a local derived-GC action,
+            // never synchronized (FR-4). Guarded by `tombstoned` so a no-op delete
+            // can't destroy a still-live doc's content in a re-create-after-delete race.
+            if let Some(uuid) = uuid {
+                let loro_path = content_doc_path(&uuid);
+                if self.fs.exists(&loro_path).await? {
+                    self.fs.delete(&loro_path).await?;
+                }
+            }
+
+            // Evict the path-keyed in-memory doc cache entry (statement-scoped borrow
+            // — never held across an await).
+            self.documents_mut().remove(path);
+
+            // Persist the tombstone immediately so it survives a restart before the
+            // next inbound sync records it (unlike the modify path, the daemon does not
+            // separately flush the index for a delete).
+            self.save_index().await?;
+        }
+
+        Ok(tombstoned)
     }
 
     /// Flow-1 — handle a local `.md` write (the fs-as-truth path, INV-6).

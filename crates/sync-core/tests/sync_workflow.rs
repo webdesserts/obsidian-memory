@@ -201,7 +201,6 @@ mod sync_workflow {
             .sync_node
             .join_vault_gossip(&shared_vault_id(), vec![])
             .await
-            .map_err(Into::into)
     }
 
     /// Subscribe device B to gossip, bootstrapping off device A.
@@ -209,7 +208,6 @@ mod sync_workflow {
         b.sync_node
             .join_vault_gossip(&shared_vault_id(), vec![a.sync_node.node_id()])
             .await
-            .map_err(Into::into)
     }
 
     // ── file sync tests ───────────────────────────────────────────────────────

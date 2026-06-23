@@ -20,6 +20,7 @@ use iroh_gossip::{
     api::{Event, GossipSender},
 };
 use n0_future::task;
+use rand::Rng;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -39,6 +40,12 @@ pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024;
 pub struct ChangeNotification {
     /// Path of the modified file
     pub path: String,
+    /// Opaque discriminator that makes successive notifications for the same path
+    /// serialize to distinct bytes, so iroh-gossip's content-hash MessageId dedup
+    /// cannot suppress a same-path follow-up within its seen-cache window. The
+    /// receiver MUST treat this as opaque — it carries no ordering or identity
+    /// meaning, it exists solely to defeat content-based dedup (Issue 2).
+    pub nonce: u64,
 }
 
 /// Envelope for all gossip messages.
@@ -97,6 +104,15 @@ pub struct VaultGossip {
     pub event_rx: mpsc::UnboundedReceiver<GossipEvent>,
     /// Background task handle (kept alive while subscription is active).
     _task: task::JoinHandle<()>,
+    /// Random session base for change-notification nonces, drawn once per
+    /// `VaultGossip`. XORed with `notif_seq` to discriminate successive
+    /// same-path notifications (see `ChangeNotification.nonce`). A daemon
+    /// restart builds a new `VaultGossip` with a fresh salt, so the counter
+    /// resetting to 0 cannot collide with pre-restart nonces.
+    notif_salt: u64,
+    /// Monotonic per-broadcast counter, 0 at construction. Makes within-session
+    /// nonce uniqueness deterministic (XOR with a fixed salt is a bijection).
+    notif_seq: u64,
 }
 
 impl VaultGossip {
@@ -173,6 +189,8 @@ impl VaultGossip {
             topic,
             event_rx,
             _task: task,
+            notif_salt: rand::rng().random(),
+            notif_seq: 0,
         }
     }
 
@@ -181,8 +199,15 @@ impl VaultGossip {
     /// The notification is small (path only). Peers who receive it will
     /// open a QUIC stream to pull the actual document updates.
     pub async fn broadcast_change(&mut self, path: &str) -> Result<()> {
+        // The nonce makes successive same-path notifications serialize to distinct
+        // bytes so iroh-gossip's content-hash dedup can't suppress a follow-up (a
+        // create-notif followed by a same-path delete-notif within the seen window).
+        // `wrapping_add` so a pathological 2^64-broadcast session can't panic in debug.
+        let nonce = self.notif_salt ^ self.notif_seq;
+        self.notif_seq = self.notif_seq.wrapping_add(1);
         let msg = GossipMessage::ChangeNotification(ChangeNotification {
             path: path.to_string(),
+            nonce,
         });
         self.broadcast_message(&msg).await
     }

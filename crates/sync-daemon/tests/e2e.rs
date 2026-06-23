@@ -127,7 +127,7 @@ async fn test_native_fs_basic_operations() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let fs = NativeFs::new(temp_dir.path().to_path_buf());
 
-    use sync_core::fs::FileSystem;
+    use vault_sync::fs::FileSystem;
 
     // Write
     fs.write("test.md", b"# Hello").await.expect("Write failed");
@@ -158,7 +158,7 @@ async fn test_native_fs_nested_directories() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let fs = NativeFs::new(temp_dir.path().to_path_buf());
 
-    use sync_core::fs::FileSystem;
+    use vault_sync::fs::FileSystem;
 
     // Write to nested path (should create directories)
     fs.write("knowledge/topic.md", b"# Topic")

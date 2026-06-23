@@ -13,11 +13,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use sync_core::allowlist::AllowlistStorage;
-use sync_core::fs::FileSystem;
 use sync_core::network::discovery::MeshMetadata;
 use sync_core::network::pairing::pair_with_mesh_interactive;
+// `VaultId` here is the mesh's id recovered from the gossip topic (a
+// `sync_core::VaultId`), used by the iroh layer. It is bridged to a
+// `vault_sync::VaultId` only at the `vault.adopt_vault_id` boundary below.
 use sync_core::{PeerId, VaultId};
 use sync_core::pairing::{PairingHello};
+use vault_sync::fs::FileSystem;
 
 use super::Daemon;
 
@@ -440,8 +443,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         new_vault_id: VaultId,
         mesh_members: Vec<PeerId>,
     ) -> Result<()> {
-        // 1. Adopt the VaultId (metadata.toml + in-memory).
-        self.vault.lock().await.adopt_vault_id(new_vault_id).await?;
+        // 1. Adopt the VaultId (metadata.toml + in-memory). `new_vault_id` is a
+        //    `sync_core::VaultId` (recovered from the gossip topic); bridge it through
+        //    `u64` to the `vault_sync::VaultId` the vault index speaks.
+        self.vault
+            .lock()
+            .await
+            .adopt_vault_id(vault_sync::VaultId::from(new_vault_id.as_u64()))
+            .await?;
 
         // 2. Bootstrap gossip off the mesh members (same filter-map as startup).
         let bootstrap_ids: Vec<EndpointId> = mesh_members

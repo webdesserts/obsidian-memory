@@ -1,31 +1,29 @@
-/// Tests for the sync-flag echo suppression fix.
+/// Tests for the echo-safe Flow-1 vault primitives (`on_file_changed` / `delete_file`).
 ///
-/// Before the fix, `on_file_modified` and `on_file_deleted` early-returned when
-/// `vault.consume_sync_flag(path)` was true. A stale-armed flag (armed by an
-/// inbound sync with no follow-up watcher event; TTL 30s) caused a real local
-/// edit to skip `vault.on_file_changed` — leaving a stale .loro — and a real
-/// local delete to produce no registry tombstone or broadcast.
+/// Echo suppression is now a CONTENT-DIFF, not a path-keyed sync flag. The daemon's
+/// `on_file_modified`/`on_file_deleted` no longer early-return on any flag; they always
+/// apply the vault primitive and gate the broadcast on its returned bool:
+/// - `Vault::on_file_changed` returns `Result<bool>` — `true` only when the body/frontmatter
+///   actually changed, so re-applying identical content (the watcher echo after an inbound
+///   sync write) returns `false` and suppresses a re-broadcast.
+/// - `Vault::delete_file` returns `Result<bool>` — `true` only when a live node was
+///   tombstoned (idempotent: a no-op delete returns `false`).
 ///
-/// The fix: remove both early-returns. Always apply the vault primitive (they are
-/// echo-safe/idempotent). `Vault::on_file_changed` now returns `Result<bool>`
-/// indicating whether the document body or frontmatter actually changed; the
-/// daemon gates its broadcast on that bool. `Vault::delete_file` similarly
-/// returns `Result<bool>` (true when a live node was tombstoned).
-///
-/// These tests use NativeFs on a `tempfile::tempdir` to match the production
-/// codepath (InMemoryFs masks the class of bug the prior ENOENT fix addressed).
+/// These tests cover that content-diff echo-safety and the persist/tombstone properties
+/// directly. They use NativeFs on a `tempfile::tempdir` to match the production codepath
+/// (InMemoryFs masks the class of bug the prior ENOENT fix addressed).
 mod echo_suppression {
     use std::sync::Arc;
 
-    use sync_core::fs::FileSystem;
     use sync_core::peer_id::PeerId;
-    use sync_core::Vault;
     use sync_daemon::NativeFs;
     use tempfile::tempdir;
+    use vault_sync::Vault;
+    use vault_sync::fs::FileSystem;
 
-    /// Deterministic author seed.
-    fn test_author() -> PeerId {
-        PeerId::from_secret_bytes([99u8; 32])
+    /// Deterministic author seed. vault-sync authors Loro ops under a bare u64.
+    fn test_author() -> u64 {
+        PeerId::from_secret_bytes([99u8; 32]).as_u64()
     }
 
     // ── on_file_changed return value ─────────────────────────────────────────
@@ -91,17 +89,19 @@ mod echo_suppression {
         );
     }
 
-    /// Proves the Vault primitive is flag-agnostic: `mark_synced` has no effect on
-    /// `on_file_changed`, which always applies the edit and advances the .loro snapshot
-    /// on disk. The daemon-handler regression (early-return swallowing real edits) is
-    /// covered by `test_local_edit_during_armed_flag_propagates_to_peer` in
-    /// `daemon_integration.rs`.
+    /// A real edit is applied and its `.loro` snapshot persisted to disk.
+    ///
+    /// Echo-safety is now a content-diff inside `on_file_changed` (it returns `false`
+    /// only when the body is unchanged — see `on_file_changed_returns_false_for_unchanged_echo`),
+    /// not a path-keyed sync flag. There is no flag to "arm" anymore, so this test proves
+    /// the property the old flag-based variant ultimately guarded: a genuine edit returns
+    /// `true` and the new content reaches the on-disk `.loro`.
     ///
     /// The on-disk assertion uses a cold `Vault::load` over the same tempdir — this
     /// exercises the real NativeFs read path and confirms the .loro snapshot persisted,
     /// not just that the in-memory cache advanced.
     #[tokio::test]
-    async fn local_edit_during_armed_flag_still_updates_loro() {
+    async fn real_edit_is_applied_and_persisted_to_loro() {
         let dir = tempdir().expect("tempdir");
         let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
         let vault = Vault::init(fs.clone(), test_author())
@@ -115,21 +115,15 @@ mod echo_suppression {
             .await
             .expect("index initial");
 
-        // Arm the sync flag — simulates the lingering-flag window after inbound sync.
-        vault.mark_synced("note.md");
-
         // Edit the file on disk.
         fs.write("note.md", b"# Edited after sync").await.expect("write edit");
 
-        // The edit must be applied regardless of the armed flag.
+        // A real content change is applied.
         let changed = vault
             .on_file_changed("note.md")
             .await
             .expect("on_file_changed after edit");
-        assert!(
-            changed,
-            "on_file_changed must return true for a real edit even when sync flag was armed"
-        );
+        assert!(changed, "on_file_changed must return true for a real edit");
 
         // Drop the first vault and open a cold second vault over the same tempdir.
         // This proves the .loro snapshot was actually persisted to disk — not just
@@ -206,13 +200,14 @@ mod echo_suppression {
         );
     }
 
-    /// Proves the Vault primitive is flag-agnostic: `mark_synced` has no effect on
-    /// `delete_file`, which always tombstones the registry entry. The daemon-handler
-    /// regression (early-return producing no tombstone or broadcast) is covered by
-    /// `test_local_delete_during_armed_flag_propagates_to_peer` in
-    /// `daemon_integration.rs`.
+    /// A real delete tombstones the registry entry.
+    ///
+    /// Like the edit case above, the path-keyed sync flag this test once "armed" is gone
+    /// (echo-safety moved into the `on_file_changed`/`delete_file` content-diff), so this
+    /// proves the property directly: a genuine delete returns `true` and records the
+    /// tombstone in the Index tree.
     #[tokio::test]
-    async fn local_delete_during_armed_flag_still_tombstones() {
+    async fn real_delete_tombstones_the_node() {
         let dir = tempdir().expect("tempdir");
         let fs = Arc::new(NativeFs::new(dir.path().to_path_buf()));
         let vault = Vault::init(fs.clone(), test_author())
@@ -225,22 +220,17 @@ mod echo_suppression {
             .await
             .expect("index");
 
-        // Arm the sync flag — simulates the lingering-flag window.
-        vault.mark_synced("flagged.md");
-
-        // Delete the file — must succeed even with the flag armed.
+        // A real local delete tombstones the node.
         let deleted = vault
             .delete_file("flagged.md")
             .await
             .expect("delete_file");
-        assert!(
-            deleted,
-            "delete_file must return true for a real delete even when sync flag was armed"
-        );
+        assert!(deleted, "delete_file must return true for a real delete");
 
-        // The vault must now report the file as deleted.
+        // The vault must now report the file as deleted (the tombstone is recorded
+        // in the Index tree).
         assert!(
-            vault.is_file_deleted("flagged.md"),
+            vault.index().is_path_deleted("flagged.md"),
             "vault must report the file as deleted after delete_file"
         );
     }

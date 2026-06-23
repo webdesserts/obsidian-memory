@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use iroh::RelayUrl;
 use sync_core::allowlist::InMemoryAllowlist;
-use sync_core::fs::InMemoryFs;
 use sync_core::network::SyncNode;
 use sync_core::peer_id::PeerId;
-use sync_core::Vault;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use vault_sync::Vault;
+use vault_sync::fs::InMemoryFs;
 
 /// Generate a deterministic 32-byte key seed from a small integer.
 ///
@@ -42,19 +43,41 @@ pub struct RelayNode {
     pub allowlist: Arc<InMemoryAllowlist>,
     pub sync_node: SyncNode,
     pub node_id: PeerId,
+    /// The inbound-sync freshness receiver paired with the node's pumped handler.
+    /// Wire into the daemon via `set_inbound_seen_rx` so inbound-only peers count
+    /// as alive (S2).
+    pub inbound_seen_rx: mpsc::UnboundedReceiver<PeerId>,
 }
 
 /// Build a [`RelayNode`] whose home relay is `relay_url`.
+///
+/// Built with the daemon's PUMPED inbound handler (the relay-path convergence
+/// tests run a full `Daemon`, so the responder must drive the multi-message
+/// vault-sync handshake exactly as production does).
 #[allow(dead_code)] // see RelayNode — per-binary common compilation
-pub async fn build_node_with_relay(seed_byte: u8, relay_url: &RelayUrl) -> anyhow::Result<RelayNode> {
+pub async fn build_node_with_relay(
+    seed_byte: u8,
+    relay_url: &RelayUrl,
+) -> anyhow::Result<RelayNode> {
     let fs = Arc::new(InMemoryFs::new());
     let author = PeerId::from_secret_bytes(seed(seed_byte));
-    let vault = Vault::init(fs.clone(), author).await?;
+    let vault = Vault::init(fs.clone(), author.as_u64()).await?;
     let vault = Arc::new(Mutex::new(vault));
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let sync_node =
-        SyncNode::new(seed(seed_byte), std::slice::from_ref(relay_url), allowlist.clone()).await?;
+    let (inbound_seen_tx, inbound_seen_rx) = mpsc::unbounded_channel();
+    let sync_handler = sync_daemon::daemon::PumpedSyncHandler::new(
+        vault.clone(),
+        allowlist.clone(),
+        inbound_seen_tx,
+    );
+    let sync_node = SyncNode::new_with_sync_handler(
+        seed(seed_byte),
+        std::slice::from_ref(relay_url),
+        allowlist.clone(),
+        sync_handler,
+    )
+    .await?;
     let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
 
     Ok(RelayNode {
@@ -63,6 +86,7 @@ pub async fn build_node_with_relay(seed_byte: u8, relay_url: &RelayUrl) -> anyho
         allowlist,
         sync_node,
         node_id,
+        inbound_seen_rx,
     })
 }
 
@@ -76,16 +100,29 @@ pub async fn build_node_with_relay(seed_byte: u8, relay_url: &RelayUrl) -> anyho
 /// localhost nodes discover each other's direct addresses and bypass the relay,
 /// masking relay-path bugs.
 #[allow(dead_code)] // see RelayNode — per-binary common compilation
-pub async fn build_relay_only_node(seed_byte: u8, relay_url: &RelayUrl) -> anyhow::Result<RelayNode> {
+pub async fn build_relay_only_node(
+    seed_byte: u8,
+    relay_url: &RelayUrl,
+) -> anyhow::Result<RelayNode> {
     let fs = Arc::new(InMemoryFs::new());
     let author = PeerId::from_secret_bytes(seed(seed_byte));
-    let vault = Vault::init(fs.clone(), author).await?;
+    let vault = Vault::init(fs.clone(), author.as_u64()).await?;
     let vault = Arc::new(Mutex::new(vault));
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let sync_node =
-        SyncNode::new_relay_only(seed(seed_byte), std::slice::from_ref(relay_url), allowlist.clone())
-            .await?;
+    let (inbound_seen_tx, inbound_seen_rx) = mpsc::unbounded_channel();
+    let sync_handler = sync_daemon::daemon::PumpedSyncHandler::new(
+        vault.clone(),
+        allowlist.clone(),
+        inbound_seen_tx,
+    );
+    let sync_node = SyncNode::new_relay_only_with_sync_handler(
+        seed(seed_byte),
+        std::slice::from_ref(relay_url),
+        allowlist.clone(),
+        sync_handler,
+    )
+    .await?;
     let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
 
     Ok(RelayNode {
@@ -94,6 +131,7 @@ pub async fn build_relay_only_node(seed_byte: u8, relay_url: &RelayUrl) -> anyho
         allowlist,
         sync_node,
         node_id,
+        inbound_seen_rx,
     })
 }
 

@@ -10,11 +10,14 @@
 use std::path::Path;
 
 use iroh::{EndpointId, RelayUrl};
-use sync_core::SyncMetadata;
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
 use sync_core::network::SyncNode;
 use sync_core::peer_id::{PeerId, VaultId};
 use tracing::warn;
+// The on-disk `.sync/metadata.toml` is owned by the vault-sync engine; `NativeFs`
+// implements vault-sync's `FileSystem`, so the metadata round-trip goes through
+// `vault_sync::SyncMetadata` (the format is byte-identical to the old sync-core one).
+use vault_sync::SyncMetadata;
 
 use crate::native_fs::NativeFs;
 
@@ -34,10 +37,10 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
 ) {
     // Bootstrap the allowlist on first pair: add self so the responder side's
     // sync requests are accepted once gossip joins.
-    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty()) {
-        if let Err(e) = allowlist.add_peer(self_peer_id, self_device_name).await {
-            warn!("Failed to add self to allowlist on first pair: {}", e);
-        }
+    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty())
+        && let Err(e) = allowlist.add_peer(self_peer_id, self_device_name).await
+    {
+        warn!("Failed to add self to allowlist on first pair: {}", e);
     }
 
     for member_id in mesh_members {
@@ -60,6 +63,10 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
 /// sync; this on-disk variant is the equivalent for the exit-then-restart CLI.
 pub async fn adopt_vault_id_on_disk(vault_path: &Path, new_id: VaultId) -> anyhow::Result<()> {
     let fs = NativeFs::new(vault_path.to_path_buf());
+    // `new_id` is the mesh's `sync_core::VaultId` recovered from the gossip topic;
+    // bridge it through `u64` to the `vault_sync::VaultId` the metadata file speaks
+    // (both newtypes wrap the same u64 and serialize to identical hex).
+    let new_id = vault_sync::VaultId::from(new_id.as_u64());
     let existing = SyncMetadata::load_or_migrate(&fs).await?;
     if existing.vault_id == new_id {
         return Ok(());
@@ -123,10 +130,11 @@ pub async fn persist_adopted_relay(
     // off-LAN-reach store). `add_known_public_relay` self-guards on
     // off-LAN-reachability, so a same-LAN-only pair (private relay URL) is a
     // no-op here — the live lookup seed below still happens for that session.
-    if let Err(e) = crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
-        config.add_known_public_relay(&url_str)
-    })
-    .await
+    if let Err(e) =
+        crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
+            config.add_known_public_relay(&url_str)
+        })
+        .await
     {
         warn!("Failed to persist adopted public relay URL: {}", e);
         return;
@@ -283,7 +291,7 @@ mod tests {
         persist_adopted_relay(
             vault_path,
             responder_id,
-            &[responder_relay.clone()],
+            std::slice::from_ref(&responder_relay),
             Some(own_relay_url.clone()),
             &sync_node,
         )

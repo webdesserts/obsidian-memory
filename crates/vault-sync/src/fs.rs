@@ -12,12 +12,12 @@
 //!
 //! All `FileSystem` implementations **must** return `FsError::NotFound` when an
 //! operation targets a path that does not exist (read, stat, delete, rename with a
-//! missing source). Callers branch on this variant — most critically, the
-//! `ensure_consistency` skip-deleted guard matches `FsError::NotFound` to safely
-//! ignore paths that were removed between `mark_synced` and the next reconcile pass.
-//! Returning `FsError::Io` for ENOENT breaks that guard and aborts the entire
-//! inbound sync batch. Every implementation must pass the shared conformance suite
-//! in the [`conformance`] module.
+//! missing source). Callers branch on this variant — most critically, the boot
+//! reconcile's per-file loop (`Vault::reconcile`) matches `FsError::NotFound` to
+//! safely skip a `.md` that vanished between the directory scan and the reconcile of
+//! that file. Returning `FsError::Io` for ENOENT breaks that guard and aborts the
+//! entire boot reconcile pass over a single race-deleted file. Every implementation
+//! must pass the shared conformance suite in the [`conformance`] module.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -582,7 +582,11 @@ pub mod conformance {
 }
 
 // Implement FileSystem for Arc<T> where T: FileSystem
-// This allows sharing a filesystem between multiple Vaults in tests
+// This allows sharing a filesystem between multiple Vaults in tests.
+//
+// `atomic_write` is intentionally NOT overridden — it uses the trait default,
+// which composes the overridden `write` + `rename` below, so it transparently
+// inherits the inner `T`'s atomicity without a hand-written delegation.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg(not(target_arch = "wasm32"))]

@@ -31,8 +31,8 @@ pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use hash::{ContentSummary, content_hash, content_summary, content_version_fingerprint};
 pub use index::{
-    FileMove, Index, IndexError, ReconcileReport, SyncMetadata, SyncState, VaultId,
-    content_doc_path,
+    FileMove, Index, IndexError, JournalReStitch, ReconcileReport, SyncMetadata, SyncState,
+    VaultId, content_doc_path,
 };
 pub use markdown::ParsedMarkdown;
 pub use protocol::{

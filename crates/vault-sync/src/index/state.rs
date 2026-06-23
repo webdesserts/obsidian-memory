@@ -393,24 +393,6 @@ impl SyncState {
         false
     }
 
-    /// Check if a path was synced (without consuming).
-    /// Returns false if the flag has expired.
-    #[allow(dead_code)]
-    pub fn is_synced(&self, path: &str) -> bool {
-        let paths = self.synced_paths.lock().unwrap();
-        if let Some(timestamp) = paths.get(path) {
-            return timestamp.elapsed() < FLAG_TTL;
-        }
-        false
-    }
-
-    /// Remove expired flags to prevent memory growth.
-    #[allow(dead_code)]
-    pub fn cleanup_expired(&self) {
-        let mut paths = self.synced_paths.lock().unwrap();
-        paths.retain(|_, timestamp| timestamp.elapsed() < FLAG_TTL);
-    }
-
     /// Take all paths pending reconciliation (called before a sync import).
     /// Returns the set of paths and clears the pending set.
     pub fn take_pending_reconcile(&self) -> HashSet<String> {

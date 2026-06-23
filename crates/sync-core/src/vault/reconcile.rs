@@ -105,21 +105,20 @@ impl<F: FileSystem> Vault<F> {
                     let content = String::from_utf8_lossy(&bytes);
                     if let Ok(new_doc) =
                         NoteDocument::from_markdown(new_path, &content, self.loro_author)
+                        && new_doc.content_hash() == orphaned_content_hash
                     {
-                        if new_doc.content_hash() == orphaned_content_hash {
-                            // Content matches - this is a move!
-                            tracing::info!("File move detected: {} -> {}", old_path, new_path);
+                        // Content matches - this is a move!
+                        tracing::info!("File move detected: {} -> {}", old_path, new_path);
 
-                            // Migrate the Loro doc to the new path
-                            self.migrate_document(old_hash, new_path).await?;
+                        // Migrate the Loro doc to the new path
+                        self.migrate_document(old_hash, new_path).await?;
 
-                            report.moved.push(FileMove {
-                                from: old_path.clone(),
-                                to: new_path.clone(),
-                            });
-                            matched_new_files.insert(new_path.clone());
-                            break;
-                        }
+                        report.moved.push(FileMove {
+                            from: old_path.clone(),
+                            to: new_path.clone(),
+                        });
+                        matched_new_files.insert(new_path.clone());
+                        break;
                     }
                 }
             }

@@ -231,13 +231,13 @@ async fn pair_inner(
         eprintln!("Warning: failed to adopt the mesh VaultId: {}", e);
     }
     crate::pair_shared::persist_adopted_relay(
-        &vault_path,
+        vault_path,
         peer_endpoint_id,
         &result.relay_urls,
         // The CLI pairing flow runs no relay of its own (SyncNode created with
         // no relay above), so there is no advertised relay_url to preserve.
         None,
-        &sync_node,
+        sync_node,
     )
     .await;
 

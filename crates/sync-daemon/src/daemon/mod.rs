@@ -7,18 +7,29 @@
 //!   `InitiatorPairOutcome`, `run_initiator_pairing_parked`, and the five
 //!   `impl Daemon` initiator methods).
 
-mod startup;
 mod initiator;
+mod move_recovery;
+mod startup;
 mod sync_exchange;
+mod sync_stream;
 
 // Re-export public names so `sync_daemon::daemon::X` paths stay byte-identical.
-pub use startup::{run, run_with_shutdown, run_with_shutdown_controlled};
 use initiator::{InitiatorPairOutcome, InitiatorSession};
+pub use startup::{run, run_with_shutdown, run_with_shutdown_controlled};
 use sync_exchange::{SyncExchangeKind, spawn_sync_exchange};
+// Re-exported for the integration-test harness, which builds nodes with the same
+// pumped inbound handler production uses (see `sync_stream`).
+pub use sync_stream::PumpedSyncHandler;
+// Re-exported for the boot-recovery integration harness (`spawn_daemon_from_loaded`),
+// which runs the SAME journal-read → restitch → clear sequence as `startup_inner` so
+// production and test cannot diverge (P4f-2b-ii §0.1).
+pub use move_recovery::{clear_pending_journal, read_pending_journal, restitch_inputs};
 
-use crate::pair_api::{
-    ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary,
+use crate::move_coalescer::{
+    Expired, JournaledMove, MoveCoalescer, MoveDecision, PENDING_MOVES_FILE, PENDING_MOVES_VERSION,
+    PendingKind, PendingMovesFile,
 };
+use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::relay_class::relay_is_offlan_reachable;
 use crate::watcher::{FileEvent, FileEventKind};
 use iroh::{EndpointAddr, EndpointId};
@@ -31,16 +42,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
-use sync_core::fs::FileSystem;
 use sync_core::network::{
     GOSSIP_ALPN, SyncNode,
     gossip::{GossipEvent, GossipMessage, MAX_GOSSIP_MESSAGE_SIZE, VaultGossip},
     pairing::{InboundPairingExchange, PairingApproval, PairingEvent},
-    streams::InboundSyncRequest,
 };
 use sync_core::pairing::{PairingChallenge, PairingSession};
 use sync_core::time_scale::{scaled, scaled_ms};
-use sync_core::{PeerId, PeerRegistry, Vault};
+use sync_core::{PeerId, PeerRegistry};
+// The vault/sync-engine layer is vault-sync; the iroh half stays on sync-core.
+// `Daemon<FS>` and `Vault<FS>` are both generic over vault-sync's `FileSystem`.
+use uuid::Uuid;
+use vault_sync::Vault;
+use vault_sync::fs::FileSystem;
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -204,6 +218,16 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// change needs a restart." `None` in tests that don't exercise reconnect,
     /// and on any build where `watch_addr` isn't wired.
     net_change_rx: Option<mpsc::Receiver<()>>,
+    /// Inbound-sync freshness signal. The pumped inbound handler
+    /// (`sync_stream::PumpedSyncHandler`) processes a peer's sync inline and
+    /// fires that peer's id here on completion; the run-loop drains it and stamps
+    /// `peer_registry.update_last_seen`. The handler can't touch `peer_registry`
+    /// directly — it's built before `Daemon` exists — so this fire-and-forget
+    /// channel carries the inbound liveness stamp instead (S2). It is the
+    /// inbound-only-peer liveness path that the `alive_count` broadcast gate
+    /// reads. `None` (inert) until wired post-construction by `startup.rs` or a
+    /// test; an undrained channel is harmless (the handler's `send` fails quietly).
+    inbound_seen_rx: Option<mpsc::UnboundedReceiver<PeerId>>,
     /// Tracks liveness state of all peers observed in the gossip swarm.
     ///
     /// Wrapped in `Arc<Mutex<...>>` so spawned tasks (QUIC sync exchanges) can
@@ -292,6 +316,30 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// reconcile within `wait_until`'s budget — same test-seam rationale as
     /// [`Daemon::set_reconnect_interval`].
     roster_reconcile_interval_ms: u64,
+
+    // ── native-move coalescing (P4f-1) ──────────────────────────────────────
+    /// Buffers not-yet-tracked create/delete events for a short window so a native
+    /// rename (which the watcher delivers as an unlinked delete+create — see
+    /// `move_coalescer`) collapses into one same-UUID move instead of a tombstone
+    /// plus a fresh-UUID create. Pure (no vault handle); `on_file_changed` computes
+    /// the content hashes and executes the decisions it returns.
+    move_coalescer: MoveCoalescer,
+    /// Drives the coalescer's window-expiry sweep on a steady cadence — a buffered
+    /// event whose partner never arrived commits to its standalone meaning (a real
+    /// tombstone or a real new doc) once its window passes.
+    move_sweep_tick: tokio::time::Interval,
+    /// Filesystem handle for writing the move-coalescer's crash-recovery journal
+    /// (`.sync/pending-moves.json`, P4f-2). The daemon writes the journal — NOT the
+    /// coalescer (which stays pure) and NOT `persistence.rs` (which writes through
+    /// `std::fs` against the real OS path, bypassing the vault's `FileSystem` and so
+    /// unusable in the in-memory test harness). Routing through the SAME
+    /// `FileSystem` the vault uses keeps the crash/boot tests hermetic — the journal
+    /// lands in the same fs as the `.loro`/`.md`. Wired post-construction (mirrors
+    /// `inbound_seen_rx` / `net_change_rx`) via [`Daemon::set_fs`]; `None` means
+    /// journal persistence is inert (the write logs a `warn!` and skips, degrading
+    /// to the crash-tail — never silently no-ops). `FileSystem` is impl'd for
+    /// `Arc<T>`, so an `Arc<FS>` is itself a usable filesystem.
+    fs: Option<Arc<FS>>,
 }
 
 impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
@@ -320,10 +368,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // The reconnect supervisor wakes on a steady cadence; backoff (tracked in
         // the fields below) gates whether a wake actually re-dials. `Delay` skips
         // missed ticks rather than bursting to catch up after a slow turn.
-        let mut reconnect_tick = tokio::time::interval(scaled(std::time::Duration::from_millis(
-            RECONNECT_BASE_MS,
-        )));
+        let mut reconnect_tick =
+            tokio::time::interval(scaled(std::time::Duration::from_millis(RECONNECT_BASE_MS)));
         reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // The move-coalescer sweep wakes on a fraction of the pairing window so an
+        // unpaired event's standalone commit is caught promptly. `Delay` skips
+        // missed ticks rather than bursting after a slow turn.
+        let mut move_sweep_tick = tokio::time::interval(MoveCoalescer::sweep_interval());
+        move_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         Self {
             vault,
@@ -335,6 +388,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             // tests via `set_net_change_rx`); `None` means net-change reconnect
             // is inert, exactly like an unwired `discovery_rx`.
             net_change_rx: None,
+            // Wired post-construction (startup.rs / tests via `set_inbound_seen_rx`);
+            // `None` means inbound freshness stamping is inert, like an unwired
+            // `net_change_rx`.
+            inbound_seen_rx: None,
             peer_registry: Arc::new(Mutex::new(PeerRegistry::new())),
             allowlist,
             active_pairing: None,
@@ -356,6 +413,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             bootstrap_connect_inflight: Arc::new(Mutex::new(HashSet::new())),
             last_roster_reconcile_ms: None,
             roster_reconcile_interval_ms: scaled_ms(ROSTER_RECONCILE_MS),
+            move_coalescer: MoveCoalescer::new(),
+            move_sweep_tick,
+            // Wired post-construction (startup.rs / tests via `set_fs`); `None`
+            // means the crash-recovery journal write is inert, like an unwired
+            // `inbound_seen_rx`.
+            fs: None,
         }
     }
 
@@ -456,8 +519,17 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     }
                 }
 
-                Some(inbound) = self.sync_node.inbound_sync_rx.recv() => {
-                    self.on_inbound_sync(inbound).await;
+                Some(remote_id) = async {
+                    match self.inbound_seen_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    // A peer completed an inbound sync (handled inline by the pumped
+                    // handler). Stamp its liveness so the broadcast `alive_count`
+                    // gate counts an inbound-only peer (S2) — the inbound handler
+                    // can't reach `peer_registry`, so it routes the stamp here.
+                    self.peer_registry.lock().await.update_last_seen(&remote_id);
                 }
 
                 Some(pairing_event) = self.sync_node.inbound_pairing_rx.recv() => {
@@ -518,8 +590,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     self.on_reconnect_tick().await;
                 }
 
+                _ = self.move_sweep_tick.tick() => {
+                    self.sweep_pending_moves().await;
+                }
+
                 _ = self.shutdown.cancelled() => {
                     info!("Shutting down");
+                    // Drain the move-coalescer buffer BEFORE break: `select!` never
+                    // re-polls `file_event_rx` once this arm runs, so no new event
+                    // mutates the buffer after the drain. Runs here (not after the
+                    // loop) so the vault + gossip handles are still alive when the
+                    // standalone sinks fire (P4f-2c).
+                    self.drain_pending_moves().await;
                     break;
                 }
             }
@@ -1066,8 +1148,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 continue;
             }
             self.sync_node.add_peer_relay(endpoint_id, &url);
-            self.peer_relays
-                .push(crate::persistence::PeerRelay::new(endpoint_hex, url_str.clone()));
+            self.peer_relays.push(crate::persistence::PeerRelay::new(
+                endpoint_hex,
+                url_str.clone(),
+            ));
         }
     }
 
@@ -1095,6 +1179,28 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// `#[cfg(test)]` gate would break them). Not a public production API.
     pub fn set_net_change_rx(&mut self, rx: mpsc::Receiver<()>) {
         self.net_change_rx = Some(rx);
+    }
+
+    /// Wire the inbound-sync freshness receiver — the other half of the channel
+    /// the pumped inbound handler sends on (built alongside the `SyncNode` in
+    /// `startup.rs` / `build_node`). The run-loop drains it to stamp
+    /// `peer_registry.update_last_seen` for peers that synced inbound, so a peer
+    /// that only ever connects inbound still counts as alive (S2). `pub` for
+    /// integration-test access — same seam rationale as [`Daemon::set_net_change_rx`].
+    pub fn set_inbound_seen_rx(&mut self, rx: mpsc::UnboundedReceiver<PeerId>) {
+        self.inbound_seen_rx = Some(rx);
+    }
+
+    /// Wire the filesystem handle used to write the move-coalescer's crash-recovery
+    /// journal (`.sync/pending-moves.json`, P4f-2). Pass the SAME `Arc<FS>` the
+    /// vault uses so the journal lands in the same filesystem as the vault's
+    /// `.loro`/`.md` — in the in-memory test harness this means sharing the one
+    /// stateful `InMemoryFs` instance (a separate instance would not see the
+    /// journal, making the crash/boot tests meaningless). Called post-construction
+    /// by `startup.rs` and the test harness; `pub` for integration-test access —
+    /// same seam rationale as [`Daemon::set_inbound_seen_rx`].
+    pub fn set_fs(&mut self, fs: Arc<FS>) {
+        self.fs = Some(fs);
     }
 
     /// Populate the in-memory peer-relay snapshot the supervisor re-dials from.
@@ -1246,14 +1352,295 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
-    /// Handle a file change event from the watcher.
+    /// Handle a file change event from the watcher, routing through the
+    /// move-coalescer so a native rename (delivered as an unlinked delete+create —
+    /// see [`crate::move_coalescer`]) collapses into one same-UUID move rather than
+    /// a tombstone plus a fresh-UUID create.
+    ///
+    /// Only events that COULD be half of a move enter the window:
+    /// - a `Modified` at a path with a still-live node and NO buffered delete is an
+    ///   edit — dispatched immediately, the no-latency common case;
+    /// - a `Modified` at a not-yet-tracked path (or a path whose deletion is
+    ///   currently buffered — the re-create-at-a-just-deleted-path edge, OQ-D) is a
+    ///   create-candidate;
+    /// - a `Deleted` is always a move-candidate (its standalone meaning on expiry is
+    ///   a real tombstone).
     async fn on_file_changed(&mut self, event: FileEvent) {
         match event.kind {
             FileEventKind::Modified => {
-                self.on_file_modified(&event.path).await;
+                // An in-place edit of an already-tracked file is NOT a move
+                // candidate — dispatch it immediately so the common case adds zero
+                // latency. The buffered-delete check keeps OQ-D (a re-create at a
+                // path whose deletion we are deliberately holding) on the create
+                // path: the node still reads "live" only because the buffer has not
+                // tombstoned it yet.
+                let is_create = !self.path_has_live_node(&event.path).await
+                    || self.move_coalescer.has_pending_delete(&event.path);
+                if !is_create {
+                    self.on_file_modified(&event.path).await;
+                    return;
+                }
+                self.on_create_candidate(&event.path).await;
             }
             FileEventKind::Deleted => {
-                self.on_file_deleted(&event.path).await;
+                self.on_delete_candidate(&event.path).await;
+            }
+        }
+    }
+
+    /// Whether the index currently has a live node at `path`.
+    async fn path_has_live_node(&self, path: &str) -> bool {
+        let vault = self.vault.lock().await;
+        vault.index().node_for_path(path).is_some()
+    }
+
+    /// Feed a create-candidate `Modified` into the coalescer and act on its
+    /// decision: pair it into a move now, or buffer it for the window.
+    async fn on_create_candidate(&mut self, path: &str) {
+        let Some(hash) = self.hash_new_file(path).await else {
+            // Couldn't read/parse the new file — fall back to the standalone create
+            // path rather than buffering an event we can't pair. The coalescer is
+            // untouched, so the journal needs no rewrite here.
+            self.on_file_modified(path).await;
+            return;
+        };
+        match self.move_coalescer.on_create(hash, path) {
+            MoveDecision::Move { old_path, new_path } => {
+                self.emit_file_move(&old_path, &new_path).await;
+            }
+            MoveDecision::Buffered => {}
+        }
+        // Persist AFTER the mutation (a buffered create added a record, or a paired
+        // move popped both halves) so the journal reflects the post-commit state —
+        // the persist-after-commit invariant that makes pruning automatic (P4f-2).
+        self.persist_pending_moves().await;
+    }
+
+    /// Feed a delete-candidate `Deleted` into the coalescer and act on its
+    /// decision: pair it into a move now, or buffer it for the window.
+    ///
+    /// The doc's content hash is captured from its still-present `ContentDoc`
+    /// BEFORE any tombstone (the buffer holds the event; nothing is deleted until
+    /// the window resolves).
+    async fn on_delete_candidate(&mut self, path: &str) {
+        let Some((hash, uuid)) = self.hash_tracked_doc(path).await else {
+            // No content doc resolves for this path (an unknown/already-gone path) —
+            // it can't be the old half of a move; commit it standalone. The
+            // coalescer is untouched, so the journal needs no rewrite here.
+            self.on_file_deleted(path).await;
+            return;
+        };
+        match self.move_coalescer.on_delete(hash, path, uuid) {
+            MoveDecision::Move { old_path, new_path } => {
+                self.emit_file_move(&old_path, &new_path).await;
+            }
+            MoveDecision::Buffered => {}
+        }
+        // Persist AFTER the mutation (a buffered delete added a record, or a paired
+        // move popped both halves) — the post-commit snapshot (P4f-2).
+        self.persist_pending_moves().await;
+    }
+
+    /// Content hash AND document UUID of a tracked document at `path`. The hash is
+    /// in the same domain as [`Self::hash_new_file`] (both hash the canonical
+    /// materialized markdown); the UUID is the node's identity, carried through the
+    /// coalescer into the crash-recovery journal so a buffered move's lineage can be
+    /// re-stitched on boot (P4f-2). Both are read under ONE vault lock so they
+    /// describe the same snapshot of the node. `None` if no node resolves for the
+    /// path.
+    async fn hash_tracked_doc(&self, path: &str) -> Option<([u8; 32], Uuid)> {
+        let vault = self.vault.lock().await;
+        let node = vault.index().node_for_path(path)?;
+        let uuid = vault.index().node_uuid(&node)?;
+        let doc = vault.get_document(path).await.ok()?;
+        Some((vault_sync::content_hash(&doc), uuid))
+    }
+
+    /// Content hash of a not-yet-tracked `.md` on disk, built from its markdown so
+    /// it lands in the same hash domain as the delete side. The author is
+    /// irrelevant — [`vault_sync::content_hash`] is taken over the document's
+    /// materialized markdown, not its peer id.
+    async fn hash_new_file(&self, path: &str) -> Option<[u8; 32]> {
+        let vault = self.vault.lock().await;
+        let bytes = vault.read_raw(path).await.ok()?;
+        let content = String::from_utf8_lossy(&bytes);
+        let doc = vault_sync::ContentDoc::from_markdown(&content, 0).ok()?;
+        Some(vault_sync::content_hash(&doc))
+    }
+
+    /// Execute a matched move: re-parent the existing node (preserving its UUID and
+    /// content — `move_node` re-transfers nothing, INV-1), persist the index, and
+    /// broadcast the new path so peers apply the structural `tree.mov`.
+    ///
+    /// A same-path move (the OQ-D re-create) is a no-op in the index — the doc
+    /// stays alive under its UUID and no broadcast is needed.
+    async fn emit_file_move(&mut self, old_path: &str, new_path: &str) {
+        if old_path == new_path {
+            info!("Move coalesced to a same-path no-op: {}", old_path);
+            return;
+        }
+
+        let vault = self.vault.lock().await;
+        if let Err(e) = vault.index().move_node(old_path, new_path) {
+            error!(
+                "Failed to coalesce move {} -> {}: {}",
+                old_path, new_path, e
+            );
+            return;
+        }
+        if let Err(e) = vault.save_index().await {
+            error!(
+                "Failed to persist index after move {} -> {}: {}",
+                old_path, new_path, e
+            );
+            return;
+        }
+        drop(vault);
+
+        info!("Coalesced native move: {} -> {}", old_path, new_path);
+
+        let has_peers = self.peer_registry.lock().await.alive_count() > 0;
+        if has_peers && let Err(e) = self.vault_gossip.broadcast_change(new_path).await {
+            error!("Failed to broadcast move of {}: {}", new_path, e);
+        }
+    }
+
+    /// Sweep the coalescer for events whose window expired with no partner and
+    /// commit each to its standalone meaning. Driven by `move_sweep_tick`.
+    async fn sweep_pending_moves(&mut self) {
+        let expired = self.move_coalescer.sweep();
+        if expired.is_empty() {
+            // The common idle tick: nothing expired, so the pending set is
+            // unchanged and the journal needs no rewrite. Skipping the write here
+            // keeps the sweep off the journal's hot path.
+            return;
+        }
+        self.commit_expired(expired).await;
+        // The sweep removed expired records (and `commit_expired` finalized them
+        // standalone), so rewrite the journal from the now-smaller snapshot — the
+        // post-commit prune for the expiry path (P4f-2).
+        self.persist_pending_moves().await;
+    }
+
+    /// Graceful-shutdown drain (P4f-2c): force-expire EVERY buffered move record to
+    /// its standalone meaning, then clear the journal — so a clean quit leaves nothing
+    /// pending and the next boot has zero recovery work (OQ-A). Reuses the exact
+    /// standalone sinks the sweep and 2b boot-finalize use (`on_file_deleted` /
+    /// `on_file_modified` via `commit_expired`).
+    ///
+    /// Wait-free: pairing is eager, so the buffer holds only unpaired singletons at
+    /// shutdown — there is no partner to wait for, so the drain is bounded by the
+    /// commit work, not a timer. Layered on 2b's safety net: a crash mid-drain leaves
+    /// the un-cleared journal, which 2b recovers on the next boot to the SAME end
+    /// state — so 2c is a graceful-path optimization, not a data-safety requirement.
+    ///
+    /// The journal clear is ONE write AFTER the full drain (never incremental): a
+    /// crash before it re-runs the whole idempotent pass from the intact journal.
+    pub async fn drain_pending_moves(&mut self) {
+        let drained = self.move_coalescer.drain_all();
+        if !drained.is_empty() {
+            self.commit_expired(drained).await;
+        }
+        // Rewrite the journal empty now that the buffer is drained, so the next boot
+        // recovers nothing. `clear_pending_journal` is the 2b helper (re-exported from
+        // `daemon`); it writes a well-formed empty journal via the daemon's wired fs.
+        // Mirrors `persist_pending_moves`'s guard — an unwired fs degrades to "drained
+        // standalone but journal not re-cleared," which 2b then handles on next boot.
+        if let Some(fs) = self.fs.clone() {
+            move_recovery::clear_pending_journal(fs.as_ref()).await;
+        }
+    }
+
+    /// Dispatch each expired record to its standalone sink (the same handlers the
+    /// immediate-dispatch path used before coalescing).
+    async fn commit_expired(&mut self, expired: Vec<Expired>) {
+        for record in expired {
+            match record {
+                Expired::StandaloneDelete { path } => {
+                    self.on_file_deleted(&path).await;
+                }
+                Expired::StandaloneCreate { path } => {
+                    self.on_file_modified(&path).await;
+                }
+            }
+        }
+    }
+
+    /// Rewrite the move-coalescer's crash-recovery journal
+    /// (`.sync/pending-moves.json`) from the coalescer's current pending set, so a
+    /// move buffered in-memory survives a daemon crash within its window (P4f-2).
+    ///
+    /// **Persist-after-commit:** callers invoke this AFTER a buffer mutation
+    /// completes — a committed record has already left the coalescer's maps, so the
+    /// snapshot omits it and the rewrite prunes it. The full-rewrite-from-snapshot
+    /// (rather than an incremental shrink) makes pruning fall out for free and
+    /// avoids the partial-update bug class (a stale committed record that boot would
+    /// re-commit).
+    ///
+    /// **Durability — `atomic_write`, NOT fsync:** the temp+rename write fixes the
+    /// torn-file bug (a plain `write` crashed mid-flight could leave half-written
+    /// JSON the next boot mis-parses) AND survives a process crash (the kernel page
+    /// cache outlives process death). A per-mutation fsync is deliberately omitted:
+    /// it only buys power-loss durability, whose consequence here is benign (an
+    /// in-flight move degrades to delete+create — UUID churn, NO data loss) and
+    /// whose cost is an fsync per buffer mutation on every folder-move burst.
+    ///
+    /// No-op (with a `warn!`) if the fs handle was never wired — degrades to the
+    /// crash-tail rather than silently swallowing the journal.
+    async fn persist_pending_moves(&self) {
+        // Borrow discipline (NFR-1): take an owned snapshot and clone the fs handle
+        // out of `&self` BEFORE the write `.await` — never hold a coalescer borrow
+        // across it.
+        let Some(fs) = self.fs.clone() else {
+            warn!("Move-coalescer journal fs unwired; pending moves are not persisted");
+            return;
+        };
+        let file = PendingMovesFile {
+            version: PENDING_MOVES_VERSION,
+            pending: self.move_coalescer.snapshot(),
+        };
+        let bytes = match serde_json::to_vec(&file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize pending-moves journal: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = fs.atomic_write(PENDING_MOVES_FILE, &bytes).await {
+            error!("Failed to write pending-moves journal: {}", e);
+        }
+    }
+
+    /// Standalone-finalize the journaled records that boot re-stitch did NOT resolve
+    /// (P4f-2b-ii). Run once at boot AFTER `Vault::load_with_journal`, before the
+    /// run-loop spawns.
+    ///
+    /// A journaled DELETE whose `old_path` STILL has a live node after load is one the
+    /// re-stitch left alone — no content-matching orphan was found, so it was a real
+    /// deletion, not a move. Reconcile never tombstones a live node (that is a
+    /// data-loss class it refuses), so the daemon commits the deletion here via the
+    /// idempotent `on_file_deleted` sink. CREATE records need no finalize: reconcile's
+    /// per-file loop already minted a fresh-UUID node for any unmatched create (§1), so
+    /// the daemon ignores them.
+    ///
+    /// Idempotent on a re-boot (crash after re-stitch, before the journal was cleared):
+    /// a successful re-stitch vacated `old_path` and a prior finalize tombstoned it, so
+    /// `path_has_live_node(old_path)` is `false` either way and this skips. Even a stale
+    /// check is safe — `on_file_deleted` early-returns when `delete_file` reports the
+    /// path was already absent. At boot no peer is alive yet (`alive_count() == 0`), so
+    /// `on_file_deleted`'s broadcast is a structural no-op; the tombstone lands locally
+    /// and peers learn it on their next normal sync (correct CRDT behavior — §3.3).
+    pub async fn finalize_recovered_journal(&mut self, records: &[JournaledMove]) {
+        for record in records {
+            if record.kind != PendingKind::Delete {
+                continue; // creates are reconcile's job (§1)
+            }
+            if self.path_has_live_node(&record.path).await {
+                info!(
+                    "Boot finalize: unmatched journaled delete -> tombstone {}",
+                    record.path
+                );
+                self.on_file_deleted(&record.path).await;
             }
         }
     }
@@ -1310,7 +1697,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         // Always update vault state so .loro files stay current for future sync exchanges.
         // Without this, edits made while no peers are connected would be silently lost
-        // when a peer connects — prepare_sync_request trusts .loro state, with no fallback.
+        // when a peer connects — prepare_request trusts .loro state, with no fallback.
         let changed = match vault.on_file_changed(path).await {
             Ok(v) => v,
             Err(e) => {
@@ -1323,8 +1710,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // on_file_changed is sync-agnostic (called from both the watcher and reconcile
         // paths); the caller owns the flush decision. Reconcile batches to one save;
         // watcher events each flush here so a restart doesn't lose newly-created file nodes.
-        if let Err(e) = vault.save_registry().await {
-            error!("Failed to persist registry after file change for {}: {}", path, e);
+        if let Err(e) = vault.save_index().await {
+            error!(
+                "Failed to persist registry after file change for {}: {}",
+                path, e
+            );
             return;
         }
 
@@ -1357,10 +1747,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_neighbor_up(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
-        self.peer_registry
-            .lock()
-            .await
-            .on_neighbor_up(peer_id.clone());
+        self.peer_registry.lock().await.on_neighbor_up(peer_id);
         self.emit_status().await;
 
         if !self.is_peer_allowed(&peer_id).await {
@@ -1369,7 +1756,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let vault = self.vault.lock().await;
-        let request_bytes = match vault.prepare_sync_request().await {
+        let request_bytes = match vault.prepare_request().await {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Failed to prepare sync request for {}: {}", node_id, e);
@@ -1426,7 +1813,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let vault = self.vault.lock().await;
-        let request_bytes = match vault.prepare_sync_request().await {
+        let request_bytes = match vault.prepare_request().await {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!("Failed to prepare sync request for change pull: {}", e);
@@ -1561,16 +1948,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// device. Only one pairing session at a time — concurrent requests are dropped.
     async fn on_inbound_pairing_request(&mut self, exchange: InboundPairingExchange) {
         // Reject concurrent pairing attempts — only one session at a time.
-        if let Some(ref existing) = self.active_pairing {
-            if !existing.is_expired() {
-                warn!(
-                    device = %exchange.hello.device_name,
-                    "Pairing request rejected: session already active"
-                );
-                // Dropping reply_tx signals rejection to the handler.
-                drop(exchange.reply_tx);
-                return;
-            }
+        if let Some(ref existing) = self.active_pairing
+            && !existing.is_expired()
+        {
+            warn!(
+                device = %exchange.hello.device_name,
+                "Pairing request rejected: session already active"
+            );
+            // Dropping reply_tx signals rejection to the handler.
+            drop(exchange.reply_tx);
+            return;
         }
 
         let session = PairingSession::new(exchange.remote_id, &exchange.hello.device_name);
@@ -1645,13 +2032,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         self.active_pairing = None;
 
-        let allowed_peer = AllowedPeer::new(peer_id.clone(), device_name.clone());
+        let allowed_peer = AllowedPeer::new(peer_id, device_name.clone());
 
         // Bootstrap: if this is the first pairing, also add ourselves to the allowlist.
         let is_first_pair =
             matches!(self.allowlist.list_peers().await, Ok(peers) if peers.is_empty());
 
-        if let Err(e) = self.allowlist.add_peer(peer_id.clone(), &device_name).await {
+        if let Err(e) = self.allowlist.add_peer(peer_id, &device_name).await {
             error!("Failed to add paired peer to allowlist: {}", e);
             return;
         }
@@ -1701,55 +2088,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         self.active_pairing = None;
         warn!("Pairing failed for {}: {}", peer_id, reason);
     }
-
-    /// Handle an inbound sync request from a remote peer (via QUIC bi-stream).
-    async fn on_inbound_sync(&mut self, inbound: InboundSyncRequest) {
-        if !self.is_peer_allowed(&inbound.remote_id).await {
-            warn!(peer = %inbound.remote_id, "Inbound sync from non-allowlisted peer, dropping");
-            // Dropping reply_tx closes the QUIC stream without a response.
-            drop(inbound.reply_tx);
-            return;
-        }
-
-        let vault = self.vault.lock().await;
-        match vault.process_sync_message(&inbound.message_bytes).await {
-            Ok((response_bytes_opt, modified_paths)) => {
-                if !modified_paths.is_empty() {
-                    info!("Applied {} file(s) from inbound sync", modified_paths.len());
-                }
-
-                self.peer_registry
-                    .lock()
-                    .await
-                    .update_last_seen(&inbound.remote_id);
-                if let Err(e) = self
-                    .allowlist
-                    .update_last_seen(&inbound.remote_id, now_ms())
-                    .await
-                {
-                    warn!(
-                        "Failed to update allowlist last_seen for {}: {}",
-                        inbound.remote_id, e
-                    );
-                }
-
-                if let Some(resp_bytes) = response_bytes_opt {
-                    // reply_tx being dropped closes the stream without a response — that's fine.
-                    let _ = inbound.reply_tx.send(resp_bytes);
-                }
-            }
-            Err(e) => {
-                error!("Failed to process inbound sync message: {}", e);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod backoff_tests {
-    use super::{
-        HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, hint_attempt_due, per_hint_backoff,
-    };
+    use super::{HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, hint_attempt_due, per_hint_backoff};
     use crate::persistence::PeerRelay;
 
     // A failure count comfortably past the shift ceiling, to prove the clamp.

@@ -33,6 +33,7 @@ mod reconcile;
 mod state;
 mod tree;
 
+pub use reconcile::JournalReStitch;
 pub use state::{FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId};
 pub use tree::{FolderEntry, StructuralNode, SweptOrphan};
 
