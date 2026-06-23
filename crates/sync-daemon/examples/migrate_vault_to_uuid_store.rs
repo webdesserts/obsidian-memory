@@ -388,7 +388,7 @@ fn report<F: FileSystem>(vault: &Vault<F>, summary: &MigrationSummary) {
     println!("  content docs:   {} (one docs/<uuid>.loro per note)", summary.note_count);
     println!();
     println!("This is the CANONICAL store. On each laptop: stop the daemon, delete its");
-    println!("local .sync/ engine store (keeping its own daemon.key/daemon.toml), then COPY");
+    println!("local .sync/ engine store (keeping its own daemon.key/daemon.toml/allowlist.json), then COPY");
     println!("this vault's .sync/index.loro + .sync/docs/ + .sync/metadata.toml across.");
     println!("Laptops RE-CLONE — they must NOT re-run this migration (it would mint different");
     println!("UUIDs and cause a mass collision on first sync).");
