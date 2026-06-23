@@ -181,12 +181,11 @@ async fn main() -> Result<()> {
                             return;
                         }
                     };
-                    if let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                        if let Ok(data) = recv.read_to_end(1024).await {
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await
+                        && let Ok(data) = recv.read_to_end(1024).await {
                             let _ = send.write_all(&data).await;
                             let _ = send.finish();
                         }
-                    }
                     conn.closed().await;
                 });
             }

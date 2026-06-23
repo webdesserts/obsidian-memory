@@ -143,8 +143,8 @@ mod daemon_integration {
         lookup_b.add_endpoint_info(addr_a.clone());
         b.sync_node.endpoint.address_lookup()?.add(lookup_b);
 
-        a.allowlist.add_peer(b.node_id.clone(), "peer-b").await?;
-        b.allowlist.add_peer(a.node_id.clone(), "peer-a").await?;
+        a.allowlist.add_peer(b.node_id, "peer-b").await?;
+        b.allowlist.add_peer(a.node_id, "peer-a").await?;
 
         Ok(())
     }
@@ -4533,12 +4533,12 @@ mod daemon_integration {
         // Initiator: a node that opens the handshake. Its vault builds a real
         // `SyncRequest` opener so the responder's handler runs its true path.
         let initiator = build_node(81).await?;
-        let initiator_id = initiator.node_id.clone();
+        let initiator_id = initiator.node_id;
 
         // The handler allowlists once per connection (deny-on-error) — the initiator
         // must be allowed, or the inbound sync is dropped before it fires the signal.
         responder_allowlist
-            .add_peer(initiator_id.clone(), "initiator")
+            .add_peer(initiator_id, "initiator")
             .await?;
 
         // Teach the initiator how to reach the responder's endpoint.

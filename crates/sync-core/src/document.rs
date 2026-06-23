@@ -190,11 +190,10 @@ impl NoteDocument {
     pub fn stored_path(&self) -> Option<String> {
         let meta = self.doc.get_map(META_CONTAINER);
         let value = meta.get_deep_value();
-        if let loro::LoroValue::Map(map) = value {
-            if let Some(loro::LoroValue::String(s)) = map.get(META_PATH) {
+        if let loro::LoroValue::Map(map) = value
+            && let Some(loro::LoroValue::String(s)) = map.get(META_PATH) {
                 return Some(s.to_string());
             }
-        }
         None
     }
 
@@ -206,11 +205,10 @@ impl NoteDocument {
     pub fn doc_id(&self) -> Option<String> {
         let meta = self.doc.get_map(META_CONTAINER);
         let value = meta.get_deep_value();
-        if let loro::LoroValue::Map(map) = value {
-            if let Some(loro::LoroValue::String(s)) = map.get(META_DOC_ID) {
+        if let loro::LoroValue::Map(map) = value
+            && let Some(loro::LoroValue::String(s)) = map.get(META_DOC_ID) {
                 return Some(s.to_string());
             }
-        }
         None
     }
 

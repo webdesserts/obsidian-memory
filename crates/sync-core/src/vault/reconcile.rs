@@ -105,8 +105,7 @@ impl<F: FileSystem> Vault<F> {
                     let content = String::from_utf8_lossy(&bytes);
                     if let Ok(new_doc) =
                         NoteDocument::from_markdown(new_path, &content, self.loro_author)
-                    {
-                        if new_doc.content_hash() == orphaned_content_hash {
+                        && new_doc.content_hash() == orphaned_content_hash {
                             // Content matches - this is a move!
                             tracing::info!("File move detected: {} -> {}", old_path, new_path);
 
@@ -120,7 +119,6 @@ impl<F: FileSystem> Vault<F> {
                             matched_new_files.insert(new_path.clone());
                             break;
                         }
-                    }
                 }
             }
         }

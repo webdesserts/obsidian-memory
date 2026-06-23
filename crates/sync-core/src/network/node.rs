@@ -386,8 +386,8 @@ impl SyncNode {
 
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip_handler)
-            .accept(SYNC_ALPN.to_vec(), sync_handler)
-            .accept(PAIRING_ALPN.to_vec(), pairing_handler)
+            .accept(SYNC_ALPN, sync_handler)
+            .accept(PAIRING_ALPN, pairing_handler)
             .spawn();
 
         Ok(Self {

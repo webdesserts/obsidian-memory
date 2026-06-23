@@ -1750,7 +1750,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         self.peer_registry
             .lock()
             .await
-            .on_neighbor_up(peer_id.clone());
+            .on_neighbor_up(peer_id);
         self.emit_status().await;
 
         if !self.is_peer_allowed(&peer_id).await {
@@ -1951,8 +1951,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// device. Only one pairing session at a time — concurrent requests are dropped.
     async fn on_inbound_pairing_request(&mut self, exchange: InboundPairingExchange) {
         // Reject concurrent pairing attempts — only one session at a time.
-        if let Some(ref existing) = self.active_pairing {
-            if !existing.is_expired() {
+        if let Some(ref existing) = self.active_pairing
+            && !existing.is_expired() {
                 warn!(
                     device = %exchange.hello.device_name,
                     "Pairing request rejected: session already active"
@@ -1961,7 +1961,6 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 drop(exchange.reply_tx);
                 return;
             }
-        }
 
         let session = PairingSession::new(exchange.remote_id, &exchange.hello.device_name);
 
@@ -2035,13 +2034,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         self.active_pairing = None;
 
-        let allowed_peer = AllowedPeer::new(peer_id.clone(), device_name.clone());
+        let allowed_peer = AllowedPeer::new(peer_id, device_name.clone());
 
         // Bootstrap: if this is the first pairing, also add ourselves to the allowlist.
         let is_first_pair =
             matches!(self.allowlist.list_peers().await, Ok(peers) if peers.is_empty());
 
-        if let Err(e) = self.allowlist.add_peer(peer_id.clone(), &device_name).await {
+        if let Err(e) = self.allowlist.add_peer(peer_id, &device_name).await {
             error!("Failed to add paired peer to allowlist: {}", e);
             return;
         }

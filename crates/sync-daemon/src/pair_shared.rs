@@ -37,11 +37,10 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
 ) {
     // Bootstrap the allowlist on first pair: add self so the responder side's
     // sync requests are accepted once gossip joins.
-    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty()) {
-        if let Err(e) = allowlist.add_peer(self_peer_id, self_device_name).await {
+    if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty())
+        && let Err(e) = allowlist.add_peer(self_peer_id, self_device_name).await {
             warn!("Failed to add self to allowlist on first pair: {}", e);
         }
-    }
 
     for member_id in mesh_members {
         let peer = AllowedPeer::new(*member_id, "unknown");
@@ -290,7 +289,7 @@ mod tests {
         persist_adopted_relay(
             vault_path,
             responder_id,
-            &[responder_relay.clone()],
+            std::slice::from_ref(&responder_relay),
             Some(own_relay_url.clone()),
             &sync_node,
         )

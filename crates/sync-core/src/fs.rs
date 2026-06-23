@@ -235,7 +235,7 @@ impl FileSystem for InMemoryFs {
         files
             .get(&path)
             .cloned()
-            .ok_or_else(|| FsError::NotFound(path))
+            .ok_or(FsError::NotFound(path))
     }
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
@@ -283,14 +283,13 @@ impl FileSystem for InMemoryFs {
                         is_dir: false,
                     });
                 }
-            } else if prefix.is_empty() && !file_path.contains('/') {
-                if seen.insert(file_path.clone()) {
+            } else if prefix.is_empty() && !file_path.contains('/')
+                && seen.insert(file_path.clone()) {
                     entries.push(FileEntry {
                         name: file_path.clone(),
                         is_dir: false,
                     });
                 }
-            }
         }
 
         // List subdirectories
@@ -303,14 +302,13 @@ impl FileSystem for InMemoryFs {
                         is_dir: true,
                     });
                 }
-            } else if prefix.is_empty() && !dir_path.is_empty() && !dir_path.contains('/') {
-                if seen.insert(dir_path.clone()) {
+            } else if prefix.is_empty() && !dir_path.is_empty() && !dir_path.contains('/')
+                && seen.insert(dir_path.clone()) {
                     entries.push(FileEntry {
                         name: dir_path.clone(),
                         is_dir: true,
                     });
                 }
-            }
         }
 
         Ok(entries)
