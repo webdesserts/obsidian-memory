@@ -367,12 +367,3 @@ jobs:
     secrets: inherit
     permissions:
       "packages": "write"
-
-  custom-plugin:
-    needs:
-      - plan
-      - announce
-    uses: ./.github/workflows/plugin.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit

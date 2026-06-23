@@ -76,7 +76,7 @@ Only after Phase A passes.
 
 - **Relay path** — LAN peers go direct; umbra's relay isn't exercised here. Needs an off-LAN device to test.
 - **Mobile** — no working mobile sync in v0.5.x (WASM can't bind UDP in the mobile webview). Skip the phone.
-- **Obsidian plugin** — not needed for sync. Install later for the in-app dashboard: `cd plugin && npm install && npm run build:wasm && npm run build` (the wasm build needs a wasm-capable clang, e.g. Homebrew LLVM — Apple's default clang can't target wasm32), then copy `plugin/dist/obsidian-p2p-sync/*` → `<vault>/.obsidian/plugins/obsidian-p2p-sync/`.
+- **Obsidian plugin** — REMOVED from v0.5.x (2026-06-23; vault-sync is the go-forward engine, the plugin/sync-wasm path is no longer maintained). The Obsidian plugin + `sync-wasm` browser/mobile code is preserved at the **`v0.4.0` git tag** — reference that for any future Obsidian-mobile / plugin work (the plan is a thin rebuild on vault-sync + iroh).
 - **Persistent umbra service** — `cargo run` is a foreground dev process. Turning umbra's app into a launch-at-boot service (built `.app` + launchd) is a follow-up once the flow is proven.
 - **Multi-vault + in-app vault/folder picker** — deferred; one vault per app instance via `OBSIDIAN_MEMORY_VAULT` for now.
 - **Configurable health port** — currently hardcoded `8081`, overridden on umbra by a local edit; making it configurable (env var) is a small follow-up.

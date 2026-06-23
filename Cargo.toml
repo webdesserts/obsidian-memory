@@ -9,7 +9,6 @@ members = [
     "crates/auth-service",
     "crates/sync-core",
     "crates/sync-daemon",
-    "crates/sync-wasm",
     "crates/desktop",
     "crates/vault-sync",
 ]
