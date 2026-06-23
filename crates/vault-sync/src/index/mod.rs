@@ -39,6 +39,11 @@ pub use reconcile::JournalReStitch;
 pub use state::{FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId};
 pub use tree::{FolderEntry, StructuralNode, SweptOrphan};
 
+/// Test-only seam: shrink the sync-flag TTL so the over-suppression expiry path is
+/// checkable without a real 30s sleep. Not present in production builds.
+#[cfg(test)]
+pub(crate) use state::set_flag_ttl_for_test;
+
 use crate::fs::FileSystem;
 use loro::LoroDoc;
 use loro::TreeID;

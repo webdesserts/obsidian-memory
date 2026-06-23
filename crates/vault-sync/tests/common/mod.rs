@@ -16,6 +16,8 @@
 
 #![allow(dead_code)]
 
+pub mod case_insensitive_fs;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 

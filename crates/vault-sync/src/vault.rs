@@ -584,6 +584,23 @@ impl<F: FileSystem> Vault<F> {
     /// echo direction. The immediate `save_index` persists the tombstone so it
     /// survives a restart before the next inbound sync would record it.
     pub async fn delete_file(&self, path: &str) -> Result<bool> {
+        // Bug-2 echo-suppress: an inbound move-apply marks `mv.from` synced (in
+        // `cleanup_vacated_paths`, under the apply's vault lock) BEFORE it vacates the
+        // old path on disk. The watcher-delete that fires for that vacated path takes
+        // the SAME vault lock afterward, so any watcher-delete observing the vacated
+        // path is guaranteed to see the mark. Consume it here: a hit means this delete
+        // is the move's OWN echo — the node legitimately lives at the new path now, so
+        // tombstoning `mv.from` would destroy the moved document (the vanish bug). Skip
+        // the tombstone entirely and report `false` so the daemon does not re-broadcast.
+        //
+        // One-shot (consume + clear): the FIRST echo delete is suppressed; a GENUINE
+        // later delete of the same path (mark already consumed, or expired past
+        // FLAG_TTL) sees no mark and tombstones normally.
+        if self.index.sync_state.consume_synced(path) {
+            tracing::debug!("delete_file: suppressed move-echo delete for {}", path);
+            return Ok(false);
+        }
+
         // Resolve the UUID BEFORE the tombstone — `delete_node` strips the uuid cache,
         // so a lookup after it would fail and the content `.loro` would leak (Risk #1).
         // `Option<Uuid>` is `Copy`, so this snapshot survives the awaits below with no
@@ -759,5 +776,88 @@ impl<F: FileSystem> Vault<F> {
 
         tracing::debug!("Updated document via diff: {}", path);
         Ok(changed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::InMemoryFs;
+    use crate::index::set_flag_ttl_for_test;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const AUTHOR: u64 = 0x0101_0101_0101_0101;
+
+    async fn seeded_vault(path: &str) -> (Arc<InMemoryFs>, Vault<Arc<InMemoryFs>>) {
+        let fs = Arc::new(InMemoryFs::new());
+        let vault = Vault::init(Arc::clone(&fs), AUTHOR).await.unwrap();
+        fs.write(path, b"body").await.unwrap();
+        vault.on_file_changed(path).await.unwrap();
+        vault.save_index().await.unwrap();
+        (fs, vault)
+    }
+
+    /// Bug-2 echo-suppress: a delete of a path that was just marked synced by a
+    /// move-apply (the `mv.from` mark) is the move's OWN watcher-echo. `delete_file`
+    /// must consume the mark and return `Ok(false)` — NO tombstone, NO `.loro`
+    /// reclaim — so the live node the move re-pathed elsewhere is not destroyed and
+    /// the daemon does not re-broadcast a phantom delete.
+    #[tokio::test]
+    async fn delete_of_a_just_synced_path_is_suppressed_as_a_move_echo() {
+        let (fs, vault) = seeded_vault("Plans/a.md").await;
+        let uuid = vault.uuid_for_path("Plans/a.md").unwrap();
+
+        // The move-apply marks the vacated old path synced before the disk delete.
+        vault.mark_synced("Plans/a.md");
+
+        let removed = vault.delete_file("Plans/a.md").await.unwrap();
+
+        assert!(
+            !removed,
+            "a move-echo delete is suppressed: delete_file returns false"
+        );
+        assert!(
+            vault.index().node_for_path("Plans/a.md").is_some(),
+            "the live node is NOT tombstoned by the suppressed echo"
+        );
+        assert!(
+            !vault.index().is_path_deleted("Plans/a.md"),
+            "no resurrection guard is armed for a suppressed echo"
+        );
+        assert!(
+            fs.exists(&content_doc_path(&uuid)).await.unwrap(),
+            "the content .loro is NOT reclaimed by a suppressed echo"
+        );
+    }
+
+    /// Over-suppression bound: the synced mark expires (FLAG_TTL). A GENUINE delete
+    /// of the same path AFTER the mark expired is no longer suppressed — it tombstones
+    /// normally. Drives the expiry deterministically via the test-only TTL override
+    /// (production keeps the fixed 30s window).
+    #[tokio::test]
+    async fn genuine_delete_after_mark_expiry_still_tombstones() {
+        set_flag_ttl_for_test(Duration::from_millis(10));
+        let (fs, vault) = seeded_vault("notes/topic.md").await;
+        let uuid = vault.uuid_for_path("notes/topic.md").unwrap();
+
+        vault.mark_synced("notes/topic.md");
+        // Let the mark age past the (shrunk) TTL so it no longer suppresses.
+        std::thread::sleep(Duration::from_millis(25));
+
+        let removed = vault.delete_file("notes/topic.md").await.unwrap();
+
+        assert!(
+            removed,
+            "an expired mark does not suppress a genuine later delete"
+        );
+        assert!(
+            vault.index().node_for_path("notes/topic.md").is_none(),
+            "the genuine delete tombstones the node after the mark expired"
+        );
+        assert!(
+            !fs.exists(&content_doc_path(&uuid)).await.unwrap(),
+            "the genuine delete reclaims the content .loro"
+        );
     }
 }

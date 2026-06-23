@@ -342,7 +342,41 @@ pub struct SyncState {
 /// Time-to-live for sync flags. Flags older than this are considered stale.
 /// Set to 30s to provide safety margin for echo detection even with delayed file
 /// watchers.
+///
+/// Production always uses this fixed 30s window. Tests need to expire a flag
+/// without sleeping a real 30s, so under `cfg(test)` the TTL is read through
+/// [`flag_ttl`], which a test can shrink via [`set_flag_ttl_for_test`]. The
+/// override is strictly test-only — it does not exist in production builds.
 const FLAG_TTL: Duration = Duration::from_secs(30);
+
+/// The active sync-flag TTL. Production is always [`FLAG_TTL`]; a test may shrink
+/// the window (per-thread) so the over-suppression expiry path is checkable without
+/// a real 30s sleep.
+#[cfg(not(test))]
+#[inline]
+fn flag_ttl() -> Duration {
+    FLAG_TTL
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLAG_TTL_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn flag_ttl() -> Duration {
+    FLAG_TTL_OVERRIDE.with(|c| c.get()).unwrap_or(FLAG_TTL)
+}
+
+/// Override the sync-flag TTL for the current test thread (test-only).
+///
+/// Lets a test drive the genuine-later-delete-after-expiry path deterministically:
+/// set a tiny TTL, wait past it, and the consumed flag returns `false` so a real
+/// delete tombstones. Production has no such lever — the 30s window is fixed.
+#[cfg(test)]
+pub(crate) fn set_flag_ttl_for_test(ttl: Duration) {
+    FLAG_TTL_OVERRIDE.with(|c| c.set(Some(ttl)));
+}
 
 impl Default for SyncState {
     fn default() -> Self {
@@ -381,7 +415,7 @@ impl SyncState {
         self.pending_reconcile.lock().unwrap().remove(path);
         let mut paths = self.synced_paths.lock().unwrap();
         if let Some(timestamp) = paths.remove(path) {
-            if timestamp.elapsed() < FLAG_TTL {
+            if timestamp.elapsed() < flag_ttl() {
                 return true;
             }
             tracing::debug!(

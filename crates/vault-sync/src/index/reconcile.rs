@@ -94,6 +94,14 @@ impl<F: FileSystem> Vault<F> {
     ) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
 
+        // Recover any stray `*.casemv-tmp` directory a crash left between the two steps
+        // of a case-only directory rename (Fix-3 Facet A). This MUST run before the
+        // listing below: a stray dir's children look like brand-new files to the
+        // per-file loop, which would mint ghost UUIDs (the exact pollution this change
+        // fixes). The sweep completes the interrupted rename so the children survive at a
+        // real tracked path — never losing them.
+        self.sweep_stray_casemv_tmp().await;
+
         // Every markdown file on disk, and every document UUID with a content `.loro`.
         let md_files: HashSet<String> = self.list_files().await?.into_iter().collect();
         let doc_uuids = self.list_content_docs().await?;
@@ -194,6 +202,114 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(report)
+    }
+
+    /// Boot-time recovery for a crash BETWEEN the two steps of a case-only directory
+    /// rename (Fix-3 Facet A: `Foo` → `Foo.casemv-tmp` → `foo`). Step 1 leaves a stray
+    /// `Foo.casemv-tmp/` on disk that is NOT in the index; reconcile would otherwise see
+    /// its children as brand-new files and mint ghost UUIDs (the case-dup pollution this
+    /// change exists to prevent — P4f-2's journal does NOT cover Facet A's `fs.rename`).
+    ///
+    /// For each stray directory the sweep completes the interrupted rename to an
+    /// **unambiguous** target: the base name with the suffix stripped (`Foo`), preferring
+    /// the casing of an existing live folder node that matches it case-insensitively (so
+    /// recovery lands on the path the index already tracks). If the target is occupied by
+    /// a DIFFERENT real directory (an ambiguous collision), it LOUDLY warns and leaves the
+    /// stray for manual handling — NEVER silently losing the children. Best-effort: a
+    /// rename failure is logged, never propagated (it must not fail `Vault::load`).
+    ///
+    /// Once recovered to a tracked path, the case rename re-propagates through normal
+    /// sync (the sender's sweep re-detects the drift), so no convergence is lost.
+    async fn sweep_stray_casemv_tmp(&self) {
+        let suffix = Vault::<F>::CASEMV_TMP_SUFFIX;
+        let strays = match self.list_dirs_with_suffix(suffix).await {
+            Ok(dirs) => dirs,
+            Err(e) => {
+                warn!(
+                    "sweep_stray_casemv_tmp: failed to scan for stray dirs: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        for stray in strays {
+            let base = &stray[..stray.len() - suffix.len()];
+            // Prefer the casing of a live folder node that matches the base
+            // case-insensitively (recover toward what the index tracks); else the base.
+            let target = self
+                .index()
+                .folder_paths()
+                .into_iter()
+                .find(|f| !f.is_deleted && f.path.eq_ignore_ascii_case(base))
+                .map(|f| f.path)
+                .unwrap_or_else(|| base.to_string());
+
+            // Ambiguity guard: if the target already exists as a directory whose casing
+            // is NOT the stray's (a genuine other directory occupies it), do not clobber
+            // it — warn loudly and leave the stray for manual resolution.
+            match self.fs().exists(&target).await {
+                Ok(true) => {
+                    warn!(
+                        "sweep_stray_casemv_tmp: stray {} cannot be completed — target {} \
+                         already exists; leaving stray for manual handling (children NOT lost)",
+                        stray, target
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        "sweep_stray_casemv_tmp: cannot stat target {} for stray {}: {} — \
+                         leaving stray",
+                        target, stray, e
+                    );
+                    continue;
+                }
+            }
+
+            if let Err(e) = self.fs().rename(&stray, &target).await {
+                warn!(
+                    "sweep_stray_casemv_tmp: failed to complete {} -> {}: {} — leaving stray \
+                     for manual handling (children NOT lost)",
+                    stray, target, e
+                );
+            } else {
+                info!(
+                    "sweep_stray_casemv_tmp: recovered stray {} -> {} (crash mid case-rename)",
+                    stray, target
+                );
+            }
+        }
+    }
+
+    /// List every directory (at any depth, excluding `.sync`/hidden) whose final path
+    /// segment ends with `suffix`. Used by [`Self::sweep_stray_casemv_tmp`].
+    async fn list_dirs_with_suffix(&self, suffix: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut dirs_to_visit = vec![String::new()];
+
+        while let Some(dir) = dirs_to_visit.pop() {
+            let entries = self.fs().list(&dir).await?;
+            for entry in entries {
+                if !entry.is_dir {
+                    continue;
+                }
+                let path = if dir.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{}/{}", dir, entry.name)
+                };
+                if path.starts_with(".sync") || path.starts_with('.') {
+                    continue;
+                }
+                if entry.name.ends_with(suffix) {
+                    out.push(path.clone());
+                }
+                dirs_to_visit.push(path);
+            }
+        }
+        Ok(out)
     }
 
     /// Adopt orphaned content docs — the fs↔loro divergence heal and the native-move

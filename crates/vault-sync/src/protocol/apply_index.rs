@@ -35,6 +35,39 @@ use tracing::{debug, error, warn};
 
 use super::{DocId, Result};
 
+/// Whether `from` and `to` differ ONLY by ASCII case (a pure case rename).
+fn is_case_only(from: &str, to: &str) -> bool {
+    from != to && from.eq_ignore_ascii_case(to)
+}
+
+/// For a case-only move, find the shallowest DIRECTORY-segment prefix whose casing
+/// differs — the folder rename that subsumes this child move. Returns `None` when only
+/// the leaf filename's casing differs (a leaf case rename, not a folder one).
+///
+/// Both paths are assumed `is_case_only` (the caller's guard) and to have equal segment
+/// counts (a pure case rename never changes the path shape).
+fn case_drift_prefix(from: &str, to: &str) -> Option<(String, String)> {
+    let from_segs: Vec<&str> = from.split('/').collect();
+    let to_segs: Vec<&str> = to.split('/').collect();
+    if from_segs.len() != to_segs.len() {
+        return None;
+    }
+    let last = from_segs.len() - 1;
+    for (i, (fseg, tseg)) in from_segs.iter().zip(to_segs.iter()).enumerate() {
+        if fseg == tseg {
+            continue;
+        }
+        if i < last {
+            // A directory segment changed case: the shallowest such segment names the
+            // folder rename (all descendants follow via the one directory rename).
+            return Some((from_segs[..=i].join("/"), to_segs[..=i].join("/")));
+        }
+        // Only the leaf filename changed case.
+        return None;
+    }
+    None
+}
+
 /// A move detected during an Index import: a still-alive node that now lives at a
 /// different path than before.
 struct DetectedMove {
@@ -854,7 +887,35 @@ impl<F: FileSystem> Vault<F> {
             self.documents_mut().remove(path);
         }
 
+        // Fix-3 Facet A: a CASE-ONLY move (`from.eq_ignore_ascii_case(to) && from != to`)
+        // converges the on-disk casing via a real two-step `fs.rename` here, run purely
+        // for its side-effects.
+        self.converge_case_only_moves(&vacated.moves).await;
+
         for mv in &vacated.moves {
+            // A case-only move is NEVER routed through the write+delete path below —
+            // regardless of whether `converge_case_only_moves` above succeeded or its
+            // `fs.rename` failed. On a case-insensitive volume (APFS) the move's old and
+            // new paths share ONE physical inode and the old-cased directory still
+            // exists, so `remove_md_file(from)` + `rematerialize(to)` would:
+            //   - rewrite the `.md` back into the still-physical old-cased dir (APFS
+            //     resolves `plans/a.md` into the existing `Plans/`), leaving the casing
+            //     stuck at the old `Plans/` while the index says `plans/` — a
+            //     non-converging ping-pong against the sender; and
+            //   - on a device whose `.loro` is absent, delete-then-fail-rematerialize
+            //     loses the file outright.
+            // Skipping by `is_case_only` (not by a "handled" set) makes the skip total:
+            // it never depends on the converge step having populated a set on every
+            // failure branch. An unconverged-casing end state on rename failure is the
+            // honest outcome — no data loss, no write+delete. It does NOT self-heal here:
+            // the case-drift sweep is disk-as-truth (it emits `old=index_path →
+            // new=disk_path`), so the next sweep REVERTS this move fleet-wide toward the
+            // still-old-cased disk rather than re-converging to the new casing (the
+            // receiver-side index-as-truth re-convergence lives in a separate ticket).
+            if is_case_only(&mv.from, &mv.to) {
+                continue;
+            }
+
             // Remove the stale `.md` at the old path ONLY if no node re-took it. A swap
             // (another node moved in) or a cascade survivor (kept the loser's old path)
             // leaves the old `.md` belonging to the new occupant — removing it would
@@ -876,6 +937,140 @@ impl<F: FileSystem> Vault<F> {
         }
 
         Ok(())
+    }
+
+    /// Suffix used for the recognizable intermediate of a two-step directory case
+    /// rename (`Foo` → `Foo.casemv-tmp` → `foo`). A boot-time sweep
+    /// ([`Vault::sweep_stray_casemv_tmp`]) detects + recovers any stray directory
+    /// left by a crash between the two steps, so reconcile never ghosts on it.
+    pub(crate) const CASEMV_TMP_SUFFIX: &'static str = ".casemv-tmp";
+
+    /// Converge every CASE-ONLY move's on-disk casing via a real `fs.rename`. Run purely
+    /// for its filesystem side-effects — the caller skips every case-only move from the
+    /// write+delete loop by `is_case_only`, independent of what this does, so there is
+    /// no return value. A non-case-only move is left untouched.
+    ///
+    /// Folder-segment case renames are grouped by the shallowest differing directory
+    /// prefix and converged with ONE two-step directory rename per folder
+    /// (`Foo` → `Foo.casemv-tmp` → `foo`) — on APFS a single-step case-only directory
+    /// rename is a no-op, so the recognizable intermediate is required. A bare
+    /// leaf-FILENAME case change converges with one direct file rename (APFS re-cases a
+    /// file directly).
+    ///
+    /// For every renamed child this marks BOTH `mv.from` and `mv.to` synced BEFORE the
+    /// rename (inside the apply's vault lock-hold) — the load-bearing coupling with the
+    /// Bug-2 lib-side suppress: the directory rename makes the OS fire
+    /// `Deleted(Foo/child.md)` watcher events, and those are recognized as echoes (and
+    /// dropped) only because the mark was set first. NEVER tombstones / `delete_file`s
+    /// in this path (a rename is one relocation — the {old-alive,new-tombstoned}
+    /// intermediate must stay unconstructable).
+    async fn converge_case_only_moves(&self, moves: &[DetectedMove]) {
+        use std::collections::BTreeMap;
+
+        // Partition the case-only moves into folder-prefix groups and leaf-only moves.
+        // A folder group maps `(old_prefix, new_prefix)` → the child `from` paths under
+        // it; a leaf move re-cases only its filename. `BTreeMap` keeps the order stable
+        // (deterministic across replicas) and groups identical prefixes.
+        let mut folder_groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        let mut leaf_moves: Vec<&DetectedMove> = Vec::new();
+
+        for mv in moves {
+            if !is_case_only(&mv.from, &mv.to) {
+                continue;
+            }
+            match case_drift_prefix(&mv.from, &mv.to) {
+                Some((old_prefix, new_prefix)) => {
+                    folder_groups
+                        .entry((old_prefix, new_prefix))
+                        .or_default()
+                        .push(mv.from.clone());
+                }
+                None => leaf_moves.push(mv),
+            }
+        }
+
+        // Folder case renames: ONE two-step directory rename per renamed folder.
+        for ((old_prefix, new_prefix), children) in &folder_groups {
+            // Mark every child's from+to synced BEFORE the rename so the watcher-deletes
+            // the directory rename generates are recognized as echoes (Bug-2 coupling).
+            for from in children {
+                let to = format!("{}{}", new_prefix, &from[old_prefix.len()..]);
+                self.mark_synced(from);
+                self.mark_synced(&to);
+            }
+
+            let tmp = format!("{}{}", old_prefix, Self::CASEMV_TMP_SUFFIX);
+            if let Err(e) = self.fs().rename(old_prefix, &tmp).await {
+                // The casing stays at the old prefix this round — the caller's
+                // `is_case_only` skip already keeps these children off the write+delete
+                // path (which would have rewritten them back into the old-cased dir and
+                // re-armed the ping-pong), so the unconverged casing simply re-attempts
+                // the next time a case-only move for the node is applied. No file is
+                // touched here on failure, so there is nothing to recover.
+                warn!(
+                    "converge_case_only_moves: step 1 rename {} -> {} failed: {} \
+                     (casing left unconverged; re-attempts on the next case-only move)",
+                    old_prefix, tmp, e
+                );
+                continue;
+            }
+            if let Err(e) = self.fs().rename(&tmp, new_prefix).await {
+                // Step 1 ran but step 2 did not — a stray `*.casemv-tmp` dir is left on
+                // disk. The boot guard (`sweep_stray_casemv_tmp`) completes the rename to
+                // the index-tracked casing on the next load, UNLESS the target prefix is
+                // already occupied by a different real dir (then it loudly warns and
+                // leaves the stray — children never lost, but auto-heal can't fire).
+                error!(
+                    "converge_case_only_moves: step 2 rename {} -> {} failed: {} \
+                     (stray {} left for boot recovery via sweep_stray_casemv_tmp)",
+                    tmp, new_prefix, e, tmp
+                );
+                continue;
+            }
+
+            // Re-key the in-memory document cache for each renamed child to the new path.
+            for from in children {
+                let to = format!("{}{}", new_prefix, &from[old_prefix.len()..]);
+                let mut docs = self.documents_mut();
+                if let Some(doc) = docs.remove(from) {
+                    docs.insert(to.clone(), doc);
+                }
+                drop(docs);
+            }
+            debug!(
+                "converge_case_only_moves: directory case-rename {} -> {} ({} children)",
+                old_prefix,
+                new_prefix,
+                children.len()
+            );
+        }
+
+        // Leaf-filename case renames: one direct file rename each.
+        for mv in leaf_moves {
+            self.mark_synced(&mv.from);
+            self.mark_synced(&mv.to);
+            if let Err(e) = self.fs().rename(&mv.from, &mv.to).await {
+                // No file touched on failure — the caller's `is_case_only` skip keeps
+                // this leaf off the write+delete path (which would rewrite it into the
+                // old-cased name and re-arm the ping-pong). The casing stays unconverged
+                // and re-attempts the next time a case-only move for the node is applied.
+                warn!(
+                    "converge_case_only_moves: leaf rename {} -> {} failed: {} \
+                     (casing left unconverged; re-attempts on the next case-only move)",
+                    mv.from, mv.to, e
+                );
+                continue;
+            }
+            let mut docs = self.documents_mut();
+            if let Some(doc) = docs.remove(&mv.from) {
+                docs.insert(mv.to.clone(), doc);
+            }
+            drop(docs);
+            debug!(
+                "converge_case_only_moves: leaf case-rename {} -> {}",
+                mv.from, mv.to
+            );
+        }
     }
 
     /// Re-materialize a moved document's `.md` at its new path from the local
