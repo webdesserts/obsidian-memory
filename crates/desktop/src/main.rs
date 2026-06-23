@@ -137,7 +137,22 @@ mod tests {
 }
 
 fn main() -> Result<()> {
-    memory_common::init_tracing(false, "desktop");
+    // Resolve the log path and create its directory before initializing tracing.
+    // Using a stable directory name so the path survives the pending
+    // `desktop` → `memory-desktop` bundle rename (app_log_dir() would move at rename).
+    // Soft-fail on mkdir error so a permissions problem doesn't prevent the app from
+    // starting — logs fall through to stderr only in that case.
+    let log_path = memory_common::expand_tilde("~/Library/Logs/webdesserts-memory/desktop.log");
+    if let Some(log_dir) = log_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(log_dir) {
+            eprintln!("warning: could not create log directory {log_dir:?}: {e}");
+        }
+    }
+
+    // The WorkerGuard flushes the background log-writer thread when dropped. It must
+    // remain in scope for the full duration of main() so buffered lines aren't dropped
+    // early. tauri.run() is blocking, so _guard held here outlives the entire app run.
+    let _guard = memory_common::init_tracing_with_file(false, "desktop", &log_path);
 
     info!("Starting Memory");
 
