@@ -1747,10 +1747,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_neighbor_up(&mut self, node_id: EndpointId) {
         info!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
-        self.peer_registry
-            .lock()
-            .await
-            .on_neighbor_up(peer_id);
+        self.peer_registry.lock().await.on_neighbor_up(peer_id);
         self.emit_status().await;
 
         if !self.is_peer_allowed(&peer_id).await {
@@ -1952,15 +1949,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     async fn on_inbound_pairing_request(&mut self, exchange: InboundPairingExchange) {
         // Reject concurrent pairing attempts — only one session at a time.
         if let Some(ref existing) = self.active_pairing
-            && !existing.is_expired() {
-                warn!(
-                    device = %exchange.hello.device_name,
-                    "Pairing request rejected: session already active"
-                );
-                // Dropping reply_tx signals rejection to the handler.
-                drop(exchange.reply_tx);
-                return;
-            }
+            && !existing.is_expired()
+        {
+            warn!(
+                device = %exchange.hello.device_name,
+                "Pairing request rejected: session already active"
+            );
+            // Dropping reply_tx signals rejection to the handler.
+            drop(exchange.reply_tx);
+            return;
+        }
 
         let session = PairingSession::new(exchange.remote_id, &exchange.hello.device_name);
 

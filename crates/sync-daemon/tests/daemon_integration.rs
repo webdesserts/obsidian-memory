@@ -4507,14 +4507,15 @@ mod daemon_integration {
     /// `PeerId`. A regression that drops the handler's `inbound_seen_tx.send` (or
     /// hands the setter a different channel) would leave the receiver empty here.
     #[tokio::test]
-    async fn inbound_sync_fires_the_freshness_signal_for_the_wired_receiver()
-    -> anyhow::Result<()> {
+    async fn inbound_sync_fires_the_freshness_signal_for_the_wired_receiver() -> anyhow::Result<()>
+    {
         // Responder: a node holding the pumped handler, plus the receiver the daemon
         // would wire via `set_inbound_seen_rx`.
         let responder_fs = Arc::new(InMemoryFs::new());
         let responder_author = PeerId::from_secret_bytes(super::common::seed(80));
-        let responder_vault =
-            Arc::new(Mutex::new(Vault::init(responder_fs.clone(), responder_author.as_u64()).await?));
+        let responder_vault = Arc::new(Mutex::new(
+            Vault::init(responder_fs.clone(), responder_author.as_u64()).await?,
+        ));
         let responder_allowlist = Arc::new(InMemoryAllowlist::new());
         let (inbound_seen_tx, mut inbound_seen_rx) = mpsc::unbounded_channel();
         let handler = sync_daemon::daemon::PumpedSyncHandler::new(

@@ -182,10 +182,11 @@ async fn main() -> Result<()> {
                         }
                     };
                     if let Ok((mut send, mut recv)) = conn.accept_bi().await
-                        && let Ok(data) = recv.read_to_end(1024).await {
-                            let _ = send.write_all(&data).await;
-                            let _ = send.finish();
-                        }
+                        && let Ok(data) = recv.read_to_end(1024).await
+                    {
+                        let _ = send.write_all(&data).await;
+                        let _ = send.finish();
+                    }
                     conn.closed().await;
                 });
             }
@@ -213,7 +214,9 @@ async fn main() -> Result<()> {
             .await
             .map_err(|err| anyhow!("{err}"))
             .context("write")?;
-        send.finish().map_err(|err| anyhow!("{err}")).context("finish")?;
+        send.finish()
+            .map_err(|err| anyhow!("{err}"))
+            .context("finish")?;
         let echoed = recv
             .read_to_end(1024)
             .await

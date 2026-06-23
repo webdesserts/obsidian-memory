@@ -200,13 +200,15 @@ mod sync_workflow {
         device
             .sync_node
             .join_vault_gossip(&shared_vault_id(), vec![])
-            .await}
+            .await
+    }
 
     /// Subscribe device B to gossip, bootstrapping off device A.
     async fn subscribe_gossip_via(b: &TestDevice, a: &TestDevice) -> anyhow::Result<VaultGossip> {
         b.sync_node
             .join_vault_gossip(&shared_vault_id(), vec![a.sync_node.node_id()])
-            .await}
+            .await
+    }
 
     // ── file sync tests ───────────────────────────────────────────────────────
 

@@ -69,10 +69,11 @@ impl FileWatcher {
                         for event in events {
                             if let Some(file_event) =
                                 Self::process_event(&event, &vault_path_clone, &mtime_cache_clone)
-                                && event_tx.send(file_event).is_err() {
-                                    // Receiver dropped
-                                    return;
-                                }
+                                && event_tx.send(file_event).is_err()
+                            {
+                                // Receiver dropped
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -145,15 +146,17 @@ impl FileWatcher {
         let relative_path = relative.to_path_buf();
         if kind == FileEventKind::Modified {
             if let Ok(metadata) = std::fs::metadata(path)
-                && let Ok(mtime) = metadata.modified() {
-                    let mut cache = mtime_cache.lock().expect("mtime cache mutex poisoned");
-                    if let Some(last_mtime) = cache.get(&relative_path)
-                        && *last_mtime == mtime {
-                            // Mtime unchanged - spurious event, skip it
-                            return None;
-                        }
-                    cache.insert(relative_path, mtime);
+                && let Ok(mtime) = metadata.modified()
+            {
+                let mut cache = mtime_cache.lock().expect("mtime cache mutex poisoned");
+                if let Some(last_mtime) = cache.get(&relative_path)
+                    && *last_mtime == mtime
+                {
+                    // Mtime unchanged - spurious event, skip it
+                    return None;
                 }
+                cache.insert(relative_path, mtime);
+            }
         } else if kind == FileEventKind::Deleted {
             // Remove from cache when file is deleted
             let mut cache = mtime_cache.lock().expect("mtime cache mutex poisoned");

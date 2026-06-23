@@ -171,9 +171,10 @@ impl<F: FileSystem> Vault<F> {
             // Remove .loro document
             let sync_path = self.document_sync_path(path);
             if self.fs.exists(&sync_path).await.unwrap_or(false)
-                && let Err(e) = self.fs.delete(&sync_path).await {
-                    warn!("Failed to delete .loro file {}: {}", sync_path, e);
-                }
+                && let Err(e) = self.fs.delete(&sync_path).await
+            {
+                warn!("Failed to delete .loro file {}: {}", sync_path, e);
+            }
 
             // Remove from documents cache
             self.documents_mut().remove(path);

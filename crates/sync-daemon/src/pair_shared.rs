@@ -38,9 +38,10 @@ pub async fn write_pair_allowlist<AL: AllowlistStorage>(
     // Bootstrap the allowlist on first pair: add self so the responder side's
     // sync requests are accepted once gossip joins.
     if matches!(allowlist.list_peers().await, Ok(peers) if peers.is_empty())
-        && let Err(e) = allowlist.add_peer(self_peer_id, self_device_name).await {
-            warn!("Failed to add self to allowlist on first pair: {}", e);
-        }
+        && let Err(e) = allowlist.add_peer(self_peer_id, self_device_name).await
+    {
+        warn!("Failed to add self to allowlist on first pair: {}", e);
+    }
 
     for member_id in mesh_members {
         let peer = AllowedPeer::new(*member_id, "unknown");
@@ -129,10 +130,11 @@ pub async fn persist_adopted_relay(
     // off-LAN-reach store). `add_known_public_relay` self-guards on
     // off-LAN-reachability, so a same-LAN-only pair (private relay URL) is a
     // no-op here — the live lookup seed below still happens for that session.
-    if let Err(e) = crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
-        config.add_known_public_relay(&url_str)
-    })
-    .await
+    if let Err(e) =
+        crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
+            config.add_known_public_relay(&url_str)
+        })
+        .await
     {
         warn!("Failed to persist adopted public relay URL: {}", e);
         return;
