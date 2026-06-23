@@ -78,10 +78,7 @@ pub async fn one_vault(files: &[(&str, &str)]) -> (Vault<Arc<InMemoryFs>>, Arc<I
 /// process restart from a cold cache (the `.loro`/registry persist on disk while
 /// the in-memory document cache starts empty). Authored by `author(1)` to match
 /// `one_vault`. Used by the "survives reload" persistence and migration tests.
-pub async fn reload(
-    vault: Vault<Arc<InMemoryFs>>,
-    fs: &Arc<InMemoryFs>,
-) -> Vault<Arc<InMemoryFs>> {
+pub async fn reload(vault: Vault<Arc<InMemoryFs>>, fs: &Arc<InMemoryFs>) -> Vault<Arc<InMemoryFs>> {
     drop(vault);
     Vault::load(Arc::clone(fs), author(1)).await.unwrap()
 }

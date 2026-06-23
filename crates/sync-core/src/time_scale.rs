@@ -166,7 +166,13 @@ mod tests {
         assert_eq!(from_negative, base.mul_f64(MIN_SCALE));
 
         // ms variant: same clamp behavior, no panic.
-        assert_eq!(scaled_ms_with(60_000, f64::NAN), (60_000_f64 * MIN_SCALE) as u64);
-        assert_eq!(scaled_ms_with(60_000, -5.0), (60_000_f64 * MIN_SCALE) as u64);
+        assert_eq!(
+            scaled_ms_with(60_000, f64::NAN),
+            (60_000_f64 * MIN_SCALE) as u64
+        );
+        assert_eq!(
+            scaled_ms_with(60_000, -5.0),
+            (60_000_f64 * MIN_SCALE) as u64
+        );
     }
 }

@@ -20,8 +20,8 @@ mod common;
 use std::sync::Arc;
 
 use common::author;
-use sync_core::fs::{FileEntry, FileStat, FileSystem, FsError, InMemoryFs};
 use sync_core::Vault;
+use sync_core::fs::{FileEntry, FileStat, FileSystem, FsError, InMemoryFs};
 
 /// Seed a tombstoned-with-meta orphan and return a loaded vault whose
 /// `deleted_paths` is repopulated from the persisted tombstone, with the orphan

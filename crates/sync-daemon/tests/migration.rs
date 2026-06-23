@@ -81,8 +81,7 @@ mod migration {
         fs: &Arc<NativeFs>,
         originals: &[(String, String)],
     ) {
-        let md_files: BTreeSet<String> =
-            vault.list_files().await.unwrap().into_iter().collect();
+        let md_files: BTreeSet<String> = vault.list_files().await.unwrap().into_iter().collect();
         let nodes = file_nodes(vault);
 
         // Assertion 1: every `.md` is indexed with a UUID.
@@ -147,8 +146,7 @@ mod migration {
 
         // Assertion 7: folder paths preserved — the migrated `.md` set equals what was
         // staged on disk (the keys of `originals`).
-        let expected_md: BTreeSet<String> =
-            originals.iter().map(|(p, _)| p.clone()).collect();
+        let expected_md: BTreeSet<String> = originals.iter().map(|(p, _)| p.clone()).collect();
         assert_eq!(
             md_files, expected_md,
             "assertion 7: the migrated `.md` path set must equal the on-disk `.md` set"

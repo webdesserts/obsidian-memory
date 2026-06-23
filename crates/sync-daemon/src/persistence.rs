@@ -751,12 +751,16 @@ incarnation = 3
             "two distinct public relays, deduped; set was {:?}",
             loaded.known_public_relays
         );
-        assert!(loaded
-            .known_public_relays
-            .contains(&"https://umbra.computer/".to_string()));
-        assert!(loaded
-            .known_public_relays
-            .contains(&"https://relay.example.com/".to_string()));
+        assert!(
+            loaded
+                .known_public_relays
+                .contains(&"https://umbra.computer/".to_string())
+        );
+        assert!(
+            loaded
+                .known_public_relays
+                .contains(&"https://relay.example.com/".to_string())
+        );
     }
 
     /// An old daemon.toml without `known_public_relays` loads fine — the field
@@ -828,7 +832,10 @@ incarnation = 3
 
         // The file should contain the relay_url.
         let contents = fs::read_to_string(vault_path.join(".sync/daemon.toml")).unwrap();
-        assert!(contents.contains("relay_url"), "relay_url should be written");
+        assert!(
+            contents.contains("relay_url"),
+            "relay_url should be written"
+        );
 
         // Reload — relay_url must come back as None (runtime state, not preserved).
         let (reloaded, _) = DaemonConfig::load_or_generate(vault_path, None)

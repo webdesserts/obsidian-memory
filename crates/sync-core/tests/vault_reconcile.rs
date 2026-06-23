@@ -13,8 +13,8 @@ mod common;
 use std::sync::Arc;
 
 use common::author;
-use sync_core::fs::{FileEntry, FileStat, FileSystem, FsError, InMemoryFs};
 use sync_core::Vault;
+use sync_core::fs::{FileEntry, FileStat, FileSystem, FsError, InMemoryFs};
 
 #[tokio::test]
 async fn vault_init_reports_initialized() {

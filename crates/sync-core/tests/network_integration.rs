@@ -463,7 +463,11 @@ mod network_integration {
             received_roster.0, node_b_id,
             "AllowlistRoster.from should be B's id"
         );
-        assert_eq!(received_roster.1.len(), 2, "roster should carry both entries");
+        assert_eq!(
+            received_roster.1.len(),
+            2,
+            "roster should carry both entries"
+        );
         let received_tombstone = received_roster
             .1
             .iter()

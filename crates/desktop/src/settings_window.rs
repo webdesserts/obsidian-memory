@@ -43,6 +43,9 @@ pub fn open(app: &AppHandle) {
     });
 
     if let Err(e) = dispatch_result {
-        warn!("Failed to dispatch open settings window to main thread: {}", e);
+        warn!(
+            "Failed to dispatch open settings window to main thread: {}",
+            e
+        );
     }
 }

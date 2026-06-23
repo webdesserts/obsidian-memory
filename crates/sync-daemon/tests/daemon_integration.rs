@@ -4596,7 +4596,13 @@ mod daemon_integration {
     /// `sweep_case_drift` (and other handlers) directly and inspect the vault
     /// afterward. Joins gossip solo (no peer) so `broadcast_change` is gated off
     /// (`alive_count() == 0`) and the sweep's structural effect is isolated.
-    async fn build_daemon_no_loop(seed_byte: u8) -> (Daemon<Arc<InMemoryFs>, InMemoryAllowlist>, Arc<Mutex<Vault<Arc<InMemoryFs>>>>, Arc<InMemoryFs>) {
+    async fn build_daemon_no_loop(
+        seed_byte: u8,
+    ) -> (
+        Daemon<Arc<InMemoryFs>, InMemoryAllowlist>,
+        Arc<Mutex<Vault<Arc<InMemoryFs>>>>,
+        Arc<InMemoryFs>,
+    ) {
         let node = build_node(seed_byte).await.expect("build node");
         let gossip = node
             .sync_node
@@ -4696,16 +4702,12 @@ mod daemon_integration {
         // THE anti-ping-pong guarantee: NO live `Plans/` folder node remains, so
         // `materialize_folders` cannot re-mkdir the stale casing.
         let folders = vault.lock().await.index().folder_paths();
-        let stale_plans_alive = folders
-            .iter()
-            .any(|f| f.path == "Plans" && !f.is_deleted);
+        let stale_plans_alive = folders.iter().any(|f| f.path == "Plans" && !f.is_deleted);
         assert!(
             !stale_plans_alive,
             "the source folder node was re-homed by move_subtree — no orphaned live `Plans/` node"
         );
-        let lowercase_plans_alive = folders
-            .iter()
-            .any(|f| f.path == "plans" && !f.is_deleted);
+        let lowercase_plans_alive = folders.iter().any(|f| f.path == "plans" && !f.is_deleted);
         assert!(
             lowercase_plans_alive,
             "the re-homed folder node lives at the lowercase casing"
@@ -4720,7 +4722,12 @@ mod daemon_integration {
         let (mut daemon, vault, fs) = build_daemon_no_loop(61).await;
 
         fs.write("Plans/a.md", b"# A").await.unwrap();
-        vault.lock().await.on_file_changed("Plans/a.md").await.unwrap();
+        vault
+            .lock()
+            .await
+            .on_file_changed("Plans/a.md")
+            .await
+            .unwrap();
         fs.write("plans/a.md", b"# A").await.unwrap();
         fs.delete("Plans/a.md").await.unwrap();
 

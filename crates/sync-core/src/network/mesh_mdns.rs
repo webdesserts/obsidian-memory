@@ -52,6 +52,8 @@
 //! intentionally NOT extracted in `publish()` — it is managed separately via
 //! `set_user_data` to prevent iroh's auto-publish from clobbering our JSON.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -61,8 +63,6 @@ use std::{
     },
     time::Duration,
 };
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 
 use iroh::EndpointId;
 use iroh::address_lookup::{
@@ -73,7 +73,11 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use n0_future::boxed::BoxStream;
 use n0_future::task::AbortOnDropHandle;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc::{self, error::TrySendError}, watch, Notify};
+use tokio::sync::{
+    Notify,
+    mpsc::{self, error::TrySendError},
+    watch,
+};
 use tokio::time::{self, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace, warn};
@@ -272,11 +276,7 @@ impl AddressLookup for MeshMdns {
         let _ = self.sender.try_send(Message::SetRelayUrl(relay_url));
 
         // Extract direct IPv4 addresses so peers can attempt direct connections.
-        let addrs: Vec<SocketAddr> = data
-            .ip_addrs()
-            .filter(|sa| sa.is_ipv4())
-            .copied()
-            .collect();
+        let addrs: Vec<SocketAddr> = data.ip_addrs().filter(|sa| sa.is_ipv4()).copied().collect();
         if !addrs.is_empty() {
             let (port, ips) = socket_addrs_to_port_addrs(&addrs);
             let _ = self.sender.try_send(Message::RepublishAddrs(port, ips));
@@ -412,14 +412,8 @@ impl MeshMdns {
         let own_peer_id_bytes = *endpoint_id.as_bytes();
 
         // Build and register the initial ServiceInfo.
-        let initial_service_info = build_service_info(
-            &service_type,
-            &instance_name,
-            port,
-            &addrs,
-            None,
-            None,
-        );
+        let initial_service_info =
+            build_service_info(&service_type, &instance_name, port, &addrs, None, None);
         match initial_service_info {
             Ok(info) => {
                 if let Err(e) = daemon.register(info) {
@@ -525,8 +519,7 @@ impl MeshMdns {
                                         }
                                         trace!(%endpoint_id, "mDNS: service removed");
                                         peers.remove(&endpoint_id);
-                                        subscribers
-                                            .send(DiscoveryEvent::Expired { endpoint_id });
+                                        subscribers.send(DiscoveryEvent::Expired { endpoint_id });
                                     }
                                     Err(_) => {
                                         debug!(
@@ -571,7 +564,9 @@ impl MeshMdns {
                         // always reads a fresh deadline when it wakes from notified().
                         {
                             let mut guard = fast_until.lock().unwrap();
-                            *guard = Some(Instant::now() + crate::time_scale::scaled(FAST_PHASE_DURATION));
+                            *guard = Some(
+                                Instant::now() + crate::time_scale::scaled(FAST_PHASE_DURATION),
+                            );
                         }
                         requery_wake.notify_one();
 
@@ -749,9 +744,7 @@ impl MeshMdns {
     /// Routed through the actor channel so it is sequenced with any concurrent
     /// `RepublishAddrs` calls — prevents TXT state from diverging due to ordering.
     pub fn set_user_data(&self, json: &str) {
-        let _ = self
-            .sender
-            .try_send(Message::SetUserData(json.to_string()));
+        let _ = self.sender.try_send(Message::SetUserData(json.to_string()));
     }
 
     /// Update or clear the advertised relay URL TXT attribute.
@@ -881,7 +874,14 @@ fn reregister(
     user_data: Option<&str>,
     relay_url: Option<&str>,
 ) {
-    match build_service_info(service_type, instance_name, port, addrs, user_data, relay_url) {
+    match build_service_info(
+        service_type,
+        instance_name,
+        port,
+        addrs,
+        user_data,
+        relay_url,
+    ) {
         Ok(info) => {
             if let Err(e) = daemon.register(info) {
                 warn!("mDNS: re-register failed: {e}");
@@ -1047,8 +1047,14 @@ async fn handle_service_resolved(
 /// `Subscribe` replay path so the two cannot drift on `user_data` parsing
 /// semantics. Parse errors are silently swallowed here — callers that want
 /// the error logged (the live path) do so before calling this helper.
-fn discovered_event_from_snapshot(endpoint_id: EndpointId, snapshot: &PeerSnapshot) -> DiscoveryEvent {
-    let user_data = snapshot.user_data.as_deref().and_then(|s| s.parse::<UserData>().ok());
+fn discovered_event_from_snapshot(
+    endpoint_id: EndpointId,
+    snapshot: &PeerSnapshot,
+) -> DiscoveryEvent {
+    let user_data = snapshot
+        .user_data
+        .as_deref()
+        .and_then(|s| s.parse::<UserData>().ok());
     DiscoveryEvent::Discovered {
         endpoint_info: EndpointInfo {
             endpoint_id,
@@ -1117,23 +1123,19 @@ fn snapshot_to_address_lookup_item(
 ) -> AddressLookupItem {
     use iroh::{RelayUrl, TransportAddr};
 
-    let relay_url: Option<RelayUrl> = snapshot.relay_url.as_deref().and_then(|s| {
-        match s.parse() {
-            Ok(url) => Some(url),
-            Err(e) => {
-                debug!(%endpoint_id, "mDNS: failed to parse relay URL from snapshot: {e}");
-                None
-            }
+    let relay_url: Option<RelayUrl> = snapshot.relay_url.as_deref().and_then(|s| match s.parse() {
+        Ok(url) => Some(url),
+        Err(e) => {
+            debug!(%endpoint_id, "mDNS: failed to parse relay URL from snapshot: {e}");
+            None
         }
     });
 
-    let user_data: Option<UserData> = snapshot.user_data.as_deref().and_then(|s| {
-        match s.parse() {
-            Ok(ud) => Some(ud),
-            Err(e) => {
-                debug!(%endpoint_id, "mDNS: failed to parse user-data from snapshot: {e}");
-                None
-            }
+    let user_data: Option<UserData> = snapshot.user_data.as_deref().and_then(|s| match s.parse() {
+        Ok(ud) => Some(ud),
+        Err(e) => {
+            debug!(%endpoint_id, "mDNS: failed to parse user-data from snapshot: {e}");
+            None
         }
     });
 
@@ -1172,16 +1174,16 @@ pub(crate) fn socket_addrs_to_port_addrs(addrs: &[SocketAddr]) -> (u16, Vec<IpAd
 
 #[cfg(test)]
 mod tests {
+    use n0_future::StreamExt;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
-    use n0_future::StreamExt;
     use tokio::runtime::Handle;
 
     use iroh::{EndpointId, SecretKey};
 
     use super::{
-        strip_conflict_suffix, DiscoveryEvent, MeshMdns, PeerSnapshot,
-        FAST_PHASE_DURATION, FAST_REQUERY_INTERVAL, SLOW_REQUERY_INTERVAL,
+        DiscoveryEvent, FAST_PHASE_DURATION, FAST_REQUERY_INTERVAL, MeshMdns, PeerSnapshot,
+        SLOW_REQUERY_INTERVAL, strip_conflict_suffix,
     };
 
     // Helper: generate a deterministic test EndpointId from a seed byte.
@@ -1195,7 +1197,10 @@ mod tests {
     // Helper: a snapshot with user_data set.
     fn snapshot_with_data(user_data_str: &str) -> PeerSnapshot {
         PeerSnapshot {
-            addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 9000)],
+            addrs: vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                9000,
+            )],
             relay_url: None,
             user_data: Some(user_data_str.to_string()),
         }
@@ -1204,7 +1209,10 @@ mod tests {
     // Helper: a snapshot without user_data.
     fn snapshot_without_data() -> PeerSnapshot {
         PeerSnapshot {
-            addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9001)],
+            addrs: vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                9001,
+            )],
             relay_url: Some("https://relay.example.com".to_string()),
             user_data: None,
         }
@@ -1247,8 +1255,10 @@ mod tests {
         let user_data_str = r#"{"mesh":"Test Vault","vid":"0000000000000000","ver":1}"#;
 
         // Seed two peers into the actor before subscribing.
-        mdns.seed_peer_for_test(peer_with_data, snapshot_with_data(user_data_str)).await;
-        mdns.seed_peer_for_test(peer_without_data, snapshot_without_data()).await;
+        mdns.seed_peer_for_test(peer_with_data, snapshot_with_data(user_data_str))
+            .await;
+        mdns.seed_peer_for_test(peer_without_data, snapshot_without_data())
+            .await;
 
         // Subscribe after the seeds arrive; the actor should replay both.
         let mut stream = mdns.subscribe().await;
@@ -1278,8 +1288,14 @@ mod tests {
             }
         }
 
-        assert!(seen_ids.contains(&peer_with_data), "peer_with_data not replayed");
-        assert!(seen_ids.contains(&peer_without_data), "peer_without_data not replayed");
+        assert!(
+            seen_ids.contains(&peer_with_data),
+            "peer_with_data not replayed"
+        );
+        assert!(
+            seen_ids.contains(&peer_without_data),
+            "peer_without_data not replayed"
+        );
         assert!(user_data_round_tripped, "user_data did not round-trip");
     }
 
@@ -1296,14 +1312,16 @@ mod tests {
         let user_data_str = r#"{"mesh":"Order Test","vid":"1111111111111111","ver":1}"#;
 
         // Seed one peer before subscribing.
-        mdns.seed_peer_for_test(seeded_peer, snapshot_with_data(user_data_str)).await;
+        mdns.seed_peer_for_test(seeded_peer, snapshot_with_data(user_data_str))
+            .await;
 
         // Subscribe — the seeded peer should be replayed first.
         let mut stream = mdns.subscribe().await;
 
         // Immediately after subscribe, inject a live peer via SeedPeerForTest
         // (standing in for a live ServiceResolved event).
-        mdns.seed_peer_for_test(live_peer, snapshot_without_data()).await;
+        mdns.seed_peer_for_test(live_peer, snapshot_without_data())
+            .await;
 
         // First event must be the replayed seeded_peer, not the live_peer.
         let first_event = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -1348,13 +1366,21 @@ mod tests {
         let mdns = MeshMdns::new_for_test(own_id, &rt).expect("daemon started");
 
         // Initially inactive — no subscribers yet.
-        assert!(!mdns.requery_is_active(), "requery should be inactive before any subscriber");
+        assert!(
+            !mdns.requery_is_active(),
+            "requery should be inactive before any subscriber"
+        );
 
         // Subscribe — task should start.
         let stream1 = mdns.subscribe().await;
         // The channel send completes once the value lands in the buffer, but the
         // actor processes it asynchronously. Poll the flag with a short timeout.
-        wait_for(&mdns, true, "requery should be active after first subscriber").await;
+        wait_for(
+            &mdns,
+            true,
+            "requery should be active after first subscriber",
+        )
+        .await;
 
         // Drop the only subscriber. The actor's end-of-loop prune() call detects
         // the closed channel on the next message it processes.
@@ -1362,8 +1388,14 @@ mod tests {
 
         // Trigger the actor to process a message so it runs the prune check.
         let trigger_peer = test_endpoint_id(0x20);
-        mdns.seed_peer_for_test(trigger_peer, snapshot_without_data()).await;
-        wait_for(&mdns, false, "requery should be inactive after last subscriber dropped").await;
+        mdns.seed_peer_for_test(trigger_peer, snapshot_without_data())
+            .await;
+        wait_for(
+            &mdns,
+            false,
+            "requery should be inactive after last subscriber dropped",
+        )
+        .await;
 
         // Subscribing again restarts the task.
         let _stream2 = mdns.subscribe().await;
@@ -1409,7 +1441,8 @@ mod tests {
         // bridge never delivers any further Message::Peer events — which means the
         // subscriber never sees this Discovered event.
         let post_requery_peer = test_endpoint_id(0x30);
-        mdns.seed_peer_for_test(post_requery_peer, snapshot_without_data()).await;
+        mdns.seed_peer_for_test(post_requery_peer, snapshot_without_data())
+            .await;
 
         // The Discovered event must arrive within a generous timeout. On the broken
         // code this times out: the bridge exited after the first or second Requery.

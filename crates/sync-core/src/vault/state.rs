@@ -387,10 +387,7 @@ impl SyncState {
     /// Called synchronously by `delete_file` so an inbound DocumentUpdate arriving before
     /// the next registry sync is still guarded against resurrecting the just-deleted path.
     pub fn mark_path_deleted(&self, path: &str) {
-        self.deleted_paths
-            .lock()
-            .unwrap()
-            .insert(path.to_string());
+        self.deleted_paths.lock().unwrap().insert(path.to_string());
     }
 
     /// Replace the entire deleted-paths set with one freshly derived from registry truth.

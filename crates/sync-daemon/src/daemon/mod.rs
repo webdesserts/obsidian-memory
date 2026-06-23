@@ -1597,7 +1597,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
             // ONE batched save for the whole sweep (OQ-5).
             if let Err(e) = vault.save_index().await {
-                error!("Case-drift sweep: failed to persist index after re-homing: {}", e);
+                error!(
+                    "Case-drift sweep: failed to persist index after re-homing: {}",
+                    e
+                );
                 return;
             }
         }

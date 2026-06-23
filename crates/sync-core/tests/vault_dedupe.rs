@@ -16,8 +16,8 @@ mod common;
 use std::sync::Arc;
 
 use common::author;
-use sync_core::fs::{FileSystem, InMemoryFs};
 use sync_core::Vault;
+use sync_core::fs::{FileSystem, InMemoryFs};
 
 #[tokio::test]
 async fn find_registry_debris_ignores_healthy_node() {

@@ -115,8 +115,11 @@ pub async fn request_pairing(
     vault_id: String,
     control: State<'_, ControlState>,
 ) -> Result<PairSuccessResult, String> {
-    let device_name =
-        dispatch(&control, |reply| DaemonCommand::RequestPairing { vault_id, reply }).await??;
+    let device_name = dispatch(&control, |reply| DaemonCommand::RequestPairing {
+        vault_id,
+        reply,
+    })
+    .await??;
     Ok(PairSuccessResult { device_name })
 }
 
@@ -132,8 +135,12 @@ pub async fn submit_pair_code(
     code: String,
     control: State<'_, ControlState>,
 ) -> Result<PairSuccessResult, String> {
-    let device_name =
-        dispatch(&control, |reply| DaemonCommand::SubmitCode { code, vault_id, reply }).await??;
+    let device_name = dispatch(&control, |reply| DaemonCommand::SubmitCode {
+        code,
+        vault_id,
+        reply,
+    })
+    .await??;
     Ok(PairSuccessResult { device_name })
 }
 
@@ -177,9 +184,7 @@ pub struct SettingsPayload {
 ///
 /// Returns `Ok(())` if valid, or an error message suitable for display in the panel.
 fn validate_relay_url(relay_url: &str) -> Result<(), String> {
-    if relay_url.is_empty()
-        || relay_url.starts_with("http://")
-        || relay_url.starts_with("https://")
+    if relay_url.is_empty() || relay_url.starts_with("http://") || relay_url.starts_with("https://")
     {
         Ok(())
     } else {

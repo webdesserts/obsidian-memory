@@ -44,7 +44,10 @@ mod echo_suppression {
             .await
             .expect("first on_file_changed");
         // New document creation always counts as a change.
-        assert!(first, "on_file_changed should return true for a new document");
+        assert!(
+            first,
+            "on_file_changed should return true for a new document"
+        );
 
         // Now update the file content on disk and call on_file_changed again.
         fs.write("note.md", b"# Modified").await.expect("overwrite");
@@ -52,7 +55,10 @@ mod echo_suppression {
             .on_file_changed("note.md")
             .await
             .expect("second on_file_changed");
-        assert!(second, "on_file_changed should return true when body changes");
+        assert!(
+            second,
+            "on_file_changed should return true when body changes"
+        );
     }
 
     /// Calling `on_file_changed` twice with identical content returns `false`
@@ -69,14 +75,19 @@ mod echo_suppression {
             .await
             .expect("vault init");
 
-        fs.write("note.md", b"# Stable content").await.expect("write");
+        fs.write("note.md", b"# Stable content")
+            .await
+            .expect("write");
 
         // Index the file for the first time.
         let first = vault
             .on_file_changed("note.md")
             .await
             .expect("first on_file_changed");
-        assert!(first, "on_file_changed should return true for a new document");
+        assert!(
+            first,
+            "on_file_changed should return true for a new document"
+        );
 
         // Call again with identical disk content — no diff → false.
         let second = vault
@@ -109,14 +120,18 @@ mod echo_suppression {
             .expect("vault init");
 
         // Index the file with initial content.
-        fs.write("note.md", b"# Initial").await.expect("write initial");
+        fs.write("note.md", b"# Initial")
+            .await
+            .expect("write initial");
         vault
             .on_file_changed("note.md")
             .await
             .expect("index initial");
 
         // Edit the file on disk.
-        fs.write("note.md", b"# Edited after sync").await.expect("write edit");
+        fs.write("note.md", b"# Edited after sync")
+            .await
+            .expect("write edit");
 
         // A real content change is applied.
         let changed = vault
@@ -155,17 +170,19 @@ mod echo_suppression {
             .await
             .expect("vault init");
 
-        fs.write("to-delete.md", b"# Delete me").await.expect("write");
-        vault
-            .on_file_changed("to-delete.md")
+        fs.write("to-delete.md", b"# Delete me")
             .await
-            .expect("index");
+            .expect("write");
+        vault.on_file_changed("to-delete.md").await.expect("index");
 
         let deleted = vault
             .delete_file("to-delete.md")
             .await
             .expect("delete_file");
-        assert!(deleted, "delete_file should return true when deleting a live node");
+        assert!(
+            deleted,
+            "delete_file should return true when deleting a live node"
+        );
     }
 
     /// `delete_file` returns `false` when called a second time on the same path
@@ -178,11 +195,10 @@ mod echo_suppression {
             .await
             .expect("vault init");
 
-        fs.write("to-delete.md", b"# Delete me").await.expect("write");
-        vault
-            .on_file_changed("to-delete.md")
+        fs.write("to-delete.md", b"# Delete me")
             .await
-            .expect("index");
+            .expect("write");
+        vault.on_file_changed("to-delete.md").await.expect("index");
 
         let first_delete = vault
             .delete_file("to-delete.md")
@@ -214,17 +230,13 @@ mod echo_suppression {
             .await
             .expect("vault init");
 
-        fs.write("flagged.md", b"# Will be deleted").await.expect("write");
-        vault
-            .on_file_changed("flagged.md")
+        fs.write("flagged.md", b"# Will be deleted")
             .await
-            .expect("index");
+            .expect("write");
+        vault.on_file_changed("flagged.md").await.expect("index");
 
         // A real local delete tombstones the node.
-        let deleted = vault
-            .delete_file("flagged.md")
-            .await
-            .expect("delete_file");
+        let deleted = vault.delete_file("flagged.md").await.expect("delete_file");
         assert!(deleted, "delete_file must return true for a real delete");
 
         // The vault must now report the file as deleted (the tombstone is recorded

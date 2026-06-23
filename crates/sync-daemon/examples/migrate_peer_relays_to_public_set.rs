@@ -186,7 +186,7 @@ fn report(outcome: &MigrationOutcome) {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate_config, Table, Value};
+    use super::{Table, Value, migrate_config};
 
     /// An existing-mesh `daemon.toml` at upgrade time: a `[[peer_relays]]` block
     /// mixing a PUBLIC relay (`umbra.computer`) with a PRIVATE LAN-IP relay, plus

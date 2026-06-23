@@ -20,9 +20,9 @@ mod common;
 use std::sync::Arc;
 
 use common::author;
+use sync_core::Vault;
 use sync_core::fs::{FileSystem, InMemoryFs};
 use sync_core::vault::VaultError;
-use sync_core::Vault;
 
 const REGISTRY_FILE: &str = ".sync/registry.loro";
 const REGISTRY_TREE: &str = "files";

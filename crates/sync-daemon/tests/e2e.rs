@@ -339,7 +339,9 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
     let relay_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind relay port");
-    let relay_addr = relay_listener.local_addr().expect("Failed to get relay addr");
+    let relay_addr = relay_listener
+        .local_addr()
+        .expect("Failed to get relay addr");
     drop(relay_listener);
 
     // TEST-NET-2 (RFC 5737) — documentation address, never dialed.
@@ -371,7 +373,8 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
     toml_text.push_str(&format!(
         "\n[[peer_relays]]\nendpoint_id = \"{peer_relay_endpoint}\"\nrelay_url = \"{peer_relay_url}\"\nfailure_count = 2\n"
     ));
-    fs::write(vault_path.join(".sync/daemon.toml"), toml_text).expect("Failed to write seeded config");
+    fs::write(vault_path.join(".sync/daemon.toml"), toml_text)
+        .expect("Failed to write seeded config");
 
     let config = DaemonRunConfig {
         vault: vault_path.clone(),
@@ -407,8 +410,8 @@ async fn test_headless_startup_advertised_relay_url_and_hint_seeding() {
     }
 
     // --- Assert 1: relay_url in daemon.toml equals the ADVERTISED URL, not bound addr ---
-    let toml_contents =
-        fs::read_to_string(vault_path.join(".sync/daemon.toml")).expect("Failed to read daemon.toml");
+    let toml_contents = fs::read_to_string(vault_path.join(".sync/daemon.toml"))
+        .expect("Failed to read daemon.toml");
     assert!(
         toml_contents.contains(&advertised_url),
         "daemon.toml must contain the advertised relay URL ({advertised_url}), got:\n{toml_contents}"

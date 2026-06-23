@@ -145,10 +145,7 @@ impl AppSettings {
 ///    useful error message.
 ///
 /// Extracted as a pure function so it can be unit-tested without launching Tauri.
-pub fn resolve_vault_path(
-    env_vault: Option<&str>,
-    stored_vault: Option<&str>,
-) -> Option<PathBuf> {
+pub fn resolve_vault_path(env_vault: Option<&str>, stored_vault: Option<&str>) -> Option<PathBuf> {
     if let Some(v) = env_vault.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(v));
     }

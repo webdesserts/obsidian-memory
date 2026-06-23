@@ -43,9 +43,7 @@ impl NativeFs {
 impl FileSystem for NativeFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let full_path = self.full_path(path);
-        fs::read(&full_path)
-            .await
-            .map_err(|e| map_io_err(path, e))
+        fs::read(&full_path).await.map_err(|e| map_io_err(path, e))
     }
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {

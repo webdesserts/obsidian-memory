@@ -439,7 +439,10 @@ mod tests {
 
         let peers: Vec<AllowedPeer> = serde_json::from_str(json).unwrap();
         assert_eq!(peers.len(), 1);
-        assert!(!peers[0].removed, "missing `removed` field must default to live");
+        assert!(
+            !peers[0].removed,
+            "missing `removed` field must default to live"
+        );
         assert_eq!(peers[0].removed_at, None);
 
         let storage = InMemoryAllowlist::new();
@@ -539,7 +542,11 @@ mod tests {
 
         assert!(!storage.is_allowed(&c).await.unwrap());
         let peers = storage.list_peers().await.unwrap();
-        assert_eq!(peers.len(), 1, "tombstone replaces the live row, not appends");
+        assert_eq!(
+            peers.len(),
+            1,
+            "tombstone replaces the live row, not appends"
+        );
         assert!(peers[0].removed);
     }
 
@@ -555,7 +562,10 @@ mod tests {
 
         assert!(!storage.is_allowed(&c).await.unwrap());
         let peers = storage.list_peers().await.unwrap();
-        assert!(peers[0].removed, "a stale live row must not resurrect a tombstone");
+        assert!(
+            peers[0].removed,
+            "a stale live row must not resurrect a tombstone"
+        );
     }
 
     #[tokio::test]
@@ -588,7 +598,11 @@ mod tests {
         let peers = storage.list_peers().await.unwrap();
         assert_eq!(peers[0].device_name, "new-name", "name takes incoming");
         assert_eq!(peers[0].paired_at, 100, "paired_at takes the earliest");
-        assert_eq!(peers[0].last_seen, Some(80), "last_seen takes the most recent");
+        assert_eq!(
+            peers[0].last_seen,
+            Some(80),
+            "last_seen takes the most recent"
+        );
     }
 
     #[tokio::test]

@@ -17,8 +17,8 @@ mod common;
 use std::sync::Arc;
 
 use common::author;
-use sync_core::fs::{FileSystem, InMemoryFs};
 use sync_core::Vault;
+use sync_core::fs::{FileSystem, InMemoryFs};
 
 // ========== Registry-sync effects ==========
 

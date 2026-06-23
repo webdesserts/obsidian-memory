@@ -38,9 +38,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 use vault_sync::index::StructuralNode;
-use vault_sync::{
-    ContentDoc, FileSystem, InMemoryFs, Vault, content_doc_path, content_hash,
-};
+use vault_sync::{ContentDoc, FileSystem, InMemoryFs, Vault, content_doc_path, content_hash};
 
 /// A device's Loro author id (a Loro peer id). The migration mints UUIDs into the
 /// content docs; the author only stamps Loro ops, so any stable value works.
@@ -412,7 +410,10 @@ mod unicode_and_special_filenames {
     async fn unicode_emoji_and_spaces_migrate_intact() {
         let files = &[
             ("notes/café ☕ überschrift.md", "# Café\n\nUnicode title."),
-            ("notes/with spaces in name.md", "# Spaces\n\nSpaces in filename."),
+            (
+                "notes/with spaces in name.md",
+                "# Spaces\n\nSpaces in filename.",
+            ),
             ("emoji 🎉/party 🥳.md", "# Party\n\nEmoji folder and file."),
             ("日本語/ノート.md", "# 日本語\n\nJapanese path."),
         ];
@@ -431,8 +432,7 @@ mod large_files {
     #[tokio::test]
     async fn large_file_content_round_trips_without_truncation() {
         // ~3 MB of repeated paragraphs — comfortably past any small-buffer boundary.
-        let big_body = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-            .repeat(55_000);
+        let big_body = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(55_000);
         let big_md = format!("# Large note\n\n{big_body}");
         let files: &[(&str, &str)] = &[
             ("notes/large.md", &big_md),
@@ -502,7 +502,11 @@ mod frontmatter_normalization {
         // Make the normalization explicit and visible: the materialized markdown has
         // sorted keys and the collapsed blank-line run, and it is NOT byte-equal to the
         // messy original — yet assertion 6 (above) passed, which is the whole point.
-        let materialized = vault.get_document("notes/messy.md").await.unwrap().to_markdown();
+        let materialized = vault
+            .get_document("notes/messy.md")
+            .await
+            .unwrap()
+            .to_markdown();
         assert_ne!(
             materialized, messy,
             "precondition: the migration genuinely normalized the messy original \
@@ -554,9 +558,10 @@ mod non_markdown_files_present {
             ("notes/keep.md", "# Keep\n\nA real note."),
             ("notes/also.md", "# Also\n\nAnother real note."),
         ];
-        let expected_md: BTreeSet<String> = ["notes/keep.md".to_string(), "notes/also.md".to_string()]
-            .into_iter()
-            .collect();
+        let expected_md: BTreeSet<String> =
+            ["notes/keep.md".to_string(), "notes/also.md".to_string()]
+                .into_iter()
+                .collect();
 
         // Only the two `.md` files migrated; the contract's count assertion (2) pins
         // that the `.png`/`.txt`/`.DS_Store` produced no phantom nodes.

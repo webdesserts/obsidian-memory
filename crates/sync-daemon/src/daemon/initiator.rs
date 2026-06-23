@@ -18,8 +18,8 @@ use sync_core::network::pairing::pair_with_mesh_interactive;
 // `VaultId` here is the mesh's id recovered from the gossip topic (a
 // `sync_core::VaultId`), used by the iroh layer. It is bridged to a
 // `vault_sync::VaultId` only at the `vault.adopt_vault_id` boundary below.
+use sync_core::pairing::PairingHello;
 use sync_core::{PeerId, VaultId};
-use sync_core::pairing::{PairingHello};
 use vault_sync::fs::FileSystem;
 
 use super::Daemon;
@@ -87,7 +87,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             });
         }
         if let Some(ref session) = self.active_initiator {
-            session.discovered.lock().await.insert(vault_id, endpoint_id);
+            session
+                .discovered
+                .lock()
+                .await
+                .insert(vault_id, endpoint_id);
         }
     }
 
@@ -296,7 +300,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             let map = session.discovered.lock().await;
             if !map.contains_key(&vault_id) {
                 let _ = reply.send(Err(
-                    "That mesh is no longer the active pairing target.".to_string(),
+                    "That mesh is no longer the active pairing target.".to_string()
                 ));
                 return;
             }
@@ -318,7 +322,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             let reply = session.submit_reply.take();
             if let Some(r) = reply {
                 let _ = r.send(Err(
-                    "Pairing request is no longer active. Try again.".to_string(),
+                    "Pairing request is no longer active. Try again.".to_string()
                 ));
             }
         }
@@ -347,7 +351,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             .and_then(|s| s.submit_reply.take());
 
         let Some(reply) = reply else {
-            warn!("on_initiator_pair_outcome: no submit_reply to route result (session cancelled?)");
+            warn!(
+                "on_initiator_pair_outcome: no submit_reply to route result (session cancelled?)"
+            );
             return;
         };
 
@@ -375,7 +381,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // failure rather than a silent success: skipping adoption would land the
         // device on the wrong gossip topic, so pairing "succeeds" but sync never
         // works. Surfacing the error lets the user retry instead.
-        let Some(new_vault_id) = crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic)
+        let Some(new_vault_id) =
+            crate::pair_shared::vault_id_from_pairing_topic(result.vault_topic)
         else {
             error!("Pairing succeeded but the mesh did not provide a vault topic");
             let _ = reply.send(Err(
@@ -533,30 +540,25 @@ async fn run_initiator_pairing_parked(
     let connect_reply_cell = Arc::new(Mutex::new(Some(connect_reply)));
     let connect_reply_for_closure = connect_reply_cell.clone();
 
-    let result = pair_with_mesh_interactive(
-        endpoint,
-        peer_endpoint_id,
-        &hello,
-        move |challenge| {
-            let setter = captured_device_name_setter.clone();
-            let reply_cell = connect_reply_for_closure.clone();
-            let code_rx = code_rx; // move into closure — runs exactly once
-            async move {
-                let responder_name = challenge.device_name.clone();
-                *setter.lock().await = responder_name.clone();
+    let result = pair_with_mesh_interactive(endpoint, peer_endpoint_id, &hello, move |challenge| {
+        let setter = captured_device_name_setter.clone();
+        let reply_cell = connect_reply_for_closure.clone();
+        let code_rx = code_rx; // move into closure — runs exactly once
+        async move {
+            let responder_name = challenge.device_name.clone();
+            *setter.lock().await = responder_name.clone();
 
-                // Signal the GUI: connection established, responder is showing its code.
-                if let Some(reply) = reply_cell.lock().await.take() {
-                    let _ = reply.send(Ok(responder_name));
-                }
-
-                // Park here until SubmitCode delivers the typed code.
-                code_rx
-                    .await
-                    .map_err(|_| anyhow::anyhow!("pairing cancelled before code was entered"))
+            // Signal the GUI: connection established, responder is showing its code.
+            if let Some(reply) = reply_cell.lock().await.take() {
+                let _ = reply.send(Ok(responder_name));
             }
-        },
-    )
+
+            // Park here until SubmitCode delivers the typed code.
+            code_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("pairing cancelled before code was entered"))
+        }
+    })
     .await;
 
     match result {

@@ -886,7 +886,10 @@ mod ac_p4f_2b_journal_restitch {
 
         // Distinct content means distinct UUIDs and distinct hashes — the two records do
         // not compete for the same orphan.
-        assert_ne!(uuid_a, uuid_b, "precondition: the two moves are distinct documents");
+        assert_ne!(
+            uuid_a, uuid_b,
+            "precondition: the two moves are distinct documents"
+        );
 
         let journaled = vec![
             JournalReStitch {

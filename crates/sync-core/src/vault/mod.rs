@@ -17,12 +17,12 @@ use std::collections::HashMap;
 // The interior-mutability wrappers for the Vault struct fork by target: native uses
 // Arc/Mutex (multi-threaded Tokio), wasm uses Rc/RefCell (single-threaded browser).
 // SyncState owns its own unconditional Arc<Mutex<…>> over in state.rs.
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Mutex};
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
 
 // ========== Debug API Types ==========
 
@@ -1251,7 +1251,9 @@ mod tests {
         vault.delete_file("recreated.md").await.unwrap();
 
         // User recreates the file and it is registered live again (fresh node).
-        fs.write("recreated.md", b"# Recreated by user").await.unwrap();
+        fs.write("recreated.md", b"# Recreated by user")
+            .await
+            .unwrap();
         vault.register_file("recreated.md").unwrap();
 
         // Precondition: deleted_paths is still armed (register_file doesn't clear it),
@@ -1421,7 +1423,10 @@ mod tests {
         let stats = vault.apply_dedupe(&report).await.unwrap();
 
         assert_eq!(stats.groups_deduped, 1, "one group was deduped");
-        assert_eq!(stats.nodes_tombstoned, 1, "exactly the loser was tombstoned");
+        assert_eq!(
+            stats.nodes_tombstoned, 1,
+            "exactly the loser was tombstoned"
+        );
         assert_eq!(stats.relics_tombstoned, 0, "no relics in this fixture");
 
         let tree = vault.file_tree();
@@ -1525,9 +1530,15 @@ mod tests {
         let stats = vault.apply_dedupe(&report).await.unwrap();
 
         assert_eq!(stats.relics_tombstoned, 1, "the relic must be tombstoned");
-        assert_eq!(stats.groups_deduped, 0, "no duplicate groups in this fixture");
+        assert_eq!(
+            stats.groups_deduped, 0,
+            "no duplicate groups in this fixture"
+        );
         assert!(
-            vault.file_tree().is_node_deleted(&relic_id).unwrap_or(false),
+            vault
+                .file_tree()
+                .is_node_deleted(&relic_id)
+                .unwrap_or(false),
             "the relic node must be tombstoned"
         );
     }
