@@ -28,11 +28,13 @@
 //! fs-agnostic. The public `Vault<F>` handle (a later chunk) owns the fs, the
 //! content docs, and the flows that tie them to the Index.
 
+mod case_drift;
 mod digest;
 mod reconcile;
 mod state;
 mod tree;
 
+pub use case_drift::{CaseDrift, FileCaseMove, FolderCaseMove};
 pub use reconcile::JournalReStitch;
 pub use state::{FileMove, IndexError, ReconcileReport, Result, SyncMetadata, SyncState, VaultId};
 pub use tree::{FolderEntry, StructuralNode, SweptOrphan};

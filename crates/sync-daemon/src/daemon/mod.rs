@@ -98,6 +98,17 @@ const STALE_FAILURE_THRESHOLD: u32 = 5;
 /// stated 3-machine scale and negligible fan-out.
 const ROSTER_RECONCILE_MS: u64 = 60_000;
 
+/// How often the case-drift sweep lists the vault and reconciles disk-vs-index
+/// folder/file casing (Bug 1). A folder case-rename on a case-INSENSITIVE
+/// filesystem fires no watcher delete (the old casing still resolves), so the
+/// event path can't see it — this dedicated sweep is the reliable signal. A few
+/// seconds keeps the ghost-minting window between a rename and its detection
+/// small while staying off the per-event hot path. Deliberately NOT piggybacked
+/// on the reconcile/move-sweep timer (it is a distinct, independently-tunable
+/// concern), and ALSO triggerable on demand so a controlled fleet rename fires
+/// it immediately rather than waiting the interval.
+const CASE_DRIFT_SWEEP_MS: u64 = 3_000;
+
 /// Per-hint exponential backoff window from a hint's consecutive failure count.
 ///
 /// `HINT_BACKOFF_BASE_MS << min(failure_count, HINT_BACKOFF_CEIL)`, saturating
@@ -328,6 +339,11 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// event whose partner never arrived commits to its standalone meaning (a real
     /// tombstone or a real new doc) once its window passes.
     move_sweep_tick: tokio::time::Interval,
+    /// Drives the case-drift sweep (Bug 1): a folder/file case-rename on a
+    /// case-insensitive fs fires no watcher delete, so a periodic disk-vs-index
+    /// casing reconcile is the only reliable detection. Dedicated (not the
+    /// move-sweep timer) and also reachable on demand via [`Self::sweep_case_drift`].
+    case_drift_sweep_tick: tokio::time::Interval,
     /// Filesystem handle for writing the move-coalescer's crash-recovery journal
     /// (`.sync/pending-moves.json`, P4f-2). The daemon writes the journal — NOT the
     /// coalescer (which stays pure) and NOT `persistence.rs` (which writes through
@@ -378,6 +394,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let mut move_sweep_tick = tokio::time::interval(MoveCoalescer::sweep_interval());
         move_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // The case-drift sweep wakes on its own few-second cadence (scaled for
+        // tests). `Delay` skips missed ticks rather than bursting after a slow turn.
+        let mut case_drift_sweep_tick = tokio::time::interval(scaled(
+            std::time::Duration::from_millis(CASE_DRIFT_SWEEP_MS),
+        ));
+        case_drift_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         Self {
             vault,
             sync_node,
@@ -415,6 +438,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             roster_reconcile_interval_ms: scaled_ms(ROSTER_RECONCILE_MS),
             move_coalescer: MoveCoalescer::new(),
             move_sweep_tick,
+            case_drift_sweep_tick,
             // Wired post-construction (startup.rs / tests via `set_fs`); `None`
             // means the crash-recovery journal write is inert, like an unwired
             // `inbound_seen_rx`.
@@ -592,6 +616,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
                 _ = self.move_sweep_tick.tick() => {
                     self.sweep_pending_moves().await;
+                }
+
+                _ = self.case_drift_sweep_tick.tick() => {
+                    self.sweep_case_drift().await;
                 }
 
                 _ = self.shutdown.cancelled() => {
@@ -1502,6 +1530,85 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let has_peers = self.peer_registry.lock().await.alive_count() > 0;
         if has_peers && let Err(e) = self.vault_gossip.broadcast_change(new_path).await {
             error!("Failed to broadcast move of {}: {}", new_path, e);
+        }
+    }
+
+    /// List the vault and re-home any case-only drift between disk and index
+    /// (Bug 1). Folder-level renames go through `move_subtree` (one per folder),
+    /// leaf-filename renames through `move_node` — both UUID-preserving. Exactly
+    /// ONE `save_index` covers the whole sweep (not one per move): a 198-file
+    /// folder rename is one subtree move + one save, and a crash mid-sweep leaves
+    /// the index either fully pre- or fully post-save, never partial.
+    ///
+    /// Driven by `case_drift_sweep_tick` and also callable on demand. Idempotent:
+    /// once a move re-paths the node, the next sweep finds the casing already in
+    /// agreement and detects no drift.
+    pub async fn sweep_case_drift(&mut self) {
+        // Detect → apply → persist must run as ONE critical section under a single
+        // continuous vault-lock hold: a concurrent mutation slipping in between the
+        // drift snapshot and the apply could make the moves act on stale paths
+        // (re-homing a node that no longer lives where the snapshot saw it). The lock
+        // is released BEFORE the network broadcast — never held across an await on the
+        // wire — so the gossip send below runs unlocked.
+        let mut applied: Vec<String> = Vec::new();
+        {
+            let vault = self.vault.lock().await;
+            let disk_paths = match vault.list_files().await {
+                Ok(paths) => paths,
+                Err(e) => {
+                    error!("Case-drift sweep failed to list vault files: {}", e);
+                    return;
+                }
+            };
+            let drift = vault.index().detect_case_drift(&disk_paths);
+            if drift.is_empty() {
+                return;
+            }
+
+            // Apply every move, then persist ONCE.
+            // Folder moves first so a re-homed subtree settles before any leaf move.
+            for fm in &drift.folder_moves {
+                if let Err(e) = vault.index().move_subtree(&fm.old_prefix, &fm.new_prefix) {
+                    error!(
+                        "Case-drift sweep: failed to re-home folder {} -> {}: {}",
+                        fm.old_prefix, fm.new_prefix, e
+                    );
+                    continue;
+                }
+                info!(
+                    "Case-drift sweep re-homed folder: {} -> {}",
+                    fm.old_prefix, fm.new_prefix
+                );
+                applied.push(fm.new_prefix.clone());
+            }
+            for fm in &drift.file_moves {
+                if let Err(e) = vault.index().move_node(&fm.old_path, &fm.new_path) {
+                    error!(
+                        "Case-drift sweep: failed to re-home file {} -> {}: {}",
+                        fm.old_path, fm.new_path, e
+                    );
+                    continue;
+                }
+                info!(
+                    "Case-drift sweep re-homed file: {} -> {}",
+                    fm.old_path, fm.new_path
+                );
+                applied.push(fm.new_path.clone());
+            }
+            // ONE batched save for the whole sweep (OQ-5).
+            if let Err(e) = vault.save_index().await {
+                error!("Case-drift sweep: failed to persist index after re-homing: {}", e);
+                return;
+            }
+        }
+
+        let has_peers = self.peer_registry.lock().await.alive_count() > 0;
+        if has_peers {
+            for new_path in &applied {
+                if let Err(e) = self.vault_gossip.broadcast_change(new_path).await {
+                    error!("Case-drift sweep: failed to broadcast {}: {}", new_path, e);
+                }
+            }
         }
     }
 
