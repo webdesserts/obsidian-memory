@@ -96,11 +96,10 @@ pub async fn persist_adopted_relay(
     // off-LAN-reach store). `add_known_public_relay` self-guards on
     // off-LAN-reachability, so a same-LAN-only pair (private relay URL) is a
     // no-op here — the live lookup seed below still happens for that session.
-    if let Err(e) =
-        crate::persistence::persist_config_change(vault_path, self_relay_url, |config| {
-            config.add_known_public_relay(&url_str)
-        })
-        .await
+    if let Err(e) = p2p_core::persist_config_change(vault_path, self_relay_url, |config| {
+        config.add_known_public_relay(&url_str)
+    })
+    .await
     {
         warn!("Failed to persist adopted public relay URL: {}", e);
         return;
