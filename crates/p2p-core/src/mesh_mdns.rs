@@ -82,7 +82,7 @@ use tokio::time::{self, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, trace, warn};
 
-use super::discovery::{DiscoveryEvent, EndpointData, EndpointInfo};
+use crate::discovery::{DiscoveryEvent, EndpointData, EndpointInfo};
 
 /// TXT key for the `UserData` JSON blob (matches iroh's wire format).
 const USER_DATA_ATTRIBUTE: &str = "user-data";
@@ -1162,7 +1162,7 @@ fn snapshot_to_address_lookup_item(
 /// iroh's `bound_sockets()` returns flat `SocketAddr`s. This groups them
 /// by picking the port from the first address (all sockets typically share
 /// one port) and collecting all IPs.
-pub(crate) fn socket_addrs_to_port_addrs(addrs: &[SocketAddr]) -> (u16, Vec<IpAddr>) {
+pub fn socket_addrs_to_port_addrs(addrs: &[SocketAddr]) -> (u16, Vec<IpAddr>) {
     let port = addrs.first().map(|a| a.port()).unwrap_or(0);
     let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
     (port, ips)

@@ -9,7 +9,7 @@ default = ["native"]
 # Native-only: direct QUIC sockets (require OS networking) and full tokio runtime.
 # iroh/default enables direct socket binding and portmapper — not available in WASM.
 # The network module itself (gossip, streams, node) compiles for both native and WASM.
-native = ["iroh/default", "dep:mdns-sd", "tokio/rt", "tokio/macros"]
+native = ["iroh/default", "tokio/rt", "tokio/macros"]
 # Test-only surface: exposes constructors that simulate constrained network
 # conditions (e.g. relay-only endpoints with no IP transports) so downstream
 # integration-test crates can reproduce off-LAN/NAT topologies. Never enabled
@@ -43,9 +43,6 @@ iroh = { version = "1.0.0-rc.1", default-features = false, features = ["tls-ring
 # The `net` feature enables the Gossip API (GossipTopic, GossipSender, Event).
 # tokio::sync (used by gossip internals) compiles to WASM, so net works in both targets.
 iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
-mdns-sd = { version = "0.20", optional = true }
-data-encoding = "2"
-tokio-stream = "0.1"
 
 # Cross-platform async task spawning.
 # On native: delegates to tokio::spawn. In WASM: uses wasm_bindgen_futures::spawn_local.
