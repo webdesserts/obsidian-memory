@@ -10,21 +10,20 @@
 //!
 //! ## Production safety — the property that gates everything
 //!
-//! With no scale ever seeded (production: desktop app, daemon, and the WASM
-//! plugin), [`time_scale`] returns exactly `1.0` and [`scaled`] / [`scaled_ms`]
-//! take an early-return identity branch — the returned value is the base
-//! UNCHANGED, with no float arithmetic applied. Production timing is therefore
-//! bit-identical to a build without this module. [`MAX_SCALE`] is `1.0`, making
-//! this a speed-up-only lever: even a *set* scale can only shrink a duration,
-//! never lengthen it, so a misconfigured env var can at worst speed tests up.
+//! With no scale ever seeded (production: desktop app and daemon),
+//! [`time_scale`] returns exactly `1.0` and [`scaled`] / [`scaled_ms`] take an
+//! early-return identity branch — the returned value is the base UNCHANGED, with
+//! no float arithmetic applied. Production timing is therefore bit-identical to a
+//! build without this module. [`MAX_SCALE`] is `1.0`, making this a speed-up-only
+//! lever: even a *set* scale can only shrink a duration, never lengthen it, so a
+//! misconfigured env var can at worst speed tests up.
 //!
-//! ## WASM safety
+//! ## Seeding
 //!
-//! This module is wasm-safe by construction: it uses only [`OnceLock`] and
-//! [`std::time::Duration`] and reads NO environment variable (the
-//! `OBSIDIAN_MEMORY_TIME_SCALE` read lives in sync-daemon's `startup_inner`,
-//! never here). The WASM/plugin build has no startup seeding hook, so it always
-//! observes the `1.0` default.
+//! This module uses only [`OnceLock`] and [`std::time::Duration`] and reads NO
+//! environment variable (the `OBSIDIAN_MEMORY_TIME_SCALE` read lives in
+//! sync-daemon's `startup_inner`, never here). The daemon seeds the scale once at
+//! startup; any process that never seeds observes the `1.0` default.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -58,8 +57,8 @@ fn sanitize_scale(scale: f64) -> f64 {
 /// Seed the process-global time scale. Idempotent: the FIRST call wins and later
 /// calls are ignored; returns whether this call set the value. The input is
 /// clamped to `[MIN_SCALE, MAX_SCALE]` (non-finite input maps to `MIN_SCALE`).
-/// Call once at daemon startup. NOT called on the WASM/plugin path, which keeps
-/// the `1.0` default.
+/// Call once at daemon startup. A process that never seeds keeps the `1.0`
+/// default.
 pub fn set_time_scale(scale: f64) -> bool {
     TIME_SCALE.set(sanitize_scale(scale)).is_ok()
 }

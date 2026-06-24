@@ -38,7 +38,12 @@ pub use p2p_core::key_storage;
 pub use p2p_core::pairing;
 pub mod peers;
 pub mod sync;
-pub mod time_scale;
+// The process-global test-time-scale lever now lives in `p2p-core` (the lowest
+// layer of the stack, no deps). Re-export the whole module so existing
+// `sync_core::time_scale::*` and the network submodules' `crate::time_scale::*`
+// paths keep resolving, and so the single `OnceLock` has exactly one home that
+// the daemon's lone `set_time_scale` seed reaches.
+pub use p2p_core::time_scale;
 
 pub use p2p_core::allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
 pub use p2p_core::key_storage::{KeyStorage, KeyStorageError};
