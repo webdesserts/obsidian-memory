@@ -187,4 +187,26 @@ mod tests {
         };
         assert!(mesh_from_discovery_event(&event).is_none());
     }
+
+    /// Wire-contract guard: `MeshMetadata` is serialized to JSON and broadcast as
+    /// live mDNS user-data across the running fleet. The Rust field names ARE the
+    /// JSON keys (no `#[serde(rename)]`), so renaming a field silently changes the
+    /// wire format and breaks discovery mid-migration. This test fails loudly if a
+    /// future refactor renames a field without adding a `#[serde(rename = "...")]`
+    /// to preserve the key.
+    #[test]
+    fn mesh_metadata_wire_keys_are_stable() {
+        let m = MeshMetadata {
+            mesh: "x".into(),
+            vid: "deadbeef".into(),
+            ver: 1,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"mesh\":"));
+        assert!(json.contains("\"vid\":"));
+        assert!(json.contains("\"ver\":"));
+        // Round-trip stability.
+        let back: MeshMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vid, "deadbeef");
+    }
 }
