@@ -13,13 +13,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use p2p_core::FileAllowlistStorage;
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::network::discovery::MeshMetadata;
 use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
 use vault_sync::Vault;
 use vault_sync::fs::FileSystem;
 
-use crate::allowlist::FileAllowlistStorage;
 use crate::daemon_lock::DaemonLock;
 use crate::http;
 use crate::native_fs::NativeFs;

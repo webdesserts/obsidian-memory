@@ -14,6 +14,7 @@ use futures::StreamExt;
 use std::sync::Arc;
 use tracing::debug;
 
+use p2p_core::FileAllowlistStorage;
 use sync_core::allowlist::InMemoryAllowlist;
 use sync_core::network::{
     SyncNode, SyncNodeSeam,
@@ -23,7 +24,6 @@ use sync_core::network::{
 use sync_core::pairing::PairingHello;
 use sync_core::peer_id::PeerId;
 
-use crate::allowlist::FileAllowlistStorage;
 use crate::persistence::DaemonConfig;
 
 /// How long to listen for mDNS broadcasts before giving up.
@@ -209,13 +209,8 @@ async fn pair_inner(
 
     // Write the mesh roster to the local allowlist (shared with the tray path).
     let allowlist = FileAllowlistStorage::new(vault_path);
-    crate::pair_shared::write_pair_allowlist(
-        &allowlist,
-        self_peer_id,
-        device_name,
-        &result.mesh_members,
-    )
-    .await;
+    p2p_core::write_pair_allowlist(&allowlist, self_peer_id, device_name, &result.mesh_members)
+        .await;
 
     // Adopt the mesh's VaultId so the next `memory sync up` joins the right
     // gossip topic. The CLI process exits after pairing, so this is an on-disk

@@ -3,7 +3,6 @@
 //! This is a thin library layer over the daemon components,
 //! allowing integration tests to access internal types.
 
-pub mod allowlist;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod http;
@@ -16,8 +15,8 @@ pub mod persistence;
 pub mod watcher;
 
 // Re-export key types for convenience
-pub use allowlist::FileAllowlistStorage;
 pub use native_fs::NativeFs;
-// FileKeyStorage / IdentityKey now live in p2p-core (the native networking substrate).
-pub use p2p_core::{FileKeyStorage, IdentityKey};
+// FileAllowlistStorage / FileKeyStorage / IdentityKey now live in p2p-core (the
+// native networking substrate).
+pub use p2p_core::{FileAllowlistStorage, FileKeyStorage, IdentityKey};
 pub use watcher::{FileEvent, FileEventKind, FileWatcher};

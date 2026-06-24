@@ -366,7 +366,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let self_peer_id = PeerId::from_bytes(*self.sync_node.node_id().as_bytes());
-        crate::pair_shared::write_pair_allowlist(
+        p2p_core::write_pair_allowlist(
             self.allowlist.as_ref(),
             self_peer_id,
             &self.device_name,
