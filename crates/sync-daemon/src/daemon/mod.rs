@@ -84,6 +84,21 @@ const HINT_BACKOFF_CEIL: u32 = 5;
 /// failed-dial burst is negligible noise (vs the continuous loop we're fixing).
 const MAX_HINT_BACKOFF_MS: u64 = 1_800_000;
 
+/// Grace window after a network change during which per-hint backoff is floored
+/// at base, regardless of accumulated failures.
+///
+/// Off-LAN after a network change, the first reconnect dials fire while iroh is
+/// still re-homing its OWN relay, so they fail and ramp the backoff (60s → 2m →
+/// 4m → … → 30m) with no second reset once iroh's relay is ready — leaving the
+/// daemon parked at a multi-minute backoff even though the public relay is now
+/// reachable (the ~29-min off-LAN rehome). For this window we keep re-dialing on
+/// the base cadence so a peer is re-reached within ~1 min of the network
+/// settling instead of after the full ramp. 3 min comfortably covers iroh's
+/// relay re-home while staying short enough that a genuinely-dead hint resumes
+/// its real backoff promptly. Scaled for test-time-scale consistency with the
+/// other backoff windows.
+const NET_CHANGE_GRACE_MS: u64 = 180_000;
+
 /// Consecutive failed attempts after which a hint is considered "stale": it
 /// gets the max-backoff cadence and the one-shot eviction log. Low enough to
 /// quiet noise within ~an hour of a peer going dark, high enough not to throttle
@@ -122,7 +137,8 @@ fn per_hint_backoff(failure_count: u32) -> u64 {
     scaled_ms(HINT_BACKOFF_BASE_MS << shift).min(scaled_ms(MAX_HINT_BACKOFF_MS))
 }
 
-/// Whether a hint is due for another reconnect attempt at `now_ms`.
+/// Whether a hint is due for another reconnect attempt at `now_ms`, honoring an
+/// optional post-network-change grace window.
 ///
 /// A never-attempted hint (`last_attempt_ms == None`) is due immediately — we
 /// have never tried it, so there is nothing to back off from. For an
@@ -130,13 +146,25 @@ fn per_hint_backoff(failure_count: u32) -> u64 {
 /// clock jump (a `last_attempt_ms` in the future) yields `0` elapsed — the hint
 /// reads not-yet-due for one window, then becomes due again, never permanently
 /// wedged.
-fn hint_attempt_due(hint: &crate::persistence::PeerRelay, now_ms: u64) -> bool {
-    match hint.last_attempt_ms {
-        None => true,
-        Some(last_attempt) => {
-            now_ms.saturating_sub(last_attempt) >= per_hint_backoff(hint.failure_count)
-        }
-    }
+///
+/// While `now_ms` is inside the grace window (`grace_until_ms`, set by
+/// [`Daemon::on_network_change`]), the effective failure count is floored to `0`,
+/// so the due-gate uses the base backoff window regardless of how many early
+/// dials have failed. This is the [`NET_CHANGE_GRACE_MS`] rehome fix: it keeps a
+/// post-net-change hint re-dialing on the base cadence while iroh re-homes its
+/// own relay, instead of ramping to a multi-minute backoff that strands the peer.
+/// Only the GATE is floored — the stored `failure_count` keeps climbing (see
+/// [`Daemon::record_due_hint_failures`]) so real backoff resumes once the window
+/// expires.
+fn effective_backoff_due(
+    failure_count: u32,
+    last_attempt_ms: Option<u64>,
+    now_ms: u64,
+    grace_until_ms: Option<u64>,
+) -> bool {
+    let in_grace = grace_until_ms.is_some_and(|g| now_ms < g);
+    let effective = if in_grace { 0 } else { failure_count };
+    last_attempt_ms.is_none_or(|last| now_ms.saturating_sub(last) >= per_hint_backoff(effective))
 }
 
 /// Decide whether a relay learned from a peer should be adopted into this node's
@@ -229,6 +257,12 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// change needs a restart." `None` in tests that don't exercise reconnect,
     /// and on any build where `watch_addr` isn't wired.
     net_change_rx: Option<mpsc::Receiver<()>>,
+    /// Deadline (`now_ms()`) until which per-hint reconnect backoff is floored at
+    /// base, set by [`on_network_change`] to `now + NET_CHANGE_GRACE_MS`. Session-
+    /// only and NOT persisted — a fresh process simply starts without a grace
+    /// window. `None` means no grace window is active (the steady state). See
+    /// [`effective_backoff_due`] for how it floors the due-gate.
+    net_change_grace_until_ms: Option<u64>,
     /// Inbound-sync freshness signal. The pumped inbound handler
     /// (`sync_stream::PumpedSyncHandler`) processes a peer's sync inline and
     /// fires that peer's id here on completion; the run-loop drains it and stamps
@@ -363,6 +397,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///
     /// The `run()` function creates these from real filesystem paths; tests
     /// inject in-memory equivalents directly.
+    // The constructor takes each pre-built component by value (a builder/struct
+    // would just move the same fields one layer up and obscure the public test
+    // harness's call site). Bundling them is churn for no readability gain on a
+    // sensitive ctor, so we annotate rather than refactor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vault: Arc<Mutex<Vault<FS>>>,
         sync_node: SyncNode,
@@ -411,6 +450,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             // tests via `set_net_change_rx`); `None` means net-change reconnect
             // is inert, exactly like an unwired `discovery_rx`.
             net_change_rx: None,
+            // No grace window until the first network change opens one.
+            net_change_grace_until_ms: None,
             // Wired post-construction (startup.rs / tests via `set_inbound_seen_rx`);
             // `None` means inbound freshness stamping is inert, like an unwired
             // `net_change_rx`.
@@ -653,7 +694,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///
     /// 1. A live neighbor → connected. Return (no log spam, no churn).
     /// 2. No known peer relays → nothing to chase (unpaired or hint-less). Return.
-    /// 3. For each hint, `hint_attempt_due` decides:
+    /// 3. For each hint, `effective_backoff_due` decides:
     ///    - **Due:** re-seed its relay (`set_peer_relay`) and re-bootstrap gossip
     ///      toward its EndpointId. An unparseable URL skips the seed but STILL
     ///      bootstraps by EndpointId — mDNS or a prior direct address may reach
@@ -751,7 +792,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 continue;
             };
 
-            if hint_attempt_due(hint, now) {
+            if effective_backoff_due(
+                hint.failure_count,
+                hint.last_attempt_ms,
+                now,
+                self.net_change_grace_until_ms,
+            ) {
                 // Re-add the hint and dial it. Re-add is UNCONDITIONAL of
                 // failure_count — the last-hint guarantee that a returning
                 // off-LAN peer is never stranded.
@@ -790,7 +836,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 // Otherwise RETAINED in the lookup — the relay-reap reconnect fix,
                 // generalized to the off-LAN lifeline.
                 //
-                // We throttle the dial FREQUENCY (the `hint_attempt_due` gate
+                // We throttle the dial FREQUENCY (the `effective_backoff_due` gate
                 // above already does this), not the address PRESENCE — never
                 // evicting a partitioned peer's only lifeline. If we removed it,
                 // the next due tick would re-seed an address that had been gone,
@@ -953,6 +999,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// The throttle is runtime-only: the supervisor's working set is seeded from
     /// the `allowlist × known_public_relays` cross-product on each boot, so a
     /// restart resetting backoff is fine and there is nothing to persist.
+    ///
+    /// Grace-window interaction: this keeps bumping `failure_count` even during a
+    /// post-net-change grace window. The grace window floors only the DUE-GATE
+    /// (see [`effective_backoff_due`]), not the counter — so the accumulated
+    /// failure history stays intact and real backoff resumes from it the moment
+    /// the window expires. (A successful dial still zeroes the count via
+    /// [`on_exchange_learned`], grace or not.)
     fn record_due_hint_failures(&mut self, due_ids: &[EndpointId]) {
         if due_ids.is_empty() {
             return;
@@ -982,8 +1035,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///
     /// Purely additive: the supervisor's dial/evict/sole-hint logic
     /// (`on_reconnect_tick`) is untouched; we only un-throttle the hints by
-    /// zeroing `failure_count`/`last_attempt_ms`, which flips `hint_attempt_due`
-    /// to `true` for every hint so they all re-dial on the next wake.
+    /// zeroing `failure_count`/`last_attempt_ms`, which flips `effective_backoff_due`
+    /// to `true` for every hint so they all re-dial on the next wake. We ALSO open
+    /// a [`NET_CHANGE_GRACE_MS`] grace window (`net_change_grace_until_ms`) so the
+    /// early post-change dials that fail while iroh re-homes its own relay can't
+    /// ramp the backoff back up before the relay is reachable (the off-LAN rehome
+    /// fix; see [`effective_backoff_due`]).
     ///
     /// This pairs with `on_reconnect_tick`'s off-LAN-lifeline retention to protect
     /// the public-relay lifeline across a network switch: retention keeps it
@@ -1012,6 +1069,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             hint.failure_count = 0;
             hint.last_attempt_ms = None;
         }
+
+        // (1b) Open the post-net-change grace window. Zeroing failure_count above
+        // resets backoff to base, but the early reconnect dials fail while iroh
+        // re-homes its own relay, ramping the backoff right back up with no second
+        // reset once the relay is ready. The grace window floors the due-gate at
+        // base for NET_CHANGE_GRACE_MS so those early failures don't strand a
+        // now-reachable peer behind a multi-minute backoff (the off-LAN rehome fix).
+        // Scaled so the window shrinks under the test-time-scale, consistent with
+        // per_hint_backoff's own scaling.
+        self.net_change_grace_until_ms = Some(now_ms() + scaled_ms(NET_CHANGE_GRACE_MS));
 
         // (2) Kick mDNS: re-advertise addresses + restart the browse for prompt
         // same-LAN re-discovery. Strictly additive — synchronous, best-effort,
@@ -2202,7 +2269,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
 #[cfg(test)]
 mod backoff_tests {
-    use super::{HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, hint_attempt_due, per_hint_backoff};
+    use super::{
+        HINT_BACKOFF_BASE_MS, MAX_HINT_BACKOFF_MS, NET_CHANGE_GRACE_MS, effective_backoff_due,
+        per_hint_backoff,
+    };
     use crate::persistence::PeerRelay;
 
     // A failure count comfortably past the shift ceiling, to prove the clamp.
@@ -2215,6 +2285,13 @@ mod backoff_tests {
         h.failure_count = failure_count;
         h.last_attempt_ms = last_attempt_ms;
         h
+    }
+
+    /// Whether a hint is due with NO grace window active (the steady-state path).
+    /// Keeps the backoff-cadence tests reading as "is this hint due now" while
+    /// routing through the real `effective_backoff_due` gate.
+    fn due(h: &PeerRelay, now_ms: u64) -> bool {
+        effective_backoff_due(h.failure_count, h.last_attempt_ms, now_ms, None)
     }
 
     /// Per-hint backoff doubles per failure, saturates at the cap, never overflows.
@@ -2241,8 +2318,8 @@ mod backoff_tests {
     /// A never-attempted hint is due immediately.
     #[test]
     fn never_attempted_hint_is_due() {
-        assert!(hint_attempt_due(&hint(0, None), 0));
-        assert!(hint_attempt_due(&hint(9, None), 5_000_000));
+        assert!(due(&hint(0, None), 0));
+        assert!(due(&hint(9, None), 5_000_000));
     }
 
     /// A fresh hint (no failures) is due on the base cadence: not due before the
@@ -2251,9 +2328,9 @@ mod backoff_tests {
     fn fresh_hint_due_on_base_cadence() {
         let h = hint(0, Some(1_000));
         // Just before the base window: not due.
-        assert!(!hint_attempt_due(&h, 1_000 + HINT_BACKOFF_BASE_MS - 1));
+        assert!(!due(&h, 1_000 + HINT_BACKOFF_BASE_MS - 1));
         // Exactly at the window: due.
-        assert!(hint_attempt_due(&h, 1_000 + HINT_BACKOFF_BASE_MS));
+        assert!(due(&h, 1_000 + HINT_BACKOFF_BASE_MS));
     }
 
     /// A throttled hint stays not-due inside its (longer) window and becomes due
@@ -2262,8 +2339,8 @@ mod backoff_tests {
     fn throttled_hint_respects_wider_window() {
         let h = hint(2, Some(10_000));
         let window = per_hint_backoff(2);
-        assert!(!hint_attempt_due(&h, 10_000 + window - 1));
-        assert!(hint_attempt_due(&h, 10_000 + window));
+        assert!(!due(&h, 10_000 + window - 1));
+        assert!(due(&h, 10_000 + window));
     }
 
     /// Last-hint guarantee: even the stalest hint comes due within the capped
@@ -2272,9 +2349,9 @@ mod backoff_tests {
     fn stalest_hint_eventually_due() {
         let h = hint(u32::MAX, Some(0));
         // One nanosecond before the cap elapses: still throttled.
-        assert!(!hint_attempt_due(&h, MAX_HINT_BACKOFF_MS - 1));
+        assert!(!due(&h, MAX_HINT_BACKOFF_MS - 1));
         // At the cap: due again — re-added and dialed.
-        assert!(hint_attempt_due(&h, MAX_HINT_BACKOFF_MS));
+        assert!(due(&h, MAX_HINT_BACKOFF_MS));
     }
 
     /// Clock-backward tolerance: a `last_attempt_ms` in the future (clock jumped
@@ -2285,9 +2362,74 @@ mod backoff_tests {
     fn clock_backward_does_not_panic_or_wedge() {
         let h = hint(0, Some(1_000_000));
         // "Now" is before the recorded attempt — not due, no panic.
-        assert!(!hint_attempt_due(&h, 0));
+        assert!(!due(&h, 0));
         // Once the clock advances past attempt + window, it's due again.
-        assert!(hint_attempt_due(&h, 1_000_000 + HINT_BACKOFF_BASE_MS));
+        assert!(due(&h, 1_000_000 + HINT_BACKOFF_BASE_MS));
+    }
+
+    /// The post-net-change grace window floors backoff at base (the off-LAN
+    /// rehome fix). A hint that has failed enough to back off well past the base
+    /// window (here `failure_count = 3` → `60s << 3 = 8min`) is nonetheless due
+    /// again on the BASE cadence (60s) while inside the grace window, so the early
+    /// post-change dials that fail while iroh re-homes its relay keep retrying
+    /// promptly instead of being stranded behind the ramped backoff. Without a
+    /// grace window the same hint must wait the full 8-minute window.
+    #[test]
+    fn grace_window_floors_backoff_to_base() {
+        let t0 = 1_000;
+        let grace_until = Some(t0 + NET_CHANGE_GRACE_MS);
+        // Sanity: failure_count 3 normally backs off far past the base window.
+        assert!(per_hint_backoff(3) > HINT_BACKOFF_BASE_MS);
+
+        // Just past the base window, still inside the grace window → due (the
+        // grace floor uses per_hint_backoff(0) = base regardless of failures).
+        assert!(effective_backoff_due(
+            3,
+            Some(t0),
+            t0 + HINT_BACKOFF_BASE_MS + 1_000,
+            grace_until,
+        ));
+        // Same instant with NO grace window → NOT due (the real 8-minute window
+        // governs), proving the grace floor is what makes the difference.
+        assert!(!effective_backoff_due(
+            3,
+            Some(t0),
+            t0 + HINT_BACKOFF_BASE_MS + 1_000,
+            None,
+        ));
+    }
+
+    /// Once the grace window expires, normal backoff resumes from the still-intact
+    /// failure_count (the counter keeps climbing during grace; only the due-gate
+    /// is floored). A hint that was due-on-base mid-window is no longer due just
+    /// past base once `now` passes the grace deadline — it must wait its full
+    /// failure-scaled window again.
+    #[test]
+    fn backoff_resumes_after_grace_window_expires() {
+        let t0 = 1_000;
+        let grace_deadline = t0 + NET_CHANGE_GRACE_MS;
+        let grace_until = Some(grace_deadline);
+        let last_attempt = grace_deadline; // attempted right as grace ends
+        let just_past_base = last_attempt + HINT_BACKOFF_BASE_MS + 1_000;
+
+        // `now` is past the grace deadline, and only the base window has elapsed
+        // since the last attempt — the full failure-scaled window has not, so the
+        // hint is throttled again (grace no longer applies).
+        assert!(just_past_base >= grace_deadline);
+        assert!(!effective_backoff_due(
+            3,
+            Some(last_attempt),
+            just_past_base,
+            grace_until
+        ));
+
+        // It becomes due once the real failure-scaled window elapses.
+        assert!(effective_backoff_due(
+            3,
+            Some(last_attempt),
+            last_attempt + per_hint_backoff(3),
+            grace_until,
+        ));
     }
 }
 

@@ -4743,4 +4743,30 @@ mod daemon_integration {
             "a converged casing produces no further moves on re-sweep"
         );
     }
+
+    /// The daemon's persisted PeerId must equal the identity key's PeerId after
+    /// `load_or_generate` — `DaemonConfig` derives its `peer_id` from the identity
+    /// key, and a divergence would let the daemon advertise an identity it can't
+    /// authenticate with. This invariant was asserted by the IdentityKey unit
+    /// tests until those moved to p2p-core, where `DaemonConfig` isn't visible;
+    /// this re-pins the daemon-config↔identity seam on the daemon side (Inc0-2
+    /// foundation-review carry-forward S1).
+    #[tokio::test]
+    async fn daemon_config_peer_id_matches_identity_key() -> anyhow::Result<()> {
+        use sync_daemon::persistence::DaemonConfig;
+        use tempfile::TempDir;
+
+        // Fresh vault with no existing daemon.key → load_or_generate mints a new
+        // identity and writes the config from it.
+        let vault_dir = TempDir::new()?;
+        let (config, identity) = DaemonConfig::load_or_generate(vault_dir.path(), None).await?;
+
+        assert_eq!(
+            config.peer_id,
+            identity.peer_id(),
+            "DaemonConfig.peer_id must match the identity key it was generated from"
+        );
+
+        Ok(())
+    }
 }
