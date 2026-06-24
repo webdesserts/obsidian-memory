@@ -25,10 +25,15 @@ pub mod allowlist;
 pub mod document;
 pub mod events;
 pub mod fs;
-pub mod key_storage;
 pub mod markdown;
 pub mod pairing;
 pub mod peer_id;
+
+// `KeyStorage`/`PeerId` and the file-backed identity types now live in `p2p-core`
+// (the native networking substrate sync-core depends on). Re-export the whole
+// `key_storage` module so existing `sync_core::key_storage::{KeyStorage,
+// KeyStorageError, Result}` paths keep resolving across the daemon.
+pub use p2p_core::key_storage;
 pub mod peers;
 pub mod sync;
 pub mod sync_engine;
@@ -41,7 +46,7 @@ pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
 pub use document::NoteDocument;
 pub use events::{EventBus, Subscription, SyncEvent};
 pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
-pub use key_storage::{KeyStorage, KeyStorageError};
+pub use p2p_core::key_storage::{KeyStorage, KeyStorageError};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
     generate_pairing_code, verify_hmac,

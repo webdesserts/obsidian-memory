@@ -1,8 +1,8 @@
 //! KeyStorage trait for abstracting ed25519 secret key persistence.
 //!
 //! Implementations:
-//! - `FileKeyStorage` (in sync-daemon) - Reads/writes `.sync/daemon.key` on the filesystem
-//! - Plugin implementation (future) - Reads/writes via Obsidian's localStorage bridge
+//! - `FileKeyStorage` (in the `identity` module) — reads/writes `.sync/daemon.key` on the filesystem
+//! - Plugin implementation (future) — reads/writes via Obsidian's localStorage bridge
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -22,40 +22,8 @@ pub type Result<T> = std::result::Result<T, KeyStorageError>;
 ///
 /// The key is stored as raw 32 bytes. Callers are responsible for
 /// generating a new key when `load_key` returns `None`.
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
 pub trait KeyStorage: Send + Sync {
-    /// Load an existing ed25519 secret key, or return `None` if no key exists yet.
-    async fn load_key(&self) -> Result<Option<[u8; 32]>>;
-
-    /// Persist an ed25519 secret key.
-    async fn save_key(&self, key: &[u8; 32]) -> Result<()>;
-
-    /// Load the existing key, or generate a new one and save it.
-    ///
-    /// The key is generated using cryptographically secure randomness.
-    ///
-    /// Note: This method is not atomic. If multiple processes call it
-    /// simultaneously, they may each generate different keys. Callers
-    /// should hold an appropriate lock (e.g., the daemon flock) before
-    /// calling this method.
-    async fn load_or_generate(&self) -> Result<[u8; 32]> {
-        if let Some(key) = self.load_key().await? {
-            return Ok(key);
-        }
-
-        let key = generate_key();
-        self.save_key(&key).await?;
-        Ok(key)
-    }
-}
-
-/// Abstracts loading and persisting an ed25519 secret key (WASM version without Send + Sync).
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg(target_arch = "wasm32")]
-pub trait KeyStorage {
     /// Load an existing ed25519 secret key, or return `None` if no key exists yet.
     async fn load_key(&self) -> Result<Option<[u8; 32]>>;
 
