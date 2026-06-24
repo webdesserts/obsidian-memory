@@ -11,7 +11,7 @@ use std::path::Path;
 
 use iroh::{EndpointId, RelayUrl};
 use sync_core::allowlist::{AllowedPeer, AllowlistStorage};
-use sync_core::network::SyncNode;
+use sync_core::network::{SyncNode, VaultGossipExt};
 use sync_core::peer_id::{PeerId, VaultId};
 use tracing::warn;
 // The on-disk `.sync/metadata.toml` is owned by the vault-sync engine; `NativeFs`
@@ -167,6 +167,7 @@ pub fn vault_id_from_pairing_topic(vault_topic: Option<[u8; 32]>) -> Option<Vaul
 mod tests {
     use super::*;
     use sync_core::allowlist::InMemoryAllowlist;
+    use sync_core::network::SyncNodeSeam;
 
     fn peer(byte: u8) -> PeerId {
         PeerId::from_secret_bytes([byte; 32])
@@ -278,9 +279,10 @@ mod tests {
         // of persist_adopted_relay has something to call. Use our persisted
         // identity so node_id() matches the config's peer_id.
         let allowlist = Arc::new(InMemoryAllowlist::new());
-        let sync_node = SyncNode::new(identity.secret_key_bytes(), &[], allowlist)
-            .await
-            .expect("failed to build SyncNode for test");
+        let (sync_node, _inbound_sync_rx) =
+            SyncNode::new(identity.secret_key_bytes(), &[], allowlist)
+                .await
+                .expect("failed to build SyncNode for test");
 
         // The responder is a DIFFERENT device, so its EndpointId won't trip the
         // self-skip in the live-lookup seed (`add_peer_relay`).

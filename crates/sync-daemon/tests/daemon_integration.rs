@@ -27,7 +27,7 @@ mod daemon_integration {
     use tokio_util::sync::CancellationToken;
 
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
-    use sync_core::network::{SyncNode, gossip::VaultGossip};
+    use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt, gossip::VaultGossip};
     use sync_core::peer_id::{PeerId, VaultId};
     use uuid::Uuid;
     use vault_sync::fs::{FileSystem, InMemoryFs};

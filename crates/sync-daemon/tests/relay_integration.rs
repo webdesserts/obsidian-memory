@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use iroh::{EndpointId, RelayUrl, SecretKey, Watcher};
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
-use sync_core::network::SyncNode;
 use sync_core::network::gossip::GossipEvent;
 use sync_core::network::streams::connect_and_sync_raw;
+use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
 use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 // `NativeFs`/`InMemoryFs` (via `common`) implement vault-sync's `FileSystem`.
@@ -61,13 +61,13 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 
     // Create two nodes that only know about the relay — no direct address
     // exchange. They can only reach each other by routing through the relay.
-    let node_a = SyncNode::new(
+    let (node_a, inbound_rx_a) = SyncNode::new(
         common::seed(101),
         std::slice::from_ref(&relay_url),
         allowlist_a.clone(),
     )
     .await?;
-    let node_b = SyncNode::new(
+    let (node_b, _inbound_rx_b) = SyncNode::new(
         common::seed(102),
         std::slice::from_ref(&relay_url),
         allowlist_b.clone(),
@@ -120,7 +120,7 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
     let response_bytes = bincode::serialize(&expected_response)?;
     let response_bytes_clone = response_bytes.clone();
 
-    let mut inbound_rx = node_a.inbound_sync_rx;
+    let mut inbound_rx = inbound_rx_a;
     tokio::spawn(async move {
         while let Some(req) = inbound_rx.recv().await {
             let _ = req.reply_tx.send(response_bytes_clone.clone());
@@ -175,7 +175,7 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(10), &[], allowlist).await?;
+    let (node, _inbound_rx) = SyncNode::new(common::seed(10), &[], allowlist).await?;
 
     // Use a second node's id as the "peer" and a standalone relay URL.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -223,7 +223,7 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(30), &[], allowlist).await?;
+    let (node, _inbound_rx) = SyncNode::new(common::seed(30), &[], allowlist).await?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let relay = EmbeddedRelay::start(bind_addr).await?;
@@ -251,7 +251,7 @@ async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_empty_peer_relays_leaves_lookup_empty() -> anyhow::Result<()> {
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(20), &[], allowlist).await?;
+    let (node, _inbound_rx) = SyncNode::new(common::seed(20), &[], allowlist).await?;
 
     // A deterministic peer id derived from a key seed (distinct from the node's own seed).
     let peer_secret = SecretKey::from_bytes(&[99u8; 32]);
@@ -304,13 +304,13 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
     // Node A: home relay = R_a (url_a is in its RelayMap).
     // Node B: home relay = R_b (url_b is in its RelayMap).
     // Neither node has the other's relay in its own RelayMap.
-    let node_a = SyncNode::new(
+    let (node_a, inbound_rx_a) = SyncNode::new(
         common::seed(51),
         std::slice::from_ref(&url_a),
         allowlist_a.clone(),
     )
     .await?;
-    let node_b = SyncNode::new(
+    let (node_b, _inbound_rx_b) = SyncNode::new(
         common::seed(52),
         std::slice::from_ref(&url_b),
         allowlist_b.clone(),
@@ -379,7 +379,7 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
     let response_bytes = bincode::serialize(&expected_response)?;
     let response_bytes_clone = response_bytes.clone();
 
-    let mut inbound_rx = node_a.inbound_sync_rx;
+    let mut inbound_rx = inbound_rx_a;
     tokio::spawn(async move {
         while let Some(req) = inbound_rx.recv().await {
             let _ = req.reply_tx.send(response_bytes_clone.clone());
@@ -1160,7 +1160,7 @@ async fn relay_map_homes_on_one_of_a_set() -> anyhow::Result<()> {
     // Relay-only so the endpoint MUST select a relay home (no IP transport can mask
     // the relay-home selection we're testing).
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new_relay_only(
+    let (node, _inbound_rx) = SyncNode::new_relay_only(
         common::seed(120),
         &[url_a.clone(), url_b.clone()],
         allowlist,
@@ -1214,7 +1214,7 @@ async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
     let url_b: RelayUrl = relay_b.relay_url().clone();
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new_relay_only(
+    let (node, _inbound_rx) = SyncNode::new_relay_only(
         common::seed(121),
         &[url_a.clone(), url_b.clone()],
         allowlist,
@@ -1288,7 +1288,8 @@ async fn laptop_homes_on_persisted_public_relay() -> anyhow::Result<()> {
         .collect();
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new_relay_only(common::seed(124), &home_relays, allowlist).await?;
+    let (node, _inbound_rx) =
+        SyncNode::new_relay_only(common::seed(124), &home_relays, allowlist).await?;
 
     tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
         .await
@@ -1330,7 +1331,7 @@ async fn laptop_with_empty_public_set_is_relay_disabled() -> anyhow::Result<()> 
     let home_relays: Vec<RelayUrl> = Vec::new();
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(125), &home_relays, allowlist).await?;
+    let (node, _inbound_rx) = SyncNode::new(common::seed(125), &home_relays, allowlist).await?;
 
     // With RelayMode::Disabled there is no relay to home on. Give the endpoint a
     // brief window to (not) select a home, then assert no relay home is connected.
@@ -1378,7 +1379,7 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
     let peer_2 = PeerId::from_secret_bytes(common::seed(201));
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(126), &[], allowlist.clone()).await?;
+    let (node, _inbound_rx) = SyncNode::new(common::seed(126), &[], allowlist.clone()).await?;
 
     // Add the node's OWN id to its allowlist (what the first-pair bootstrap does),
     // alongside the two real peers — so the self-skip is actually exercised.
@@ -1468,7 +1469,7 @@ async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<(
     let peer_rhea = PeerId::from_secret_bytes(common::seed(211));
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
-    let node = SyncNode::new(common::seed(127), &[], allowlist.clone()).await?;
+    let (node, _inbound_rx) = SyncNode::new(common::seed(127), &[], allowlist.clone()).await?;
 
     // The server is in its own allowlist (first-pair bootstrap) alongside the laptops.
     let own_endpoint_id = node.node_id();

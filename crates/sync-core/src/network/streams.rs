@@ -157,7 +157,7 @@ pub async fn connect_and_sync_raw(
     peer: impl Into<iroh::EndpointAddr>,
     request_bytes: &[u8],
 ) -> Result<Vec<u8>> {
-    let alpn = super::node::SYNC_ALPN;
+    let alpn = crate::network::SYNC_ALPN;
     let connection = endpoint.connect(peer, alpn).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
 

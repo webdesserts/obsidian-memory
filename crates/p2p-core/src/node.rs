@@ -1,40 +1,55 @@
-//! SyncNode: top-level iroh networking component.
+//! P2pNode: top-level iroh networking component.
 //!
-//! Creates an iroh Endpoint from an ed25519 identity key, registers
-//! the sync protocol ALPN, and provides methods for vault-scoped
-//! gossip topics and QUIC bi-stream sync sessions.
+//! Creates an iroh Endpoint from an ed25519 identity key, registers the gossip
+//! and pairing ALPNs (and a caller-supplied sync ALPN + handler), and provides
+//! methods for generic gossip topics and LAN mesh discovery.
+//!
+//! This is the application-agnostic networking node. The vault-sync protocol
+//! (`SYNC_ALPN`, the default `SyncStreamHandler`, and the `VaultId`-typed topic
+//! wrappers) lives in `sync-core`, which supplies the sync handler through the
+//! seam constructors and wraps the generic topic helpers via `VaultGossipExt`.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey};
-#[cfg(feature = "native")]
-use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    address_lookup::memory::MemoryLookup,
+};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::{Gossip, TopicId};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-#[cfg(feature = "native")]
 use crate::allowlist::AllowlistStorage;
-#[cfg(feature = "native")]
-use crate::network::pairing::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
-use crate::network::streams::{InboundSyncRx, SyncStreamHandler};
-use crate::peer_id::VaultId;
-
-/// ALPN identifier for our custom sync protocol.
-///
-/// iroh's Router dispatches incoming QUIC connections to the correct handler
-/// based on ALPN. This ALPN routes to our QUIC stream sync handler.
-pub const SYNC_ALPN: &[u8] = b"obsidian-memory/sync/1";
+use crate::mesh_mdns::MeshMdns;
+use crate::pairing_handler::{PAIRING_ALPN, PairingEvent, PairingStreamHandler};
 
 /// The mDNS service name for obsidian-sync mesh discovery.
 ///
 /// Peers using the same service name can discover each other on the LAN.
 /// Peers on a different service name are invisible to each other.
-#[cfg(feature = "native")]
 const MDNS_SERVICE_NAME: &str = "obsidian-sync";
+
+/// Derive a deterministic gossip [`TopicId`] from a `u64` seed.
+///
+/// The seed's value is written into the first 8 bytes of a 32-byte little-endian
+/// array to produce a consistent `TopicId`. sync-core's `VaultGossipExt` derives
+/// the seed from a `VaultId`, keeping the `VaultId` type out of p2p-core.
+pub fn topic_from_u64(seed: u64) -> TopicId {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    TopicId::from_bytes(bytes)
+}
+
+/// Recover the `u64` seed encoded in a gossip topic's bytes.
+///
+/// Inverse of [`topic_from_u64`]: reads the little-endian `u64` back out of
+/// `topic[0..8]`.
+pub fn u64_from_topic(topic: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(topic[..8].try_into().unwrap())
+}
 
 /// Wraps iroh-gossip's connection handler with allowlist enforcement.
 ///
@@ -44,14 +59,12 @@ const MDNS_SERVICE_NAME: &str = "obsidian-sync";
 ///
 /// The pairing ALPN is a separate handler and is NOT affected — pairing
 /// must remain open to allow new devices to join.
-#[cfg(feature = "native")]
 #[derive(Debug)]
 struct AllowlistGossipHandler<A: AllowlistStorage + std::fmt::Debug> {
     gossip: Gossip,
     allowlist: Arc<A>,
 }
 
-#[cfg(feature = "native")]
 impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHandler
     for AllowlistGossipHandler<A>
 {
@@ -85,32 +98,26 @@ impl<A: AllowlistStorage + std::fmt::Debug + 'static> iroh::protocol::ProtocolHa
     }
 }
 
-/// The iroh-based sync node.
+/// The iroh-based networking node.
 ///
 /// Owns the QUIC endpoint, gossip instance, and protocol router.
-/// One `SyncNode` per daemon/plugin instance — not per vault.
-/// Vaults get per-topic gossip subscriptions via `join_vault_gossip()`.
-pub struct SyncNode {
+/// One `P2pNode` per daemon instance — not per vault.
+/// Vaults get per-topic gossip subscriptions via `join_topic()` (wrapped by
+/// sync-core's `VaultGossipExt::join_vault_gossip`).
+pub struct P2pNode {
     /// The underlying QUIC endpoint.
     pub endpoint: Endpoint,
     /// The gossip subsystem (HyParView + PlumTree).
     pub gossip: Gossip,
-    /// Inbound sync requests from remote peers.
-    ///
-    /// Drive this in a task to process incoming sync requests. Each item
-    /// carries a `SyncMessage` and a one-shot channel to send the response.
-    pub inbound_sync_rx: InboundSyncRx,
-    /// Inbound pairing events from new devices (native only).
+    /// Inbound pairing events from new devices.
     ///
     /// Drive this in the daemon event loop to process pairing requests.
-    #[cfg(feature = "native")]
     pub inbound_pairing_rx: tokio::sync::mpsc::UnboundedReceiver<PairingEvent>,
     /// The protocol router (dispatches by ALPN).
     router: Router,
-    /// mDNS address lookup for LAN mesh discovery (native only).
-    #[cfg(feature = "native")]
-    mdns: Option<crate::network::mesh_mdns::MeshMdns>,
-    /// In-memory address lookup seeded with known peer relay hints (native only).
+    /// mDNS address lookup for LAN mesh discovery.
+    mdns: Option<MeshMdns>,
+    /// In-memory address lookup seeded with known peer relay hints.
     ///
     /// Populated at startup from the `allowlist × known_public_relays`
     /// cross-product so gossip bootstrap can resolve off-LAN peers through a
@@ -120,164 +127,91 @@ pub struct SyncNode {
     /// Exposed as `pub` so integration tests can inspect hint registration
     /// without a live connection — the canonical production verification path
     /// is full gossip connectivity (see relay_integration tests).
-    #[cfg(feature = "native")]
     pub peer_lookup: MemoryLookup,
 }
 
-impl SyncNode {
-    /// Create a new SyncNode from an ed25519 secret key.
+impl P2pNode {
+    /// Create a `P2pNode` whose `sync_alpn` connections are dispatched to a
+    /// caller-supplied `ProtocolHandler`.
     ///
-    /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
-    /// The endpoint binds to a random available port.
+    /// This is the seam sync-core uses: it binds its `SYNC_ALPN` const and a
+    /// handler (the default one-shot `SyncStreamHandler`, or the daemon's pumped
+    /// multi-message handler) and forwards them here. p2p-core stays
+    /// protocol-agnostic — it only routes the supplied ALPN to the supplied
+    /// handler alongside the always-registered gossip and pairing ALPNs.
     ///
-    /// `relays` — the set of relay URLs this node homes on. The endpoint builds a
-    /// custom `RelayMap` from them and homes on the lowest-latency reachable one,
-    /// failing over across the set. Pass `&[]` for no relay (direct QUIC only). A
-    /// server passes its own public relay (`&[own_url]`); a laptop passes the public
-    /// relays it has learned, so it can reach off-LAN peers and fail over.
-    ///
-    /// `allowlist` — on native builds, gossip connections are pre-screened using this
-    /// allowlist before the gossip protocol runs. Non-allowlisted peers are rejected
-    /// immediately. Pass `Arc::new(FileAllowlistStorage::new(&vault))` from the daemon.
-    #[cfg(feature = "native")]
-    pub async fn new<A: AllowlistStorage + std::fmt::Debug + 'static>(
+    /// Named distinctly from sync-core's `SyncNodeSeam::new_with_sync_handler`
+    /// (which forwards `SYNC_ALPN` and omits the ALPN parameter) so the two don't
+    /// collide on `SyncNode::` associated-function resolution — an inherent fn
+    /// silently shadows a same-named trait fn at `Type::func` call sites.
+    pub async fn with_sync_alpn<A, H>(
         secret_key_bytes: [u8; 32],
         relays: &[RelayUrl],
         allowlist: Arc<A>,
-    ) -> Result<Self> {
-        // The default `SyncStreamHandler` is the one-shot inbound path (one
-        // message in, one reply out over a oneshot). `inbound_sync_rx` carries
-        // those requests to the caller for processing.
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
-        Self::build(
-            secret_key_bytes,
-            relays,
-            allowlist,
-            false,
-            sync_handler,
-            inbound_sync_rx,
-        )
-        .await
-    }
-
-    /// Create a SyncNode whose `SYNC_ALPN` connections are dispatched to a
-    /// caller-supplied `ProtocolHandler` instead of the default one-shot
-    /// [`SyncStreamHandler`].
-    ///
-    /// This is the seam the daemon uses to run its multi-message *pumped*
-    /// handshake: the daemon supplies a handler that drives the variable-length
-    /// vault-sync exchange (digest → mismatch → exchange → response) inline over
-    /// one bi-stream, rather than the one-message-in / one-reply-out the default
-    /// handler does. The default [`SyncNode::new`] is unchanged, so sync-wasm —
-    /// which constructs its node via `new` and drains `inbound_sync_rx` — is
-    /// byte-identical.
-    ///
-    /// `inbound_sync_rx` is still populated (S1): the field is a non-optional
-    /// `InboundSyncRx` that sync-wasm reads, so it must always be present and the
-    /// right type. A pumped node produces no inbound channel (the supplied handler
-    /// owns the inbound path entirely), so we store a DISCONNECTED receiver — its
-    /// `.recv()` returns `None` forever, which the daemon never drains anyway.
-    #[cfg(feature = "native")]
-    pub async fn new_with_sync_handler<A, H>(
-        secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
-        allowlist: Arc<A>,
+        sync_alpn: &'static [u8],
         sync_handler: H,
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
         H: iroh::protocol::ProtocolHandler,
     {
-        // S1: keep `inbound_sync_rx` present and the right type even though the
-        // pumped handler produces no inbound channel. A disconnected receiver
-        // (sender dropped immediately) is inert and type-correct.
-        let (tx, inbound_sync_rx) = tokio::sync::mpsc::unbounded_channel();
-        drop(tx);
         Self::build(
             secret_key_bytes,
             relays,
             allowlist,
             false,
+            sync_alpn,
             sync_handler,
-            inbound_sync_rx,
         )
         .await
     }
 
-    /// Create a SyncNode whose endpoint has **no IP transports** — relay-only.
+    /// Create a `P2pNode` whose endpoint has **no IP transports** — relay-only —
+    /// with a caller-supplied `sync_alpn` handler.
     ///
-    /// Identical to [`SyncNode::new`] except the iroh endpoint is built with
-    /// `clear_ip_transports()`, so it cannot open any direct/loopback QUIC path
-    /// and can only reach peers through a relay. This reproduces the off-LAN /
+    /// Identical to [`P2pNode::with_sync_alpn`] except the iroh endpoint is built
+    /// with `clear_ip_transports()`, so it cannot open any direct/loopback QUIC
+    /// path and can only reach peers through a relay. This reproduces the off-LAN /
     /// behind-NAT condition where the relay is the sole route — the topology that
-    /// in-process localhost tests otherwise can't force, because two loopback
-    /// nodes would discover each other's direct addresses and bypass the relay.
+    /// in-process localhost tests otherwise can't force, because two loopback nodes
+    /// would discover each other's direct addresses and bypass the relay.
     ///
     /// Test-only (behind the `test-util` feature); never used in production.
-    #[cfg(all(feature = "native", feature = "test-util"))]
-    pub async fn new_relay_only<A: AllowlistStorage + std::fmt::Debug + 'static>(
+    #[cfg(feature = "test-util")]
+    pub async fn relay_only_with_sync_alpn<A, H>(
         secret_key_bytes: [u8; 32],
         relays: &[RelayUrl],
         allowlist: Arc<A>,
-    ) -> Result<Self> {
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
-        Self::build(
-            secret_key_bytes,
-            relays,
-            allowlist,
-            true,
-            sync_handler,
-            inbound_sync_rx,
-        )
-        .await
-    }
-
-    /// Relay-only [`SyncNode::new_relay_only`] with a caller-supplied `SYNC_ALPN`
-    /// handler — the off-LAN/NAT counterpart to [`SyncNode::new_with_sync_handler`].
-    ///
-    /// The daemon's relay-path convergence tests need BOTH the relay-only topology
-    /// (so the relay is the genuine sole route) AND the pumped inbound handler (so
-    /// the responder drives the multi-message handshake), which neither single
-    /// constructor provides. Test-only, behind `test-util`.
-    #[cfg(all(feature = "native", feature = "test-util"))]
-    pub async fn new_relay_only_with_sync_handler<A, H>(
-        secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
-        allowlist: Arc<A>,
+        sync_alpn: &'static [u8],
         sync_handler: H,
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
         H: iroh::protocol::ProtocolHandler,
     {
-        // S1: keep a present, correctly-typed (disconnected) `inbound_sync_rx`.
-        let (tx, inbound_sync_rx) = tokio::sync::mpsc::unbounded_channel();
-        drop(tx);
         Self::build(
             secret_key_bytes,
             relays,
             allowlist,
             true,
+            sync_alpn,
             sync_handler,
-            inbound_sync_rx,
         )
         .await
     }
 
-    /// Shared constructor body for [`SyncNode::new`] and (test-only)
-    /// [`SyncNode::new_relay_only`].
+    /// Shared constructor body.
     ///
     /// `relay_only` strips IP transports from the endpoint so the only routing
     /// path is a relay. The production callers always pass `false`; only the
     /// `test-util` relay-only constructor passes `true`.
-    #[cfg(feature = "native")]
     async fn build<A, H>(
         secret_key_bytes: [u8; 32],
         relays: &[RelayUrl],
         allowlist: Arc<A>,
         relay_only: bool,
+        sync_alpn: &'static [u8],
         sync_handler: H,
-        inbound_sync_rx: InboundSyncRx,
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
@@ -327,7 +261,7 @@ impl SyncNode {
         info!(node_id = %endpoint.id(), "Iroh endpoint created");
 
         let mdns = {
-            use crate::network::mesh_mdns::{MeshMdns, socket_addrs_to_port_addrs};
+            use crate::mesh_mdns::socket_addrs_to_port_addrs;
             let bound = endpoint.bound_sockets();
             let (port, ips) = socket_addrs_to_port_addrs(&bound);
             // Only advertise IPv4 sockets (V4Only mDNS scope).
@@ -359,7 +293,7 @@ impl SyncNode {
         // mirroring the mDNS registration pattern above.
         //
         // This is the COLD-path backstop. Gossip already shares addresses warmly
-        // (see `join_vault_gossip`), but that book is soft-state (~300s TTL) and is
+        // (see `join_topic`), but that book is soft-state (~300s TTL) and is
         // useless to a node that's been silent past the TTL, cold-started, or fully
         // partitioned (no neighbor to learn from). These PERSISTED hints are what a
         // returning off-LAN peer dials to re-enter the mesh. iroh won't persist or
@@ -386,68 +320,17 @@ impl SyncNode {
 
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip_handler)
-            .accept(SYNC_ALPN, sync_handler)
+            .accept(sync_alpn, sync_handler)
             .accept(PAIRING_ALPN, pairing_handler)
             .spawn();
 
         Ok(Self {
             endpoint,
             gossip,
-            inbound_sync_rx,
             inbound_pairing_rx,
             router,
             mdns,
             peer_lookup,
-        })
-    }
-
-    /// Create a new SyncNode from an ed25519 secret key (WASM build).
-    ///
-    /// The public key becomes this node's `EndpointId` (and derives our `PeerId`).
-    /// The endpoint binds to a random available port.
-    ///
-    /// `relays` — the set of relay URLs this node homes on. The endpoint builds a
-    /// custom `RelayMap` from them and homes on the lowest-latency reachable one,
-    /// failing over across the set. It's a SET, not a single optional URL: a server
-    /// passes its own public relay (so it homes on itself), a laptop passes the
-    /// known public relays it learned at pairing, and `&[]` means no relay at all
-    /// (LAN-direct QUIC only).
-    #[cfg(not(feature = "native"))]
-    pub async fn new(secret_key_bytes: [u8; 32], relays: &[RelayUrl]) -> Result<Self> {
-        let signing_key = SigningKey::from_bytes(&secret_key_bytes);
-        let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
-
-        // Kept in lockstep with the native `build()` RelayMode logic above:
-        // empty slice → `Disabled` (relay transport off; mDNS/peer_lookup remain),
-        // otherwise home on the SET with failover.
-        let relay_mode = if relays.is_empty() {
-            RelayMode::Disabled
-        } else {
-            RelayMode::Custom(RelayMap::from_iter(relays.iter().cloned()))
-        };
-
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(secret_key)
-            .relay_mode(relay_mode)
-            .bind()
-            .await
-            .context("Failed to create iroh endpoint")?;
-
-        info!(node_id = %endpoint.id(), "Iroh endpoint created");
-
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
-
-        let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(SYNC_ALPN.to_vec(), sync_handler)
-            .spawn();
-
-        Ok(Self {
-            endpoint,
-            gossip,
-            inbound_sync_rx,
-            router,
         })
     }
 
@@ -456,7 +339,7 @@ impl SyncNode {
         self.endpoint.id()
     }
 
-    /// Seed a relay hint for a peer into the address-lookup service (native only).
+    /// Seed a relay hint for a peer into the address-lookup service.
     ///
     /// After this call, gossip bootstrap with the peer's bare `EndpointId` will
     /// resolve the hint and attempt a connection through their relay. This is
@@ -466,7 +349,6 @@ impl SyncNode {
     /// If the relay is unreachable off-LAN, connection attempts through that hint
     /// will simply fail; there is no automatic fallback to mDNS off-LAN because
     /// mDNS does not operate across network boundaries.
-    #[cfg(feature = "native")]
     pub fn add_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
         if endpoint_id == self.node_id() {
             tracing::warn!(
@@ -480,7 +362,7 @@ impl SyncNode {
     }
 
     /// Add a relay to this node's live `RelayMap` so it can home on / fail over to
-    /// it this session, without a restart (native only).
+    /// it this session, without a restart.
     ///
     /// Used by gossip expansion: when a peer's learned home relay is a new public
     /// relay (e.g. a second server's), adopting it into the RelayMap lets net-report
@@ -491,7 +373,6 @@ impl SyncNode {
     /// Idempotent at the iroh layer: `insert_relay` replaces any existing config for
     /// the URL and returns the prior one (ignored here). Returns without effect if
     /// the endpoint is closed (`insert_relay` yields `None`).
-    #[cfg(feature = "native")]
     pub async fn add_home_relay(&self, relay_url: &RelayUrl) {
         self.endpoint
             .insert_relay(
@@ -502,7 +383,7 @@ impl SyncNode {
         tracing::info!(relay_url = %relay_url, "Added learned public relay to live RelayMap");
     }
 
-    /// Replace a peer's relay hint in the address-lookup service (native only).
+    /// Replace a peer's relay hint in the address-lookup service.
     ///
     /// Unlike `add_peer_relay`, which unions the new relay with any existing
     /// addresses for the peer, this completely overwrites the prior entry. Used
@@ -510,7 +391,6 @@ impl SyncNode {
     /// before re-bootstrapping, and learn-on-exchange replaces a moved peer's relay.
     /// A union would let a stale, dead relay URL linger alongside the fresh one and
     /// keep getting dialed; the overwrite guarantees only the latest hint remains.
-    #[cfg(feature = "native")]
     pub fn set_peer_relay(&self, endpoint_id: EndpointId, relay_url: &RelayUrl) {
         if endpoint_id == self.node_id() {
             tracing::warn!(
@@ -523,7 +403,7 @@ impl SyncNode {
         self.peer_lookup.set_endpoint_info(addr);
     }
 
-    /// Evict a peer's relay hint from the address-lookup service (native only).
+    /// Evict a peer's relay hint from the address-lookup service.
     ///
     /// Removing the entry from `peer_lookup` (`MemoryLookup`) is the only lever
     /// that stops a dead hint from being re-dialed: merely declining to re-seed
@@ -540,7 +420,6 @@ impl SyncNode {
     /// re-adds it via `set_peer_relay` on a slow cadence so a genuinely off-LAN
     /// peer that returns is still reached. Removing an absent key is a harmless
     /// no-op.
-    #[cfg(feature = "native")]
     pub fn remove_peer_relay(&self, endpoint_id: EndpointId) {
         if endpoint_id == self.node_id() {
             tracing::warn!(
@@ -552,32 +431,11 @@ impl SyncNode {
         self.peer_lookup.remove_endpoint_info(endpoint_id);
     }
 
-    /// Derive a deterministic gossip TopicId from a VaultId.
+    /// Subscribe to gossip for a specific topic.
     ///
-    /// Each vault gets its own gossip topic, scoped to peers who share that vault.
-    /// The VaultId's `u64` value is written into the first 8 bytes of a 32-byte
-    /// little-endian array to produce a consistent TopicId.
-    pub fn vault_topic(vault_id: &VaultId) -> TopicId {
-        let mut bytes = [0u8; 32];
-        bytes[..8].copy_from_slice(&vault_id.as_u64().to_le_bytes());
-        TopicId::from_bytes(bytes)
-    }
-
-    /// Recover the `VaultId` encoded in a gossip topic's bytes.
-    ///
-    /// Inverse of [`vault_topic`](Self::vault_topic): reads the little-endian
-    /// `u64` back out of `topic[0..8]`. Used when a pairing initiator must adopt
-    /// the mesh's VaultId carried in `PairingResult::vault_topic` — the topic is
-    /// the only place the VaultId travels over the wire, so this is the single
-    /// defined inverse mapping rather than duplicating the id in a separate field.
-    pub fn vault_id_from_topic(topic: &[u8; 32]) -> VaultId {
-        VaultId::from(u64::from_le_bytes(topic[..8].try_into().unwrap()))
-    }
-
-    /// Subscribe to gossip for a specific vault.
-    ///
-    /// `bootstrap_nodes` should be the `EndpointId`s of known peers for that vault.
-    /// At least one bootstrap node is needed to join the gossip swarm.
+    /// `bootstrap_nodes` should be the `EndpointId`s of known peers for that topic.
+    /// At least one bootstrap node is needed to join the gossip swarm. Returns the
+    /// raw iroh-gossip subscribe handle; sync-core wraps it in a `VaultGossip`.
     ///
     /// We pass bare `EndpointId`s and attach NO peer data — yet iroh-gossip still
     /// auto-publishes THIS node's own `EndpointAddr` (relay + direct IPs) as
@@ -591,19 +449,15 @@ impl SyncNode {
     /// The catch (why the persisted `peer_lookup` hints still exist): gossip's book
     /// is soft-state (~300s TTL) and can't cross a full partition or cold-start.
     /// That COLD path is owned by the relay hints + the reconnect supervisor.
-    pub async fn join_vault_gossip(
+    pub async fn join_topic(
         &self,
-        vault_id: &VaultId,
+        topic: TopicId,
         bootstrap_nodes: Vec<EndpointId>,
-    ) -> Result<crate::network::gossip::VaultGossip> {
-        let topic = Self::vault_topic(vault_id);
-        let handle = self
-            .gossip
+    ) -> Result<iroh_gossip::api::GossipTopic> {
+        self.gossip
             .subscribe(topic, bootstrap_nodes)
             .await
-            .context("Failed to subscribe to vault gossip topic")?;
-
-        Ok(crate::network::gossip::VaultGossip::new(handle, topic))
+            .context("Failed to subscribe to gossip topic")
     }
 
     /// Publish this node's mesh metadata via mDNS so LAN peers can discover it.
@@ -614,13 +468,12 @@ impl SyncNode {
     ///
     /// Relay URL is included when provided so discovered peers can connect
     /// even without direct address information.
-    #[cfg(feature = "native")]
     pub fn publish_mesh_info(
         &self,
-        metadata: &crate::network::discovery::MeshMetadata,
+        metadata: &crate::discovery::MeshMetadata,
         relay_url: Option<&RelayUrl>,
     ) {
-        use crate::network::mesh_mdns::socket_addrs_to_port_addrs;
+        use crate::mesh_mdns::socket_addrs_to_port_addrs;
 
         let Some(ref mdns) = self.mdns else {
             tracing::debug!("mDNS not available, skipping mesh info publish");
@@ -677,9 +530,8 @@ impl SyncNode {
     /// nudge — mdns-sd's `enable_addr_auto()` supplies the real per-interface IPs
     /// at register time. The port is the durable contribution and is stable across
     /// a LAN move, so there is no ordering requirement against iroh's rebind.
-    #[cfg(feature = "native")]
     pub fn republish_mdns_on_net_change(&self) {
-        use crate::network::mesh_mdns::socket_addrs_to_port_addrs;
+        use crate::mesh_mdns::socket_addrs_to_port_addrs;
 
         let Some(ref mdns) = self.mdns else {
             tracing::debug!("mDNS not available, skipping net-change republish");
@@ -711,12 +563,10 @@ impl SyncNode {
     /// including their `UserData` which contains JSON-encoded `MeshMetadata`.
     /// Parse the `UserData` to extract the mesh name and VaultId, then group
     /// peers by VaultId to form `DiscoveredMesh` entries.
-    #[cfg(feature = "native")]
     pub async fn subscribe_discovery(
         &self,
-    ) -> Option<
-        impl n0_future::Stream<Item = crate::network::discovery::DiscoveryEvent> + Unpin + use<>,
-    > {
+    ) -> Option<impl n0_future::Stream<Item = crate::discovery::DiscoveryEvent> + Unpin + use<>>
+    {
         let mdns = self.mdns.as_ref()?;
         Some(mdns.subscribe().await)
     }
@@ -733,18 +583,17 @@ impl SyncNode {
 mod tests {
     use super::*;
 
-    /// `vault_topic` and `vault_id_from_topic` must be exact inverses so a pairing
-    /// initiator can recover the mesh's VaultId from the topic it receives on the wire.
+    /// `topic_from_u64` and `u64_from_topic` must be exact inverses so a caller
+    /// (sync-core's `VaultGossipExt`) can recover the seed encoded in a topic.
     #[test]
-    fn vault_topic_round_trips_through_vault_id_from_topic() {
-        // Cover edge values: small ids that zero-pad the high bytes, a full-width
-        // id, and the all-ones id — the bit patterns most likely to expose a
+    fn topic_from_u64_round_trips_through_u64_from_topic() {
+        // Cover edge values: small seeds that zero-pad the high bytes, a full-width
+        // seed, and the all-ones seed — the bit patterns most likely to expose a
         // byte-order or width mistake in the encode/decode pair.
         for raw in [1u64, 0xFF, 0x1234, 0xa1b2c3d4e5f67890, u64::MAX] {
-            let vault_id = VaultId::from(raw);
-            let topic = SyncNode::vault_topic(&vault_id);
-            let recovered = SyncNode::vault_id_from_topic(topic.as_bytes());
-            assert_eq!(recovered, vault_id, "round-trip failed for {raw:#x}");
+            let topic = topic_from_u64(raw);
+            let recovered = u64_from_topic(topic.as_bytes());
+            assert_eq!(recovered, raw, "round-trip failed for {raw:#x}");
         }
     }
 }

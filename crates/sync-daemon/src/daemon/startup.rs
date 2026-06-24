@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use sync_core::allowlist::AllowlistStorage;
-use sync_core::network::SyncNode;
 use sync_core::network::discovery::MeshMetadata;
+use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
 use vault_sync::Vault;
 use vault_sync::fs::FileSystem;
 

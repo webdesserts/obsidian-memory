@@ -16,7 +16,7 @@ use tracing::debug;
 
 use sync_core::allowlist::InMemoryAllowlist;
 use sync_core::network::{
-    SyncNode,
+    SyncNode, SyncNodeSeam,
     discovery::{DiscoveredMesh, mesh_from_discovery_event},
     pairing::pair_with_mesh_interactive,
 };
@@ -50,8 +50,10 @@ pub async fn run(vault_path: PathBuf, device_name: Option<String>) -> Result<()>
     // because pairing uses its own ALPN, not the gossip ALPN.
     let pairing_allowlist = Arc::new(InMemoryAllowlist::new());
 
-    // Create a minimal SyncNode (no relay needed for LAN pairing).
-    let sync_node = SyncNode::new(secret_key_bytes, &[], pairing_allowlist)
+    // Create a minimal SyncNode (no relay needed for LAN pairing). Pairing only
+    // drives the pairing ALPN, so the default sync handler's inbound receiver is
+    // unused here.
+    let (sync_node, _inbound_sync_rx) = SyncNode::new(secret_key_bytes, &[], pairing_allowlist)
         .await
         .context("Failed to create iroh SyncNode")?;
 

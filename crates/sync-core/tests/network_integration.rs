@@ -14,7 +14,10 @@ mod network_integration {
 
     use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
-    use sync_core::network::{SyncNode, gossip::GossipEvent, streams::connect_and_sync_raw};
+    use sync_core::network::streams::InboundSyncRx;
+    use sync_core::network::{
+        SyncNode, SyncNodeSeam, VaultGossipExt, gossip::GossipEvent, streams::connect_and_sync_raw,
+    };
     use sync_core::peer_id::{PeerId, VaultId};
     use sync_core::sync::SyncMessage;
 
@@ -27,14 +30,22 @@ mod network_integration {
 
     /// Create a pair of `SyncNode`s that can reach each other directly (no relay).
     ///
-    /// Returns `(node_a, node_b, addr_a, addr_b)`. Both nodes are pre-populated
-    /// in each other's allowlists so gossip connections are accepted.
-    async fn make_test_pair() -> anyhow::Result<(SyncNode, SyncNode, EndpointAddr, EndpointAddr)> {
+    /// Returns `(node_a, node_b, addr_a, addr_b, inbound_rx_a)`. Both nodes are
+    /// pre-populated in each other's allowlists so gossip connections are accepted.
+    /// `inbound_rx_a` is node A's inbound-sync receiver — the QUIC round-trip tests
+    /// drive it to act as the responder; gossip-only tests discard it.
+    async fn make_test_pair() -> anyhow::Result<(
+        SyncNode,
+        SyncNode,
+        EndpointAddr,
+        EndpointAddr,
+        InboundSyncRx,
+    )> {
         let allowlist_a = Arc::new(InMemoryAllowlist::new());
         let allowlist_b = Arc::new(InMemoryAllowlist::new());
 
-        let node_a = make_test_node(seed(1), allowlist_a.clone()).await?;
-        let node_b = make_test_node(seed(2), allowlist_b.clone()).await?;
+        let (node_a, inbound_rx_a) = make_test_node(seed(1), allowlist_a.clone()).await?;
+        let (node_b, _inbound_rx_b) = make_test_node(seed(2), allowlist_b.clone()).await?;
 
         // Pre-populate each allowlist with the other peer's id.
         let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
@@ -54,24 +65,25 @@ mod network_integration {
         lookup_b.add_endpoint_info(addr_a.clone());
         node_b.endpoint.address_lookup()?.add(lookup_b);
 
-        Ok((node_a, node_b, addr_a, addr_b))
+        Ok((node_a, node_b, addr_a, addr_b, inbound_rx_a))
     }
 
     /// Build a `SyncNode` using the real `SyncNode::new()` constructor.
     ///
     /// Passes `None` for the relay URL (direct QUIC, no relay) and adds a `MemoryLookup`
-    /// so peers can dial each other directly in-process.
+    /// so peers can dial each other directly in-process. Returns the node and its
+    /// inbound-sync receiver.
     async fn make_test_node<
         A: sync_core::allowlist::AllowlistStorage + std::fmt::Debug + 'static,
     >(
         secret_key_bytes: [u8; 32],
         allowlist: std::sync::Arc<A>,
-    ) -> anyhow::Result<SyncNode> {
-        let node = SyncNode::new(secret_key_bytes, &[], allowlist).await?;
+    ) -> anyhow::Result<(SyncNode, InboundSyncRx)> {
+        let (node, inbound_rx) = SyncNode::new(secret_key_bytes, &[], allowlist).await?;
         // Add MemoryLookup for direct in-process connectivity without relay.
         let memory_lookup = MemoryLookup::new();
         node.endpoint.address_lookup()?.add(memory_lookup);
-        Ok(node)
+        Ok((node, inbound_rx))
     }
 
     // ── SyncNode construction ─────────────────────────────────────────────────
@@ -79,8 +91,8 @@ mod network_integration {
     /// Nodes created from different seeds must have distinct `EndpointId`s.
     #[tokio::test]
     async fn sync_node_has_unique_id_per_key() -> anyhow::Result<()> {
-        let node_a = make_test_node(seed(10), Arc::new(InMemoryAllowlist::new())).await?;
-        let node_b = make_test_node(seed(20), Arc::new(InMemoryAllowlist::new())).await?;
+        let (node_a, _rx_a) = make_test_node(seed(10), Arc::new(InMemoryAllowlist::new())).await?;
+        let (node_b, _rx_b) = make_test_node(seed(20), Arc::new(InMemoryAllowlist::new())).await?;
 
         assert_ne!(node_a.node_id(), node_b.node_id());
         Ok(())
@@ -89,8 +101,8 @@ mod network_integration {
     /// A node created from the same seed always produces the same `EndpointId`.
     #[tokio::test]
     async fn sync_node_deterministic_from_seed() -> anyhow::Result<()> {
-        let node_a = make_test_node(seed(42), Arc::new(InMemoryAllowlist::new())).await?;
-        let node_b = make_test_node(seed(42), Arc::new(InMemoryAllowlist::new())).await?;
+        let (node_a, _rx_a) = make_test_node(seed(42), Arc::new(InMemoryAllowlist::new())).await?;
+        let (node_b, _rx_b) = make_test_node(seed(42), Arc::new(InMemoryAllowlist::new())).await?;
 
         assert_eq!(node_a.node_id(), node_b.node_id());
         Ok(())
@@ -123,7 +135,7 @@ mod network_integration {
     /// Two `SyncNode`s can exchange a gossip change notification.
     #[tokio::test]
     async fn two_nodes_can_exchange_gossip() -> anyhow::Result<()> {
-        let (node_a, node_b, _addr_a, _addr_b) = make_test_pair().await?;
+        let (node_a, node_b, _addr_a, _addr_b, _inbound_rx_a) = make_test_pair().await?;
 
         let vault_id: VaultId = "deadbeefdeadbeef".parse().unwrap();
         let node_b_id = node_b.node_id();
@@ -188,7 +200,8 @@ mod network_integration {
     /// vault layer uses the raw transport.
     #[tokio::test]
     async fn sync_request_response_round_trips() -> anyhow::Result<()> {
-        let (node_server, node_client, _addr_server, _addr_client) = make_test_pair().await?;
+        let (node_server, node_client, _addr_server, _addr_client, inbound_rx_server) =
+            make_test_pair().await?;
         let addr_server = node_server.endpoint.addr();
 
         // Drive the server's inbound request handler in a background task.
@@ -203,7 +216,7 @@ mod network_integration {
         let response_bytes = bincode::serialize(&expected_response)?;
         let response_bytes_clone = response_bytes.clone();
 
-        let mut inbound_rx = node_server.inbound_sync_rx;
+        let mut inbound_rx = inbound_rx_server;
         tokio::spawn(async move {
             while let Some(req) = inbound_rx.recv().await {
                 let _ = req.reply_tx.send(response_bytes_clone.clone());
@@ -249,7 +262,8 @@ mod network_integration {
     /// Sending a large message (1 MiB of document data) succeeds.
     #[tokio::test]
     async fn sync_large_message_round_trips() -> anyhow::Result<()> {
-        let (node_server, node_client, _addr_server, _addr_client) = make_test_pair().await?;
+        let (node_server, node_client, _addr_server, _addr_client, inbound_rx_server) =
+            make_test_pair().await?;
         let addr_server = node_server.endpoint.addr();
 
         let large_data = vec![0xABu8; 1024 * 1024];
@@ -260,7 +274,7 @@ mod network_integration {
         let response_bytes = bincode::serialize(&response_msg)?;
         let response_bytes_clone = response_bytes.clone();
 
-        let mut inbound_rx = node_server.inbound_sync_rx;
+        let mut inbound_rx = inbound_rx_server;
         tokio::spawn(async move {
             while let Some(req) = inbound_rx.recv().await {
                 let _ = req.reply_tx.send(response_bytes_clone.clone());
@@ -298,10 +312,11 @@ mod network_integration {
     /// Multiple sequential sync round-trips on the same pair of nodes succeed.
     #[tokio::test]
     async fn multiple_sequential_sync_round_trips() -> anyhow::Result<()> {
-        let (node_server, node_client, _addr_server, _addr_client) = make_test_pair().await?;
+        let (node_server, node_client, _addr_server, _addr_client, inbound_rx_server) =
+            make_test_pair().await?;
         let addr_server = node_server.endpoint.addr();
 
-        let mut inbound_rx = node_server.inbound_sync_rx;
+        let mut inbound_rx = inbound_rx_server;
         tokio::spawn(async move {
             while let Some(req) = inbound_rx.recv().await {
                 let response = SyncMessage::SyncResponse {
@@ -350,8 +365,8 @@ mod network_integration {
         let allowlist_a = Arc::new(InMemoryAllowlist::new());
         let allowlist_b = Arc::new(InMemoryAllowlist::new());
 
-        let node_a = make_test_node(seed(50), allowlist_a.clone()).await?;
-        let node_b = make_test_node(seed(51), allowlist_b.clone()).await?;
+        let (node_a, _rx_a) = make_test_node(seed(50), allowlist_a.clone()).await?;
+        let (node_b, _rx_b) = make_test_node(seed(51), allowlist_b.clone()).await?;
 
         // Pre-populate each allowlist with the other peer's id.
         let peer_a = PeerId::from_bytes(*node_a.node_id().as_bytes());
@@ -492,7 +507,7 @@ mod network_integration {
     /// re-dial is validated at the daemon level by the supervisor integration test.
     #[tokio::test]
     async fn rejoin_peers_forwards_to_gossip_sender() -> anyhow::Result<()> {
-        let node = make_test_node(seed(55), Arc::new(InMemoryAllowlist::new())).await?;
+        let (node, _rx) = make_test_node(seed(55), Arc::new(InMemoryAllowlist::new())).await?;
         let vault_id: VaultId = "feedfacefeedface".parse().unwrap();
 
         let gossip = node.join_vault_gossip(&vault_id, vec![]).await?;

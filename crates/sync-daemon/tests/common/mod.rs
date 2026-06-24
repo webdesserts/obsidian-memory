@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use iroh::RelayUrl;
 use sync_core::allowlist::InMemoryAllowlist;
-use sync_core::network::SyncNode;
+use sync_core::network::{SyncNode, SyncNodeSeam};
 use sync_core::peer_id::PeerId;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;

@@ -14,8 +14,11 @@ native = ["iroh/default", "tokio/rt", "tokio/macros"]
 # conditions (e.g. relay-only endpoints with no IP transports) so downstream
 # integration-test crates can reproduce off-LAN/NAT topologies. Never enabled
 # in production builds. `#[cfg(test)]` would not cross the crate boundary into
-# sync-daemon's integration tests, so this is a feature instead.
-test-util = []
+# sync-daemon's integration tests, so this is a feature instead. The relay-only
+# constructors now live on `p2p-core`'s `P2pNode`, so this forwards to
+# `p2p-core/test-util` — the daemon's existing `sync-core/test-util` dev-dep line
+# keeps the passthrough working unchanged.
+test-util = ["p2p-core/test-util"]
 
 [dependencies]
 p2p-core = { path = "../p2p-core" }

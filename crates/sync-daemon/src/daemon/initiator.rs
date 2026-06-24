@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use sync_core::allowlist::AllowlistStorage;
+use sync_core::network::VaultGossipExt;
 use sync_core::network::discovery::MeshMetadata;
 use sync_core::network::pairing::pair_with_mesh_interactive;
 // `VaultId` here is the mesh's id recovered from the gossip topic (a
