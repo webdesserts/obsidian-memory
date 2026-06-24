@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 sync-core = { path = "../sync-core", features = ["native"] }
+# Peer identity + file-backed key storage (FileKeyStorage, IdentityKey).
+p2p-core = { path = "../p2p-core" }
 # vault-sync has no Cargo features — its native/wasm fork is `cfg(target_arch)`,
 # so this dep line is bare (a `features = [...]` spec would fail to resolve).
 vault-sync = { path = "../vault-sync" }
@@ -41,10 +43,6 @@ fs2 = "0.4"
 
 # Hostname for device name detection
 gethostname = "0.4"
-
-# Ed25519 keypairs for peer identity
-ed25519-dalek.workspace = true
-getrandom.workspace = true
 
 # Document UUIDs — captured on the delete half of a move so the move-coalescer
 # journal can re-stitch lineage on crash recovery (P4f-2).

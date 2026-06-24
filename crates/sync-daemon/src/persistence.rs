@@ -1,82 +1,19 @@
 //! Persistence for daemon state.
 //!
-//! - **`IdentityKey`** (`.sync/daemon.key`): Ed25519 secret key for the daemon's network identity
+//! - **`IdentityKey`** (`.sync/daemon.key`, in `p2p_core`): Ed25519 secret key for the daemon's network identity
 //! - **`DaemonConfig`** (`.sync/daemon.toml`): Daemon config including the derived PeerId
 
-use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use sync_core::key_storage::KeyStorage;
 use sync_core::peer_id::PeerId;
 use tracing::{info, warn};
 
-use crate::key_storage::FileKeyStorage;
+use p2p_core::IdentityKey;
 
 const DAEMON_KEY_FILE: &str = ".sync/daemon.key";
 const DAEMON_CONFIG_FILE: &str = ".sync/daemon.toml";
-
-/// The daemon's ed25519 secret key, persisted in `.sync/daemon.key`.
-///
-/// The public key (derived from this secret) is used as the daemon's `PeerId`.
-/// On first run, a new keypair is generated and the secret key is written to disk.
-/// On subsequent runs, the secret key is loaded to reconstruct a stable identity.
-pub struct IdentityKey {
-    signing_key: SigningKey,
-}
-
-impl IdentityKey {
-    /// Load or generate the default identity key at `.sync/daemon.key`.
-    ///
-    /// Delegates I/O to `FileKeyStorage`, which handles file creation,
-    /// permissions, and atomic loading.
-    pub async fn load_or_generate(vault_path: &Path) -> Result<Self> {
-        let storage = FileKeyStorage::new(vault_path);
-        let bytes = storage
-            .load_or_generate()
-            .await
-            .map_err(|e| anyhow::anyhow!("Key storage error: {}", e))?;
-        let key = Self::from_bytes(bytes);
-        info!(peer_id = %key.peer_id(), "Loaded or generated daemon identity key");
-        Ok(key)
-    }
-
-    /// Load an identity key from a custom key file path.
-    ///
-    /// The file must contain exactly 32 bytes (the ed25519 secret key).
-    pub fn load_from(key_path: &Path) -> Result<Self> {
-        let bytes = fs::read(key_path)
-            .with_context(|| format!("Failed to read key file: {}", key_path.display()))?;
-        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-            anyhow::anyhow!("Key file must be exactly 32 bytes: {}", key_path.display())
-        })?;
-        Ok(Self::from_bytes(bytes))
-    }
-
-    /// Build an `IdentityKey` from raw secret key bytes.
-    fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self {
-            signing_key: SigningKey::from_bytes(&bytes),
-        }
-    }
-
-    /// Derive the `PeerId` from this identity key's public key.
-    ///
-    /// Delegates to `PeerId::from_secret_bytes` so the secret-key → device
-    /// PeerId derivation lives in one place, shared with the WASM plugin.
-    pub fn peer_id(&self) -> PeerId {
-        PeerId::from_secret_bytes(self.signing_key.to_bytes())
-    }
-
-    /// Return the raw 32-byte ed25519 secret key.
-    ///
-    /// Used to initialize the iroh `SyncNode`, which needs the secret key to
-    /// derive a stable `EndpointId` (the iroh equivalent of our `PeerId`).
-    pub fn secret_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
-    }
-}
 
 /// A learned relay URL for a specific peer — the reconnect supervisor's
 /// in-memory working-entry type.
@@ -399,75 +336,6 @@ fn clear_known_peers(vault_path: &Path) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    // ==================== IdentityKey tests ====================
-
-    #[tokio::test]
-    async fn test_identity_key_generates_and_saves() {
-        let temp_dir = TempDir::new().unwrap();
-        let vault_path = temp_dir.path();
-
-        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
-        let peer_id = key.peer_id();
-
-        // Key file should exist with 32 bytes
-        let key_path = vault_path.join(".sync/daemon.key");
-        assert!(key_path.exists());
-        assert_eq!(fs::read(&key_path).unwrap().len(), 32);
-
-        // PeerId should be valid (64-char hex)
-        assert_eq!(peer_id.to_string().len(), 64);
-        assert_ne!(peer_id.as_u64(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_identity_key_loads_and_matches() {
-        let temp_dir = TempDir::new().unwrap();
-        let vault_path = temp_dir.path();
-
-        let key1 = IdentityKey::load_or_generate(vault_path).await.unwrap();
-        let peer_id1 = key1.peer_id();
-
-        // Second call should load the same key from disk
-        let key2 = IdentityKey::load_or_generate(vault_path).await.unwrap();
-        let peer_id2 = key2.peer_id();
-
-        // Should produce the same PeerId after loading
-        assert_eq!(peer_id1, peer_id2);
-    }
-
-    #[tokio::test]
-    async fn test_identity_key_load_from_custom_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let vault_path = temp_dir.path();
-
-        // Generate a key in a separate location via load_or_generate
-        let alt_dir = TempDir::new().unwrap();
-        let alt_key = IdentityKey::load_or_generate(alt_dir.path()).await.unwrap();
-        let alt_key_path = alt_dir.path().join(".sync/daemon.key");
-        let alt_peer_id = alt_key.peer_id();
-
-        // Load via custom path
-        let loaded = IdentityKey::load_from(&alt_key_path).unwrap();
-        assert_eq!(loaded.peer_id(), alt_peer_id);
-
-        // Should differ from what a default generate would produce
-        let default_key = IdentityKey::load_or_generate(vault_path).await.unwrap();
-        assert_ne!(default_key.peer_id(), alt_peer_id);
-    }
-
-    #[tokio::test]
-    async fn test_identity_key_secret_key_bytes() {
-        let temp_dir = TempDir::new().unwrap();
-        let vault_path = temp_dir.path();
-
-        let key = IdentityKey::load_or_generate(vault_path).await.unwrap();
-        let bytes = key.secret_key_bytes();
-
-        // Verify round-trip: reconstructing from bytes produces the same PeerId
-        let reconstructed = IdentityKey::from_bytes(bytes);
-        assert_eq!(reconstructed.peer_id(), key.peer_id());
-    }
 
     // ==================== DaemonConfig tests ====================
 
