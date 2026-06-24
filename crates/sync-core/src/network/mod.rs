@@ -36,12 +36,11 @@ mod node;
 /// direct dependency on `iroh-gossip`.
 pub use iroh_gossip::net::GOSSIP_ALPN;
 
-// mDNS discovery + the mDNS actor now live in `p2p-core` (native-only networking
-// substrate). Re-exported here so existing `sync_core::network::{discovery,
-// mesh_mdns}::*` paths keep resolving for the daemon and node code.
+// mDNS discovery, the mDNS actor, and the pairing QUIC handler now live in
+// `p2p-core` (native-only networking substrate). Re-exported here so existing
+// `sync_core::network::{discovery, mesh_mdns, pairing}::*` paths keep resolving
+// for the daemon and node code. The pairing handler is re-exported under the
+// `pairing` alias (its p2p-core module is `pairing_handler`, distinct from the
+// `pairing` message-types module).
+pub use p2p_core::pairing_handler as pairing;
 pub use p2p_core::{discovery, mesh_mdns};
-
-// pairing is native-only — it depends on iroh::protocol::ProtocolHandler
-// and tokio::time::timeout which are unavailable in WASM.
-#[cfg(feature = "native")]
-pub mod pairing;

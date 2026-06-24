@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::pairing::{PairingChallenge, PairingHello, PairingResponse, PairingResult, verify_hmac};
 use crate::peer_id::PeerId;
-use p2p_core::streams::{read_length_prefixed, write_length_prefixed};
+use crate::streams::{read_length_prefixed, write_length_prefixed};
 
 /// ALPN for the pairing protocol.
 pub const PAIRING_ALPN: &[u8] = b"obsidian-memory/pair/1";
@@ -479,11 +479,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::network::SYNC_ALPN;
-    use crate::network::streams::SyncStreamHandler;
     use iroh::protocol::Router;
     use iroh::{RelayMode, address_lookup::memory::MemoryLookup, endpoint::presets};
-    use iroh_gossip::{Gossip, net::GOSSIP_ALPN};
 
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
@@ -512,13 +509,12 @@ mod tests {
             .bind()
             .await?;
 
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-        let (sync_handler, _inbound_sync_rx) = SyncStreamHandler::new();
+        // The pairing tests only drive PAIRING_ALPN; the gossip/sync handlers that
+        // the production router also registers live in sync-core and aren't
+        // exercised here, so this router accepts the pairing protocol alone.
         let (pairing_handler, pairing_rx) = PairingStreamHandler::new();
 
         let router = Router::builder(endpoint.clone())
-            .accept(GOSSIP_ALPN, gossip.clone())
-            .accept(SYNC_ALPN, sync_handler)
             .accept(PAIRING_ALPN, pairing_handler)
             .spawn();
 
