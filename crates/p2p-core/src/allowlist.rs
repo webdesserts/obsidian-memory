@@ -143,9 +143,7 @@ fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 ///
 /// The allowlist controls which devices are permitted to sync with this vault.
 /// Only peers whose `node_id` appears in the allowlist will be accepted.
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
 pub trait AllowlistStorage: Send + Sync {
     /// Load all allowed peers from storage.
     async fn list_peers(&self) -> Result<Vec<AllowedPeer>>;
@@ -221,102 +219,20 @@ pub trait AllowlistStorage: Send + Sync {
     }
 }
 
-/// WASM version of the AllowlistStorage trait (without Send + Sync bounds).
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-#[cfg(target_arch = "wasm32")]
-pub trait AllowlistStorage {
-    /// Load all allowed peers from storage.
-    async fn list_peers(&self) -> Result<Vec<AllowedPeer>>;
-
-    /// Save the full allowlist to storage.
-    async fn save_peers(&self, peers: &[AllowedPeer]) -> Result<()>;
-
-    /// Add a peer to the allowlist.
-    ///
-    /// If a peer with this `node_id` already exists, updates the device name.
-    async fn add_peer(&self, node_id: PeerId, device_name: impl Into<String>) -> Result<()> {
-        let mut peers = self.list_peers().await?;
-        let device_name = device_name.into();
-
-        if let Some(existing) = peers.iter_mut().find(|p| p.node_id == node_id) {
-            existing.device_name = device_name;
-        } else {
-            peers.push(AllowedPeer::new(node_id, device_name));
-        }
-
-        self.save_peers(&peers).await
-    }
-
-    /// Revoke a peer by writing a tombstone.
-    ///
-    /// The entry stays in storage with `removed = true` (rather than being dropped)
-    /// so the revocation propagates across the mesh and wins over any peer that
-    /// still holds a live row (see `merge_roster`). If the peer is not present,
-    /// this is a no-op.
-    async fn remove_peer(&self, node_id: &PeerId) -> Result<()> {
-        let mut peers = self.list_peers().await?;
-        if let Some(peer) = peers.iter_mut().find(|p| &p.node_id == node_id) {
-            peer.removed = true;
-            peer.removed_at = Some(now_ms());
-            self.save_peers(&peers).await?;
-        }
-        Ok(())
-    }
-
-    /// Check whether a peer is authorized to connect.
-    ///
-    /// Tombstoned (revoked) entries are not trusted, even though they remain in
-    /// storage. This trait is the single source of truth for trust decisions.
-    async fn is_allowed(&self, node_id: &PeerId) -> Result<bool> {
-        let peers = self.list_peers().await?;
-        Ok(peers.iter().any(|p| &p.node_id == node_id && !p.removed))
-    }
-
-    /// Update the last-seen timestamp for a peer.
-    ///
-    /// If the peer is not in the allowlist, this is a no-op.
-    async fn update_last_seen(&self, node_id: &PeerId, timestamp_ms: u64) -> Result<()> {
-        let mut peers = self.list_peers().await?;
-        if let Some(peer) = peers.iter_mut().find(|p| &p.node_id == node_id) {
-            peer.last_seen = Some(timestamp_ms);
-            self.save_peers(&peers).await?;
-        }
-        Ok(())
-    }
-
-    /// Merge an incoming roster (e.g. received from a mesh peer) into local storage.
-    ///
-    /// Unions by `node_id` with tombstone-precedence so the mesh converges to one
-    /// roster (see `merge_roster_entries` for the full rule). Idempotent: re-merging
-    /// the same roster is a no-op. Saves only when the merge changed something.
-    async fn merge_roster(&self, incoming: &[AllowedPeer]) -> Result<()> {
-        let existing = self.list_peers().await?;
-        let merged = merge_roster_entries(&existing, incoming);
-        if merged != existing {
-            self.save_peers(&merged).await?;
-        }
-        Ok(())
-    }
-}
-
 /// In-memory implementation of `AllowlistStorage` for testing.
 ///
 /// Thread-safe, zero-I/O — suitable for integration tests that need
 /// a real `AllowlistStorage` without touching the filesystem.
-#[cfg(not(target_arch = "wasm32"))]
 pub struct InMemoryAllowlist {
     peers: std::sync::RwLock<Vec<AllowedPeer>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for InMemoryAllowlist {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryAllowlist").finish()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl InMemoryAllowlist {
     /// Create a new empty in-memory allowlist.
     pub fn new() -> Self {
@@ -326,14 +242,12 @@ impl InMemoryAllowlist {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Default for InMemoryAllowlist {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl AllowlistStorage for InMemoryAllowlist {
     async fn list_peers(&self) -> Result<Vec<AllowedPeer>> {

@@ -24,22 +24,22 @@
 
 pub mod network;
 
-pub mod allowlist;
 pub mod pairing;
 pub mod peer_id;
 
-// `KeyStorage`/`PeerId` and the file-backed identity types now live in `p2p-core`
-// (the native networking substrate sync-core depends on). Re-export the whole
-// `key_storage` module so existing `sync_core::key_storage::{KeyStorage,
-// KeyStorageError, Result}` paths keep resolving across the daemon.
+// `KeyStorage`/`PeerId`, the file-backed identity types, and the peer allowlist
+// now live in `p2p-core` (the native networking substrate sync-core depends on).
+// Re-export the whole modules so existing `sync_core::key_storage::{...}` and
+// `sync_core::allowlist::{...}` paths keep resolving across the daemon — and so
+// sync-core's own `crate::allowlist::*` imports in the `network` submodules keep
+// resolving without edits.
+pub use p2p_core::allowlist;
 pub use p2p_core::key_storage;
 pub mod peers;
 pub mod sync;
 pub mod time_scale;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use allowlist::InMemoryAllowlist;
-pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
+pub use p2p_core::allowlist::{AllowedPeer, AllowlistError, AllowlistStorage, InMemoryAllowlist};
 pub use p2p_core::key_storage::{KeyStorage, KeyStorageError};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
