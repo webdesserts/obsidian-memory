@@ -80,6 +80,18 @@ pub async fn n_vaults(n: u8) -> Vec<(V, Fs)> {
     out
 }
 
+/// Build three empty in-memory vaults (A/B/C, authored 1/2/3) with their retained
+/// filesystems — for the ≥3-replica determinism checks.
+pub async fn three_vaults() -> (V, V, V, Fs, Fs, Fs) {
+    let fs_a = Arc::new(InMemoryFs::new());
+    let fs_b = Arc::new(InMemoryFs::new());
+    let fs_c = Arc::new(InMemoryFs::new());
+    let a = Vault::init(Arc::clone(&fs_a), author(1)).await.unwrap();
+    let b = Vault::init(Arc::clone(&fs_b), author(2)).await.unwrap();
+    let c = Vault::init(Arc::clone(&fs_c), author(3)).await.unwrap();
+    (a, b, c, fs_a, fs_b, fs_c)
+}
+
 /// Drop `vault` and load a fresh one over the same filesystem, simulating a process
 /// restart from a cold cache (the `.loro`/registry persist on disk while the
 /// in-memory document cache starts empty). Authored by `author(1)` to match
@@ -223,6 +235,13 @@ pub async fn materialized_markdown(vault: &V, path: &str) -> String {
 /// composition suites.
 pub async fn alive_md_paths(vault: &V) -> BTreeSet<String> {
     vault.list_files().await.unwrap().into_iter().collect()
+}
+
+/// The set of `.md` files a vault currently materializes on disk (survivors + conflict
+/// files + relocated files), for exact-set assertions. A thin alias for
+/// [`alive_md_paths`] kept for the folder suites' existing call sites' readability.
+pub async fn md_files(vault: &V) -> BTreeSet<String> {
+    alive_md_paths(vault).await
 }
 
 /// The conflict-file path the cascade renames a loser to — `<stem> (conflict
