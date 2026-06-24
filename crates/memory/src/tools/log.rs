@@ -37,12 +37,12 @@ fn get_day_abbreviation(dt: &DateTime<Local>) -> &'static str {
 pub fn get_day_abbreviation_from_iso(iso_week_date: &str) -> &'static str {
     // Parse the day number from YYYY-Www-D format (1=Mon, 7=Sun)
     let parts: Vec<&str> = iso_week_date.split('-').collect();
-    if parts.len() == 3 {
-        if let Ok(day) = parts[2].parse::<u32>() {
-            // chrono's num_days_from_monday is 0-indexed, ISO week day is 1-indexed
-            if let Some(weekday) = Weekday::try_from(day as u8 - 1).ok() {
-                return weekday_abbreviation(weekday);
-            }
+    if parts.len() == 3
+        && let Ok(day) = parts[2].parse::<u32>()
+    {
+        // chrono's num_days_from_monday is 0-indexed, ISO week day is 1-indexed
+        if let Ok(weekday) = Weekday::try_from(day as u8 - 1) {
+            return weekday_abbreviation(weekday);
         }
     }
     "???"

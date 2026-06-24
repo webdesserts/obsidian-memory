@@ -87,55 +87,6 @@ fn relay_server_config(configured_relay_url: Option<String>) -> (Option<String>,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configured_relay_env_wins_over_stored() {
-        assert_eq!(
-            resolve_configured_relay_url(
-                Some("http://umbra.computer:3340/".to_string()),
-                Some("http://stored.example/".to_string()),
-            ),
-            Some("http://umbra.computer:3340/".to_string()),
-        );
-    }
-
-    #[test]
-    fn configured_relay_stored_used_when_no_env() {
-        assert_eq!(
-            resolve_configured_relay_url(None, Some("http://stored.example/".to_string())),
-            Some("http://stored.example/".to_string()),
-        );
-    }
-
-    #[test]
-    fn configured_relay_none_when_neither_set() {
-        assert_eq!(resolve_configured_relay_url(None, None), None);
-    }
-
-    /// A box with the relay-URL setting filled is a SERVER: it starts the embedded
-    /// relay (`relay_listen` bound) and advertises exactly that configured URL —
-    /// never a detected LAN IP.
-    #[test]
-    fn configured_url_runs_relay_server() {
-        let configured = Some("http://umbra.computer:3340/".to_string());
-        let (relay_listen, advertised) = relay_server_config(configured);
-        assert_eq!(relay_listen, Some(format!("0.0.0.0:{}", RELAY_PORT)));
-        assert_eq!(advertised, Some("http://umbra.computer:3340/".to_string()));
-    }
-
-    /// A laptop (blank relay-URL setting) runs NO embedded relay and advertises NO
-    /// relay URL — the core "laptops don't host a private LAN-IP relay" guarantee.
-    #[test]
-    fn blank_config_runs_no_relay() {
-        let (relay_listen, advertised) = relay_server_config(None);
-        assert_eq!(relay_listen, None);
-        assert_eq!(advertised, None);
-    }
-}
-
 fn main() -> Result<()> {
     // Resolve the log path and create its directory before initializing tracing.
     // Using a stable directory name so the path survives the pending
@@ -143,10 +94,10 @@ fn main() -> Result<()> {
     // Soft-fail on mkdir error so a permissions problem doesn't prevent the app from
     // starting — logs fall through to stderr only in that case.
     let log_path = memory_common::expand_tilde("~/Library/Logs/webdesserts-memory/desktop.log");
-    if let Some(log_dir) = log_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(log_dir) {
-            eprintln!("warning: could not create log directory {log_dir:?}: {e}");
-        }
+    if let Some(log_dir) = log_path.parent()
+        && let Err(e) = std::fs::create_dir_all(log_dir)
+    {
+        eprintln!("warning: could not create log directory {log_dir:?}: {e}");
     }
 
     // The WorkerGuard flushes the background log-writer thread when dropped. It must
@@ -460,4 +411,53 @@ fn main() -> Result<()> {
         });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_relay_env_wins_over_stored() {
+        assert_eq!(
+            resolve_configured_relay_url(
+                Some("http://umbra.computer:3340/".to_string()),
+                Some("http://stored.example/".to_string()),
+            ),
+            Some("http://umbra.computer:3340/".to_string()),
+        );
+    }
+
+    #[test]
+    fn configured_relay_stored_used_when_no_env() {
+        assert_eq!(
+            resolve_configured_relay_url(None, Some("http://stored.example/".to_string())),
+            Some("http://stored.example/".to_string()),
+        );
+    }
+
+    #[test]
+    fn configured_relay_none_when_neither_set() {
+        assert_eq!(resolve_configured_relay_url(None, None), None);
+    }
+
+    /// A box with the relay-URL setting filled is a SERVER: it starts the embedded
+    /// relay (`relay_listen` bound) and advertises exactly that configured URL —
+    /// never a detected LAN IP.
+    #[test]
+    fn configured_url_runs_relay_server() {
+        let configured = Some("http://umbra.computer:3340/".to_string());
+        let (relay_listen, advertised) = relay_server_config(configured);
+        assert_eq!(relay_listen, Some(format!("0.0.0.0:{}", RELAY_PORT)));
+        assert_eq!(advertised, Some("http://umbra.computer:3340/".to_string()));
+    }
+
+    /// A laptop (blank relay-URL setting) runs NO embedded relay and advertises NO
+    /// relay URL — the core "laptops don't host a private LAN-IP relay" guarantee.
+    #[test]
+    fn blank_config_runs_no_relay() {
+        let (relay_listen, advertised) = relay_server_config(None);
+        assert_eq!(relay_listen, None);
+        assert_eq!(advertised, None);
+    }
 }

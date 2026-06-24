@@ -112,8 +112,8 @@ pub fn normalize_note_reference(note_ref: &str) -> NoteRef {
     }
 
     // Strip .md extension if present
-    let path = if normalized.ends_with(".md") {
-        &normalized[..normalized.len() - 3]
+    let path = if let Some(stripped) = normalized.strip_suffix(".md") {
+        stripped
     } else {
         normalized
     };

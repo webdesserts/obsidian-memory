@@ -51,12 +51,7 @@ pub fn generate_discovery_status_message(discovery_result: &DiscoveryResult, cwd
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let expected = m
-                    .metadata
-                    .slug
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or("none");
+                let expected = m.metadata.slug.as_deref().unwrap_or("none");
 
                 message.push_str(&format!(
                     "Current: {}\nExpected: {}\n\nUpdate frontmatter to move old slug to old_slugs array.",

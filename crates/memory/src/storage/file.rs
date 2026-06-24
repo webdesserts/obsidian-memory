@@ -152,13 +152,13 @@ impl Storage for FileStorage {
         }
 
         // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                return Err(StorageError::ParentNotFound {
-                    uri: uri.to_string(),
-                    parent: parent.to_path_buf(),
-                });
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            return Err(StorageError::ParentNotFound {
+                uri: uri.to_string(),
+                parent: parent.to_path_buf(),
+            });
         }
 
         // Atomic write using temp file + rename
@@ -225,13 +225,13 @@ impl Storage for FileStorage {
         }
 
         // Ensure destination parent exists
-        if let Some(parent) = to_path.parent() {
-            if !parent.exists() {
-                return Err(StorageError::ParentNotFound {
-                    uri: to.to_string(),
-                    parent: parent.to_path_buf(),
-                });
-            }
+        if let Some(parent) = to_path.parent()
+            && !parent.exists()
+        {
+            return Err(StorageError::ParentNotFound {
+                uri: to.to_string(),
+                parent: parent.to_path_buf(),
+            });
         }
 
         fs::rename(&from_path, &to_path).await?;
@@ -261,10 +261,11 @@ impl FileStorage {
             let file_type = entry.file_type().await?;
             if file_type.is_dir() {
                 Box::pin(self.list_recursive(&path, notes)).await?;
-            } else if file_type.is_file() && file_name_str.ends_with(".md") {
-                if let Some(uri) = self.path_to_uri(&path) {
-                    notes.push(uri);
-                }
+            } else if file_type.is_file()
+                && file_name_str.ends_with(".md")
+                && let Some(uri) = self.path_to_uri(&path)
+            {
+                notes.push(uri);
             }
         }
 

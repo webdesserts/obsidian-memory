@@ -176,7 +176,7 @@ fn parse_time_12h(s: &str) -> Option<(u32, u32)> {
     let hour: u32 = time_parts[0].parse().ok()?;
     let minute: u32 = time_parts[1].parse().ok()?;
 
-    if hour < 1 || hour > 12 || minute > 59 {
+    if !(1..=12).contains(&hour) || minute > 59 {
         return None;
     }
 

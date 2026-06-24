@@ -238,10 +238,10 @@ impl GraphIndex {
         }
 
         // Find this note's name from path, then get backlinks (which are paths)
-        if let Some(note_name) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-            if let Some(back_paths) = self.get_backlinks(note_name) {
-                neighborhood.extend(back_paths.iter().cloned());
-            }
+        if let Some(note_name) = Path::new(path).file_stem().and_then(|s| s.to_str())
+            && let Some(back_paths) = self.get_backlinks(note_name)
+        {
+            neighborhood.extend(back_paths.iter().cloned());
         }
 
         neighborhood

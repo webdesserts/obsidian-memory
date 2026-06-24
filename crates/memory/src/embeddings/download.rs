@@ -109,11 +109,12 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
         downloaded += chunk.len() as u64;
 
         // Log progress for large files
-        if let Some(total) = total_size {
-            if total > 1_000_000 && downloaded % 10_000_000 < chunk.len() as u64 {
-                let percent = (downloaded as f64 / total as f64) * 100.0;
-                tracing::info!("  Progress: {:.1}%", percent);
-            }
+        if let Some(total) = total_size
+            && total > 1_000_000
+            && downloaded % 10_000_000 < chunk.len() as u64
+        {
+            let percent = (downloaded as f64 / total as f64) * 100.0;
+            tracing::info!("  Progress: {:.1}%", percent);
         }
     }
 

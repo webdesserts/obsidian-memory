@@ -190,41 +190,41 @@ struct MatchResult {
 /// Check if a project matches a directory via strict matching (current remotes/slug).
 fn is_strict_match(project: &ProjectMetadata, directory: &DirectoryInfo) -> MatchResult {
     // Check current remotes
-    if let Some(ref project_remotes) = project.remotes {
-        if !directory.git_remotes.is_empty() {
-            let normalized_project_remotes: Vec<String> = project_remotes
-                .iter()
-                .map(|r| normalize_remote(r))
-                .collect();
-            let normalized_dir_remotes: Vec<String> = directory
-                .git_remotes
-                .iter()
-                .map(|r| normalize_remote(r))
-                .collect();
+    if let Some(ref project_remotes) = project.remotes
+        && !directory.git_remotes.is_empty()
+    {
+        let normalized_project_remotes: Vec<String> = project_remotes
+            .iter()
+            .map(|r| normalize_remote(r))
+            .collect();
+        let normalized_dir_remotes: Vec<String> = directory
+            .git_remotes
+            .iter()
+            .map(|r| normalize_remote(r))
+            .collect();
 
-            for proj_remote in &normalized_project_remotes {
-                for dir_remote in &normalized_dir_remotes {
-                    if proj_remote == dir_remote {
-                        return MatchResult {
-                            matched: true,
-                            on: Some(MatchedOn::Remote),
-                            value: Some(dir_remote.clone()),
-                        };
-                    }
+        for proj_remote in &normalized_project_remotes {
+            for dir_remote in &normalized_dir_remotes {
+                if proj_remote == dir_remote {
+                    return MatchResult {
+                        matched: true,
+                        on: Some(MatchedOn::Remote),
+                        value: Some(dir_remote.clone()),
+                    };
                 }
             }
         }
     }
 
     // Check current slug (case-insensitive exact match)
-    if let Some(ref slug) = project.slug {
-        if slug.to_lowercase() == directory.name.to_lowercase() {
-            return MatchResult {
-                matched: true,
-                on: Some(MatchedOn::Slug),
-                value: Some(directory.name.clone()),
-            };
-        }
+    if let Some(ref slug) = project.slug
+        && slug.to_lowercase() == directory.name.to_lowercase()
+    {
+        return MatchResult {
+            matched: true,
+            on: Some(MatchedOn::Slug),
+            value: Some(directory.name.clone()),
+        };
     }
 
     MatchResult {
@@ -238,25 +238,25 @@ fn is_strict_match(project: &ProjectMetadata, directory: &DirectoryInfo) -> Matc
 /// This indicates a disconnect - the project was previously linked but remote/dir was renamed.
 fn is_loose_match(project: &ProjectMetadata, directory: &DirectoryInfo) -> MatchResult {
     // Check old remotes
-    if let Some(ref old_remotes) = project.old_remotes {
-        if !directory.git_remotes.is_empty() {
-            let normalized_old_remotes: Vec<String> =
-                old_remotes.iter().map(|r| normalize_remote(r)).collect();
-            let normalized_dir_remotes: Vec<String> = directory
-                .git_remotes
-                .iter()
-                .map(|r| normalize_remote(r))
-                .collect();
+    if let Some(ref old_remotes) = project.old_remotes
+        && !directory.git_remotes.is_empty()
+    {
+        let normalized_old_remotes: Vec<String> =
+            old_remotes.iter().map(|r| normalize_remote(r)).collect();
+        let normalized_dir_remotes: Vec<String> = directory
+            .git_remotes
+            .iter()
+            .map(|r| normalize_remote(r))
+            .collect();
 
-            for old_remote in &normalized_old_remotes {
-                for dir_remote in &normalized_dir_remotes {
-                    if old_remote == dir_remote {
-                        return MatchResult {
-                            matched: true,
-                            on: Some(MatchedOn::OldRemote),
-                            value: Some(dir_remote.clone()),
-                        };
-                    }
+        for old_remote in &normalized_old_remotes {
+            for dir_remote in &normalized_dir_remotes {
+                if old_remote == dir_remote {
+                    return MatchResult {
+                        matched: true,
+                        on: Some(MatchedOn::OldRemote),
+                        value: Some(dir_remote.clone()),
+                    };
                 }
             }
         }

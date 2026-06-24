@@ -33,9 +33,10 @@ pub fn parse_log_sections(content: &str) -> (Vec<String>, Vec<LogSection>) {
         if line.starts_with("## ") {
             let header = line.to_string();
             current_header = Some(header.clone());
-            if !sections.contains_key(&header) {
-                section_order.push(header.clone());
-                sections.insert(header, Vec::new());
+            if let std::collections::hash_map::Entry::Vacant(entry) = sections.entry(header.clone())
+            {
+                section_order.push(header);
+                entry.insert(Vec::new());
             }
         } else if let Some(ref header) = current_header {
             let trimmed = line.trim();

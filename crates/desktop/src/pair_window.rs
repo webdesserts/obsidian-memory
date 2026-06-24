@@ -163,10 +163,10 @@ pub fn open_responder(app: &AppHandle, device_name: &str, code: &str, expires_at
 pub fn close_responder(app: &AppHandle) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
-        if let Some(window) = app.get_webview_window(RESPONDER_LABEL) {
-            if let Err(e) = window.close() {
-                warn!("Failed to close pair-responder window: {}", e);
-            }
+        if let Some(window) = app.get_webview_window(RESPONDER_LABEL)
+            && let Err(e) = window.close()
+        {
+            warn!("Failed to close pair-responder window: {}", e);
         }
     });
 }

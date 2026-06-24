@@ -44,10 +44,10 @@ pub fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     let after_opening = &raw[3..];
 
     // Skip the newline after opening ---
-    let content_start = if after_opening.starts_with('\n') {
-        &after_opening[1..]
-    } else if after_opening.starts_with("\r\n") {
-        &after_opening[2..]
+    let content_start = if let Some(stripped) = after_opening.strip_prefix('\n') {
+        stripped
+    } else if let Some(stripped) = after_opening.strip_prefix("\r\n") {
+        stripped
     } else {
         // No newline after opening --- means invalid frontmatter
         return (None, raw);
@@ -59,10 +59,10 @@ pub fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
         let after_close = &content_start[close_pos + 3..];
 
         // Skip newline after closing ---
-        let content = if after_close.starts_with('\n') {
-            &after_close[1..]
-        } else if after_close.starts_with("\r\n") {
-            &after_close[2..]
+        let content = if let Some(stripped) = after_close.strip_prefix('\n') {
+            stripped
+        } else if let Some(stripped) = after_close.strip_prefix("\r\n") {
+            stripped
         } else {
             after_close
         };

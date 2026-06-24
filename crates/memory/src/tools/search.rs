@@ -171,11 +171,11 @@ async fn build_query_embedding(
         ];
 
         for path in possible_paths {
-            if path.exists() {
-                if let Ok(content) = fs::read_to_string(&path).await {
-                    texts.push(content);
-                    break;
-                }
+            if path.exists()
+                && let Ok(content) = fs::read_to_string(&path).await
+            {
+                texts.push(content);
+                break;
             }
         }
     }

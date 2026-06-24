@@ -112,10 +112,10 @@ impl EmbeddingManager {
         // Check cache
         {
             let cache = self.cache.read().await;
-            if let Some(entry) = cache.get(note_path) {
-                if entry.content_hash == content_hash {
-                    return Ok(entry.embedding.clone());
-                }
+            if let Some(entry) = cache.get(note_path)
+                && entry.content_hash == content_hash
+            {
+                return Ok(entry.embedding.clone());
             }
         }
 
@@ -153,11 +153,11 @@ impl EmbeddingManager {
             for (path, content) in notes.iter() {
                 let content_hash = compute_hash(content);
 
-                if let Some(entry) = cache.get(path) {
-                    if entry.content_hash == content_hash {
-                        results.push((path.clone(), entry.embedding.clone()));
-                        continue;
-                    }
+                if let Some(entry) = cache.get(path)
+                    && entry.content_hash == content_hash
+                {
+                    results.push((path.clone(), entry.embedding.clone()));
+                    continue;
                 }
 
                 // Need to compute this one - store hash to avoid recomputing later

@@ -63,22 +63,25 @@ pub fn parse_wiki_links(content: &str) -> Vec<WikiLink> {
 
     while i < len {
         // Check for embed: ![[
-        if i + 2 < len && chars[i] == '!' && chars[i + 1] == '[' && chars[i + 2] == '[' {
-            if let Some((link, end)) = parse_link_at(&chars, i + 1, true) {
-                links.push(link);
-                i = end;
-                continue;
-            }
+        if i + 2 < len
+            && chars[i] == '!'
+            && chars[i + 1] == '['
+            && chars[i + 2] == '['
+            && let Some((link, end)) = parse_link_at(&chars, i + 1, true)
+        {
+            links.push(link);
+            i = end;
+            continue;
         }
         // Check for regular link: [[ (but not preceded by !)
         if i + 1 < len && chars[i] == '[' && chars[i + 1] == '[' {
             // Make sure it's not part of an embed we already handled
-            if i == 0 || chars[i - 1] != '!' {
-                if let Some((link, end)) = parse_link_at(&chars, i, false) {
-                    links.push(link);
-                    i = end;
-                    continue;
-                }
+            if (i == 0 || chars[i - 1] != '!')
+                && let Some((link, end)) = parse_link_at(&chars, i, false)
+            {
+                links.push(link);
+                i = end;
+                continue;
             }
         }
         i += 1;

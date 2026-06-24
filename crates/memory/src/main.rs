@@ -363,7 +363,7 @@ impl MemoryServer {
     ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::update_frontmatter::execute(
-            &*self.storage(),
+            self.storage(),
             &graph,
             &params.0.note,
             params.0.updates,

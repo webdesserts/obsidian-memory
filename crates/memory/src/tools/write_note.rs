@@ -27,7 +27,7 @@ pub struct WriteNoteResponse {
 /// Creates new notes or overwrites existing ones.
 /// For existing notes, content_hash parameter should be provided (will be required in future).
 pub async fn execute<S: Storage>(
-    vault_path: &Path,
+    _vault_path: &Path,
     storage: &S,
     graph: &GraphIndex,
     note: &str,
