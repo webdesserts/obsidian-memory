@@ -20,9 +20,9 @@ use sync_core::network::streams::connect_and_sync_raw;
 use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 // `NativeFs`/`InMemoryFs` (via `common`) implement vault-sync's `FileSystem`.
+use p2p_core::EmbeddedRelay;
 use sync_daemon::daemon::Daemon;
 use sync_daemon::persistence::PeerRelay;
-use sync_daemon::relay::EmbeddedRelay;
 use sync_daemon::watcher::FileEvent;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

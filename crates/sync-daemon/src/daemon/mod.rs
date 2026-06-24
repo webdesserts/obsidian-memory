@@ -30,9 +30,9 @@ use crate::move_coalescer::{
     PendingKind, PendingMovesFile,
 };
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
-use crate::relay_class::relay_is_offlan_reachable;
 use crate::watcher::{FileEvent, FileEventKind};
 use iroh::{EndpointAddr, EndpointId};
+use p2p_core::relay_is_offlan_reachable;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -111,7 +111,7 @@ pub struct DaemonConfig {
     /// via gossip; a server's set is its own public relay so it homes on itself.
     ///
     /// Only off-LAN-reachable URLs belong here (gated by
-    /// [`relay_class::relay_is_offlan_reachable`](crate::relay_class)): a private
+    /// [`p2p_core::relay_is_offlan_reachable`]): a private
     /// LAN-IP relay must never be homed on off-LAN.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_public_relays: Vec<String>,
@@ -234,7 +234,7 @@ impl DaemonConfig {
     /// Mutates the in-memory config only; the caller persists (via
     /// [`persist_config_change`], which applies the `relay_url` clobber-guard).
     pub fn add_known_public_relay(&mut self, url: &str) {
-        if !crate::relay_class::relay_is_offlan_reachable(url) {
+        if !p2p_core::relay_is_offlan_reachable(url) {
             return;
         }
         if self.known_public_relays.iter().any(|u| u == url) {

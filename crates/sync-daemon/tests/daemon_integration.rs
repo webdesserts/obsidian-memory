@@ -1363,10 +1363,10 @@ mod daemon_integration {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_pairing_persists_responder_relay() -> anyhow::Result<()> {
         use iroh::EndpointId;
+        use p2p_core::EmbeddedRelay;
         use sync_daemon::daemon::Daemon;
         use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
         use sync_daemon::persistence::DaemonConfig;
-        use sync_daemon::relay::EmbeddedRelay;
         use tempfile::TempDir;
         use tokio::sync::{broadcast, mpsc, oneshot, watch};
 

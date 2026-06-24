@@ -90,7 +90,7 @@ impl EmbeddedRelay {
 
     /// The URL of this relay server.
     ///
-    /// Pass this to `SyncNode::new` so the iroh endpoint advertises and uses
+    /// Pass this to the node constructor so the iroh endpoint advertises and uses
     /// the embedded relay for peer connections.
     pub fn relay_url(&self) -> &RelayUrl {
         &self.url

@@ -41,7 +41,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sync_daemon::relay_class::relay_is_offlan_reachable;
+use p2p_core::relay_is_offlan_reachable;
 use toml::Table;
 use toml::Value;
 

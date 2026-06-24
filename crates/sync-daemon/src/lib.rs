@@ -13,8 +13,6 @@ pub mod pair;
 pub mod pair_api;
 pub mod pair_shared;
 pub mod persistence;
-pub mod relay;
-pub mod relay_class;
 pub mod watcher;
 
 // Re-export key types for convenience

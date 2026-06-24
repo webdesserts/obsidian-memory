@@ -25,8 +25,8 @@ use crate::http;
 use crate::native_fs::NativeFs;
 use crate::pair_api::{DaemonControl, DaemonStatus, PAIRING_BROADCAST_CAPACITY};
 use crate::persistence::{DaemonConfig, PeerRelay};
-use crate::relay::EmbeddedRelay;
 use crate::watcher::FileWatcher;
+use p2p_core::EmbeddedRelay;
 
 use super::Daemon;
 use super::move_recovery;
