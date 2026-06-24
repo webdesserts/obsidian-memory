@@ -33,8 +33,6 @@ uuid.workspace = true
 rand.workspace = true
 getrandom.workspace = true
 ed25519-dalek.workspace = true
-sha2 = "0.10"
-hmac = "0.12"
 
 # P2P networking — iroh QUIC transport.
 # default-features = false: skips portmapper and fast-apple-datapath (OS-specific).
