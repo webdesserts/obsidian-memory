@@ -30,9 +30,9 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::network::streams::{read_length_prefixed, write_length_prefixed};
 use crate::pairing::{PairingChallenge, PairingHello, PairingResponse, PairingResult, verify_hmac};
 use crate::peer_id::PeerId;
+use p2p_core::streams::{read_length_prefixed, write_length_prefixed};
 
 /// ALPN for the pairing protocol.
 pub const PAIRING_ALPN: &[u8] = b"obsidian-memory/pair/1";
