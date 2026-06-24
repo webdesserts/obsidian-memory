@@ -8012,7 +8012,6 @@ dependencies = [
  "hmac",
  "iroh",
  "iroh-gossip",
- "loro",
  "mdns-sd",
  "n0-future",
  "p2p-core",

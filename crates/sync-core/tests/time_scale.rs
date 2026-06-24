@@ -1,5 +1,6 @@
-//! End-to-end proof that the process-global time-scale shrinks a REAL owned
-//! duration — the sync-flag TTL (D1, base 30s in `SyncState`).
+//! End-to-end proof that the process-global `set_time_scale` seed reaches the
+//! global read path (`time_scale` / `scaled`) — the seam the pure `_with` unit
+//! tests deliberately avoid.
 //!
 //! This test seeds the global `set_time_scale`, so it lives in its OWN
 //! integration-test file: each integration test compiles to a separate binary,
@@ -7,42 +8,33 @@
 //! collide with the parallel unit tests (which use the pure `_with` helpers) or
 //! any other integration file.
 
-use std::thread::sleep;
 use std::time::Duration;
 
-use sync_core::time_scale::set_time_scale;
-use sync_core::vault::SyncState;
+use sync_core::time_scale::{scaled, set_time_scale, time_scale};
 
-/// At scale 0.1 the 30s sync-flag TTL collapses to ~3s, so a flag marked synced
-/// is still live well before 3s but has expired by ~3.3s — a window that would
-/// keep the flag valid for 30s unscaled. A `false` from `consume_synced` after
-/// the short wait therefore proves the scale reached a real production duration.
+/// At scale 0.1 a 30s base duration read through the *global* `scaled` collapses
+/// to ~3s. The inline unit tests only exercise the pure `_with` helpers with an
+/// explicit scale; this is the only coverage that the once-seeded global is what
+/// `scaled`/`time_scale` actually read, so it proves the first-wins seed reaches
+/// a real production read path.
 #[test]
-fn time_scale_shrinks_sync_flag_ttl() {
-    // Seed before touching any scaled duration. First-wins; this binary's process
+fn time_scale_seed_reaches_global_scaled() {
+    // Seed before reading any scaled duration. First-wins; this binary's process
     // is dedicated to this test, so the seed is uncontended.
     assert!(
         set_time_scale(0.1),
         "set_time_scale should win on first call in a dedicated test binary"
     );
 
-    let state = SyncState::new();
-    state.mark_synced("notes/Example.md");
+    // The seeded scale is what the global read returns — not the 1.0 default.
+    assert_eq!(time_scale(), 0.1, "global scale should reflect the seed");
 
-    // The flag is live immediately after marking — the scale only shrinks the
-    // TTL, it does not expire flags early.
-    assert!(
-        state.is_synced("notes/Example.md"),
-        "flag should be live right after mark_synced"
-    );
-
-    // Wait just past the scaled TTL (3s) but far below the unscaled 30s.
-    sleep(Duration::from_millis(3_300));
-
-    // Expired because the TTL was scaled to ~3s. Unscaled this would still be
-    // valid for another ~27s, so a `false` here is the end-to-end proof.
-    assert!(
-        !state.consume_synced("notes/Example.md"),
-        "flag should have expired by 3.3s under a 0.1 time-scale (scaled TTL ~3s)"
+    // A duration read through the global `scaled` collapses by the seeded scale:
+    // 30s → ~3s. Unscaled this would stay 30s, so the shrink is the proof the
+    // seed reached the global read path.
+    assert_eq!(
+        scaled(Duration::from_secs(30)),
+        Duration::from_secs(3),
+        "30s should collapse to 3s under a 0.1 global time-scale"
     );
 }

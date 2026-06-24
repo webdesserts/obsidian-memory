@@ -19,7 +19,6 @@ test-util = []
 
 [dependencies]
 p2p-core = { path = "../p2p-core" }
-loro.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true

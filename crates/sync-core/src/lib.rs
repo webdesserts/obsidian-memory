@@ -1,13 +1,16 @@
 // Deny holding RefCell borrows across await points - causes WASM panics
 #![deny(clippy::await_holding_refcell_ref)]
 
-//! sync-core: Shared Rust library for P2P vault synchronization using Loro CRDTs.
+//! sync-core: Shared Rust library for the P2P vault sync wire protocol.
 //!
-//! This crate provides the core functionality for:
-//! - Managing Loro documents for markdown notes
-//! - Parsing/serializing markdown with frontmatter
-//! - Sync protocol between peers
-//! - FileSystem trait abstraction
+//! This crate provides the networking surface the daemon runs on:
+//! - The sync wire protocol between peers (`network`, `sync`)
+//! - Peer pairing, allowlist, and roster management (`pairing`, `allowlist`, `peers`)
+//! - Vault identity (`peer_id`) and the test-time-scale lever (`time_scale`)
+//!
+//! The legacy path-hash vault/document/markdown engine was removed at the
+//! `vault-sync` (UUID-store) cutover; the live vault/fs/document layer now lives
+//! in the `vault-sync` crate, not here.
 //!
 //! ## Feature gates
 //!
@@ -22,10 +25,6 @@
 pub mod network;
 
 pub mod allowlist;
-pub mod document;
-pub mod events;
-pub mod fs;
-pub mod markdown;
 pub mod pairing;
 pub mod peer_id;
 
@@ -36,16 +35,11 @@ pub mod peer_id;
 pub use p2p_core::key_storage;
 pub mod peers;
 pub mod sync;
-pub mod sync_engine;
 pub mod time_scale;
-pub mod vault;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use allowlist::InMemoryAllowlist;
 pub use allowlist::{AllowedPeer, AllowlistError, AllowlistStorage};
-pub use document::NoteDocument;
-pub use events::{EventBus, Subscription, SyncEvent};
-pub use fs::{FileEntry, FileStat, FileSystem, InMemoryFs};
 pub use p2p_core::key_storage::{KeyStorage, KeyStorageError};
 pub use pairing::{
     PairingChallenge, PairingHello, PairingResponse, PairingResult, PairingSession, compute_hmac,
@@ -54,10 +48,3 @@ pub use pairing::{
 pub use peer_id::{PeerId, PeerIdError, VaultId};
 pub use peers::{PeerEntry, PeerRegistry, PeerState};
 pub use sync::SyncMessage;
-pub use vault::{
-    DebrisReport, DedupeStats, DuplicateGroup, FolderDupGroup, Relic, SyncMetadata, Vault,
-};
-
-// Re-export the loro TreeID so consumers of the registry-debris API (DebrisReport et al.)
-// can name node identities without taking a direct `loro` dependency.
-pub use loro::TreeID;
