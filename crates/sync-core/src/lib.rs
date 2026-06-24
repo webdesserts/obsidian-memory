@@ -5,7 +5,7 @@
 //!
 //! This crate provides the networking surface the daemon runs on:
 //! - The sync wire protocol between peers (`network`, `sync`)
-//! - Peer pairing, allowlist, and roster management (`pairing`, `allowlist`, `peers`)
+//! - Peer pairing, allowlist, and roster management (`pairing`, `allowlist` re-exported from `p2p-core`; `peers` local)
 //! - Vault identity (`peer_id`) and the test-time-scale lever (`time_scale`)
 //!
 //! The legacy path-hash vault/document/markdown engine was removed at the
