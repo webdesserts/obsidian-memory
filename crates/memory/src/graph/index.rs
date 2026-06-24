@@ -219,6 +219,8 @@ impl GraphIndex {
     }
 
     /// Check if the index is empty.
+    // kept: companion to `len()` (clippy expects the pair) and used by the graph tests.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.forward_links.is_empty()
     }
@@ -248,6 +250,8 @@ impl GraphIndex {
     }
 
     /// Get neighborhood as note names (for display/output purposes).
+    // kept: name-based view over `get_neighborhood`, exercised by the graph tests.
+    #[allow(dead_code)]
     pub fn get_neighborhood_names(&self, path: &str) -> HashSet<String> {
         self.get_neighborhood(path)
             .into_iter()

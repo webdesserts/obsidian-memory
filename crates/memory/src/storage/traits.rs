@@ -64,6 +64,9 @@ impl From<std::io::Error> for StorageError {
 }
 
 /// Metadata returned when reading a note.
+// kept: data contract for the Storage trait's `read`; fields are populated by impls
+// and read by optimistic-locking callers even where a given call site ignores them.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NoteMetadata {
     /// Content hash for optimistic locking (SHA-256 of content)
@@ -73,6 +76,9 @@ pub struct NoteMetadata {
 }
 
 /// Result of a write operation.
+// kept: data contract for the Storage trait's `write`; fields are populated by impls
+// and read by optimistic-locking callers even where a given call site ignores them.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WriteResult {
     /// New content hash after write
@@ -132,6 +138,9 @@ pub trait Storage: Send + Sync {
     ///
     /// # Arguments
     /// * `prefix` - Path prefix (e.g., "knowledge/", "" for all)
+    // kept: part of the Storage abstraction every backend must provide; exercised by the
+    // FileStorage tests though no production call site uses it yet.
+    #[allow(dead_code)]
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
 
     /// Move/rename a note.

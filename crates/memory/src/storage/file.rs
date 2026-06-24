@@ -44,6 +44,9 @@ impl FileStorage {
     }
 
     /// Convert a filesystem path back to a memory URI.
+    // kept: helper for the `list`/`list_recursive` traversal, which only the FileStorage
+    // tests call today (no production list call site yet).
+    #[allow(dead_code)]
     fn path_to_uri(&self, path: &Path) -> Option<String> {
         path.strip_prefix(&self.vault_path)
             .ok()
@@ -241,6 +244,8 @@ impl Storage for FileStorage {
 
 impl FileStorage {
     /// Recursively list markdown files in a directory.
+    // kept: backs the `list` trait method, which only the FileStorage tests exercise today.
+    #[allow(dead_code)]
     async fn list_recursive(
         &self,
         dir: &Path,

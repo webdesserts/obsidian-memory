@@ -1,3 +1,9 @@
+// This module is compiled into every integration-test binary, but each binary uses only
+// the helpers it needs (e.g. the fixture types are exercised by similarity_fixtures.rs but
+// not by debug_embeddings.rs). Allow dead_code so the unused-in-this-binary helpers don't
+// warn — they are live in at least one test binary.
+#![allow(dead_code)]
+
 use once_cell::sync::Lazy;
 use semantic_embeddings::ModelManager;
 use serde::Deserialize;

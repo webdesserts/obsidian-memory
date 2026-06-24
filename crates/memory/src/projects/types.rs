@@ -49,6 +49,10 @@ impl MatchedOn {
 }
 
 /// Information about a single discovered project
+// kept: `match_type`, `matched_value`, and `depth` are populated with real discovery
+// context that status-message rendering may surface; deleting them would drop data the
+// model is meant to carry.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DiscoveredProject {
     /// Project metadata from frontmatter
@@ -64,6 +68,9 @@ pub struct DiscoveredProject {
 }
 
 /// Result of project discovery for a working directory
+// kept: `cwd` and `searched_paths` record the discovery context; populated deliberately
+// and available to status-message rendering even though no consumer reads them yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DiscoveryResult {
     /// Current working directory

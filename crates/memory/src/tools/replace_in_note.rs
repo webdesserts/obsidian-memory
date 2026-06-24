@@ -213,6 +213,9 @@ mod tests {
     #[derive(Deserialize)]
     struct TestResponse {
         uri: String,
+        // kept: mirrors the `path` field in the tool's JSON response; documents the
+        // response shape even though these assertions don't check it.
+        #[allow(dead_code)]
         path: String,
         content_hash: String,
         edits_applied: usize,
