@@ -1,23 +1,18 @@
-/// Integration tests for the Daemon event loop.
-///
-/// These tests exercise the real `Daemon` struct with real iroh nodes, in-memory
-/// filesystems, and injected file events — verifying that the `tokio::select!`
-/// event loop correctly routes file changes, gossip notifications, and inbound
-/// QUIC sync requests through to vault state changes.
-///
-/// Construction pattern (mirrors sync_workflow.rs):
-/// 1. Build both nodes (`build_node`) — filesystem, vault, iroh SyncNode
-/// 2. Wire `MemoryLookup` and allowlists (`connect_nodes`)
-/// 3. Join gossip exactly once per node (A with empty bootstrap, B via A)
-/// 4. Spawn `Daemon::run_loop()` in a background task (`spawn_daemon`)
-///
-/// File events are injected by writing to `InMemoryFs` and sending a `FileEvent`
-/// into `file_event_tx` — no real OS filesystem required.
-///
-/// Seeds 20+ are used to avoid collisions with sync_workflow.rs (seeds 1–10).
+//! Integration tests for the Daemon event loop — native-move coalescing (P4f-1),
+//! boot move crash-recovery (P4f-2b-ii), and graceful-shutdown drain (P4f-2c).
+//!
+//! The inbound-sync freshness signal (S2) test was peeled into
+//! `daemon_inbound_freshness.rs` to keep this file under the line-size target.
+//!
+//! Real `Daemon` instances with real iroh nodes, in-memory filesystems, and
+//! injected file events. Carved from the former `daemon_integration.rs` monolith;
+//! the universal build/connect/spawn harness lives in `common`, while this file
+//! carries the move-coalescer/journal/stage/restitch helper cluster file-locally
+//! (it is crash-recovery-specific, used only by these groups). The 2-arg
+//! `wait_until` is file-local (name-collides with the relay `common::wait_until`).
 mod common;
 
-mod daemon_integration {
+mod daemon_move_recovery {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -25,7 +20,7 @@ mod daemon_integration {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
+    use sync_core::allowlist::InMemoryAllowlist;
     use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
     use sync_core::peer_id::PeerId;
     use uuid::Uuid;
@@ -41,11 +36,6 @@ mod daemon_integration {
     };
     use sync_daemon::watcher::FileEvent;
 
-    // ── helpers ───────────────────────────────────────────────────────────────
-    //
-    // The universal build/connect/spawn/inject helpers (plus `uuid_of`) live in
-    // `common` (shared across the `daemon_*` suites). Only the 2-arg `wait_until`
-    // stays file-local — it name-collides with the relay 3-arg `common::wait_until`.
     use super::common::{
         TestDaemon, build_node, connect_nodes, inject_deleted, inject_modified, shared_vault_id,
         spawn_daemon, uuid_of,
@@ -1510,282 +1500,6 @@ mod daemon_integration {
 
         daemon2.shutdown.cancel();
         let _ = daemon2.loop_handle.await;
-        Ok(())
-    }
-
-    // ── inbound-sync freshness signal (S2) ───────────────────────────────────────
-
-    /// The receiver `Daemon::set_inbound_seen_rx` wires is the one the pumped inbound
-    /// handler fires on: a peer that completes an inbound sync is reported on that
-    /// channel so the run loop can stamp its freshness, which is what lets an
-    /// inbound-ONLY peer (one that never initiates) still count as alive (S2).
-    ///
-    /// Proven end-to-end without a full daemon: drive a real `SYNC_ALPN` handshake
-    /// opener into a `PumpedSyncHandler` and assert the paired `inbound_seen_rx` —
-    /// the exact receiver `set_inbound_seen_rx` consumes — yields the initiator's
-    /// `PeerId`. A regression that drops the handler's `inbound_seen_tx.send` (or
-    /// hands the setter a different channel) would leave the receiver empty here.
-    #[tokio::test]
-    async fn inbound_sync_fires_the_freshness_signal_for_the_wired_receiver() -> anyhow::Result<()>
-    {
-        // Responder: a node holding the pumped handler, plus the receiver the daemon
-        // would wire via `set_inbound_seen_rx`.
-        let responder_fs = Arc::new(InMemoryFs::new());
-        let responder_author = PeerId::from_secret_bytes(super::common::seed(80));
-        let responder_vault = Arc::new(Mutex::new(
-            Vault::init(responder_fs.clone(), responder_author.as_u64()).await?,
-        ));
-        let responder_allowlist = Arc::new(InMemoryAllowlist::new());
-        let (inbound_seen_tx, mut inbound_seen_rx) = mpsc::unbounded_channel();
-        let handler = sync_daemon::daemon::PumpedSyncHandler::new(
-            responder_vault.clone(),
-            responder_allowlist.clone(),
-            inbound_seen_tx,
-        );
-        let responder = SyncNode::new_with_sync_handler(
-            super::common::seed(80),
-            &[],
-            responder_allowlist.clone(),
-            handler,
-        )
-        .await?;
-
-        // Initiator: a node that opens the handshake. Its vault builds a real
-        // `SyncRequest` opener so the responder's handler runs its true path.
-        let initiator = build_node(81).await?;
-        let initiator_id = initiator.node_id;
-
-        // The handler allowlists once per connection (deny-on-error) — the initiator
-        // must be allowed, or the inbound sync is dropped before it fires the signal.
-        responder_allowlist
-            .add_peer(initiator_id, "initiator")
-            .await?;
-
-        // Teach the initiator how to reach the responder's endpoint.
-        let lookup = MemoryLookup::new();
-        lookup.add_endpoint_info(responder.endpoint.addr());
-        initiator.sync_node.endpoint.address_lookup()?.add(lookup);
-
-        // Open the handshake: connect on `SYNC_ALPN` and write the framed opener. The
-        // wire format is sync-core's `[u32 LE len][bytes]` (re-derived here, as the
-        // daemon's own `write_frame` does — see `sync_stream.rs`).
-        let opener = initiator.vault.lock().await.prepare_request().await?;
-        let connection = initiator
-            .sync_node
-            .endpoint
-            .connect(responder.node_id(), sync_core::network::SYNC_ALPN)
-            .await?;
-        let (mut send, _recv) = connection.open_bi().await?;
-        let len = u32::try_from(opener.len()).expect("opener fits in u32");
-        send.write_all(&len.to_le_bytes()).await?;
-        send.write_all(&opener).await?;
-        send.finish()?;
-
-        // The handler processes the opener and fires the initiator's id on the
-        // freshness channel. Bound the wait so a regression fails fast.
-        let received = tokio::time::timeout(Duration::from_secs(5), inbound_seen_rx.recv())
-            .await
-            .expect("inbound-seen signal should arrive before the timeout");
-
-        assert_eq!(
-            received,
-            Some(initiator_id),
-            "the wired receiver must yield the initiator's PeerId after an inbound sync"
-        );
-
-        // Hold the responder + connection until the assertion completes (dropping the
-        // node early would tear the endpoint down before the handler runs).
-        drop(connection);
-        drop(responder);
-        Ok(())
-    }
-
-    // ── case-drift sweep (Bug 1) ────────────────────────────────────────────────
-    //
-    // A folder case-rename (`Plans/ → plans/`) on a case-INSENSITIVE filesystem
-    // fires no `Deleted` watcher event, so the move-coalescer never sees it. The
-    // daemon's case-drift sweep is the reliable detection: it lists the vault
-    // case-sensitively, compares against the (case-sensitive) index, and re-homes
-    // the folder via ONE `move_subtree`. These tests drive the real daemon sweep
-    // method (NOT `move_subtree` directly) and assert the folder move is tracked
-    // with descendant UUIDs preserved and NO orphaned source-folder node — the
-    // anti-ping-pong guarantee.
-
-    /// Build a `Daemon` WITHOUT spawning its event loop, so a test can call
-    /// `sweep_case_drift` (and other handlers) directly and inspect the vault
-    /// afterward. Joins gossip solo (no peer) so `broadcast_change` is gated off
-    /// (`alive_count() == 0`) and the sweep's structural effect is isolated.
-    async fn build_daemon_no_loop(
-        seed_byte: u8,
-    ) -> (
-        Daemon<Arc<InMemoryFs>, InMemoryAllowlist>,
-        Arc<Mutex<Vault<Arc<InMemoryFs>>>>,
-        Arc<InMemoryFs>,
-    ) {
-        let node = build_node(seed_byte).await.expect("build node");
-        let gossip = node
-            .sync_node
-            .join_vault_gossip(&shared_vault_id(), vec![])
-            .await
-            .expect("solo gossip join");
-
-        let (_file_event_tx, file_event_rx) = mpsc::unbounded_channel::<FileEvent>();
-        let shutdown = CancellationToken::new();
-        let vault = node.vault.clone();
-        let fs = node.fs.clone();
-
-        let mut daemon = Daemon::new(
-            vault.clone(),
-            node.sync_node,
-            gossip,
-            file_event_rx,
-            None,
-            node.allowlist.clone(),
-            "test-device".to_string(),
-            None,
-            "/test-vault".into(),
-            shutdown,
-        );
-        daemon.set_inbound_seen_rx(node.inbound_seen_rx);
-        daemon.set_fs(Arc::new(fs.clone()));
-        (daemon, vault, fs)
-    }
-
-    /// Count alive FILE nodes in the index — the ghost-mint guard (a subtree move
-    /// re-homes existing nodes, so this is unchanged; a fresh-UUID re-create would
-    /// bump it).
-    async fn alive_file_node_count(vault: &Arc<Mutex<Vault<Arc<InMemoryFs>>>>) -> usize {
-        vault
-            .lock()
-            .await
-            .index()
-            .scan_structural_nodes()
-            .iter()
-            .filter(|n| matches!(n, vault_sync::index::StructuralNode::File { .. }))
-            .count()
-    }
-
-    /// Index `Plans/a.md` + `Plans/b.md`, then case-rename the on-disk directory
-    /// to `plans/` while the index keeps the `Plans/` casing — exactly the state a
-    /// case-insensitive-fs folder rename leaves (the index never updated because no
-    /// `Deleted` event fired). `InMemoryFs` is case-SENSITIVE, so writing the
-    /// lowercase paths + deleting the uppercase ones makes `list_files` return the
-    /// new casing while the index retains the old — reproducing the drift directly.
-    #[tokio::test]
-    async fn case_drift_sweep_tracks_folder_rename_with_no_orphan_folder_node() {
-        let (mut daemon, vault, fs) = build_daemon_no_loop(60).await;
-
-        // Index the two files at the UPPERCASE folder casing, capture their UUIDs.
-        for (path, content) in [("Plans/a.md", b"# A".as_slice()), ("Plans/b.md", b"# B")] {
-            fs.write(path, content).await.unwrap();
-            vault.lock().await.on_file_changed(path).await.unwrap();
-        }
-        let uuid_a = uuid_of(&vault, "Plans/a.md").await.expect("a indexed");
-        let uuid_b = uuid_of(&vault, "Plans/b.md").await.expect("b indexed");
-        let file_count_before = alive_file_node_count(&vault).await;
-
-        // Disk now reads `plans/` (lowercase): write the new paths, remove the old.
-        // The index still holds `Plans/*` — the drift the sweep must heal.
-        fs.write("plans/a.md", b"# A").await.unwrap();
-        fs.write("plans/b.md", b"# B").await.unwrap();
-        fs.delete("Plans/a.md").await.unwrap();
-        fs.delete("Plans/b.md").await.unwrap();
-
-        daemon.sweep_case_drift().await;
-
-        // The folder move is TRACKED: both files now resolve at the lowercase path
-        // under their ORIGINAL UUIDs (one `move_subtree`, not fresh-UUID re-creates).
-        assert_eq!(
-            uuid_of(&vault, "plans/a.md").await.as_deref(),
-            Some(uuid_a.as_str()),
-            "a's UUID is preserved at the re-homed lowercase path"
-        );
-        assert_eq!(
-            uuid_of(&vault, "plans/b.md").await.as_deref(),
-            Some(uuid_b.as_str()),
-            "b's UUID is preserved at the re-homed lowercase path"
-        );
-        // The stale uppercase paths have no live node anymore.
-        assert!(
-            uuid_of(&vault, "Plans/a.md").await.is_none(),
-            "the stale uppercase path is vacated"
-        );
-
-        // No ghost mint: the file count is unchanged (a subtree move, not re-creates).
-        assert_eq!(
-            alive_file_node_count(&vault).await,
-            file_count_before,
-            "a subtree move re-homes existing nodes — no new file nodes minted"
-        );
-
-        // THE anti-ping-pong guarantee: NO live `Plans/` folder node remains, so
-        // `materialize_folders` cannot re-mkdir the stale casing.
-        let folders = vault.lock().await.index().folder_paths();
-        let stale_plans_alive = folders.iter().any(|f| f.path == "Plans" && !f.is_deleted);
-        assert!(
-            !stale_plans_alive,
-            "the source folder node was re-homed by move_subtree — no orphaned live `Plans/` node"
-        );
-        let lowercase_plans_alive = folders.iter().any(|f| f.path == "plans" && !f.is_deleted);
-        assert!(
-            lowercase_plans_alive,
-            "the re-homed folder node lives at the lowercase casing"
-        );
-    }
-
-    /// A second sweep after the casing has converged is a no-op: no further moves,
-    /// no further broadcasts — the sweep is idempotent (the property that keeps it
-    /// safe to run on a steady tick).
-    #[tokio::test]
-    async fn case_drift_sweep_is_idempotent_after_convergence() {
-        let (mut daemon, vault, fs) = build_daemon_no_loop(61).await;
-
-        fs.write("Plans/a.md", b"# A").await.unwrap();
-        vault
-            .lock()
-            .await
-            .on_file_changed("Plans/a.md")
-            .await
-            .unwrap();
-        fs.write("plans/a.md", b"# A").await.unwrap();
-        fs.delete("Plans/a.md").await.unwrap();
-
-        daemon.sweep_case_drift().await;
-        let uuid_after_first = uuid_of(&vault, "plans/a.md").await;
-
-        // Second sweep: disk and index now agree → detect_case_drift returns empty,
-        // so the index is untouched (same UUID, same path).
-        daemon.sweep_case_drift().await;
-        assert_eq!(
-            uuid_of(&vault, "plans/a.md").await,
-            uuid_after_first,
-            "a converged casing produces no further moves on re-sweep"
-        );
-    }
-
-    /// The daemon's persisted PeerId must equal the identity key's PeerId after
-    /// `load_or_generate` — `DaemonConfig` derives its `peer_id` from the identity
-    /// key, and a divergence would let the daemon advertise an identity it can't
-    /// authenticate with. This invariant was asserted by the IdentityKey unit
-    /// tests until those moved to p2p-core, where `DaemonConfig` isn't visible;
-    /// this re-pins the daemon-config↔identity seam on the daemon side (Inc0-2
-    /// foundation-review carry-forward S1).
-    #[tokio::test]
-    async fn daemon_config_peer_id_matches_identity_key() -> anyhow::Result<()> {
-        use sync_daemon::persistence::DaemonConfig;
-        use tempfile::TempDir;
-
-        // Fresh vault with no existing daemon.key → load_or_generate mints a new
-        // identity and writes the config from it.
-        let vault_dir = TempDir::new()?;
-        let (config, identity) = DaemonConfig::load_or_generate(vault_dir.path(), None).await?;
-
-        assert_eq!(
-            config.peer_id,
-            identity.peer_id(),
-            "DaemonConfig.peer_id must match the identity key it was generated from"
-        );
-
         Ok(())
     }
 }
