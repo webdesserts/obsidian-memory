@@ -9,12 +9,11 @@ pub enum StorageError {
     NotFound { uri: String },
     /// The note already exists (for create operations)
     AlreadyExists { uri: String },
-    /// Content hash mismatch during optimistic locking
-    HashMismatch {
-        uri: String,
-        expected: String,
-        actual: String,
-    },
+    /// Content hash mismatch during optimistic locking.
+    ///
+    /// The current on-disk hash is intentionally not carried here: surfacing it
+    /// would let a caller retry the write blind instead of re-reading the note.
+    HashMismatch { uri: String },
     /// Path validation failed (e.g., directory traversal attempt)
     InvalidPath { uri: String, reason: String },
     /// I/O error during storage operation
@@ -28,14 +27,11 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::NotFound { uri } => write!(f, "Note not found: {}", uri),
             StorageError::AlreadyExists { uri } => write!(f, "Note already exists: {}", uri),
-            StorageError::HashMismatch {
-                uri,
-                expected,
-                actual,
-            } => write!(
+            StorageError::HashMismatch { uri } => write!(
                 f,
-                "Content changed since last read for {}: expected hash {}, found {}",
-                uri, expected, actual
+                "Content changed since last read for {}. Read the note again to get the \
+                 current content and hash before retrying.",
+                uri
             ),
             StorageError::InvalidPath { uri, reason } => {
                 write!(f, "Invalid path '{}': {}", uri, reason)

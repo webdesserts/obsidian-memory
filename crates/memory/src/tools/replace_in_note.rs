@@ -137,12 +137,9 @@ pub async fn execute<S: Storage>(
     let current_hash = ContentHash::from_content(&content);
     if current_hash.as_str() != content_hash {
         return Err(ErrorData::invalid_params(
-            format!(
-                "Note modified since last read (expected hash: {}, actual: {}). \
-                 Read note again to get current content and hash.",
-                content_hash,
-                current_hash.as_str()
-            ),
+            "Note modified since last read. Read the note again to get the \
+             current content and hash before retrying."
+                .to_string(),
             None,
         ));
     }
@@ -173,14 +170,10 @@ pub async fn execute<S: Storage>(
         .write(&uri, &modified, Some(content_hash))
         .await
         .map_err(|e| match e {
-            StorageError::HashMismatch {
-                expected, actual, ..
-            } => ErrorData::invalid_params(
-                format!(
-                    "Note modified since last read (expected hash: {}, actual: {}). \
-                 Read note again to get current content and hash.",
-                    expected, actual
-                ),
+            StorageError::HashMismatch { .. } => ErrorData::invalid_params(
+                "Note modified since last read. Read the note again to get the \
+                 current content and hash before retrying."
+                    .to_string(),
                 None,
             ),
             _ => ErrorData::internal_error(format!("Failed to write note: {}", e), None),

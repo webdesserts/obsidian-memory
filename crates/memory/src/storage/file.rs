@@ -137,8 +137,6 @@ impl Storage for FileStorage {
                     if actual_hash != expected {
                         return Err(StorageError::HashMismatch {
                             uri: uri.to_string(),
-                            expected: expected.to_string(),
-                            actual: actual_hash,
                         });
                     }
                 }
@@ -146,8 +144,6 @@ impl Storage for FileStorage {
                     // File doesn't exist - hash check fails if we expected a specific hash
                     return Err(StorageError::HashMismatch {
                         uri: uri.to_string(),
-                        expected: expected.to_string(),
-                        actual: "(file does not exist)".to_string(),
                     });
                 }
                 Err(e) => return Err(StorageError::from(e)),
