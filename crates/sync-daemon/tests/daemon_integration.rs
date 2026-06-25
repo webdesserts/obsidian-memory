@@ -23,11 +23,10 @@ mod daemon_integration {
 
     use iroh::address_lookup::memory::MemoryLookup;
     use tokio::sync::{Mutex, mpsc};
-    use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
 
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
-    use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt, gossip::VaultGossip};
+    use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
     use sync_core::peer_id::{PeerId, VaultId};
     use uuid::Uuid;
     use vault_sync::fs::{FileSystem, InMemoryFs};
@@ -43,187 +42,15 @@ mod daemon_integration {
     use sync_daemon::watcher::{FileEvent, FileEventKind};
 
     // ── helpers ───────────────────────────────────────────────────────────────
-
-    /// Shared gossip topic so all test daemons join the same swarm.
-    ///
-    /// Returns a `sync_core::VaultId` — the iroh gossip layer (`join_vault_gossip`)
-    /// speaks sync-core's VaultId. The vault's own `vault_id()` returns a
-    /// `vault_sync::VaultId`; the two are bridged through `u64` at the gossip boundary.
-    fn shared_vault_id() -> VaultId {
-        "cafebabecafebabe".parse().unwrap()
-    }
-
-    /// A test daemon: vault, filesystem, allowlist, and channels for injecting
-    /// events and triggering shutdown. The event loop runs in a background task.
-    struct TestDaemon {
-        vault: Arc<Mutex<Vault<Arc<InMemoryFs>>>>,
-        fs: Arc<InMemoryFs>,
-        #[allow(dead_code)]
-        allowlist: Arc<InMemoryAllowlist>,
-        /// Send file events into the daemon's event loop.
-        file_event_tx: mpsc::UnboundedSender<FileEvent>,
-        /// Cancel to stop the daemon's event loop.
-        shutdown: CancellationToken,
-        /// Background task handle for the event loop.
-        loop_handle: JoinHandle<()>,
-    }
-
-    /// Pre-gossip node state — built first so we can wire connectivity before joining.
-    struct NodeBundle {
-        vault: Arc<Mutex<Vault<Arc<InMemoryFs>>>>,
-        fs: Arc<InMemoryFs>,
-        allowlist: Arc<InMemoryAllowlist>,
-        sync_node: SyncNode,
-        node_id: PeerId,
-        /// The inbound-sync freshness receiver paired with the pumped handler's
-        /// sender. Wired into the daemon (`set_inbound_seen_rx`) by `spawn_daemon`
-        /// so inbound-only peers are stamped alive (S2). Tests building a `Daemon`
-        /// inline can take it too, or drop it (the handler's `send` then fails
-        /// quietly — inert, since those tests don't assert inbound-only liveness).
-        inbound_seen_rx: mpsc::UnboundedReceiver<PeerId>,
-    }
-
-    /// Build an iroh node with vault and allowlist, but do NOT join gossip yet.
-    ///
-    /// Gossip is joined separately (after connectivity is wired) so each node
-    /// has exactly one subscription per topic, matching the daemon's production behavior.
-    ///
-    /// The node is built with the daemon's PUMPED inbound handler (via
-    /// `new_with_sync_handler`), not the default one-shot `SyncStreamHandler` —
-    /// the convergence tests exercise the multi-message vault-sync handshake, so
-    /// the inbound side must pump exactly as production does.
-    async fn build_node(seed_byte: u8) -> anyhow::Result<NodeBundle> {
-        let fs = Arc::new(InMemoryFs::new());
-        // Author Loro ops under a per-device PeerId derived from this node's
-        // secret seed, so each node is a distinct Loro replica.
-        let author = PeerId::from_secret_bytes(super::common::seed(seed_byte));
-        let vault = Vault::init(fs.clone(), author.as_u64()).await?;
-        let vault = Arc::new(Mutex::new(vault));
-
-        let allowlist = Arc::new(InMemoryAllowlist::new());
-        let (inbound_seen_tx, inbound_seen_rx) = mpsc::unbounded_channel();
-        let sync_handler = sync_daemon::daemon::PumpedSyncHandler::new(
-            vault.clone(),
-            allowlist.clone(),
-            inbound_seen_tx,
-        );
-        let sync_node = SyncNode::new_with_sync_handler(
-            super::common::seed(seed_byte),
-            &[],
-            allowlist.clone(),
-            sync_handler,
-        )
-        .await?;
-
-        let memory_lookup = MemoryLookup::new();
-        sync_node.endpoint.address_lookup()?.add(memory_lookup);
-
-        let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
-
-        Ok(NodeBundle {
-            vault,
-            fs,
-            allowlist,
-            sync_node,
-            node_id,
-            inbound_seen_rx,
-        })
-    }
-
-    /// Wire two nodes for direct `MemoryLookup` connectivity and mutual allowlist access.
-    async fn connect_nodes(a: &NodeBundle, b: &NodeBundle) -> anyhow::Result<()> {
-        let addr_a = a.sync_node.endpoint.addr();
-        let addr_b = b.sync_node.endpoint.addr();
-
-        let lookup_a = MemoryLookup::new();
-        lookup_a.add_endpoint_info(addr_b.clone());
-        a.sync_node.endpoint.address_lookup()?.add(lookup_a);
-
-        let lookup_b = MemoryLookup::new();
-        lookup_b.add_endpoint_info(addr_a.clone());
-        b.sync_node.endpoint.address_lookup()?.add(lookup_b);
-
-        a.allowlist.add_peer(b.node_id, "peer-b").await?;
-        b.allowlist.add_peer(a.node_id, "peer-a").await?;
-
-        Ok(())
-    }
-
-    /// Spawn the Daemon event loop from pre-wired components.
-    ///
-    /// Takes ownership of the `NodeBundle` and the gossip subscription so the
-    /// daemon owns all components for the duration of the test.
-    fn spawn_daemon(node: NodeBundle, gossip: VaultGossip) -> TestDaemon {
-        let (file_event_tx, file_event_rx) = mpsc::unbounded_channel::<FileEvent>();
-        let shutdown = CancellationToken::new();
-
-        let vault = node.vault.clone();
-        let fs = node.fs.clone();
-        let allowlist = node.allowlist.clone();
-        let inbound_seen_rx = node.inbound_seen_rx;
-
-        let mut daemon = Daemon::new(
-            vault.clone(),
-            node.sync_node,
-            gossip,
-            file_event_rx,
-            None, // no mDNS discovery in tests
-            allowlist.clone(),
-            "test-device".to_string(),
-            None,
-            "/test-vault".into(),
-            shutdown.clone(),
-        );
-        // Wire the pumped handler's freshness receiver so inbound-only peers are
-        // stamped alive (S2) — mirrors `startup.rs`.
-        daemon.set_inbound_seen_rx(inbound_seen_rx);
-        // Wire the SAME in-memory fs the vault uses so the move-coalescer's
-        // crash-recovery journal (`.sync/pending-moves.json`, P4f-2) lands in the
-        // same stateful `InMemoryFs` as the vault's `.loro`/`.md`. `InMemoryFs` is
-        // stateful, so this MUST be `node.fs`, not a fresh instance. The daemon's
-        // `FS` is `Arc<InMemoryFs>`, so the handle is double-Arc'd — harmless, the
-        // `FileSystem for Arc<T>` blanket impl makes it a usable filesystem.
-        daemon.set_fs(Arc::new(fs.clone()));
-
-        let loop_handle = tokio::spawn(async move {
-            daemon.run_loop().await;
-        });
-
-        TestDaemon {
-            vault,
-            fs,
-            allowlist,
-            file_event_tx,
-            shutdown,
-            loop_handle,
-        }
-    }
-
-    /// Inject a `FileEvent::Modified` into the daemon's event loop.
-    ///
-    /// Write the file to `daemon.fs` before calling this — the daemon's
-    /// `on_file_modified` handler calls `vault.on_file_changed()` which reads
-    /// from the in-memory filesystem.
-    fn inject_modified(daemon: &TestDaemon, path: &str) {
-        daemon
-            .file_event_tx
-            .send(FileEvent {
-                path: path.to_string(),
-                kind: FileEventKind::Modified,
-            })
-            .expect("file event channel unexpectedly closed");
-    }
-
-    /// Inject a `FileEvent::Deleted` into the daemon's event loop.
-    fn inject_deleted(daemon: &TestDaemon, path: &str) {
-        daemon
-            .file_event_tx
-            .send(FileEvent {
-                path: path.to_string(),
-                kind: FileEventKind::Deleted,
-            })
-            .expect("file event channel unexpectedly closed");
-    }
+    //
+    // The universal build/connect/spawn/inject helpers + `uuid_of`/`now_ms_test`
+    // live in `common` (shared across the `daemon_*` suites). Only the 2-arg
+    // `wait_until` stays file-local — it name-collides with the relay 3-arg
+    // `common::wait_until`.
+    use super::common::{
+        TestDaemon, build_node, connect_nodes, inject_deleted, inject_modified, now_ms_test,
+        shared_vault_id, spawn_daemon, uuid_of,
+    };
 
     /// Poll until `predicate` returns true or 10 seconds elapse.
     ///
@@ -3042,16 +2869,6 @@ mod daemon_integration {
     // fresh-UUID create. They use the same two-daemon convergence harness as the
     // sync tests above, with simulated `FileEvent`s and in-memory vaults.
 
-    /// The document UUID the index currently records for `path` (as a string), if
-    /// any. The headline property of a move is that this UUID is unchanged across
-    /// the rename, so the tests read it before and after. Returned as a `String`
-    /// purely so the assertions need no `uuid` dependency.
-    async fn uuid_of(vault: &Arc<Mutex<Vault<Arc<InMemoryFs>>>>, path: &str) -> Option<String> {
-        let vault = vault.lock().await;
-        let node = vault.index().node_for_path(path)?;
-        vault.index().node_uuid(&node).map(|u| u.to_string())
-    }
-
     /// Simulate a native rename on a daemon's filesystem: the OS atomically moves
     /// `old` → `new`, so afterward `new` holds the content and `old` is gone. The
     /// caller injects the resulting `Deleted(old)` + `Modified(new)` events.
@@ -3855,15 +3672,6 @@ mod daemon_integration {
         daemon.shutdown.cancel();
         let _ = daemon.loop_handle.await;
         Ok(())
-    }
-
-    /// Wall-clock ms helper for tests — mirrors the daemon's `now_ms` so seeded
-    /// `last_attempt_ms` values land on the same clock the supervisor reads.
-    fn now_ms_test() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
     }
 
     // ── P4f-2b-ii: boot move crash-recovery ─────────────────────────────────────
