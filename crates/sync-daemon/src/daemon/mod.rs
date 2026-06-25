@@ -32,7 +32,7 @@ use crate::move_coalescer::{
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::watcher::{FileEvent, FileEventKind};
 use iroh::{EndpointAddr, EndpointId};
-use p2p_core::{PeerConnType, relay_is_offlan_reachable};
+use p2p_core::{PLACEHOLDER_DEVICE_NAME, PeerConnType, relay_is_offlan_reachable};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -240,6 +240,27 @@ fn fmt_peer_disconnect_line(name: &str, last_conn_type: Option<&str>) -> String 
         Some(label) => format!("disconnected from {name} (was via {label})"),
         None => format!("disconnected from {name}"),
     }
+}
+
+/// The short peer-id used as a friendly-name fallback: the first 8 hex chars of
+/// the peer's public key, enough to disambiguate at a glance.
+fn short_peer_id(peer_id: &PeerId) -> String {
+    peer_id.to_string().chars().take(8).collect()
+}
+
+/// Pick the friendly name for `peer_id` from an allowlist roster.
+///
+/// Returns the peer's stored `device_name` only when it is meaningful; an empty
+/// name or the [`PLACEHOLDER_DEVICE_NAME`] (left by a gossip-membership add until
+/// the real name self-heals) falls back to the short peer-id, so the connect line
+/// never prints a placeholder like "unknown" as if it were a name.
+fn resolve_peer_name_from(peers: &[AllowedPeer], peer_id: &PeerId) -> String {
+    peers
+        .iter()
+        .find(|p| &p.node_id == peer_id)
+        .map(|p| p.device_name.clone())
+        .filter(|name| !name.is_empty() && name != PLACEHOLDER_DEVICE_NAME)
+        .unwrap_or_else(|| short_peer_id(peer_id))
 }
 
 /// Clean host display for a relay URL (`https://umbra.computer/` → `umbra.computer`).
@@ -1974,21 +1995,19 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// Resolve a peer's friendly name: its allowlist `device_name`, or a short
     /// peer-id fallback.
     ///
-    /// Degrades gracefully — an allowlist read error (or a peer not yet in the
-    /// allowlist) falls back to the short peer-id rather than suppressing the
-    /// whole log line. The short id is the first 8 hex chars of the peer's
-    /// public key, enough to disambiguate at a glance.
+    /// Degrades gracefully — an allowlist read error, a peer not yet in the
+    /// allowlist, or a peer whose stored `device_name` is not yet meaningful
+    /// (empty, or the [`PLACEHOLDER_DEVICE_NAME`] a gossip-membership add leaves
+    /// behind until the real name self-heals) all fall back to the short peer-id
+    /// rather than printing a placeholder or suppressing the whole log line. The
+    /// short id is the first 8 hex chars of the peer's public key, enough to
+    /// disambiguate at a glance.
     async fn resolve_peer_name(&self, peer_id: &PeerId) -> String {
-        let short_id = || peer_id.to_string().chars().take(8).collect::<String>();
         match self.allowlist.list_peers().await {
-            Ok(peers) => peers
-                .iter()
-                .find(|p| &p.node_id == peer_id)
-                .map(|p| p.device_name.clone())
-                .unwrap_or_else(short_id),
+            Ok(peers) => resolve_peer_name_from(&peers, peer_id),
             Err(e) => {
                 debug!("Allowlist read failed during connect log, using short peer-id: {e}");
-                short_id()
+                short_peer_id(peer_id)
             }
         }
     }
@@ -2048,10 +2067,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             "{}",
             fmt_peer_connect_line(&name, &PeerConnType::Unknown)
         );
-        self.peer_registry.lock().await.set_last_conn_type(
-            &peer_id,
-            Some(conn_type_label(&PeerConnType::Unknown).to_string()),
-        );
+        // Store `None`, not the "unknown" label: a later disconnect should fall
+        // through to the bare `disconnected from X` form rather than echoing a
+        // useless `(was via unknown)`.
+        self.peer_registry
+            .lock()
+            .await
+            .set_last_conn_type(&peer_id, None);
     }
 
     /// Shared connect-log body: resolve the name, emit the INFO line, and capture
@@ -2462,8 +2484,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
 #[cfg(test)]
 mod connect_log_tests {
-    use super::{conn_type_label, fmt_peer_connect_line, fmt_peer_disconnect_line};
-    use p2p_core::PeerConnType;
+    use super::{
+        conn_type_label, fmt_peer_connect_line, fmt_peer_disconnect_line, resolve_peer_name_from,
+    };
+    use p2p_core::{PLACEHOLDER_DEVICE_NAME, PeerConnType};
+    use sync_core::{PeerId, allowlist::AllowedPeer};
 
     fn lan(ip_port: &str) -> PeerConnType {
         PeerConnType::Lan {
@@ -2520,6 +2545,42 @@ mod connect_log_tests {
         assert_eq!(conn_type_label(&lan("192.168.1.1:1")), "LAN");
         assert_eq!(conn_type_label(&relay("https://umbra.computer/")), "relay");
         assert_eq!(conn_type_label(&PeerConnType::Unknown), "unknown");
+    }
+
+    fn peer_named(name: &str) -> (PeerId, AllowedPeer) {
+        let id = PeerId::generate();
+        (id, AllowedPeer::new(id, name))
+    }
+
+    fn short_id(peer_id: &PeerId) -> String {
+        peer_id.to_string().chars().take(8).collect()
+    }
+
+    #[test]
+    fn resolve_name_uses_real_device_name() {
+        let (id, peer) = peer_named("rhea.local");
+        assert_eq!(resolve_peer_name_from(&[peer], &id), "rhea.local");
+    }
+
+    #[test]
+    fn resolve_name_falls_back_for_placeholder_device_name() {
+        // umbra's stored value is the literal placeholder until its real name
+        // self-heals; we must not print "unknown" as if it were a name.
+        let (id, peer) = peer_named(PLACEHOLDER_DEVICE_NAME);
+        assert_eq!(resolve_peer_name_from(&[peer], &id), short_id(&id));
+    }
+
+    #[test]
+    fn resolve_name_falls_back_for_empty_device_name() {
+        let (id, peer) = peer_named("");
+        assert_eq!(resolve_peer_name_from(&[peer], &id), short_id(&id));
+    }
+
+    #[test]
+    fn resolve_name_falls_back_for_absent_peer() {
+        let (id, _peer) = peer_named("rhea.local");
+        // The roster does not contain `id`, so there is no name to resolve.
+        assert_eq!(resolve_peer_name_from(&[], &id), short_id(&id));
     }
 }
 

@@ -483,6 +483,9 @@ mod tests {
         let peer = make_peer();
         registry.on_neighbor_up(peer);
         registry.set_device_name(&peer, "Test Device".to_string());
+        // Populate the internal field so the skip-guard below proves exclusion
+        // even when there is a value to serialize.
+        registry.set_last_conn_type(&peer, Some("LAN".to_string()));
 
         let entry = &registry.get_all_peers()[0];
         let json = serde_json::to_string(entry).unwrap();
@@ -491,5 +494,11 @@ mod tests {
         assert!(json.contains("firstSeen"));
         assert!(json.contains("lastSeen"));
         assert!(json.contains("\"alive\""));
+        // `last_conn_type` is `#[serde(skip)]` — an internal connection-path
+        // descriptor that must not leak into the UI-facing PeerEntry JSON.
+        assert!(
+            !json.contains("lastConnType"),
+            "internal field must not leak to UI-facing PeerEntry JSON"
+        );
     }
 }
