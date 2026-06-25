@@ -22,7 +22,7 @@ use iroh_gossip::{
 use n0_future::task;
 use rand::Rng;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::allowlist::AllowedPeer;
 
@@ -133,11 +133,14 @@ impl VaultGossip {
 
                 let gossip_event = match event {
                     Event::NeighborUp(node_id) => {
-                        info!(peer = %node_id, "Gossip NeighborUp");
+                        // Diagnostic only: the daemon emits the enriched INFO
+                        // connect/disconnect notice off the PeerRegistry liveness
+                        // transition. This is the raw HyParView membership edge.
+                        debug!(peer = %node_id, "Gossip NeighborUp");
                         GossipEvent::NeighborUp(node_id)
                     }
                     Event::NeighborDown(node_id) => {
-                        info!(peer = %node_id, "Gossip NeighborDown");
+                        debug!(peer = %node_id, "Gossip NeighborDown");
                         GossipEvent::NeighborDown(node_id)
                     }
                     Event::Received(msg) => {
