@@ -24,6 +24,20 @@ pub enum PeerState {
     Dead,
 }
 
+/// Whether a liveness signal flipped a peer to `Alive` or it was already there.
+///
+/// Returned by [`PeerRegistry::mark_alive`] so the daemon logs the enriched
+/// connect line exactly once per alive transition, regardless of which of the
+/// several liveness signals (NeighborUp, inbound sync, gossip roster) arrives
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectTransition {
+    /// The peer just transitioned Unknown/Dead → Alive.
+    NewlyAlive,
+    /// The peer was already Alive; only `last_seen` was refreshed.
+    AlreadyAlive,
+}
+
 /// A snapshot of a peer's registry state.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +52,11 @@ pub struct PeerEntry {
     pub first_seen: u64,
     /// Unix timestamp (seconds) when the peer was last active.
     pub last_seen: u64,
+    /// Last-observed connection-path descriptor ("LAN" / "relay"), captured at
+    /// connect time so a disconnect log can echo how we had been reaching the
+    /// peer. Internal logging aid only — not consumed by the UI.
+    #[serde(skip)]
+    pub last_conn_type: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -65,25 +84,68 @@ impl PeerRegistry {
         }
     }
 
+    /// Mark a peer alive on any liveness signal, reporting the transition.
+    ///
+    /// Creates a new `Alive` entry for an unknown peer and transitions a `Dead`
+    /// peer back to `Alive` (both `NewlyAlive`); an already-`Alive` peer just has
+    /// its `last_seen` refreshed (`AlreadyAlive`). The returned
+    /// [`ConnectTransition`] lets the daemon log the enriched connect line
+    /// exactly once per alive transition even though several signals
+    /// (NeighborUp, inbound sync, gossip roster) all drive this.
+    pub fn mark_alive(&mut self, node_id: PeerId) -> ConnectTransition {
+        let now = now_secs();
+        match self.peers.get_mut(&node_id) {
+            Some(entry) => {
+                let was_alive = entry.state == PeerState::Alive;
+                entry.state = PeerState::Alive;
+                entry.last_seen = now;
+                if was_alive {
+                    ConnectTransition::AlreadyAlive
+                } else {
+                    ConnectTransition::NewlyAlive
+                }
+            }
+            None => {
+                self.peers.insert(
+                    node_id,
+                    PeerEntry {
+                        node_id,
+                        device_name: None,
+                        state: PeerState::Alive,
+                        first_seen: now,
+                        last_seen: now,
+                        last_conn_type: None,
+                    },
+                );
+                ConnectTransition::NewlyAlive
+            }
+        }
+    }
+
     /// Record that a peer joined the gossip swarm.
     ///
     /// Creates a new `Alive` entry for an unknown peer. For a peer that was
     /// previously `Dead`, transitions it back to `Alive`. For an already-`Alive`
     /// peer (e.g., duplicate event), updates `last_seen`.
     ///
-    /// Returns a reference to the updated entry.
+    /// Returns a reference to the updated entry. Thin wrapper over
+    /// [`PeerRegistry::mark_alive`] preserved for callers that don't need the
+    /// transition signal.
     pub fn on_neighbor_up(&mut self, node_id: PeerId) -> &PeerEntry {
-        let now = now_secs();
-        let entry = self.peers.entry(node_id).or_insert_with(|| PeerEntry {
-            node_id,
-            device_name: None,
-            state: PeerState::Alive,
-            first_seen: now,
-            last_seen: now,
-        });
-        entry.state = PeerState::Alive;
-        entry.last_seen = now;
-        entry
+        self.mark_alive(node_id);
+        self.peers
+            .get(&node_id)
+            .expect("mark_alive just inserted this peer")
+    }
+
+    /// Record the connection-path descriptor last observed for a peer.
+    ///
+    /// Stored so a later disconnect log can echo how we had been reaching the
+    /// peer. No-op for unknown peers.
+    pub fn set_last_conn_type(&mut self, node_id: &PeerId, conn_type: Option<String>) {
+        if let Some(entry) = self.peers.get_mut(node_id) {
+            entry.last_conn_type = conn_type;
+        }
     }
 
     /// Record that a peer left the gossip swarm.
@@ -215,6 +277,67 @@ mod tests {
         assert_eq!(registry.alive_count(), 1);
         // Still only one entry in registry
         assert_eq!(registry.get_all_peers().len(), 1);
+    }
+
+    // ── mark_alive transitions ───────────────────────────────────────────────
+
+    #[test]
+    fn mark_alive_reports_newly_alive_once_then_already_alive() {
+        let mut registry = PeerRegistry::new();
+        let peer = make_peer();
+
+        // First signal is the transition that should log.
+        assert_eq!(registry.mark_alive(peer), ConnectTransition::NewlyAlive);
+        // Duplicate liveness signals (e.g. NeighborUp + inbound sync + roster)
+        // must NOT re-log — they report AlreadyAlive.
+        assert_eq!(registry.mark_alive(peer), ConnectTransition::AlreadyAlive);
+        assert_eq!(registry.mark_alive(peer), ConnectTransition::AlreadyAlive);
+    }
+
+    #[test]
+    fn mark_alive_reports_newly_alive_again_after_dead() {
+        let mut registry = PeerRegistry::new();
+        let peer = make_peer();
+
+        assert_eq!(registry.mark_alive(peer), ConnectTransition::NewlyAlive);
+        registry.on_neighbor_down(&peer);
+        // A peer that died and rejoined is a fresh connect — should log again.
+        assert_eq!(registry.mark_alive(peer), ConnectTransition::NewlyAlive);
+    }
+
+    #[test]
+    fn on_neighbor_up_still_creates_alive_entry() {
+        // on_neighbor_up is reimplemented on mark_alive; its existing contract
+        // (returns an Alive entry for the peer) must be unchanged.
+        let mut registry = PeerRegistry::new();
+        let peer = make_peer();
+
+        let entry = registry.on_neighbor_up(peer);
+        assert_eq!(entry.state, PeerState::Alive);
+        assert_eq!(entry.node_id, peer);
+    }
+
+    // ── set_last_conn_type ───────────────────────────────────────────────────
+
+    #[test]
+    fn set_last_conn_type_for_known_peer() {
+        let mut registry = PeerRegistry::new();
+        let peer = make_peer();
+
+        registry.mark_alive(peer);
+        registry.set_last_conn_type(&peer, Some("LAN".to_string()));
+
+        let entry = &registry.get_all_peers()[0];
+        assert_eq!(entry.last_conn_type, Some("LAN".to_string()));
+    }
+
+    #[test]
+    fn set_last_conn_type_unknown_peer_is_noop() {
+        let mut registry = PeerRegistry::new();
+        let unknown = make_peer();
+
+        registry.set_last_conn_type(&unknown, Some("LAN".to_string()));
+        assert_eq!(registry.get_all_peers().len(), 0);
     }
 
     // ── Edge cases ───────────────────────────────────────────────────────────

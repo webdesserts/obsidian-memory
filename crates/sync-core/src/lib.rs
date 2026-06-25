@@ -52,5 +52,5 @@ pub use p2p_core::pairing::{
     generate_pairing_code, verify_hmac,
 };
 pub use peer_id::{PeerId, PeerIdError, VaultId};
-pub use peers::{PeerEntry, PeerRegistry, PeerState};
+pub use peers::{ConnectTransition, PeerEntry, PeerRegistry, PeerState};
 pub use sync::SyncMessage;

@@ -32,7 +32,7 @@ use crate::move_coalescer::{
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::watcher::{FileEvent, FileEventKind};
 use iroh::{EndpointAddr, EndpointId};
-use p2p_core::relay_is_offlan_reachable;
+use p2p_core::{PeerConnType, relay_is_offlan_reachable};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ use sync_core::network::{
 };
 use sync_core::pairing::{PairingChallenge, PairingSession};
 use sync_core::time_scale::{scaled, scaled_ms};
-use sync_core::{PeerId, PeerRegistry};
+use sync_core::{ConnectTransition, PeerId, PeerRegistry};
 // The vault/sync-engine layer is vault-sync; the iroh half stays on sync-core.
 // `Daemon<FS>` and `Vault<FS>` are both generic over vault-sync's `FileSystem`.
 use uuid::Uuid;
@@ -195,6 +195,61 @@ fn learned_public_relay_to_adopt(
         return None;
     }
     Some(url.clone())
+}
+
+/// The transport label for a peer's connection, used both in the connect line
+/// ("via LAN" / "via relay" / "via unknown path") and as the persisted
+/// `last_conn_type` descriptor a later disconnect echoes.
+fn conn_type_label(conn: &PeerConnType) -> &'static str {
+    match conn {
+        PeerConnType::Lan { .. } => "LAN",
+        PeerConnType::Relay { .. } => "relay",
+        PeerConnType::Unknown => "unknown",
+    }
+}
+
+/// Format the human-readable INFO connect line for a peer.
+///
+/// Shapes:
+/// - `connected to <name> (192.168.x.y) via LAN`
+/// - `connected to <name> (umbra.computer) via relay`
+/// - `connected to <name> via unknown path` (no address when the path is
+///   unsettled — graceful degradation, never an error)
+///
+/// `name` is the allowlist `device_name` (or a short peer-id fallback, resolved
+/// by the caller). The relay display uses the relay host only, not the full URL.
+fn fmt_peer_connect_line(name: &str, conn: &PeerConnType) -> String {
+    match conn {
+        PeerConnType::Lan { addr } => {
+            format!("connected to {name} ({}) via LAN", addr.ip())
+        }
+        PeerConnType::Relay { url } => {
+            format!("connected to {name} ({}) via relay", relay_display(url))
+        }
+        PeerConnType::Unknown => format!("connected to {name} via unknown path"),
+    }
+}
+
+/// Format the INFO disconnect line for a peer.
+///
+/// Echoes the last-known connection path when one was captured at connect time
+/// (`disconnected from rhea (was via LAN)`); falls back to a bare
+/// `disconnected from rhea` when the path is unknown.
+fn fmt_peer_disconnect_line(name: &str, last_conn_type: Option<&str>) -> String {
+    match last_conn_type {
+        Some(label) => format!("disconnected from {name} (was via {label})"),
+        None => format!("disconnected from {name}"),
+    }
+}
+
+/// Clean host display for a relay URL (`https://umbra.computer/` → `umbra.computer`).
+///
+/// `RelayUrl` derefs to `url::Url`, so `host_str()` gives the host without the
+/// scheme/path. Falls back to the full URL string if the host can't be parsed.
+fn relay_display(url: &iroh::RelayUrl) -> String {
+    url.host_str()
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| url.to_string())
 }
 
 /// Configuration for running the sync daemon.
@@ -591,10 +646,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     }
                 } => {
                     // A peer completed an inbound sync (handled inline by the pumped
-                    // handler). Stamp its liveness so the broadcast `alive_count`
-                    // gate counts an inbound-only peer (S2) — the inbound handler
-                    // can't reach `peer_registry`, so it routes the stamp here.
-                    self.peer_registry.lock().await.update_last_seen(&remote_id);
+                    // handler). This proves liveness even when our HyParView never
+                    // fired NeighborUp (the edge-trigger bug), so mark it alive and
+                    // log the connect line on a true transition — and stamp it so
+                    // the broadcast `alive_count` gate counts an inbound-only peer
+                    // (S2). The inbound handler can't reach `peer_registry`, so it
+                    // routes the signal here.
+                    self.on_peer_liveness(remote_id).await;
                 }
 
                 Some(pairing_event) = self.sync_node.inbound_pairing_rx.recv() => {
@@ -1913,6 +1971,129 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
     }
 
+    /// Resolve a peer's friendly name: its allowlist `device_name`, or a short
+    /// peer-id fallback.
+    ///
+    /// Degrades gracefully — an allowlist read error (or a peer not yet in the
+    /// allowlist) falls back to the short peer-id rather than suppressing the
+    /// whole log line. The short id is the first 8 hex chars of the peer's
+    /// public key, enough to disambiguate at a glance.
+    async fn resolve_peer_name(&self, peer_id: &PeerId) -> String {
+        let short_id = || peer_id.to_string().chars().take(8).collect::<String>();
+        match self.allowlist.list_peers().await {
+            Ok(peers) => peers
+                .iter()
+                .find(|p| &p.node_id == peer_id)
+                .map(|p| p.device_name.clone())
+                .unwrap_or_else(short_id),
+            Err(e) => {
+                debug!("Allowlist read failed during connect log, using short peer-id: {e}");
+                short_id()
+            }
+        }
+    }
+
+    /// Mark a peer alive from any liveness signal and log the connect line once.
+    ///
+    /// The single entry point for the non-NeighborUp liveness signals (inbound
+    /// sync, gossip roster, allowlist update) that prove a peer is reachable even
+    /// when iroh-gossip's edge-triggered `NeighborUp` never fires (the observed
+    /// bug). `mark_alive` collapses duplicate signals to `AlreadyAlive`, so the
+    /// enriched connect line is emitted exactly once per Unknown/Dead → Alive
+    /// transition no matter how many signals arrive.
+    ///
+    /// These signals carry a `PeerId`, so we recover the iroh `EndpointId` for
+    /// the connection-path lookup (SF-1: this conversion is fallible — an invalid
+    /// key degrades to an `Unknown` path rather than dropping the log).
+    async fn on_peer_liveness(&self, peer_id: PeerId) {
+        let transition = self.peer_registry.lock().await.mark_alive(peer_id);
+        if transition != ConnectTransition::NewlyAlive {
+            return;
+        }
+        match EndpointId::from_bytes(peer_id.as_bytes()) {
+            Ok(node_id) => self.log_peer_connected(node_id, peer_id).await,
+            Err(e) => {
+                debug!("Invalid peer key for connect-path lookup, logging unknown path: {e}");
+                self.log_peer_connected_unknown(peer_id).await;
+            }
+        }
+        // The transition changed `alive_count`, so refresh the tray-UI status to
+        // match — mirrors the emit on the NeighborUp/Down paths.
+        self.emit_status().await;
+    }
+
+    /// Emit the enriched INFO connect line for a freshly-alive peer.
+    ///
+    /// Composes the connection path (from the iroh node), the friendly device
+    /// name (from the allowlist), and the formatted line — and captures the
+    /// connection-path label on the registry entry so a later disconnect can
+    /// echo how we had been reaching the peer. Called only on a true
+    /// Unknown/Dead → Alive transition so duplicate liveness signals don't spam.
+    async fn log_peer_connected(&self, node_id: EndpointId, peer_id: PeerId) {
+        let conn_type = self.sync_node.peer_conn_info(node_id).await.conn_type;
+        self.log_connect_with_conn_type(node_id, peer_id, conn_type)
+            .await;
+    }
+
+    /// Connect-log fallback when the iroh `EndpointId` couldn't be recovered.
+    ///
+    /// Without a valid `EndpointId` there is no connection-path snapshot to take,
+    /// so the path degrades to `Unknown`. The full peer-id is still logged so the
+    /// canonical identity is present. Reuses the node's own `PeerId` Display for
+    /// the structured `peer` field.
+    async fn log_peer_connected_unknown(&self, peer_id: PeerId) {
+        let name = self.resolve_peer_name(&peer_id).await;
+        info!(
+            peer = %peer_id,
+            "{}",
+            fmt_peer_connect_line(&name, &PeerConnType::Unknown)
+        );
+        self.peer_registry.lock().await.set_last_conn_type(
+            &peer_id,
+            Some(conn_type_label(&PeerConnType::Unknown).to_string()),
+        );
+    }
+
+    /// Shared connect-log body: resolve the name, emit the INFO line, and capture
+    /// the connection-path label for a later disconnect echo.
+    async fn log_connect_with_conn_type(
+        &self,
+        node_id: EndpointId,
+        peer_id: PeerId,
+        conn_type: PeerConnType,
+    ) {
+        let name = self.resolve_peer_name(&peer_id).await;
+        info!(peer = %node_id, "{}", fmt_peer_connect_line(&name, &conn_type));
+
+        // Record how we reached the peer so disconnect can say "was via LAN".
+        let label = conn_type_label(&conn_type).to_string();
+        self.peer_registry
+            .lock()
+            .await
+            .set_last_conn_type(&peer_id, Some(label));
+    }
+
+    /// Emit the enriched INFO disconnect line for a peer that left.
+    ///
+    /// Echoes the last-known connection path captured at connect time when
+    /// available.
+    async fn log_peer_disconnected(&self, node_id: EndpointId, peer_id: PeerId) {
+        let last_conn_type = self
+            .peer_registry
+            .lock()
+            .await
+            .get_all_peers()
+            .iter()
+            .find(|e| e.node_id == peer_id)
+            .and_then(|e| e.last_conn_type.clone());
+        let name = self.resolve_peer_name(&peer_id).await;
+        info!(
+            peer = %node_id,
+            "{}",
+            fmt_peer_disconnect_line(&name, last_conn_type.as_deref())
+        );
+    }
+
     /// A peer joined the gossip swarm — initiate a full sync via QUIC.
     ///
     /// The allowlist check and sync-request preparation happen synchronously so
@@ -1922,9 +2103,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// — both sides fire NeighborUp simultaneously and each tries to connect to
     /// the other, which would deadlock if the QUIC call blocked the select loop.
     async fn on_neighbor_up(&mut self, node_id: EndpointId) {
-        info!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
-        self.peer_registry.lock().await.on_neighbor_up(peer_id);
+        let transition = self.peer_registry.lock().await.mark_alive(peer_id);
+        if transition == ConnectTransition::NewlyAlive {
+            self.log_peer_connected(node_id, peer_id).await;
+        }
+        debug!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
         self.emit_status().await;
 
         if !self.is_peer_allowed(&peer_id).await {
@@ -1969,8 +2153,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
     /// A peer left the gossip swarm.
     async fn on_neighbor_down(&mut self, node_id: EndpointId) {
-        info!(peer = %node_id, "Gossip NeighborDown");
         let peer_id = PeerId::from_bytes(*node_id.as_bytes());
+        self.log_peer_disconnected(node_id, peer_id).await;
         self.peer_registry.lock().await.on_neighbor_down(&peer_id);
         self.emit_status().await;
     }
@@ -2081,6 +2265,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             return;
         }
 
+        // A roster broadcast arriving from this peer proves it is connected even
+        // when our HyParView never fired NeighborUp — log the connect on a true
+        // transition (the reliability fix).
+        self.on_peer_liveness(sender_id).await;
+
         match self.allowlist.merge_roster(&peers).await {
             Ok(()) => {
                 info!(from = %from, count = peers.len(), "Merged allowlist roster via gossip");
@@ -2101,6 +2290,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             warn!(peer = %from, "Allowlist update from non-allowlisted peer, ignoring");
             return;
         }
+
+        // The update broadcast proves the sender is connected — same reliability
+        // fix as the roster path.
+        self.on_peer_liveness(sender_id).await;
 
         match self
             .allowlist
@@ -2264,6 +2457,69 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // tradeoff is acceptable.
         self.active_pairing = None;
         warn!("Pairing failed for {}: {}", peer_id, reason);
+    }
+}
+
+#[cfg(test)]
+mod connect_log_tests {
+    use super::{conn_type_label, fmt_peer_connect_line, fmt_peer_disconnect_line};
+    use p2p_core::PeerConnType;
+
+    fn lan(ip_port: &str) -> PeerConnType {
+        PeerConnType::Lan {
+            addr: ip_port.parse().unwrap(),
+        }
+    }
+
+    fn relay(url: &str) -> PeerConnType {
+        PeerConnType::Relay {
+            url: url.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn connect_line_lan_shows_ip_and_via_lan() {
+        let line = fmt_peer_connect_line("rhea.local", &lan("192.168.10.226:11204"));
+        assert_eq!(line, "connected to rhea.local (192.168.10.226) via LAN");
+    }
+
+    #[test]
+    fn connect_line_relay_shows_host_and_via_relay() {
+        let line = fmt_peer_connect_line("umbra", &relay("https://umbra.computer/"));
+        assert_eq!(line, "connected to umbra (umbra.computer) via relay");
+    }
+
+    #[test]
+    fn connect_line_unknown_omits_address() {
+        let line = fmt_peer_connect_line("rhea.local", &PeerConnType::Unknown);
+        assert_eq!(line, "connected to rhea.local via unknown path");
+    }
+
+    #[test]
+    fn connect_line_uses_provided_name_verbatim() {
+        // The caller resolves the short-peer-id fallback; the formatter just uses
+        // whatever name string it's given.
+        let line = fmt_peer_connect_line("a1b2c3d4", &lan("10.0.0.5:9000"));
+        assert_eq!(line, "connected to a1b2c3d4 (10.0.0.5) via LAN");
+    }
+
+    #[test]
+    fn disconnect_line_echoes_last_conn_type() {
+        let line = fmt_peer_disconnect_line("rhea.local", Some("LAN"));
+        assert_eq!(line, "disconnected from rhea.local (was via LAN)");
+    }
+
+    #[test]
+    fn disconnect_line_bare_when_path_unknown() {
+        let line = fmt_peer_disconnect_line("rhea.local", None);
+        assert_eq!(line, "disconnected from rhea.local");
+    }
+
+    #[test]
+    fn conn_type_label_maps_each_variant() {
+        assert_eq!(conn_type_label(&lan("192.168.1.1:1")), "LAN");
+        assert_eq!(conn_type_label(&relay("https://umbra.computer/")), "relay");
+        assert_eq!(conn_type_label(&PeerConnType::Unknown), "unknown");
     }
 }
 
