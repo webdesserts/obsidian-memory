@@ -64,3 +64,12 @@ iroh = { version = "1.0.0-rc.1", default-features = false, features = ["tls-ring
 # For the `relay_probe` example: surface iroh's own relay-client logs via RUST_LOG.
 tracing-subscriber.workspace = true
 
+# The two-node gossip/sync harness calls `P2pNode::endpoint_for_test()`, which is
+# gated behind `test-util`. Declaring the requirement here makes cargo SKIP the
+# test when the feature is off (instead of trying to compile it and failing on the
+# missing method), so `cargo test -p sync-core` and `--test network_integration`
+# both just work without remembering `--features test-util`.
+[[test]]
+name = "network_integration"
+required-features = ["test-util"]
+
