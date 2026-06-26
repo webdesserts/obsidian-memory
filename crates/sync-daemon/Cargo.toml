@@ -50,7 +50,6 @@ uuid = { workspace = true, features = ["serde"] }
 
 # Iroh node IDs (for EndpointId parsing)
 iroh = { version = "1.0.0-rc.1", default-features = false }
-iroh-relay = { version = "1.0.0-rc.1", features = ["server"] }
 
 # Cancellation tokens for daemon shutdown (shared between prod and tests)
 tokio-util = { version = "0.7", features = ["rt"] }

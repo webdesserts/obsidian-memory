@@ -8054,7 +8054,6 @@ dependencies = [
  "gethostname",
  "iroh",
  "iroh-gossip",
- "iroh-relay",
  "memory-common",
  "notify",
  "notify-debouncer-mini",
