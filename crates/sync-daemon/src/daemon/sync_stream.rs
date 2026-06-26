@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendStream};
-use iroh::protocol::{AcceptError, ProtocolHandler};
+use p2p_core::{AcceptError, ProtocolHandler};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};

@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::Connection;
-use iroh::protocol::{AcceptError, ProtocolHandler};
 use p2p_core::streams::{read_length_prefixed, write_length_prefixed};
+use p2p_core::{AcceptError, ProtocolHandler};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 

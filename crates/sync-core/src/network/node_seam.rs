@@ -66,7 +66,7 @@ pub trait SyncNodeSeam: Sized {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler;
+        H: p2p_core::ProtocolHandler;
 
     /// Relay-only [`new`](SyncNodeSeam::new) — the endpoint has no IP transports,
     /// so the relay is the sole route. Test-only (behind `test-util`).
@@ -90,7 +90,7 @@ pub trait SyncNodeSeam: Sized {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler;
+        H: p2p_core::ProtocolHandler;
 }
 
 impl SyncNodeSeam for P2pNode {
@@ -117,7 +117,7 @@ impl SyncNodeSeam for P2pNode {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler,
+        H: p2p_core::ProtocolHandler,
     {
         P2pNode::with_sync_alpn(secret_key_bytes, relays, allowlist, SYNC_ALPN, sync_handler).await
     }
@@ -149,7 +149,7 @@ impl SyncNodeSeam for P2pNode {
     ) -> Result<Self>
     where
         A: AllowlistStorage + std::fmt::Debug + 'static,
-        H: iroh::protocol::ProtocolHandler,
+        H: p2p_core::ProtocolHandler,
     {
         P2pNode::relay_only_with_sync_alpn(
             secret_key_bytes,
@@ -232,5 +232,18 @@ mod tests {
             let recovered = <P2pNode as VaultGossipExt>::vault_id_from_topic(topic.as_bytes());
             assert_eq!(recovered, vault_id, "round-trip failed for {raw:#x}");
         }
+    }
+
+    /// Freeze the three ALPN strings the Router dispatches on. These are the live
+    /// accept/dial contract — a mixed-version fleet partitions if any of them
+    /// changes. The test makes a "tidy the ALPN" edit fail at unit-test time
+    /// instead of at fleet-partition time. `GOSSIP_ALPN` is iroh-gossip's own
+    /// literal (we re-export it via `p2p_core::GOSSIP_ALPN`); pinning it documents
+    /// the iroh-gossip version we are wire-compatible with.
+    #[test]
+    fn alpn_strings_are_stable() {
+        assert_eq!(SYNC_ALPN, b"obsidian-memory/sync/1");
+        assert_eq!(p2p_core::PAIRING_ALPN, b"obsidian-memory/pair/1");
+        assert_eq!(p2p_core::GOSSIP_ALPN, b"/iroh-gossip/1");
     }
 }
