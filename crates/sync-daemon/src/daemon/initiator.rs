@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use p2p_core::RelayAddr;
+use p2p_core::{DialHandle, PeerAddr, RelayAddr};
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::network::VaultGossipExt;
 use sync_core::network::discovery::MeshMetadata;
@@ -230,7 +230,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let (code_tx, code_rx) = oneshot::channel::<String>();
         session.code_tx = Some(code_tx);
 
-        let endpoint = self.sync_node.endpoint.clone();
+        // A cheap-clone dial handle for the detached, parked pairing task — NOT a
+        // borrow of `self.sync_node` (the task is `'static` and parks awaiting a
+        // code) and NOT an `Arc<SyncNode>` (which would block `shutdown(self)`).
+        let dial = self.sync_node.dial_handle();
         let self_node_id = *self.sync_node.node_id().as_bytes();
         let device_name = self.device_name.clone();
         let outcome_tx = self.initiator_outcome_tx.clone();
@@ -238,7 +241,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         tokio::spawn(async move {
             let exchange = tokio::select! {
                 r = run_initiator_pairing_parked(
-                    &endpoint,
+                    &dial,
                     peer_endpoint_id,
                     self_node_id,
                     &device_name,
@@ -521,7 +524,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 /// (success or failed HMAC check). Returns `None` when a connection error
 /// occurs — `connect_reply` carries the `Err` in that case.
 async fn run_initiator_pairing_parked(
-    endpoint: &iroh::Endpoint,
+    dial: &DialHandle,
     peer_endpoint_id: PeerId,
     self_node_id_bytes: [u8; 32],
     device_name: &str,
@@ -533,11 +536,10 @@ async fn run_initiator_pairing_parked(
         node_id: self_peer_id,
         device_name: device_name.to_string(),
     };
-    // The pairing connect still speaks iroh's id (the `pair_with_mesh*` rework is
-    // Stage A3). The target is a discovered mesh peer whose id came from a real
-    // mDNS-advertised key, so the conversion is infallible here.
-    let peer_endpoint = EndpointId::from_bytes(peer_endpoint_id.as_bytes())
-        .expect("discovered pairing target is a valid, transport-sourced peer id");
+    // The target is a discovered mesh peer whose id came from a real mDNS-advertised
+    // key; `PeerAddr` defers the curve-point check to `connect()`, which cannot hit
+    // the legacy arm for a transport-sourced id.
+    let peer = PeerAddr::new(peer_endpoint_id);
 
     // The PairingChallenge carries the responder's device_name; capture it
     // here so we can return it to the UI's success message.
@@ -549,7 +551,7 @@ async fn run_initiator_pairing_parked(
     let connect_reply_cell = Arc::new(Mutex::new(Some(connect_reply)));
     let connect_reply_for_closure = connect_reply_cell.clone();
 
-    let result = pair_with_mesh_interactive(endpoint, peer_endpoint, &hello, move |challenge| {
+    let result = pair_with_mesh_interactive(dial, peer, &hello, move |challenge| {
         let setter = captured_device_name_setter.clone();
         let reply_cell = connect_reply_for_closure.clone();
         let code_rx = code_rx; // move into closure — runs exactly once

@@ -14,7 +14,7 @@ use futures::StreamExt;
 use std::sync::Arc;
 use tracing::debug;
 
-use p2p_core::FileAllowlistStorage;
+use p2p_core::{FileAllowlistStorage, PeerAddr};
 use sync_core::allowlist::InMemoryAllowlist;
 use sync_core::network::{
     SyncNode, SyncNodeSeam,
@@ -181,30 +181,24 @@ async fn pair_inner(
 
     eprintln!("Connecting to {}...", selected_mesh.mesh_name);
 
-    // The pairing connect still speaks iroh's id (the `pair_with_mesh*` rework is
-    // Stage A3). The target came from mDNS discovery (a real key), so the
-    // conversion is infallible here.
-    let peer_endpoint = iroh::EndpointId::from_bytes(peer_endpoint_id.as_bytes())
-        .expect("discovered pairing target is a valid, transport-sourced peer id");
+    // The target came from mDNS discovery (a real key); `PeerAddr` defers the
+    // curve-point check to `connect()`, which is infallible for it.
+    let peer = PeerAddr::new(peer_endpoint_id);
+    let dial = sync_node.dial_handle();
 
     // Connect and run the interactive pairing exchange.
-    let result = pair_with_mesh_interactive(
-        &sync_node.endpoint,
-        peer_endpoint,
-        &hello,
-        |challenge| async move {
-            eprintln!(
-                "Connected to '{}'. Enter the 6-digit code shown on that device:",
-                challenge.device_name
-            );
-            eprint!("> ");
-            io::stderr().flush()?;
+    let result = pair_with_mesh_interactive(&dial, peer, &hello, |challenge| async move {
+        eprintln!(
+            "Connected to '{}'. Enter the 6-digit code shown on that device:",
+            challenge.device_name
+        );
+        eprint!("> ");
+        io::stderr().flush()?;
 
-            let mut code = String::new();
-            io::stdin().read_line(&mut code)?;
-            Ok(code.trim().to_string())
-        },
-    )
+        let mut code = String::new();
+        io::stdin().read_line(&mut code)?;
+        Ok(code.trim().to_string())
+    })
     .await
     .context("Pairing connection failed")?;
 

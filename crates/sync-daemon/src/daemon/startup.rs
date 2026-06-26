@@ -631,13 +631,13 @@ async fn startup_inner(
     // partition empties gossip's peer views.
     {
         use futures::StreamExt;
-        use iroh::Watcher;
         // Capacity 1: a single wifi switch emits several address changes; they
         // coalesce into one backoff reset (resetting twice is a no-op).
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-        // stream_updates_only (not stream) skips the current address, so we react
-        // only to real changes — no spurious reset at startup.
-        let mut addr_stream = daemon.sync_node.endpoint.watch_addr().stream_updates_only();
+        // `watch_net_changes` wraps iroh's `watch_addr().stream_updates_only()`
+        // (skips the current address, so we react only to real changes — no
+        // spurious reset at startup) and hides `iroh::Watcher`.
+        let mut addr_stream = daemon.sync_node.watch_net_changes();
         tokio::spawn(async move {
             while addr_stream.next().await.is_some() {
                 // try_send: if a reset is already queued, dropping the extra change

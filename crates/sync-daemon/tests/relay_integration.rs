@@ -20,7 +20,7 @@ use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
 use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 // `NativeFs`/`InMemoryFs` (via `common`) implement vault-sync's `FileSystem`.
-use p2p_core::{EmbeddedRelay, RelayAddr};
+use p2p_core::{EmbeddedRelay, PeerAddr, RelayAddr};
 use sync_daemon::daemon::Daemon;
 use sync_daemon::persistence::PeerRelay;
 use sync_daemon::watcher::FileEvent;
@@ -127,8 +127,9 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
         }
     });
 
-    // B connects to A's QUIC endpoint and sends a sync request.
-    let addr_a = node_a.endpoint.addr();
+    // B connects to A and sends a sync request, routing through the relay (B knows
+    // A's identity + the shared relay, not a direct address).
+    let peer_a_addr = PeerAddr::new(node_a.node_id()).with_relay(relay_url.clone());
     let request = SyncMessage::SyncRequest {
         registry_version: vec![1, 2, 3],
         document_versions: HashMap::from([("notes/relay-test.md".to_string(), vec![0u8; 4])]),
@@ -137,7 +138,7 @@ async fn test_sync_through_embedded_relay() -> anyhow::Result<()> {
 
     let received_bytes = tokio::time::timeout(
         Duration::from_secs(30),
-        connect_and_sync_raw(&node_b.endpoint, addr_a, &request_bytes),
+        connect_and_sync_raw(&node_b, peer_a_addr, &request_bytes),
     )
     .await
     .expect("timed out waiting for QUIC sync response through relay")?;
@@ -395,7 +396,9 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
         }
     });
 
-    let addr_a = node_a.endpoint.addr();
+    // Dial A by BARE id: the per-peer relay hint seeded above (B → A through R_a)
+    // is what must resolve the route, which is exactly what this test exercises.
+    let peer_a_addr = PeerAddr::new(node_a.node_id());
     let request = SyncMessage::SyncRequest {
         registry_version: vec![1, 2, 3],
         document_versions: HashMap::from([("notes/relay-hint-test.md".to_string(), vec![0u8; 4])]),
@@ -404,7 +407,7 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
 
     let received_bytes = tokio::time::timeout(
         Duration::from_secs(30),
-        connect_and_sync_raw(&node_b.endpoint, addr_a, &request_bytes),
+        connect_and_sync_raw(&node_b, peer_a_addr, &request_bytes),
     )
     .await
     .expect("timed out waiting for QUIC sync response")?;

@@ -31,8 +31,7 @@
 
 use std::sync::Arc;
 
-use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendStream};
-use p2p_core::{AcceptError, ProtocolHandler};
+use p2p_core::{AcceptError, Connection, ProtocolHandler, ReadExactError, RecvStream, SendStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -68,9 +67,9 @@ fn idle_read_timeout() -> std::time::Duration {
 /// Drive the variable-length vault-sync handshake to termination as the
 /// initiator, over a single QUIC bi-stream.
 ///
-/// Opens a `SYNC_ALPN` connection to `target`, sends `request_bytes` (the digest
-/// opener), then ping-pongs: read the peer's reply, `process_message` it on the
-/// LOCAL vault, and send the next reply back — until the local side returns
+/// Over the established `SYNC_ALPN` `connection`, sends `request_bytes` (the
+/// digest opener), then ping-pongs: read the peer's reply, `process_message` it on
+/// the LOCAL vault, and send the next reply back — until the local side returns
 /// `reply: None` (terminal), at which point the send half is finished and the
 /// loop ends. The returned `Vec<DocId>` accumulates every document the initiator
 /// applied across the exchange (what the caller's success log + last-seen
@@ -79,15 +78,18 @@ fn idle_read_timeout() -> std::time::Duration {
 /// Replaces sync-core's `connect_and_sync_raw`, which finishes the send half
 /// after one write and reads exactly one reply — correct for sync-core's
 /// single-round-trip protocol, but it forecloses vault-sync's continuation.
+///
+/// The caller (`spawn_sync_exchange`) dials the peer on `SYNC_ALPN` via
+/// `P2pNode::connect` / `DialHandle::connect` and hands the established
+/// [`Connection`] here; this function opens the bi-stream and pumps the handshake.
 pub(super) async fn pump_outbound<FS: FileSystem>(
-    endpoint: &iroh::Endpoint,
-    target: iroh::EndpointId,
+    connection: Connection,
     request_bytes: &[u8],
     vault: &Arc<Mutex<Vault<FS>>>,
 ) -> anyhow::Result<Vec<vault_sync::DocId>> {
-    let connection = endpoint
-        .connect(target, sync_core::network::SYNC_ALPN)
-        .await?;
+    // The peer's transport id, for the leg-cap warning's log field (byte-identical
+    // to the `%target` the caller used to pass).
+    let target = connection.remote_id();
     let (mut send, mut recv) = connection.open_bi().await?;
 
     // Send the opener. Do NOT finish the send half here — that would foreclose

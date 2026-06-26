@@ -24,9 +24,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::endpoint::Connection;
 use p2p_core::streams::{read_length_prefixed, write_length_prefixed};
-use p2p_core::{AcceptError, ProtocolHandler};
+use p2p_core::{AcceptError, Connection, P2pNode, PeerAddr, ProtocolHandler};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -151,14 +150,16 @@ impl ProtocolHandler for SyncStreamHandler {
 /// Skips the serialize/deserialize step — the vault layer already produces and
 /// consumes bincode bytes, so passing raw bytes avoids a redundant round-trip.
 ///
-/// Used when initiating sync after a `NeighborUp` or change-received gossip event.
+/// Dials through `P2pNode::connect` (Tier-1, on `SYNC_ALPN`) and frames over the
+/// returned connection. Used by the integration tests' single-round-trip sync
+/// path; the daemon's production path is its own pumped handler (`sync_stream.rs`).
 pub async fn connect_and_sync_raw(
-    endpoint: &iroh::Endpoint,
-    peer: impl Into<iroh::EndpointAddr>,
+    node: &P2pNode,
+    peer: PeerAddr,
     request_bytes: &[u8],
 ) -> Result<Vec<u8>> {
     let alpn = crate::network::SYNC_ALPN;
-    let connection = endpoint.connect(peer, alpn).await?;
+    let connection = node.connect(&peer, alpn).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
 
     write_length_prefixed(&mut send, request_bytes).await?;

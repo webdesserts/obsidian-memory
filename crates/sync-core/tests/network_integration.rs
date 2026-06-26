@@ -13,6 +13,7 @@ mod network_integration {
     use std::sync::Arc;
 
     use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
+    use p2p_core::PeerAddr;
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
     use sync_core::network::streams::InboundSyncRx;
     use sync_core::network::{
@@ -202,7 +203,6 @@ mod network_integration {
     async fn sync_request_response_round_trips() -> anyhow::Result<()> {
         let (node_server, node_client, _addr_server, _addr_client, inbound_rx_server) =
             make_test_pair().await?;
-        let addr_server = node_server.endpoint.addr();
 
         // Drive the server's inbound request handler in a background task.
         // For each inbound request, respond with a fixed SyncResponse (raw bytes).
@@ -232,7 +232,11 @@ mod network_integration {
 
         let received_bytes = tokio::time::timeout(
             Duration::from_secs(10),
-            connect_and_sync_raw(&node_client.endpoint, addr_server, &request_bytes),
+            connect_and_sync_raw(
+                &node_client,
+                PeerAddr::new(node_server.node_id()),
+                &request_bytes,
+            ),
         )
         .await
         .expect("timed out waiting for sync response")?;
@@ -264,7 +268,6 @@ mod network_integration {
     async fn sync_large_message_round_trips() -> anyhow::Result<()> {
         let (node_server, node_client, _addr_server, _addr_client, inbound_rx_server) =
             make_test_pair().await?;
-        let addr_server = node_server.endpoint.addr();
 
         let large_data = vec![0xABu8; 1024 * 1024];
         let response_msg = SyncMessage::SyncResponse {
@@ -289,7 +292,11 @@ mod network_integration {
 
         let received_bytes = tokio::time::timeout(
             Duration::from_secs(15),
-            connect_and_sync_raw(&node_client.endpoint, addr_server, &request_bytes),
+            connect_and_sync_raw(
+                &node_client,
+                PeerAddr::new(node_server.node_id()),
+                &request_bytes,
+            ),
         )
         .await
         .expect("timed out")?;
@@ -314,7 +321,7 @@ mod network_integration {
     async fn multiple_sequential_sync_round_trips() -> anyhow::Result<()> {
         let (node_server, node_client, _addr_server, _addr_client, inbound_rx_server) =
             make_test_pair().await?;
-        let addr_server = node_server.endpoint.addr();
+        let server_id = node_server.node_id();
 
         let mut inbound_rx = inbound_rx_server;
         tokio::spawn(async move {
@@ -337,7 +344,7 @@ mod network_integration {
 
             let received_bytes = tokio::time::timeout(
                 Duration::from_secs(10),
-                connect_and_sync_raw(&node_client.endpoint, addr_server.clone(), &request_bytes),
+                connect_and_sync_raw(&node_client, PeerAddr::new(server_id), &request_bytes),
             )
             .await
             .expect("timed out")?;

@@ -31,8 +31,10 @@ use crate::move_coalescer::{
 };
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::watcher::{FileEvent, FileEventKind};
-use iroh::{EndpointAddr, EndpointId};
-use p2p_core::{PLACEHOLDER_DEVICE_NAME, PeerConnType, RelayAddr, relay_is_offlan_reachable};
+use iroh::EndpointId;
+use p2p_core::{
+    PLACEHOLDER_DEVICE_NAME, PeerAddr, PeerConnType, RelayAddr, relay_is_offlan_reachable,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -983,8 +985,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// whose connect is already in flight, insert before spawning, and remove when
     /// the task finishes (both success and failure).
     fn spawn_bootstrap_connect(&self, peer: PeerId, relay_url: RelayAddr) {
-        let endpoint = self.sync_node.endpoint.clone();
-        let gossip = self.sync_node.gossip.clone();
+        // A cheap-clone dial handle (endpoint + gossip clones) for the detached
+        // task — NOT an `Arc<SyncNode>`, which would block the node's consuming
+        // `shutdown(self)` if this task is still in flight at shutdown.
+        let dial = self.sync_node.dial_handle();
         let rejoin = self.vault_gossip.rejoin_handle();
         let inflight = self.bootstrap_connect_inflight.clone();
 
@@ -1007,32 +1011,24 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 debug!(peer = %peer, "bootstrap re-join before connect failed: {e}");
             }
 
-            // The supervisor working set speaks `PeerId`; the raw `endpoint.connect`
-            // needs iroh's id. A snapshot hint with a legacy/non-curve-point id
-            // could never be dialed, so skip it (releasing the in-flight slot).
-            let Ok(endpoint_id) = iroh::EndpointId::from_bytes(peer.as_bytes()) else {
-                debug!(peer = %peer, "bootstrap connect skipped — hint id is not a valid key");
-                inflight.lock().await.remove(&peer);
-                return;
-            };
-            // The relay-carrying addr is inserted as an `App` path before address
-            // lookup runs, so the connect resolves immediately and cannot park.
-            // The relay round-trips back to iroh's URL type for the raw connect; it
-            // parsed cleanly when the hint was read, so re-parsing cannot fail.
-            let addr = EndpointAddr::new(endpoint_id)
-                .with_relay_url(relay_url.as_str().parse().expect("RelayAddr re-parses"));
-            match endpoint.connect(addr, GOSSIP_ALPN).await {
+            // Dial through p2p-core with the relay-carrying addr (inserted as an
+            // `App` path before address lookup runs, so the connect resolves
+            // immediately and cannot park). `connect` returns `Err` for a
+            // legacy/non-curve-point hint id, so the former explicit pre-check
+            // collapses into the `Err` arm below (slot released either way).
+            let addr = PeerAddr::new(peer).with_relay(relay_url);
+            match dial.connect(&addr, GOSSIP_ALPN).await {
                 Ok(conn) => {
                     // Adopt the connection into gossip: drains the queued Join →
                     // peer Active → handshake → NeighborUp.
-                    if let Err(e) = gossip.handle_connection(conn).await {
+                    if let Err(e) = dial.adopt_gossip_connection(conn).await {
                         debug!(peer = %peer, "gossip rejected supervisor bootstrap connection: {e}");
                     }
                 }
                 Err(e) => {
                     // A real, fast failure now (vs the parked bare-id dial) — the
-                    // relay is genuinely unreachable this attempt. The next due
-                    // tick retries.
+                    // relay is genuinely unreachable this attempt (or, for a legacy
+                    // id, un-dialable). The next due tick retries.
                     debug!(peer = %peer, "supervisor bootstrap connect failed: {e}");
                 }
             }
@@ -2168,7 +2164,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.vault.clone(),
             self.allowlist.clone(),
             self.peer_registry.clone(),
-            self.sync_node.endpoint.clone(),
+            self.sync_node.dial_handle(),
             self.exchange_learn_tx.clone(),
             SyncExchangeKind::NeighborUp,
         );
@@ -2223,7 +2219,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             self.vault.clone(),
             self.allowlist.clone(),
             self.peer_registry.clone(),
-            self.sync_node.endpoint.clone(),
+            self.sync_node.dial_handle(),
             self.exchange_learn_tx.clone(),
             SyncExchangeKind::ChangePull { path },
         );
