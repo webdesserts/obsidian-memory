@@ -5,7 +5,6 @@
 //! that constructs a real `NativeFs` / `FileAllowlistStorage` `Daemon`.
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -443,7 +442,7 @@ async fn startup_inner(
             // Validate the peer key, skipping a legacy/non-curve-point id
             // gracefully (never panicking) — the deliberate degrade this seed has
             // always done. The seed itself speaks `PeerId`.
-            if EndpointId::from_bytes(peer.node_id.as_bytes()).is_err() {
+            if !peer.node_id.is_dialable() {
                 warn!("Skipping invalid allowlist peer for peer-relay seed");
                 continue;
             }
@@ -491,14 +490,11 @@ async fn startup_inner(
             // Validate each key, skipping a non-curve-point id gracefully (it could
             // never be a reachable bootstrap target); keep the `PeerId`.
             .filter(|p| {
-                EndpointId::from_bytes(p.node_id.as_bytes())
-                    .map_err(|e| {
-                        warn!(
-                            "Skipping invalid allowlist peer for gossip bootstrap: {}",
-                            e
-                        )
-                    })
-                    .is_ok()
+                let dialable = p.node_id.is_dialable();
+                if !dialable {
+                    warn!("Skipping invalid allowlist peer for gossip bootstrap");
+                }
+                dialable
             })
             .map(|p| p.node_id)
             .collect(),

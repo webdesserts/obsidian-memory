@@ -48,9 +48,6 @@ gethostname = "0.4"
 # journal can re-stitch lineage on crash recovery (P4f-2).
 uuid = { workspace = true, features = ["serde"] }
 
-# Iroh node IDs (for EndpointId parsing)
-iroh = { version = "1.0.0-rc.1", default-features = false }
-
 # Cancellation tokens for daemon shutdown (shared between prod and tests)
 tokio-util = { version = "0.7", features = ["rt"] }
 
@@ -62,6 +59,11 @@ reqwest = "0.13.2"
 tempfile.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Iroh is no longer a PRODUCTION dependency — the daemon reaches the network
+# entirely through p2p-core. The integration tests still name iroh types directly
+# (MemoryLookup harness plumbing, the `_for_test` raw handles, hand-rolled gossip
+# scaffolding), so it stays a dev-dependency.
+iroh = { version = "1.0.0-rc.1", default-features = false }
 iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
 bincode.workspace = true
 anyhow.workspace = true

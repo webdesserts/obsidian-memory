@@ -54,17 +54,17 @@ mod network_integration {
         allowlist_a.add_peer(peer_b, "node-b").await?;
         allowlist_b.add_peer(peer_a, "node-a").await?;
 
-        let addr_a = node_a.endpoint.addr();
-        let addr_b = node_b.endpoint.addr();
+        let addr_a = node_a.endpoint_for_test().addr();
+        let addr_b = node_b.endpoint_for_test().addr();
 
         // Teach each node how to reach the other.
         let lookup_a = MemoryLookup::new();
         lookup_a.add_endpoint_info(addr_b.clone());
-        node_a.endpoint.address_lookup()?.add(lookup_a);
+        node_a.endpoint_for_test().address_lookup()?.add(lookup_a);
 
         let lookup_b = MemoryLookup::new();
         lookup_b.add_endpoint_info(addr_a.clone());
-        node_b.endpoint.address_lookup()?.add(lookup_b);
+        node_b.endpoint_for_test().address_lookup()?.add(lookup_b);
 
         Ok((node_a, node_b, addr_a, addr_b, inbound_rx_a))
     }
@@ -83,7 +83,9 @@ mod network_integration {
         let (node, inbound_rx) = SyncNode::new(secret_key_bytes, &[], allowlist).await?;
         // Add MemoryLookup for direct in-process connectivity without relay.
         let memory_lookup = MemoryLookup::new();
-        node.endpoint.address_lookup()?.add(memory_lookup);
+        node.endpoint_for_test()
+            .address_lookup()?
+            .add(memory_lookup);
         Ok((node, inbound_rx))
     }
 
@@ -381,16 +383,16 @@ mod network_integration {
         allowlist_a.add_peer(peer_b, "node-b").await?;
         allowlist_b.add_peer(peer_a, "node-a").await?;
 
-        let addr_a = node_a.endpoint.addr();
-        let addr_b = node_b.endpoint.addr();
+        let addr_a = node_a.endpoint_for_test().addr();
+        let addr_b = node_b.endpoint_for_test().addr();
 
         let lookup_a = MemoryLookup::new();
         lookup_a.add_endpoint_info(addr_b.clone());
-        node_a.endpoint.address_lookup()?.add(lookup_a);
+        node_a.endpoint_for_test().address_lookup()?.add(lookup_a);
 
         let lookup_b = MemoryLookup::new();
         lookup_b.add_endpoint_info(addr_a.clone());
-        node_b.endpoint.address_lookup()?.add(lookup_b);
+        node_b.endpoint_for_test().address_lookup()?.add(lookup_b);
 
         let vault_id: VaultId = "cafebabecafebabe".parse().unwrap();
         let node_b_id = node_b.node_id();

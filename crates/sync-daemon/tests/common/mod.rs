@@ -256,7 +256,10 @@ pub async fn build_node(seed_byte: u8) -> anyhow::Result<NodeBundle> {
             .await?;
 
     let memory_lookup = MemoryLookup::new();
-    sync_node.endpoint.address_lookup()?.add(memory_lookup);
+    sync_node
+        .endpoint_for_test()
+        .address_lookup()?
+        .add(memory_lookup);
 
     let node_id = PeerId::from_bytes(*sync_node.node_id().as_bytes());
 
@@ -273,16 +276,22 @@ pub async fn build_node(seed_byte: u8) -> anyhow::Result<NodeBundle> {
 /// Wire two nodes for direct `MemoryLookup` connectivity and mutual allowlist access.
 #[allow(dead_code)]
 pub async fn connect_nodes(a: &NodeBundle, b: &NodeBundle) -> anyhow::Result<()> {
-    let addr_a = a.sync_node.endpoint.addr();
-    let addr_b = b.sync_node.endpoint.addr();
+    let addr_a = a.sync_node.endpoint_for_test().addr();
+    let addr_b = b.sync_node.endpoint_for_test().addr();
 
     let lookup_a = MemoryLookup::new();
     lookup_a.add_endpoint_info(addr_b.clone());
-    a.sync_node.endpoint.address_lookup()?.add(lookup_a);
+    a.sync_node
+        .endpoint_for_test()
+        .address_lookup()?
+        .add(lookup_a);
 
     let lookup_b = MemoryLookup::new();
     lookup_b.add_endpoint_info(addr_a.clone());
-    b.sync_node.endpoint.address_lookup()?.add(lookup_b);
+    b.sync_node
+        .endpoint_for_test()
+        .address_lookup()?
+        .add(lookup_b);
 
     a.allowlist.add_peer(b.node_id, "peer-b").await?;
     b.allowlist.add_peer(a.node_id, "peer-a").await?;

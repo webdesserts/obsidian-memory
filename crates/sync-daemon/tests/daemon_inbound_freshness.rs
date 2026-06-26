@@ -73,21 +73,25 @@ mod daemon_inbound_freshness {
 
         // Teach the initiator how to reach the responder's endpoint.
         let lookup = MemoryLookup::new();
-        lookup.add_endpoint_info(responder.endpoint.addr());
-        initiator.sync_node.endpoint.address_lookup()?.add(lookup);
+        lookup.add_endpoint_info(responder.endpoint_for_test().addr());
+        initiator
+            .sync_node
+            .endpoint_for_test()
+            .address_lookup()?
+            .add(lookup);
 
         // Open the handshake: connect on `SYNC_ALPN` and write the framed opener. The
         // wire format is sync-core's `[u32 LE len][bytes]` (re-derived here, as the
         // daemon's own `write_frame` does — see `sync_stream.rs`).
         let opener = initiator.vault.lock().await.prepare_request().await?;
-        // `node_id()` is now a `PeerId`; the raw iroh `connect` wants its
-        // `EndpointId` (same 32 bytes).
-        let responder_endpoint =
-            iroh::EndpointId::from_bytes(responder.node_id().as_bytes()).unwrap();
+        // Dial through `P2pNode::connect` (the public Tier-1 method); the bare
+        // `PeerAddr` resolves via the lookup we just seeded.
         let connection = initiator
             .sync_node
-            .endpoint
-            .connect(responder_endpoint, sync_core::network::SYNC_ALPN)
+            .connect(
+                &p2p_core::PeerAddr::new(responder.node_id()),
+                sync_core::network::SYNC_ALPN,
+            )
             .await?;
         let (mut send, _recv) = connection.open_bi().await?;
         let len = u32::try_from(opener.len()).expect("opener fits in u32");

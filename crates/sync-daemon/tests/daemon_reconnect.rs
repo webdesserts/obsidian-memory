@@ -309,7 +309,7 @@ mod daemon_reconnect {
 
         // A clone of the lookup shares the same backing store, so it observes the
         // supervisor's mutations from outside the spawned event loop.
-        let lookup = node_a.sync_node.peer_lookup.clone();
+        let lookup = node_a.sync_node.peer_lookup_for_test().clone();
         assert!(
             lookup
                 .get_endpoint_info(endpoint_id(throttled_id))
@@ -420,7 +420,7 @@ mod daemon_reconnect {
         // A clone of the lookup shares the backing store, so it observes the
         // supervisor's mutations from outside the spawned event loop. The hint
         // starts absent: the first due tick is what adds it.
-        let lookup = node_a.sync_node.peer_lookup.clone();
+        let lookup = node_a.sync_node.peer_lookup_for_test().clone();
         assert!(
             lookup.get_endpoint_info(endpoint_id(peer_id)).is_none(),
             "hint should start absent — the first supervisor tick adds it"
@@ -521,7 +521,7 @@ mod daemon_reconnect {
         node_a.sync_node.set_peer_relay(x_id, &x_relay_url);
         node_a.sync_node.set_peer_relay(y_id, &y_relay_url);
 
-        let lookup = node_a.sync_node.peer_lookup.clone();
+        let lookup = node_a.sync_node.peer_lookup_for_test().clone();
         assert!(lookup.get_endpoint_info(endpoint_id(x_id)).is_some());
         assert!(lookup.get_endpoint_info(endpoint_id(y_id)).is_some());
 
@@ -625,7 +625,7 @@ mod daemon_reconnect {
             .set_peer_relay(lifeline_id, &lifeline_relay_url);
         node_a.sync_node.set_peer_relay(lan_id, &lan_relay_url);
 
-        let lookup = node_a.sync_node.peer_lookup.clone();
+        let lookup = node_a.sync_node.peer_lookup_for_test().clone();
         assert!(
             lookup.get_endpoint_info(endpoint_id(lifeline_id)).is_some(),
             "domain lifeline hint should start present in the lookup"

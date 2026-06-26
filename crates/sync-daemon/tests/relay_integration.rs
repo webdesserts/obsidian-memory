@@ -190,7 +190,7 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
 
     // Before seeding, the lookup should have no entry for this peer.
     assert!(
-        node.peer_lookup
+        node.peer_lookup_for_test()
             .get_endpoint_info(peer_endpoint_id)
             .is_none(),
         "lookup should be empty before add_peer_relay"
@@ -200,7 +200,7 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
 
     // After seeding, the hint must be resolvable and carry the relay URL.
     let info = node
-        .peer_lookup
+        .peer_lookup_for_test()
         .get_endpoint_info(peer_endpoint_id)
         .expect("hint should be present after add_peer_relay");
 
@@ -242,7 +242,7 @@ async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
 
     // The lookup must remain empty — no self-hint was registered.
     assert!(
-        node.peer_lookup
+        node.peer_lookup_for_test()
             .get_endpoint_info(common::endpoint_id(node.node_id()))
             .is_none(),
         "self-id should not be seeded into the peer lookup"
@@ -270,7 +270,7 @@ async fn test_empty_peer_relays_leaves_lookup_empty() -> anyhow::Result<()> {
     // With no add_peer_relay calls (simulating an empty cross-product seed),
     // the lookup must return None for any peer id.
     assert!(
-        node.peer_lookup
+        node.peer_lookup_for_test()
             .get_endpoint_info(peer_endpoint_id)
             .is_none(),
         "peer_lookup should be empty when no hints are seeded"
@@ -671,8 +671,8 @@ async fn relay_only_control_connects_with_seeded_hint() -> anyhow::Result<()> {
     // Ensure both endpoints have actually connected to their home relay before
     // we test routing — a relay-only node that hasn't homed yet is unreachable
     // through the relay, which would confound the result.
-    node_a.sync_node.endpoint.online().await;
-    node_b.sync_node.endpoint.online().await;
+    node_a.sync_node.endpoint_for_test().online().await;
+    node_b.sync_node.endpoint_for_test().online().await;
 
     // Seed B's relay hint into A's lookup BEFORE bootstrap — the persisted-hint
     // path (mirrors rhea's daemon.toml peer_relays). B's relay is NOT in A's
@@ -777,8 +777,8 @@ async fn supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial() -> an
     let b_id = node_b.sync_node.node_id();
 
     // Both endpoints home on the relay before any routing is attempted.
-    node_a.sync_node.endpoint.online().await;
-    node_b.sync_node.endpoint.online().await;
+    node_a.sync_node.endpoint_for_test().online().await;
+    node_b.sync_node.endpoint_for_test().online().await;
 
     // Seed a note into B's vault so A pulling it proves the partition healed —
     // the same durable observable the other supervisor tests assert on.
@@ -980,8 +980,8 @@ async fn supervisor_recovers_offlan_peer_from_cross_product_seed() -> anyhow::Re
     let a_id = node_a.sync_node.node_id();
     let b_id = node_b.sync_node.node_id();
 
-    node_a.sync_node.endpoint.online().await;
-    node_b.sync_node.endpoint.online().await;
+    node_a.sync_node.endpoint_for_test().online().await;
+    node_b.sync_node.endpoint_for_test().online().await;
 
     // Seed a note into B's vault so A pulling it proves the partition healed.
     node_b
@@ -1176,12 +1176,12 @@ async fn relay_map_homes_on_one_of_a_set() -> anyhow::Result<()> {
 
     // `online()` returns once at least one home relay is connected — so the endpoint
     // has finished selecting a home from the RelayMap.
-    tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint_for_test().online())
         .await
         .expect("relay-only node with a 2-relay RelayMap failed to home on any relay");
 
     // The connected home must be one of the two relays we configured.
-    let statuses = node.endpoint.home_relay_status().get();
+    let statuses = node.endpoint_for_test().home_relay_status().get();
     let homed: Vec<RelayUrl> = statuses
         .iter()
         .filter(|s| s.is_connected())
@@ -1236,13 +1236,13 @@ async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
     )
     .await?;
 
-    tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint_for_test().online())
         .await
         .expect("node failed to home on any relay");
 
     // Kill whichever relay the node homed on; it must migrate to the survivor.
     let homed_on_a = node
-        .endpoint
+        .endpoint_for_test()
         .home_relay_status()
         .get()
         .iter()
@@ -1259,7 +1259,7 @@ async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
     let migrated = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let connected_survivor = node
-                .endpoint
+                .endpoint_for_test()
                 .home_relay_status()
                 .get()
                 .iter()
@@ -1307,12 +1307,12 @@ async fn laptop_homes_on_persisted_public_relay() -> anyhow::Result<()> {
     let (node, _inbound_rx) =
         SyncNode::new_relay_only(common::seed(124), &home_relays, allowlist).await?;
 
-    tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
+    tokio::time::timeout(Duration::from_secs(30), node.endpoint_for_test().online())
         .await
         .expect("laptop with a persisted public relay failed to home on it");
 
     let homed: Vec<RelayUrl> = node
-        .endpoint
+        .endpoint_for_test()
         .home_relay_status()
         .get()
         .iter()
@@ -1353,7 +1353,7 @@ async fn laptop_with_empty_public_set_is_relay_disabled() -> anyhow::Result<()> 
     // brief window to (not) select a home, then assert no relay home is connected.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let connected_homes: Vec<RelayUrl> = node
-        .endpoint
+        .endpoint_for_test()
         .home_relay_status()
         .get()
         .iter()
@@ -1424,7 +1424,7 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
     // peer_lookup wire: every one of the 4 (peer, relay) pairs must resolve.
     for peer in [peer_1, peer_2] {
         let info = node
-            .peer_lookup
+            .peer_lookup_for_test()
             .get_endpoint_info(common::endpoint_id(peer))
             .unwrap_or_else(|| {
                 panic!("peer {peer} should be resolvable from the cross-product seed")

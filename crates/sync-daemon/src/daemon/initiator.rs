@@ -5,7 +5,6 @@
 //! `run_initiator_pairing_parked` free function drives the QUIC exchange itself.
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -469,9 +468,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let bootstrap_ids: Vec<PeerId> = mesh_members
             .iter()
             .filter(|p| {
-                EndpointId::from_bytes(p.as_bytes())
-                    .map_err(|e| warn!("Skipping invalid mesh member for gossip bootstrap: {}", e))
-                    .is_ok()
+                let dialable = p.is_dialable();
+                if !dialable {
+                    warn!("Skipping invalid mesh member for gossip bootstrap");
+                }
+                dialable
             })
             .copied()
             .collect();

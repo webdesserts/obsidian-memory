@@ -647,7 +647,7 @@ mod daemon_pairing {
         // Clone B's peer_lookup handle BEFORE moving sync_node into Daemon::new.
         // MemoryLookup is Arc-backed, so the clone stays live and reflects any
         // add_peer_relay calls made on the daemon's internal copy.
-        let b_peer_lookup = node_b.sync_node.peer_lookup.clone();
+        let b_peer_lookup = node_b.sync_node.peer_lookup_for_test().clone();
 
         // B needs a real on-disk vault path so `persist_adopted_relay` can write
         // `known_public_relays` to `daemon.toml` and we can reload it.

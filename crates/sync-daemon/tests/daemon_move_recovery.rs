@@ -922,7 +922,7 @@ mod daemon_move_recovery {
         .expect("sync node should build");
         let memory_lookup = MemoryLookup::new();
         sync_node
-            .endpoint
+            .endpoint_for_test()
             .address_lookup()
             .unwrap()
             .add(memory_lookup);

@@ -31,7 +31,6 @@ use crate::move_coalescer::{
 };
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::watcher::{FileEvent, FileEventKind};
-use iroh::EndpointId;
 use p2p_core::{
     PLACEHOLDER_DEVICE_NAME, PeerAddr, PeerConnType, RelayAddr, relay_is_offlan_reachable,
 };
@@ -1304,7 +1303,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             // Validate the peer key up front, skipping a legacy/non-curve-point id
             // gracefully (never panicking) — the deliberate degrade this loop has
             // always done. The seed itself now speaks `PeerId`.
-            if EndpointId::from_bytes(peer.node_id.as_bytes()).is_err() {
+            if !peer.node_id.is_dialable() {
                 warn!("Skipping invalid allowlist peer for learned-relay seed");
                 continue;
             }
@@ -2019,20 +2018,20 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// enriched connect line is emitted exactly once per Unknown/Dead → Alive
     /// transition no matter how many signals arrive.
     ///
-    /// These signals carry a `PeerId`, so we recover the iroh `EndpointId` for
-    /// the connection-path lookup (SF-1: this conversion is fallible — an invalid
-    /// key degrades to an `Unknown` path rather than dropping the log).
+    /// These signals carry a `PeerId`. A dialable (real-key) id takes the enriched
+    /// connect path with a connection-path snapshot; a legacy/non-curve-point id
+    /// degrades to the `Unknown`-path log rather than dropping it (SF-1 — never
+    /// panic on a non-dialable id).
     async fn on_peer_liveness(&self, peer_id: PeerId) {
         let transition = self.peer_registry.lock().await.mark_alive(peer_id);
         if transition != ConnectTransition::NewlyAlive {
             return;
         }
-        match EndpointId::from_bytes(peer_id.as_bytes()) {
-            Ok(node_id) => self.log_peer_connected(node_id, peer_id).await,
-            Err(e) => {
-                debug!("Invalid peer key for connect-path lookup, logging unknown path: {e}");
-                self.log_peer_connected_unknown(peer_id).await;
-            }
+        if peer_id.is_dialable() {
+            self.log_peer_connected(peer_id).await;
+        } else {
+            debug!(%peer_id, "Invalid peer key for connect-path lookup, logging unknown path");
+            self.log_peer_connected_unknown(peer_id).await;
         }
         // The transition changed `alive_count`, so refresh the tray-UI status to
         // match — mirrors the emit on the NeighborUp/Down paths.
@@ -2046,13 +2045,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// connection-path label on the registry entry so a later disconnect can
     /// echo how we had been reaching the peer. Called only on a true
     /// Unknown/Dead → Alive transition so duplicate liveness signals don't spam.
-    async fn log_peer_connected(&self, node_id: EndpointId, peer_id: PeerId) {
-        // `peer_conn_info` now takes the `PeerId` (it degrades to an Unknown path
-        // on a non-curve-point key); `node_id` stays for the byte-identical
-        // `%node_id` log field this cluster emits.
+    async fn log_peer_connected(&self, peer_id: PeerId) {
+        // `peer_conn_info` takes the `PeerId` (it degrades to an Unknown path on a
+        // non-curve-point key). The `%peer_id` log field renders the same 64-hex as
+        // the former `%node_id` (pinned by `peer_id_display_matches_iroh_endpoint_id`).
         let conn_type = self.sync_node.peer_conn_info(peer_id).await.conn_type;
-        self.log_connect_with_conn_type(node_id, peer_id, conn_type)
-            .await;
+        self.log_connect_with_conn_type(peer_id, conn_type).await;
     }
 
     /// Connect-log fallback when the iroh `EndpointId` couldn't be recovered.
@@ -2079,14 +2077,9 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
     /// Shared connect-log body: resolve the name, emit the INFO line, and capture
     /// the connection-path label for a later disconnect echo.
-    async fn log_connect_with_conn_type(
-        &self,
-        node_id: EndpointId,
-        peer_id: PeerId,
-        conn_type: PeerConnType,
-    ) {
+    async fn log_connect_with_conn_type(&self, peer_id: PeerId, conn_type: PeerConnType) {
         let name = self.resolve_peer_name(&peer_id).await;
-        info!(peer = %node_id, "{}", fmt_peer_connect_line(&name, &conn_type));
+        info!(peer = %peer_id, "{}", fmt_peer_connect_line(&name, &conn_type));
 
         // Record how we reached the peer so disconnect can say "was via LAN".
         let label = conn_type_label(&conn_type).to_string();
@@ -2100,7 +2093,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///
     /// Echoes the last-known connection path captured at connect time when
     /// available.
-    async fn log_peer_disconnected(&self, node_id: EndpointId, peer_id: PeerId) {
+    async fn log_peer_disconnected(&self, peer_id: PeerId) {
         let last_conn_type = self
             .peer_registry
             .lock()
@@ -2111,7 +2104,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             .and_then(|e| e.last_conn_type.clone());
         let name = self.resolve_peer_name(&peer_id).await;
         info!(
-            peer = %node_id,
+            peer = %peer_id,
             "{}",
             fmt_peer_disconnect_line(&name, last_conn_type.as_deref())
         );
@@ -2126,20 +2119,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// — both sides fire NeighborUp simultaneously and each tries to connect to
     /// the other, which would deadlock if the QUIC call blocked the select loop.
     async fn on_neighbor_up(&mut self, peer_id: PeerId) {
-        // A NeighborUp peer is over a live gossip connection — its id is
-        // transport-sourced, so the iroh-id conversion (needed for the
-        // connection-path snapshot the connect log takes) cannot fail.
-        let node_id = EndpointId::from_bytes(peer_id.as_bytes())
-            .expect("NeighborUp peer is a live, transport-sourced peer id");
         let transition = self.peer_registry.lock().await.mark_alive(peer_id);
         if transition == ConnectTransition::NewlyAlive {
-            self.log_peer_connected(node_id, peer_id).await;
+            self.log_peer_connected(peer_id).await;
         }
-        debug!(peer = %node_id, "Gossip NeighborUp — initiating full sync");
+        // `%peer_id` renders the same 64-hex as the former `%node_id` EndpointId.
+        debug!(peer = %peer_id, "Gossip NeighborUp — initiating full sync");
         self.emit_status().await;
 
         if !self.is_peer_allowed(&peer_id).await {
-            warn!(peer = %node_id, "Peer not in allowlist, skipping sync");
+            warn!(peer = %peer_id, "Peer not in allowlist, skipping sync");
             return;
         }
 
@@ -2147,7 +2136,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let request_bytes = match vault.prepare_request().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("Failed to prepare sync request for {}: {}", node_id, e);
+                error!("Failed to prepare sync request for {}: {}", peer_id, e);
                 return;
             }
         };
@@ -2180,11 +2169,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
     /// A peer left the gossip swarm.
     async fn on_neighbor_down(&mut self, peer_id: PeerId) {
-        // A NeighborDown peer was just connected, so its id is transport-sourced
-        // and the iroh-id conversion (for the disconnect log) cannot fail.
-        let node_id = EndpointId::from_bytes(peer_id.as_bytes())
-            .expect("NeighborDown peer is a live, transport-sourced peer id");
-        self.log_peer_disconnected(node_id, peer_id).await;
+        self.log_peer_disconnected(peer_id).await;
         self.peer_registry.lock().await.on_neighbor_down(&peer_id);
         self.emit_status().await;
     }
