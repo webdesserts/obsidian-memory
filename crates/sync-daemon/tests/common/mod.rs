@@ -8,8 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::RelayUrl;
 use iroh::address_lookup::memory::MemoryLookup;
+use p2p_core::RelayAddr;
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::{SyncNode, SyncNodeSeam, gossip::VaultGossip};
 use sync_core::peer_id::{PeerId, VaultId};
@@ -64,7 +64,7 @@ pub struct RelayNode {
 #[allow(dead_code)] // see RelayNode — per-binary common compilation
 pub async fn build_node_with_relay(
     seed_byte: u8,
-    relay_url: &RelayUrl,
+    relay_url: &RelayAddr,
 ) -> anyhow::Result<RelayNode> {
     let fs = Arc::new(InMemoryFs::new());
     let author = PeerId::from_secret_bytes(seed(seed_byte));
@@ -109,7 +109,7 @@ pub async fn build_node_with_relay(
 #[allow(dead_code)] // see RelayNode — per-binary common compilation
 pub async fn build_relay_only_node(
     seed_byte: u8,
-    relay_url: &RelayUrl,
+    relay_url: &RelayAddr,
 ) -> anyhow::Result<RelayNode> {
     let fs = Arc::new(InMemoryFs::new());
     let author = PeerId::from_secret_bytes(seed(seed_byte));

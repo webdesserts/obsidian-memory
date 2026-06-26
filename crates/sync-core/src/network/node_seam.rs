@@ -17,9 +17,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::{EndpointId, RelayUrl};
+use iroh::EndpointId;
 use iroh_gossip::TopicId;
-use p2p_core::{AllowlistStorage, P2pNode};
+use p2p_core::{AllowlistStorage, P2pNode, RelayAddr};
 
 use crate::network::SYNC_ALPN;
 use crate::network::gossip::VaultGossip;
@@ -46,7 +46,7 @@ pub trait SyncNodeSeam: Sized {
     /// task to process incoming sync requests from other nodes.
     async fn new<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
     ) -> Result<(Self, InboundSyncRx)>;
 
@@ -61,7 +61,7 @@ pub trait SyncNodeSeam: Sized {
     /// receiver is returned.
     async fn new_with_sync_handler<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         sync_handler: H,
     ) -> Result<Self>
@@ -74,7 +74,7 @@ pub trait SyncNodeSeam: Sized {
     #[cfg(feature = "test-util")]
     async fn new_relay_only<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
     ) -> Result<(Self, InboundSyncRx)>;
 
@@ -85,7 +85,7 @@ pub trait SyncNodeSeam: Sized {
     #[cfg(feature = "test-util")]
     async fn new_relay_only_with_sync_handler<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         sync_handler: H,
     ) -> Result<Self>
@@ -97,7 +97,7 @@ pub trait SyncNodeSeam: Sized {
 impl SyncNodeSeam for P2pNode {
     async fn new<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
     ) -> Result<(Self, InboundSyncRx)> {
         // The default `SyncStreamHandler` is the one-shot inbound path (one
@@ -112,7 +112,7 @@ impl SyncNodeSeam for P2pNode {
 
     async fn new_with_sync_handler<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         sync_handler: H,
     ) -> Result<Self>
@@ -126,7 +126,7 @@ impl SyncNodeSeam for P2pNode {
     #[cfg(feature = "test-util")]
     async fn new_relay_only<A: AllowlistStorage + std::fmt::Debug + 'static>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
     ) -> Result<(Self, InboundSyncRx)> {
         let (sync_handler, inbound_sync_rx) = SyncStreamHandler::new();
@@ -144,7 +144,7 @@ impl SyncNodeSeam for P2pNode {
     #[cfg(feature = "test-util")]
     async fn new_relay_only_with_sync_handler<A, H>(
         secret_key_bytes: [u8; 32],
-        relays: &[RelayUrl],
+        relays: &[RelayAddr],
         allowlist: Arc<A>,
         sync_handler: H,
     ) -> Result<Self>

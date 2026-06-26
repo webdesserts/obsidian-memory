@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use p2p_core::RelayAddr;
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::network::VaultGossipExt;
 use sync_core::network::discovery::MeshMetadata;
@@ -493,7 +494,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let relay_url = self
             .relay_url
             .as_ref()
-            .and_then(|u| u.parse::<iroh::RelayUrl>().ok());
+            .and_then(|u| RelayAddr::parse(u).ok());
         self.sync_node
             .publish_mesh_info(&mesh_metadata, relay_url.as_ref());
 

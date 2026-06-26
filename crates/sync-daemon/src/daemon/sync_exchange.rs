@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use iroh::EndpointId;
+use p2p_core::RelayAddr;
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::{PeerId, PeerRegistry};
 use vault_sync::Vault;
@@ -26,12 +27,17 @@ use super::{ExchangeLearned, now_ms};
 /// learn-on-exchange should refresh the stored hint to. A LAN-direct connection
 /// has no active relay path, yielding `None` (we still stamp success, we just
 /// don't overwrite the stored URL with nothing).
-fn active_relay_url(info: &iroh::endpoint::RemoteInfo) -> Option<iroh::RelayUrl> {
+fn active_relay_url(info: &iroh::endpoint::RemoteInfo) -> Option<RelayAddr> {
     use iroh::TransportAddr;
     use iroh::endpoint::TransportAddrUsage;
 
     info.addrs().find_map(|a| match (a.usage(), a.addr()) {
-        (TransportAddrUsage::Active, TransportAddr::Relay(url)) => Some(url.clone()),
+        // The relay comes off a raw iroh snapshot; round-trip it through its
+        // string form (lossless for a valid relay URL) so the daemon hands the
+        // run loop a `RelayAddr` and never names iroh's URL type.
+        (TransportAddrUsage::Active, TransportAddr::Relay(url)) => {
+            RelayAddr::parse(&url.to_string()).ok()
+        }
         _ => None,
     })
 }

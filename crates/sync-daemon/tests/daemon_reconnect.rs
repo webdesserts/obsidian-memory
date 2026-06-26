@@ -289,7 +289,7 @@ mod daemon_reconnect {
     /// interference). Seeds 84/85/86 reserved (85/86 only supply valid EndpointIds).
     #[tokio::test]
     async fn supervisor_evicts_throttled_hint_keeps_due() -> anyhow::Result<()> {
-        use iroh::RelayUrl;
+        use p2p_core::RelayAddr;
         use sync_daemon::persistence::PeerRelay;
 
         let node_a = build_node(84).await?;
@@ -299,7 +299,7 @@ mod daemon_reconnect {
 
         let throttled_id = node_throttled.sync_node.node_id();
         let due_id = node_due.sync_node.node_id();
-        let relay_url: RelayUrl = "http://example.com:3340/".parse()?;
+        let relay_url = RelayAddr::parse("http://example.com:3340/")?;
 
         // Seed BOTH hints into A's lookup so eviction is observable as a removal.
         node_a.sync_node.set_peer_relay(throttled_id, &relay_url);
@@ -494,7 +494,7 @@ mod daemon_reconnect {
     /// Seeds 91 reserved (92/93 only mint valid peer EndpointIds).
     #[tokio::test]
     async fn supervisor_evicts_both_when_two_throttled_none_due() -> anyhow::Result<()> {
-        use iroh::RelayUrl;
+        use p2p_core::RelayAddr;
         use sync_daemon::persistence::PeerRelay;
 
         let node_a = build_node(91).await?;
@@ -506,8 +506,8 @@ mod daemon_reconnect {
         // Distinct LAN-IP relays: both LAN-only, so neither is the off-LAN
         // lifeline the new rule protects. (The seeds only need to parse; the
         // classification reads the snapshot strings below.)
-        let x_relay_url: RelayUrl = "http://192.168.68.52:3340/".parse()?;
-        let y_relay_url: RelayUrl = "http://10.0.0.5:3340/".parse()?;
+        let x_relay_url = RelayAddr::parse("http://192.168.68.52:3340/")?;
+        let y_relay_url = RelayAddr::parse("http://10.0.0.5:3340/")?;
 
         // Seed BOTH hints into A's lookup so eviction is observable as removal.
         node_a.sync_node.set_peer_relay(x_id, &x_relay_url);
@@ -594,7 +594,7 @@ mod daemon_reconnect {
     /// Seed 103 reserved (104/105 only mint valid peer EndpointIds).
     #[tokio::test]
     async fn supervisor_retains_throttled_offlan_lifeline_over_lan_hint() -> anyhow::Result<()> {
-        use iroh::RelayUrl;
+        use p2p_core::RelayAddr;
         use sync_daemon::persistence::PeerRelay;
 
         let node_a = build_node(103).await?;
@@ -607,8 +607,8 @@ mod daemon_reconnect {
         // The seeded URL only needs to parse; the classification reads the
         // snapshot `PeerRelay.relay_url` string, so the domain-vs-IP distinction
         // is carried by the snapshot strings below, not by these seeds.
-        let lifeline_relay_url: RelayUrl = "http://example.com:3340/".parse()?;
-        let lan_relay_url: RelayUrl = "http://192.168.68.52:3340/".parse()?;
+        let lifeline_relay_url = RelayAddr::parse("http://example.com:3340/")?;
+        let lan_relay_url = RelayAddr::parse("http://192.168.68.52:3340/")?;
 
         // Seed BOTH hints into A's lookup so eviction is observable as a removal.
         node_a
@@ -1203,7 +1203,7 @@ mod daemon_reconnect {
             shutdown.clone(),
         );
 
-        let learned: iroh::RelayUrl = "https://server2.example.com/".parse().unwrap();
+        let learned = p2p_core::RelayAddr::parse("https://server2.example.com/").unwrap();
         daemon.learn_public_relay_for_test(&learned).await;
 
         let (config, _) = DaemonConfig::load_or_generate(&vault_path, None).await?;
@@ -1253,7 +1253,7 @@ mod daemon_reconnect {
             shutdown.clone(),
         );
 
-        let learned: iroh::RelayUrl = "http://192.168.68.52:3340/".parse().unwrap();
+        let learned = p2p_core::RelayAddr::parse("http://192.168.68.52:3340/").unwrap();
         daemon.learn_public_relay_for_test(&learned).await;
 
         let (config, _) = DaemonConfig::load_or_generate(&vault_path, None).await?;
@@ -1312,7 +1312,7 @@ mod daemon_reconnect {
         );
 
         let relay_str = "https://server2.example.com/".to_string();
-        let learned: iroh::RelayUrl = relay_str.parse().unwrap();
+        let learned = p2p_core::RelayAddr::parse(&relay_str).unwrap();
         daemon.learn_public_relay_for_test(&learned).await;
 
         // Persisted into the cold store.

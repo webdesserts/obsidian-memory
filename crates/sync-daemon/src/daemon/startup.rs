@@ -5,7 +5,7 @@
 //! that constructs a real `NativeFs` / `FileAllowlistStorage` `Daemon`.
 
 use anyhow::{Context, Result};
-use iroh::{EndpointId, RelayUrl};
+use iroh::EndpointId;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use p2p_core::FileAllowlistStorage;
+use p2p_core::RelayAddr;
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::network::discovery::MeshMetadata;
 use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
@@ -299,7 +300,7 @@ async fn startup_inner(
                 };
                 match relay_result {
                     Ok(relay) => {
-                        info!(url = %relay.relay_url(), "Embedded relay started");
+                        info!(url = %relay.relay_url().as_str(), "Embedded relay started");
                         Some(relay)
                     }
                     Err(e) => {
@@ -323,7 +324,7 @@ async fn startup_inner(
     let relay_url = embedded_relay.as_ref().map(|r| r.relay_url().clone());
 
     if let Some(ref url) = relay_url {
-        if let Err(e) = daemon_config.set_relay_url(Some(url.to_string()), &config.vault) {
+        if let Err(e) = daemon_config.set_relay_url(Some(url.as_str()), &config.vault) {
             warn!("Failed to persist relay URL to daemon.toml: {}", e);
         }
 
@@ -337,7 +338,7 @@ async fn startup_inner(
         // recovery). `add_known_public_relay`'s off-LAN-reachable guard keeps a
         // loopback-bound relay out (correctly — it's no use as a dial target), and it
         // dedups, so this is a no-op once the public domain is already present.
-        daemon_config.add_known_public_relay(&url.to_string());
+        daemon_config.add_known_public_relay(&url.as_str());
         if let Err(e) = daemon_config.save(&config.vault) {
             warn!(
                 "Failed to persist own relay into known_public_relays: {}",
@@ -353,10 +354,10 @@ async fn startup_inner(
     // this node's RelayMap (a laptop's home/failover) and, crossed with the
     // allowlist, the live peer_lookup + supervisor snapshot. Malformed entries
     // are skipped with a warning rather than failing startup.
-    let public_relays: Vec<RelayUrl> = daemon_config
+    let public_relays: Vec<RelayAddr> = daemon_config
         .known_public_relays
         .iter()
-        .filter_map(|url| match url.parse::<RelayUrl>() {
+        .filter_map(|url| match RelayAddr::parse(url) {
             Ok(parsed) => Some(parsed),
             Err(e) => {
                 warn!(relay_url = %url, "Skipping known public relay — invalid URL: {e}");
@@ -377,7 +378,7 @@ async fn startup_inner(
     // so it homes on a public relay it can reach off-LAN (and fails over across the
     // set). An empty set → `RelayMode::Disabled` (LAN-only — the never-met-a-server
     // edge).
-    let home_relays: Vec<RelayUrl> = match relay_url.as_ref() {
+    let home_relays: Vec<RelayAddr> = match relay_url.as_ref() {
         Some(own) => vec![own.clone()],
         None => public_relays.clone(),
     };
@@ -456,7 +457,7 @@ async fn startup_inner(
             let endpoint_hex = peer.node_id.to_string();
             for relay in &public_relays {
                 sync_node.add_peer_relay(endpoint_id, relay);
-                seed.push(PeerRelay::new(endpoint_hex.clone(), relay.to_string()));
+                seed.push(PeerRelay::new(endpoint_hex.clone(), relay.as_str()));
             }
         }
         seed
@@ -571,7 +572,7 @@ async fn startup_inner(
         discovery_rx,
         allowlist,
         device_name,
-        relay_url.as_ref().map(|u| u.to_string()),
+        relay_url.as_ref().map(|u| u.as_str()),
         config.vault.clone(),
         shutdown,
     );

@@ -20,7 +20,7 @@ use sync_core::network::{SyncNode, SyncNodeSeam, VaultGossipExt};
 use sync_core::peer_id::{PeerId, VaultId};
 use sync_core::sync::SyncMessage;
 // `NativeFs`/`InMemoryFs` (via `common`) implement vault-sync's `FileSystem`.
-use p2p_core::EmbeddedRelay;
+use p2p_core::{EmbeddedRelay, RelayAddr};
 use sync_daemon::daemon::Daemon;
 use sync_daemon::persistence::PeerRelay;
 use sync_daemon::watcher::FileEvent;
@@ -202,10 +202,16 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
         .get_endpoint_info(peer_endpoint_id)
         .expect("hint should be present after add_peer_relay");
 
-    let relay_urls: Vec<_> = info.into_endpoint_addr().relay_urls().cloned().collect();
+    // iroh's lookup hands back its own `RelayUrl`; compare via string form against
+    // the seeded `RelayAddr` (both render the same full URL).
+    let relay_urls: Vec<String> = info
+        .into_endpoint_addr()
+        .relay_urls()
+        .map(|u| u.to_string())
+        .collect();
     assert_eq!(
         relay_urls,
-        vec![relay_url],
+        vec![relay_url.as_str()],
         "seeded relay URL should be recoverable from the lookup"
     );
 
@@ -458,13 +464,11 @@ async fn test_non_home_relay_hint_resolves_and_routes() -> anyhow::Result<()> {
 #[tokio::test]
 #[ignore = "idles past iroh's 60s RELAY_INACTIVE_CLEANUP_TIME reap (~65s+); run with --ignored"]
 async fn supervisor_heals_after_peer_relay_reap() -> anyhow::Result<()> {
-    use iroh::RelayUrl;
-
     // Two disjoint home relays: R_a is A's home; R_peer is B's home (the flapper).
     let relay_a = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
     let relay_peer = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
-    let url_a: RelayUrl = relay_a.relay_url().clone();
-    let url_peer: RelayUrl = relay_peer.relay_url().clone();
+    let url_a: RelayAddr = relay_a.relay_url().clone();
+    let url_peer: RelayAddr = relay_peer.relay_url().clone();
 
     // Build full relay-aware nodes (home relay each), then allowlist both ways.
     let node_a = common::build_node_with_relay(60, &url_a).await?;
@@ -559,13 +563,10 @@ async fn supervisor_heals_after_peer_relay_reap() -> anyhow::Result<()> {
     // Flap B's relay and idle past the 60s reap — A's non-home actor for
     // `relay_peer` goes idle and reaps. Capture the bind addr first so the
     // replacement can advertise the identical URL.
-    let peer_bind: SocketAddr = format!(
-        "{}:{}",
-        url_peer.host_str().unwrap(),
-        url_peer.port().unwrap()
-    )
-    .parse()
-    .unwrap();
+    let peer_bind: SocketAddr =
+        format!("{}:{}", url_peer.host().unwrap(), url_peer.port().unwrap())
+            .parse()
+            .unwrap();
     relay_peer.shutdown().await;
     tokio::time::sleep(Duration::from_secs(70)).await;
 
@@ -577,7 +578,7 @@ async fn supervisor_heals_after_peer_relay_reap() -> anyhow::Result<()> {
         Err(_) => {
             EmbeddedRelay::start_with_advertised_url(
                 "127.0.0.1:0".parse().unwrap(),
-                url_peer.as_str(),
+                &url_peer.as_str(),
             )
             .await?
         }
@@ -840,7 +841,7 @@ async fn supervisor_recovers_relay_only_peer_after_parked_bootstrap_dial() -> an
     );
     daemon_a.set_inbound_seen_rx(node_a.inbound_seen_rx);
     daemon_a.set_net_change_rx(net_rx);
-    let b_hint = PeerRelay::new(b_id.to_string(), relay_url.to_string());
+    let b_hint = PeerRelay::new(b_id.to_string(), relay_url.as_str());
     daemon_a.seed_peer_relays_snapshot(vec![b_hint]);
     daemon_a.set_reconnect_interval(Duration::from_millis(200));
 
@@ -1043,7 +1044,7 @@ async fn supervisor_recovers_offlan_peer_from_cross_product_seed() -> anyhow::Re
         let mut seed = Vec::new();
         for peer in &peers {
             for relay in &known_public_relays {
-                seed.push(PeerRelay::new(peer.node_id.to_string(), relay.to_string()));
+                seed.push(PeerRelay::new(peer.node_id.to_string(), relay.as_str()));
             }
         }
         seed
@@ -1051,7 +1052,7 @@ async fn supervisor_recovers_offlan_peer_from_cross_product_seed() -> anyhow::Re
     assert!(
         cross_product
             .iter()
-            .any(|h| h.endpoint_id == b_id.to_string() && h.relay_url == relay_url.to_string()),
+            .any(|h| h.endpoint_id == b_id.to_string() && h.relay_url == relay_url.as_str()),
         "the cross-product must contain the (B, relay) hint; built {cross_product:?}"
     );
     daemon_a.seed_peer_relays_snapshot(cross_product);
@@ -1154,8 +1155,8 @@ async fn relay_map_homes_on_one_of_a_set() -> anyhow::Result<()> {
     // Two independent relays; the node's RelayMap contains BOTH.
     let relay_a = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
     let relay_b = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
-    let url_a: RelayUrl = relay_a.relay_url().clone();
-    let url_b: RelayUrl = relay_b.relay_url().clone();
+    let url_a: RelayAddr = relay_a.relay_url().clone();
+    let url_b: RelayAddr = relay_b.relay_url().clone();
 
     // Relay-only so the endpoint MUST select a relay home (no IP transport can mask
     // the relay-home selection we're testing).
@@ -1185,7 +1186,9 @@ async fn relay_map_homes_on_one_of_a_set() -> anyhow::Result<()> {
         "online() returned but no home relay is connected"
     );
     assert!(
-        homed.iter().all(|u| *u == url_a || *u == url_b),
+        homed
+            .iter()
+            .all(|u| u.to_string() == url_a.as_str() || u.to_string() == url_b.as_str()),
         "home relay {homed:?} is not a member of the configured set {{{url_a}, {url_b}}}"
     );
 
@@ -1210,13 +1213,19 @@ async fn relay_map_homes_on_one_of_a_set() -> anyhow::Result<()> {
 async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
     let relay_a = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
     let relay_b = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
-    let url_a: RelayUrl = relay_a.relay_url().clone();
-    let url_b: RelayUrl = relay_b.relay_url().clone();
+    // Kept as iroh `RelayUrl` here: the assertions below compare against iroh's
+    // own `home_relay_status()` URLs. The RelayMap is fed `RelayAddr`s (the seam's
+    // type) built from these.
+    let url_a: RelayUrl = relay_a.relay_url().as_str().parse().unwrap();
+    let url_b: RelayUrl = relay_b.relay_url().as_str().parse().unwrap();
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
     let (node, _inbound_rx) = SyncNode::new_relay_only(
         common::seed(121),
-        &[url_a.clone(), url_b.clone()],
+        &[
+            RelayAddr::parse(&url_a.to_string()).unwrap(),
+            RelayAddr::parse(&url_b.to_string()).unwrap(),
+        ],
         allowlist,
     )
     .await?;
@@ -1277,14 +1286,15 @@ async fn relay_map_fails_over_when_home_dies() -> anyhow::Result<()> {
 #[tokio::test]
 async fn laptop_homes_on_persisted_public_relay() -> anyhow::Result<()> {
     let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
-    let relay_url: RelayUrl = relay.relay_url().clone();
+    // Kept as iroh `RelayUrl` for the `home_relay_status()` comparison below.
+    let relay_url: RelayUrl = relay.relay_url().as_str().parse().unwrap();
 
     // Model the persisted store: the laptop has one known public relay (its paired
-    // server's). Parse it exactly as startup.rs does (String → RelayUrl).
+    // server's). Parse it exactly as startup.rs does (String → RelayAddr).
     let known_public_relays: Vec<String> = vec![relay_url.to_string()];
-    let home_relays: Vec<RelayUrl> = known_public_relays
+    let home_relays: Vec<RelayAddr> = known_public_relays
         .iter()
-        .filter_map(|u| u.parse::<RelayUrl>().ok())
+        .filter_map(|u| RelayAddr::parse(u).ok())
         .collect();
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
@@ -1328,7 +1338,7 @@ async fn laptop_homes_on_persisted_public_relay() -> anyhow::Result<()> {
 #[tokio::test]
 async fn laptop_with_empty_public_set_is_relay_disabled() -> anyhow::Result<()> {
     // Empty persisted public set → empty relay slice (the C5 laptop edge).
-    let home_relays: Vec<RelayUrl> = Vec::new();
+    let home_relays: Vec<RelayAddr> = Vec::new();
 
     let allowlist = Arc::new(InMemoryAllowlist::new());
     let (node, _inbound_rx) = SyncNode::new(common::seed(125), &home_relays, allowlist).await?;
@@ -1370,8 +1380,8 @@ async fn laptop_with_empty_public_set_is_relay_disabled() -> anyhow::Result<()> 
 #[tokio::test]
 async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::Result<()> {
     // Two public relays (just need valid, distinct URLs — not dialed here).
-    let relay_x: RelayUrl = "https://relay-x.test/".parse().unwrap();
-    let relay_y: RelayUrl = "https://relay-y.test/".parse().unwrap();
+    let relay_x = RelayAddr::parse("https://relay-x.test/").unwrap();
+    let relay_y = RelayAddr::parse("https://relay-y.test/").unwrap();
     let public_relays = [relay_x.clone(), relay_y.clone()];
 
     // Two allowlisted peers (distinct from our own identity).
@@ -1403,7 +1413,7 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
         let endpoint_hex = peer.node_id.to_string();
         for relay in &public_relays {
             node.add_peer_relay(endpoint_id, relay);
-            supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.to_string()));
+            supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.as_str()));
         }
     }
 
@@ -1416,10 +1426,15 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
             .unwrap_or_else(|| {
                 panic!("peer {peer} should be resolvable from the cross-product seed")
             });
-        let relay_urls: Vec<RelayUrl> = info.into_endpoint_addr().relay_urls().cloned().collect();
+        // iroh's lookup returns its own `RelayUrl`; compare via string form.
+        let relay_urls: Vec<String> = info
+            .into_endpoint_addr()
+            .relay_urls()
+            .map(|u| u.to_string())
+            .collect();
         for relay in &public_relays {
             assert!(
-                relay_urls.contains(relay),
+                relay_urls.contains(&relay.as_str()),
                 "peer {peer}'s lookup entry should carry relay {relay}; got {relay_urls:?}"
             );
         }
@@ -1462,7 +1477,7 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
 async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<()> {
     // The server's own public relay — the sole member of its public set after the
     // startup consistency seed (a server learns others' relays only via pairing).
-    let own_relay: RelayUrl = "https://umbra-server.test/".parse().unwrap();
+    let own_relay = RelayAddr::parse("https://umbra-server.test/").unwrap();
     let public_relays = [own_relay.clone()];
 
     let peer_charon = PeerId::from_secret_bytes(common::seed(210));
@@ -1489,7 +1504,7 @@ async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<(
         let endpoint_hex = peer.node_id.to_string();
         for relay in &public_relays {
             node.add_peer_relay(endpoint_id, relay);
-            supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.to_string()));
+            supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.as_str()));
         }
     }
 
@@ -1507,7 +1522,7 @@ async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<(
         assert!(
             supervisor_seed
                 .iter()
-                .any(|h| h.endpoint_id == peer_hex && h.relay_url == own_relay.to_string()),
+                .any(|h| h.endpoint_id == peer_hex && h.relay_url == own_relay.as_str()),
             "supervisor should target {peer} through the server's own relay; got {supervisor_seed:?}"
         );
     }

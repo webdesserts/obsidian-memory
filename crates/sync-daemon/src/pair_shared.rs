@@ -9,7 +9,8 @@
 
 use std::path::Path;
 
-use iroh::{EndpointId, RelayUrl};
+use iroh::EndpointId;
+use p2p_core::RelayAddr;
 use sync_core::network::{SyncNode, VaultGossipExt};
 use sync_core::peer_id::VaultId;
 use tracing::warn;
@@ -109,12 +110,12 @@ pub async fn persist_adopted_relay(
     // relay in the current session without waiting for a restart. This is an
     // EPHEMERAL in-memory write — no persisted per-peer hint (the public-relay
     // set above is the only durable networking store).
-    if let Ok(relay_url) = url_str.parse::<RelayUrl>() {
-        sync_node.add_peer_relay(responder_id, &relay_url);
+    if let Ok(relay_addr) = RelayAddr::parse(&url_str) {
+        sync_node.add_peer_relay(responder_id, &relay_addr);
     } else {
         warn!(
             url = %url_str,
-            "Adopted relay URL is not a valid RelayUrl — skipping live lookup seed"
+            "Adopted relay URL is not a valid relay URL — skipping live lookup seed"
         );
     }
 }

@@ -32,7 +32,7 @@ use crate::move_coalescer::{
 use crate::pair_api::{ConnectionState, DaemonCommand, DaemonStatus, PairingUiEvent, PeerSummary};
 use crate::watcher::{FileEvent, FileEventKind};
 use iroh::{EndpointAddr, EndpointId};
-use p2p_core::{PLACEHOLDER_DEVICE_NAME, PeerConnType, relay_is_offlan_reachable};
+use p2p_core::{PLACEHOLDER_DEVICE_NAME, PeerConnType, RelayAddr, relay_is_offlan_reachable};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -183,11 +183,11 @@ fn effective_backoff_due(
 ///   RelayMap membership — every relay we insert we also persist and vice-versa —
 ///   preventing per-exchange RelayMap churn and duplicate cross-product entries).
 fn learned_public_relay_to_adopt(
-    learned: Option<&iroh::RelayUrl>,
+    learned: Option<&RelayAddr>,
     known_public_relays: &[String],
-) -> Option<iroh::RelayUrl> {
+) -> Option<RelayAddr> {
     let url = learned?;
-    let url_str = url.to_string();
+    let url_str = url.as_str();
     if !relay_is_offlan_reachable(&url_str) {
         return None;
     }
@@ -224,7 +224,9 @@ fn fmt_peer_connect_line(name: &str, conn: &PeerConnType) -> String {
             format!("connected to {name} ({}) via LAN", addr.ip())
         }
         PeerConnType::Relay { url } => {
-            format!("connected to {name} ({}) via relay", relay_display(url))
+            // `RelayAddr`'s `Display` is host-only with a full-URL fallback, the
+            // same shape the former `relay_display` helper produced.
+            format!("connected to {name} ({url}) via relay")
         }
         PeerConnType::Unknown => format!("connected to {name} via unknown path"),
     }
@@ -263,16 +265,6 @@ fn resolve_peer_name_from(peers: &[AllowedPeer], peer_id: &PeerId) -> String {
         .unwrap_or_else(|| short_peer_id(peer_id))
 }
 
-/// Clean host display for a relay URL (`https://umbra.computer/` → `umbra.computer`).
-///
-/// `RelayUrl` derefs to `url::Url`, so `host_str()` gives the host without the
-/// scheme/path. Falls back to the full URL string if the host can't be parsed.
-fn relay_display(url: &iroh::RelayUrl) -> String {
-    url.host_str()
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| url.to_string())
-}
-
 /// Configuration for running the sync daemon.
 pub struct DaemonRunConfig {
     pub vault: PathBuf,
@@ -306,7 +298,7 @@ struct ExchangeLearned {
     /// The active relay URL iroh reported for the peer, if it connected through
     /// a relay. `None` for a LAN-direct connection (no relay path) — we still
     /// stamp success, we just don't overwrite the stored URL with nothing.
-    relay_url: Option<iroh::RelayUrl>,
+    relay_url: Option<RelayAddr>,
 }
 
 /// Daemon state holding all components.
@@ -843,7 +835,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // Due hints whose relay URL parses, paired with that URL. Drives the
         // supervisor-issued relay-carrying connect below — the recovery for peers
         // whose bare-id gossip dial parked and can never be re-dialed by gossip.
-        let mut due_relay_targets: Vec<(EndpointId, iroh::RelayUrl)> = Vec::new();
+        let mut due_relay_targets: Vec<(EndpointId, RelayAddr)> = Vec::new();
 
         // When this is the only hint we have, it is the lookup's sole route to
         // the peer — we never evict it while partitioned (see the throttled
@@ -880,13 +872,13 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 // Re-add the hint and dial it. Re-add is UNCONDITIONAL of
                 // failure_count — the last-hint guarantee that a returning
                 // off-LAN peer is never stranded.
-                if let Ok(relay_url) = hint.relay_url.parse::<iroh::RelayUrl>() {
-                    self.sync_node.set_peer_relay(endpoint_id, &relay_url);
+                if let Ok(relay_addr) = RelayAddr::parse(&hint.relay_url) {
+                    self.sync_node.set_peer_relay(endpoint_id, &relay_addr);
                     // Also drive a supervisor-issued connect for this hint (below):
                     // gossip's bare-id Dialer can park forever and is then never
                     // re-dialed, so we establish the relay-carrying connection
                     // ourselves and hand it to gossip.
-                    due_relay_targets.push((endpoint_id, relay_url));
+                    due_relay_targets.push((endpoint_id, relay_addr));
                 }
                 // Even with an unparseable URL, still bootstrap by EndpointId —
                 // mDNS or a prior direct address may reach the peer on-LAN.
@@ -990,7 +982,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// same peer would accumulate dozens of concurrent connects. We skip a peer
     /// whose connect is already in flight, insert before spawning, and remove when
     /// the task finishes (both success and failure).
-    fn spawn_bootstrap_connect(&self, endpoint_id: EndpointId, relay_url: iroh::RelayUrl) {
+    fn spawn_bootstrap_connect(&self, endpoint_id: EndpointId, relay_url: RelayAddr) {
         let endpoint = self.sync_node.endpoint.clone();
         let gossip = self.sync_node.gossip.clone();
         let rejoin = self.vault_gossip.rejoin_handle();
@@ -1017,7 +1009,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
             // The relay-carrying addr is inserted as an `App` path before address
             // lookup runs, so the connect resolves immediately and cannot park.
-            let addr = EndpointAddr::new(endpoint_id).with_relay_url(relay_url);
+            // The relay round-trips back to iroh's URL type for the raw connect; it
+            // parsed cleanly when the hint was read, so re-parsing cannot fail.
+            let addr = EndpointAddr::new(endpoint_id)
+                .with_relay_url(relay_url.as_str().parse().expect("RelayAddr re-parses"));
             match endpoint.connect(addr, GOSSIP_ALPN).await {
                 Ok(conn) => {
                     // Adopt the connection into gossip: drains the queued Join →
@@ -1197,13 +1192,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             hint.last_success_ms = Some(now);
             hint.failure_count = 0;
             if let Some(ref url) = learned.relay_url {
-                hint.relay_url = url.to_string();
+                hint.relay_url = url.as_str();
             }
         } else if let Some(ref url) = learned.relay_url {
             // No hint yet, but we learned this peer's relay — record it so the
             // supervisor can re-dial them this session (responder-asymmetry fix).
-            let mut entry =
-                crate::persistence::PeerRelay::new(endpoint_hex.clone(), url.to_string());
+            let mut entry = crate::persistence::PeerRelay::new(endpoint_hex.clone(), url.as_str());
             entry.last_success_ms = Some(now);
             self.peer_relays.push(entry);
         }
@@ -1251,12 +1245,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// and vice-versa, set-membership stands in for RelayMap membership and prevents
     /// per-exchange churn. The config read is skipped for the common LAN-direct /
     /// private cases via the cheap classifier pre-check below.
-    async fn learn_public_relay(&mut self, learned: Option<&iroh::RelayUrl>) {
+    async fn learn_public_relay(&mut self, learned: Option<&RelayAddr>) {
         // Cheap pre-filter: skip the disk read for the overwhelmingly common cases
         // (LAN-direct exchange → None; a loopback/LAN relay → private). Only a
         // genuinely public learned relay is worth a config round-trip.
         let candidate = match learned {
-            Some(url) if relay_is_offlan_reachable(&url.to_string()) => url,
+            Some(url) if relay_is_offlan_reachable(&url.as_str()) => url,
             _ => return,
         };
 
@@ -1274,7 +1268,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         let Some(url) = learned_public_relay_to_adopt(Some(candidate), &known) else {
             return;
         };
-        let url_str = url.to_string();
+        let url_str = url.as_str();
 
         // (1) Live RelayMap.
         self.sync_node.add_home_relay(&url).await;
@@ -1412,7 +1406,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// [`Daemon::seed_peer_relays_snapshot`] — integration-test binaries compile
     /// this crate without the `test` cfg, so a `#[cfg(test)]` gate would break them.
     /// Not a public production API.
-    pub async fn learn_public_relay_for_test(&mut self, relay_url: &iroh::RelayUrl) {
+    pub async fn learn_public_relay_for_test(&mut self, relay_url: &RelayAddr) {
         self.learn_public_relay(Some(relay_url)).await;
     }
 
@@ -1438,7 +1432,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     pub async fn apply_exchange_success_for_test(
         &mut self,
         endpoint_id: EndpointId,
-        relay_url: Option<iroh::RelayUrl>,
+        relay_url: Option<RelayAddr>,
     ) {
         self.on_exchange_learned(ExchangeLearned {
             endpoint_id,
@@ -2755,9 +2749,10 @@ mod backoff_tests {
 #[cfg(test)]
 mod learn_public_relay_tests {
     use super::learned_public_relay_to_adopt;
+    use p2p_core::RelayAddr;
 
-    fn url(s: &str) -> iroh::RelayUrl {
-        s.parse().expect("test relay URL should parse")
+    fn url(s: &str) -> RelayAddr {
+        RelayAddr::parse(s).expect("test relay URL should parse")
     }
 
     /// A peer's home relay that is off-LAN-reachable (a public server relay) and
