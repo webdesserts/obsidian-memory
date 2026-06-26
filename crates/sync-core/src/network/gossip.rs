@@ -1,26 +1,27 @@
-//! Vault-scoped gossip topic management.
+//! Vault-scoped gossip codec over p2p-core's generic byte-transport.
 //!
-//! Each vault subscribes to its own iroh-gossip topic (TopicId derived from VaultId).
-//! The gossip layer handles:
-//! - Membership via HyParView (`NeighborUp`/`NeighborDown` events)
-//! - Lightweight broadcast via PlumTree (file change notifications, allowlist updates)
+//! Each vault subscribes to its own gossip topic (derived from its VaultId). The
+//! transport itself — membership (`NeighborUp`/`NeighborDown`) and opaque
+//! broadcast/receive — lives in `p2p_core::GossipSubscription`. This module is the
+//! thin VAULT codec on top:
+//!
+//! - Outbound: serialize a [`GossipMessage`] with bincode and hand the bytes to
+//!   the transport (`GossipHandle::broadcast`).
+//! - Inbound: a decode pump consumes the transport's generic events, deserializes
+//!   `Data` payloads back into [`GossipMessage`], and surfaces decoded vault-level
+//!   [`GossipEvent`]s to the daemon.
 //!
 //! All gossip payloads are wrapped in [`GossipMessage`] so the wire format can
-//! carry multiple message types without breaking framing. This is a breaking
-//! wire format change introduced on `v0.5.x`.
+//! carry multiple message types without breaking framing. The bincode encoding of
+//! that envelope is the gossip WIRE format — a mixed-version fleet depends on it
+//! byte-for-byte, so it is pinned by `golden_change_notification_bytes_are_stable`.
 //!
 //! Gossip messages must be small (~1KB). Large sync data goes through QUIC streams.
 
 use anyhow::Result;
 use bytes::Bytes;
-use futures::StreamExt;
-use iroh::EndpointId;
-use iroh_gossip::{
-    TopicId,
-    api::{Event, GossipSender},
-};
-use n0_future::task;
-use p2p_core::PeerId;
+use n0_future::task::{self, AbortOnDropHandle};
+use p2p_core::{GossipHandle, GossipSubscription, PeerId, Topic};
 use rand::Rng;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -95,16 +96,24 @@ pub enum GossipEvent {
 
 /// Handle for a vault-scoped gossip subscription.
 ///
-/// Provides broadcast capability (via the sender) and event stream (via the task).
+/// A thin codec over [`p2p_core::GossipSubscription`]: broadcasts serialize a
+/// [`GossipMessage`] and hand the bytes to the transport; a decode pump turns the
+/// transport's opaque `Data` events back into decoded [`GossipEvent`]s for the
+/// daemon. The transport's membership events pass straight through.
 pub struct VaultGossip {
-    /// Channel to broadcast messages to the gossip swarm.
-    sender: GossipSender,
-    /// The gossip topic ID.
-    pub topic: TopicId,
-    /// Events from the gossip subscription, pumped by a background task.
+    /// Cloneable transport handle for broadcast + rejoin.
+    handle: GossipHandle,
+    /// The gossip topic (its `as_bytes()` feeds the pairing approval wire field).
+    topic: Topic,
+    /// Decoded vault-level events, fed by the decode pump.
     pub event_rx: mpsc::UnboundedReceiver<GossipEvent>,
-    /// Background task handle (kept alive while subscription is active).
-    _task: task::JoinHandle<()>,
+    /// The decode pump. Abort-on-drop and owner of the MOVED `GossipSubscription`,
+    /// so dropping this `VaultGossip` aborts the decode task, which drops the
+    /// subscription, which aborts the transport pump and drops the gossip sender —
+    /// leaving the topic. A bare `JoinHandle` would DETACH (not abort), leaking
+    /// both tasks and never leaving the topic, breaking the `adopt_and_rejoin`
+    /// old-topic-leave invariant. See the constructor's teardown-chain note.
+    _decode_task: AbortOnDropHandle<()>,
     /// Random session base for change-notification nonces, drawn once per
     /// `VaultGossip`. XORed with `notif_seq` to discriminate successive
     /// same-path notifications (see `ChangeNotification.nonce`). A daemon
@@ -117,60 +126,63 @@ pub struct VaultGossip {
 }
 
 impl VaultGossip {
-    /// Create a new VaultGossip from an iroh subscription handle.
-    pub fn new(handle: iroh_gossip::api::GossipTopic, topic: TopicId) -> Self {
-        let (sender, mut receiver) = handle.split();
+    /// Wrap a p2p-core gossip subscription with the vault `GossipMessage` codec.
+    ///
+    /// Spawns the decode pump: it consumes the subscription's generic events,
+    /// deserializes `Data` payloads into [`GossipMessage`], and forwards decoded
+    /// [`GossipEvent`]s on `event_rx`. Membership events pass through; `Lagged` and
+    /// decode errors are logged and skipped (so a `Lagged` never reaches the
+    /// daemon, preserving today's behavior).
+    ///
+    /// 🔴 Teardown chain (load-bearing — both tasks are `AbortOnDropHandle`).
+    /// The subscription is MOVED into the decode task. Dropping a bare
+    /// `tokio`/`n0_future` `JoinHandle` DETACHES rather than aborts, so a bare
+    /// handle would leak both this decode pump AND the transport pump, and the
+    /// gossip topic would never be left (iroh-gossip leaves only when both split
+    /// halves drop). With abort-on-drop the chain is:
+    ///
+    /// `VaultGossip` drop → `_decode_task` abort → the moved `GossipSubscription`
+    /// drops → its transport-pump `AbortOnDropHandle` aborts + its `GossipSender`
+    /// drops → both split halves gone → iroh-gossip leaves the topic.
+    ///
+    /// This is what makes the VaultId-swap (`initiator::adopt_and_rejoin`, which
+    /// drops the old `VaultGossip`) leave the abandoned topic, and makes daemon
+    /// shutdown leak no tasks/topics.
+    pub fn new(subscription: GossipSubscription) -> Self {
+        let topic = subscription.topic();
+        let handle = subscription.handle();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        let task = task::spawn(async move {
-            while let Some(result) = receiver.next().await {
-                let event = match result {
-                    Ok(e) => e,
-                    Err(e) => {
-                        debug!("Gossip stream error: {}", e);
-                        break;
-                    }
-                };
-
-                let gossip_event = match event {
-                    Event::NeighborUp(node_id) => {
-                        // Diagnostic only: the daemon emits the enriched INFO
-                        // connect/disconnect notice off the PeerRegistry liveness
-                        // transition. This is the raw HyParView membership edge.
-                        debug!(peer = %node_id, "Gossip NeighborUp");
-                        // iroh's EndpointId is the same 32 bytes as our PeerId; this
-                        // reverse conversion is infallible.
-                        GossipEvent::NeighborUp(PeerId::from_bytes(*node_id.as_bytes()))
-                    }
-                    Event::NeighborDown(node_id) => {
-                        debug!(peer = %node_id, "Gossip NeighborDown");
-                        GossipEvent::NeighborDown(PeerId::from_bytes(*node_id.as_bytes()))
-                    }
-                    Event::Received(msg) => {
-                        let from = PeerId::from_bytes(*msg.delivered_from.as_bytes());
-                        match bincode::deserialize::<GossipMessage>(&msg.content) {
+        // The decode pump owns the MOVED subscription (see the teardown chain).
+        let _decode_task = AbortOnDropHandle::new(task::spawn(async move {
+            let mut sub = subscription;
+            while let Some(ev) = sub.recv().await {
+                let gossip_event = match ev {
+                    p2p_core::GossipEvent::NeighborUp(peer) => GossipEvent::NeighborUp(peer),
+                    p2p_core::GossipEvent::NeighborDown(peer) => GossipEvent::NeighborDown(peer),
+                    p2p_core::GossipEvent::Data { from, bytes } => {
+                        match bincode::deserialize::<GossipMessage>(&bytes) {
                             Ok(GossipMessage::ChangeNotification(notification)) => {
-                                debug!(path = %notification.path, from = %msg.delivered_from, "Change notification received");
+                                debug!(path = %notification.path, %from, "Change notification received");
                                 GossipEvent::ChangeReceived { from, notification }
                             }
                             Ok(GossipMessage::AllowlistUpdate(peer)) => {
-                                debug!(peer_id = %peer.node_id, from = %msg.delivered_from, "Allowlist update received");
+                                debug!(peer_id = %peer.node_id, %from, "Allowlist update received");
                                 GossipEvent::AllowlistUpdate { from, peer }
                             }
                             Ok(GossipMessage::AllowlistRoster(peers)) => {
-                                debug!(count = peers.len(), from = %msg.delivered_from, "Allowlist roster received");
+                                debug!(count = peers.len(), %from, "Allowlist roster received");
                                 GossipEvent::AllowlistRoster { from, peers }
                             }
                             Err(e) => {
-                                warn!(
-                                    "Failed to deserialize gossip message from {}: {}",
-                                    msg.delivered_from, e
-                                );
+                                warn!("Failed to deserialize gossip message from {from}: {e}");
                                 continue;
                             }
                         }
                     }
-                    Event::Lagged => {
+                    p2p_core::GossipEvent::Lagged => {
+                        // Swallowed at the daemon boundary, matching the prior
+                        // single-pump behavior (Lagged was never forwarded).
                         debug!("Gossip lagged (message buffer overflow)");
                         continue;
                     }
@@ -180,16 +192,22 @@ impl VaultGossip {
                     break; // Receiver dropped
                 }
             }
-        });
+        }));
 
         Self {
-            sender,
+            handle,
             topic,
             event_rx,
-            _task: task,
+            _decode_task,
             notif_salt: rand::rng().random(),
             notif_seq: 0,
         }
+    }
+
+    /// The gossip topic. Its `as_bytes()` is read into the pairing approval's
+    /// `vault_topic` wire field, so the 32 bytes are byte-identical.
+    pub fn topic(&self) -> Topic {
+        self.topic
     }
 
     /// Broadcast a change notification to all vault peers.
@@ -234,34 +252,31 @@ impl VaultGossip {
 
     /// Re-bootstrap gossip toward a set of known peers without re-subscribing.
     ///
-    /// Sends `Command::JoinPeers` to the gossip actor on the already-subscribed
-    /// topic, telling HyParView to (re-)dial those peers. Used by the reconnect
-    /// supervisor to recover from a partition: after a `NeighborDown`, neither
-    /// side dials the other again on its own, so the supervisor re-seeds relay
-    /// hints and calls this to re-establish the swarm. Re-subscribing would churn
-    /// the swarm; `join_peers` is the targeted re-bootstrap.
+    /// Tells HyParView to (re-)dial those peers on the already-subscribed topic.
+    /// Used by the reconnect supervisor to recover from a partition: after a
+    /// `NeighborDown`, neither side dials the other again on its own, so the
+    /// supervisor re-seeds relay hints and calls this to re-establish the swarm.
+    /// Re-subscribing would churn the swarm; the targeted re-join is cheaper.
     pub async fn rejoin_peers(&self, peers: Vec<PeerId>) -> Result<()> {
-        self.sender
-            .join_peers(peer_ids_to_endpoints(peers))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
+        self.handle.rejoin_peers(peers).await
     }
 
     /// A cloneable handle that can re-join peers from a spawned task.
     ///
     /// `VaultGossip` itself is not `Clone` (it owns the event receiver and the
-    /// pump task), but the reconnect supervisor's bootstrap-connect runs in a
+    /// decode task), but the reconnect supervisor's bootstrap-connect runs in a
     /// spawned task that must re-queue a Join just before adopting the connection.
-    /// This hands out a lightweight clone of the underlying gossip sender for that
-    /// purpose without exposing the receiver.
-    pub fn rejoin_handle(&self) -> GossipRejoinHandle {
-        GossipRejoinHandle {
-            sender: self.sender.clone(),
-        }
+    /// This hands out the underlying p2p-core gossip handle for that purpose.
+    pub fn rejoin_handle(&self) -> GossipHandle {
+        self.handle.clone()
     }
 
     /// Serialize and broadcast a [`GossipMessage`] envelope.
-    async fn broadcast_message(&mut self, msg: &GossipMessage) -> Result<()> {
+    ///
+    /// This is the gossip WIRE-PRODUCTION site: `bincode::serialize` produces the
+    /// exact bytes that travel (pinned by the golden-bytes test). The transport
+    /// (`GossipHandle::broadcast`) is a pure pass-through — no envelope is added.
+    async fn broadcast_message(&self, msg: &GossipMessage) -> Result<()> {
         let bytes: Bytes = bincode::serialize(msg)?.into();
         if bytes.len() > MAX_GOSSIP_MESSAGE_SIZE {
             return Err(anyhow::anyhow!(
@@ -270,40 +285,45 @@ impl VaultGossip {
                 MAX_GOSSIP_MESSAGE_SIZE
             ));
         }
-        self.sender.broadcast(bytes).await?;
-        Ok(())
+        self.handle.broadcast(bytes).await
     }
 }
 
-/// A cloneable handle for re-joining gossip peers from a spawned task.
-///
-/// Obtained via [`VaultGossip::rejoin_handle`]. Carries only a clone of the
-/// gossip sender, so it can be moved into a `tokio::spawn`ed task (the reconnect
-/// supervisor's bootstrap-connect) where the non-`Clone` `VaultGossip` cannot go.
-#[derive(Clone)]
-pub struct GossipRejoinHandle {
-    sender: GossipSender,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl GossipRejoinHandle {
-    /// Re-join the given peers — see [`VaultGossip::rejoin_peers`].
-    pub async fn rejoin_peers(&self, peers: Vec<PeerId>) -> Result<()> {
-        self.sender
-            .join_peers(peer_ids_to_endpoints(peers))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
+    /// 🔴 Gossip WIRE pin (the fleet anchor). The bincode encoding of a
+    /// `GossipMessage` IS the gossip wire format; a mixed-version mesh
+    /// (VaultId `cc7727ad30b7b1c7`) partitions silently if it drifts — peers
+    /// connect at the gossip layer but every broadcast is undecodable on the other
+    /// side. This literal was captured from REAL serialization at the deployed tip
+    /// (`c0ced264`), so it is the external anchor against a bincode-config change
+    /// (fixint→varint, endianness, a serde attr) — a change the two-node
+    /// pass-through test alone would NOT catch (it runs the same bincode on both
+    /// ends, so it round-trips green even as it diverges from the fleet's bytes).
+    ///
+    /// `ChangeNotification` is the highest-traffic path; `nonce: 0` keeps the bytes
+    /// deterministic. Layout: variant tag (u32 LE = 0) + string len (u64 LE = 14) +
+    /// the 14 UTF-8 bytes of "notes/hello.md" + nonce (u64 LE = 0) = 34 bytes.
+    #[test]
+    fn golden_change_notification_bytes_are_stable() {
+        let msg = GossipMessage::ChangeNotification(ChangeNotification {
+            path: "notes/hello.md".into(),
+            nonce: 0,
+        });
+        let bytes = bincode::serialize(&msg).unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                0, 0, 0, 0, // ChangeNotification variant tag (u32 LE)
+                14, 0, 0, 0, 0, 0, 0, 0, // path length 14 (u64 LE)
+                110, 111, 116, 101, 115, 47, 104, 101, 108, 108, 111, 46, 109,
+                100, // "notes/hello.md"
+                0, 0, 0, 0, 0, 0, 0, 0, // nonce 0 (u64 LE)
+            ],
+            "gossip wire encoding drifted from the deployed fleet — a mixed-version \
+             mesh would silently partition"
+        );
     }
-}
-
-/// Convert `PeerId`s to iroh `EndpointId`s for a gossip re-join, dropping any
-/// legacy/non-curve-point id (it could never be a reachable bootstrap target).
-///
-/// gossip.rs still speaks iroh's gossip transport directly (the transport descent
-/// is Stage C), so the `PeerId → EndpointId` conversion is inlined here rather than
-/// going through p2p-core's crate-private adapter.
-fn peer_ids_to_endpoints(peers: Vec<PeerId>) -> Vec<EndpointId> {
-    peers
-        .into_iter()
-        .filter_map(|p| EndpointId::from_bytes(p.as_bytes()).ok())
-        .collect()
 }

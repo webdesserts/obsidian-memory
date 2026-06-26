@@ -6,10 +6,11 @@ license.workspace = true
 
 [features]
 default = ["native"]
-# Native-only: direct QUIC sockets (require OS networking) and full tokio runtime.
-# iroh/default enables direct socket binding and portmapper — not available in WASM.
-# The network module itself (gossip, streams, node) compiles for both native and WASM.
-native = ["iroh/default", "tokio/rt", "tokio/macros"]
+# Native-only: the async test runtime + proc macros. sync-core no longer names
+# iroh directly — the socket-binding capability (direct QUIC, portmapper) now
+# arrives transitively through `p2p-core`, an unconditional dependency that
+# enables iroh's `default` feature. So `native` only gates tokio's rt + macros.
+native = ["tokio/rt", "tokio/macros"]
 # Test-only surface: exposes constructors that simulate constrained network
 # conditions (e.g. relay-only endpoints with no IP transports) so downstream
 # integration-test crates can reproduce off-LAN/NAT topologies. Never enabled
@@ -23,7 +24,6 @@ test-util = ["p2p-core/test-util"]
 [dependencies]
 p2p-core = { path = "../p2p-core" }
 async-trait.workspace = true
-futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -37,18 +37,8 @@ rand.workspace = true
 getrandom.workspace = true
 ed25519-dalek.workspace = true
 
-# P2P networking — iroh QUIC transport.
-# default-features = false: skips portmapper and fast-apple-datapath (OS-specific).
-# The `native` feature re-enables iroh/default for direct socket binding.
-iroh = { version = "1.0.0-rc.1", default-features = false, features = ["tls-ring"] }
-
-# iroh-gossip — HyParView membership + PlumTree broadcast.
-# The `net` feature enables the Gossip API (GossipTopic, GossipSender, Event).
-# tokio::sync (used by gossip internals) compiles to WASM, so net works in both targets.
-iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
-
-# Cross-platform async task spawning.
-# On native: delegates to tokio::spawn. In WASM: uses wasm_bindgen_futures::spawn_local.
+# Cross-platform async task spawning — drives the gossip decode pump.
+# On native: delegates to tokio::spawn.
 n0-future = "0.3"
 
 # Utilities used by the network module — always needed (not native-only).
@@ -66,6 +56,11 @@ tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tempfile.workspace = true
 anyhow.workspace = true
 bytes = "1"
+# Test-harness plumbing only: the `network_integration` test seeds a `MemoryLookup`
+# and names `EndpointAddr` to wire two in-process nodes. iroh is no longer a
+# PRODUCTION dep of sync-core (it descended to p2p-core in Stage C); this dev-dep
+# keeps the integration harness compiling without re-adding iroh to the lib.
+iroh = { version = "1.0.0-rc.1", default-features = false, features = ["tls-ring"] }
 # For the `relay_probe` example: surface iroh's own relay-client logs via RUST_LOG.
 tracing-subscriber.workspace = true
 

@@ -17,8 +17,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh_gossip::TopicId;
-use p2p_core::{AllowlistStorage, P2pNode, PeerId, RelayAddr};
+use p2p_core::{AllowlistStorage, P2pNode, PeerId, RelayAddr, Topic};
 
 use crate::network::SYNC_ALPN;
 use crate::network::gossip::VaultGossip;
@@ -170,10 +169,10 @@ impl SyncNodeSeam for P2pNode {
 /// p2p-core.
 #[allow(async_fn_in_trait)]
 pub trait VaultGossipExt {
-    /// Derive a deterministic gossip [`TopicId`] from a [`VaultId`].
+    /// Derive a deterministic gossip [`Topic`] from a [`VaultId`].
     ///
     /// Each vault gets its own gossip topic, scoped to peers who share that vault.
-    fn vault_topic(vault_id: &VaultId) -> TopicId;
+    fn vault_topic(vault_id: &VaultId) -> Topic;
 
     /// Recover the [`VaultId`] encoded in a gossip topic's bytes.
     ///
@@ -196,8 +195,8 @@ pub trait VaultGossipExt {
 }
 
 impl VaultGossipExt for P2pNode {
-    fn vault_topic(vault_id: &VaultId) -> TopicId {
-        p2p_core::topic_from_u64(vault_id.as_u64())
+    fn vault_topic(vault_id: &VaultId) -> Topic {
+        Topic::from_u64(vault_id.as_u64())
     }
 
     fn vault_id_from_topic(topic: &[u8; 32]) -> VaultId {
@@ -210,8 +209,8 @@ impl VaultGossipExt for P2pNode {
         bootstrap_nodes: Vec<PeerId>,
     ) -> Result<VaultGossip> {
         let topic = <P2pNode as VaultGossipExt>::vault_topic(vault_id);
-        let handle = self.join_topic(topic, bootstrap_nodes).await?;
-        Ok(VaultGossip::new(handle, topic))
+        let subscription = self.subscribe(topic, bootstrap_nodes).await?;
+        Ok(VaultGossip::new(subscription))
     }
 }
 

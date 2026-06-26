@@ -2355,7 +2355,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         };
 
         // Collect vault gossip topic bytes for the new device.
-        let vault_topic = *self.vault_gossip.topic.as_bytes();
+        let vault_topic = *self.vault_gossip.topic().as_bytes();
 
         // Include our relay URL if the embedded relay is running.
         let relay_urls: Vec<String> = self.relay_url.iter().cloned().collect();

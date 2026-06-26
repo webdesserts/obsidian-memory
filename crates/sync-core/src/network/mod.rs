@@ -1,30 +1,26 @@
-//! Iroh-based P2P networking for sync-core.
+//! The vault-sync wire protocol layered onto p2p-core's networking substrate.
 //!
-//! This module implements the network layer using iroh (QUIC transport, hole punching,
-//! relay servers) and iroh-gossip (HyParView + PlumTree epidemic broadcast).
+//! The generic node, gossip transport, mDNS discovery, relay, and pairing handler
+//! all live in `p2p-core` (`P2pNode`). sync-core no longer names iroh anything — it
+//! layers the *vault-sync specifics* back on top:
 //!
 //! # Architecture
 //!
 //! ```text
-//! SyncNode
-//! ├── iroh::Endpoint      — QUIC transport with relay fallback
-//! ├── iroh_gossip::Gossip — HyParView membership + PlumTree broadcast
-//! ├── iroh::Router        — ALPN-based protocol dispatch
-//! └── GossipHandle        — Per-vault gossip topic subscription
+//! p2p_core::P2pNode          — QUIC endpoint + Router + gossip transport (the substrate)
+//! └── sync-core (this module)
+//!     ├── SyncNodeSeam       — binds SYNC_ALPN + the sync stream handler
+//!     ├── VaultGossipExt     — maps VaultId onto the generic gossip topic
+//!     ├── gossip::VaultGossip — the GossipMessage codec over the byte-transport
+//!     └── streams            — the QUIC bi-stream sync request/response codec
 //! ```
 //!
 //! Two channels serve different purposes:
 //! - **Gossip**: Lightweight change notifications (~1KB). Broadcast to all peers.
 //! - **QUIC streams**: Heavy data transfer. Version vector exchange, bulk updates.
 //!
-//! # Platform support
-//!
-//! The networking stack compiles for both native and WASM targets.
-//! On native, peers connect via direct QUIC sockets or relay-assisted hole punching.
-//! In WASM (Obsidian plugin), peers connect exclusively via relay-assisted QUIC
-//! since browsers cannot bind UDP sockets directly.
-//!
-//! mDNS local discovery requires OS-level networking and is native-only.
+//! Native-only: the networking stack requires OS-level sockets (direct QUIC,
+//! relay-assisted hole punching, mDNS), all of which live in p2p-core.
 
 pub mod gossip;
 pub mod node_seam;
