@@ -181,10 +181,16 @@ async fn pair_inner(
 
     eprintln!("Connecting to {}...", selected_mesh.mesh_name);
 
+    // The pairing connect still speaks iroh's id (the `pair_with_mesh*` rework is
+    // Stage A3). The target came from mDNS discovery (a real key), so the
+    // conversion is infallible here.
+    let peer_endpoint = iroh::EndpointId::from_bytes(peer_endpoint_id.as_bytes())
+        .expect("discovered pairing target is a valid, transport-sourced peer id");
+
     // Connect and run the interactive pairing exchange.
     let result = pair_with_mesh_interactive(
         &sync_node.endpoint,
-        peer_endpoint_id,
+        peer_endpoint,
         &hello,
         |challenge| async move {
             eprintln!(

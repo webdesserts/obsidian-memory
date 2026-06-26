@@ -182,9 +182,10 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
     let relay = EmbeddedRelay::start(bind_addr).await?;
     let relay_url = relay.relay_url().clone();
 
-    // A plausible peer id derived from a distinct key seed.
-    let peer_secret = SecretKey::from_bytes(&[42u8; 32]);
-    let peer_endpoint_id: EndpointId = peer_secret.public();
+    // A plausible peer id derived from a distinct key seed. `add_peer_relay`
+    // takes our `PeerId`; the raw iroh lookup is keyed by `EndpointId`.
+    let peer_id = PeerId::from_secret_bytes([42u8; 32]);
+    let peer_endpoint_id = common::endpoint_id(peer_id);
 
     // Before seeding, the lookup should have no entry for this peer.
     assert!(
@@ -194,7 +195,7 @@ async fn test_add_peer_relay_registers_resolvable_hint() -> anyhow::Result<()> {
         "lookup should be empty before add_peer_relay"
     );
 
-    node.add_peer_relay(peer_endpoint_id, &relay_url);
+    node.add_peer_relay(peer_id, &relay_url);
 
     // After seeding, the hint must be resolvable and carry the relay URL.
     let info = node
@@ -240,7 +241,9 @@ async fn test_add_peer_relay_ignores_self_id() -> anyhow::Result<()> {
 
     // The lookup must remain empty — no self-hint was registered.
     assert!(
-        node.peer_lookup.get_endpoint_info(node.node_id()).is_none(),
+        node.peer_lookup
+            .get_endpoint_info(common::endpoint_id(node.node_id()))
+            .is_none(),
         "self-id should not be seeded into the peer lookup"
     );
 
@@ -1393,8 +1396,7 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
 
     // Add the node's OWN id to its allowlist (what the first-pair bootstrap does),
     // alongside the two real peers — so the self-skip is actually exercised.
-    let own_endpoint_id = node.node_id();
-    let own_peer_id = PeerId::from_bytes(*own_endpoint_id.as_bytes());
+    let own_peer_id = node.node_id();
     allowlist.add_peer(own_peer_id, "self").await?;
     allowlist.add_peer(peer_1, "peer-1").await?;
     allowlist.add_peer(peer_2, "peer-2").await?;
@@ -1406,23 +1408,21 @@ async fn startup_seeds_peer_lookup_from_allowlist_cross_public_set() -> anyhow::
     let peers = allowlist.list_peers().await?;
     let mut supervisor_seed: Vec<PeerRelay> = Vec::new();
     for peer in &peers {
-        let endpoint_id = EndpointId::from_bytes(peer.node_id.as_bytes())?;
-        if endpoint_id == own_endpoint_id {
+        if peer.node_id == own_peer_id {
             continue;
         }
         let endpoint_hex = peer.node_id.to_string();
         for relay in &public_relays {
-            node.add_peer_relay(endpoint_id, relay);
+            node.add_peer_relay(peer.node_id, relay);
             supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.as_str()));
         }
     }
 
     // peer_lookup wire: every one of the 4 (peer, relay) pairs must resolve.
     for peer in [peer_1, peer_2] {
-        let endpoint_id = EndpointId::from_bytes(peer.as_bytes())?;
         let info = node
             .peer_lookup
-            .get_endpoint_info(endpoint_id)
+            .get_endpoint_info(common::endpoint_id(peer))
             .unwrap_or_else(|| {
                 panic!("peer {peer} should be resolvable from the cross-product seed")
             });
@@ -1487,8 +1487,7 @@ async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<(
     let (node, _inbound_rx) = SyncNode::new(common::seed(127), &[], allowlist.clone()).await?;
 
     // The server is in its own allowlist (first-pair bootstrap) alongside the laptops.
-    let own_endpoint_id = node.node_id();
-    let own_peer_id = PeerId::from_bytes(*own_endpoint_id.as_bytes());
+    let own_peer_id = node.node_id();
     allowlist.add_peer(own_peer_id, "self").await?;
     allowlist.add_peer(peer_charon, "charon").await?;
     allowlist.add_peer(peer_rhea, "rhea").await?;
@@ -1497,13 +1496,12 @@ async fn cross_product_for_server_is_peers_times_own_relay() -> anyhow::Result<(
     let peers = allowlist.list_peers().await?;
     let mut supervisor_seed: Vec<PeerRelay> = Vec::new();
     for peer in &peers {
-        let endpoint_id = EndpointId::from_bytes(peer.node_id.as_bytes())?;
-        if endpoint_id == own_endpoint_id {
+        if peer.node_id == own_peer_id {
             continue;
         }
         let endpoint_hex = peer.node_id.to_string();
         for relay in &public_relays {
-            node.add_peer_relay(endpoint_id, relay);
+            node.add_peer_relay(peer.node_id, relay);
             supervisor_seed.push(PeerRelay::new(endpoint_hex.clone(), relay.as_str()));
         }
     }

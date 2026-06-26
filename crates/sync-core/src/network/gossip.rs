@@ -20,6 +20,7 @@ use iroh_gossip::{
     api::{Event, GossipSender},
 };
 use n0_future::task;
+use p2p_core::PeerId;
 use rand::Rng;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -74,20 +75,20 @@ pub enum GossipMessage {
 #[derive(Debug)]
 pub enum GossipEvent {
     /// A peer joined the gossip swarm for this vault.
-    NeighborUp(EndpointId),
+    NeighborUp(PeerId),
     /// A peer left the gossip swarm for this vault.
-    NeighborDown(EndpointId),
+    NeighborDown(PeerId),
     /// A change notification broadcast received from a peer.
     ChangeReceived {
-        from: EndpointId,
+        from: PeerId,
         notification: ChangeNotification,
     },
     /// A peer was added to the allowlist by a trusted mesh member.
-    AllowlistUpdate { from: EndpointId, peer: AllowedPeer },
+    AllowlistUpdate { from: PeerId, peer: AllowedPeer },
     /// A full membership roster received from a trusted mesh member, to be
     /// merged into the local allowlist by union with tombstone-precedence.
     AllowlistRoster {
-        from: EndpointId,
+        from: PeerId,
         peers: Vec<AllowedPeer>,
     },
 }
@@ -137,34 +138,28 @@ impl VaultGossip {
                         // connect/disconnect notice off the PeerRegistry liveness
                         // transition. This is the raw HyParView membership edge.
                         debug!(peer = %node_id, "Gossip NeighborUp");
-                        GossipEvent::NeighborUp(node_id)
+                        // iroh's EndpointId is the same 32 bytes as our PeerId; this
+                        // reverse conversion is infallible.
+                        GossipEvent::NeighborUp(PeerId::from_bytes(*node_id.as_bytes()))
                     }
                     Event::NeighborDown(node_id) => {
                         debug!(peer = %node_id, "Gossip NeighborDown");
-                        GossipEvent::NeighborDown(node_id)
+                        GossipEvent::NeighborDown(PeerId::from_bytes(*node_id.as_bytes()))
                     }
                     Event::Received(msg) => {
+                        let from = PeerId::from_bytes(*msg.delivered_from.as_bytes());
                         match bincode::deserialize::<GossipMessage>(&msg.content) {
                             Ok(GossipMessage::ChangeNotification(notification)) => {
                                 debug!(path = %notification.path, from = %msg.delivered_from, "Change notification received");
-                                GossipEvent::ChangeReceived {
-                                    from: msg.delivered_from,
-                                    notification,
-                                }
+                                GossipEvent::ChangeReceived { from, notification }
                             }
                             Ok(GossipMessage::AllowlistUpdate(peer)) => {
                                 debug!(peer_id = %peer.node_id, from = %msg.delivered_from, "Allowlist update received");
-                                GossipEvent::AllowlistUpdate {
-                                    from: msg.delivered_from,
-                                    peer,
-                                }
+                                GossipEvent::AllowlistUpdate { from, peer }
                             }
                             Ok(GossipMessage::AllowlistRoster(peers)) => {
                                 debug!(count = peers.len(), from = %msg.delivered_from, "Allowlist roster received");
-                                GossipEvent::AllowlistRoster {
-                                    from: msg.delivered_from,
-                                    peers,
-                                }
+                                GossipEvent::AllowlistRoster { from, peers }
                             }
                             Err(e) => {
                                 warn!(
@@ -245,9 +240,9 @@ impl VaultGossip {
     /// side dials the other again on its own, so the supervisor re-seeds relay
     /// hints and calls this to re-establish the swarm. Re-subscribing would churn
     /// the swarm; `join_peers` is the targeted re-bootstrap.
-    pub async fn rejoin_peers(&self, peers: Vec<EndpointId>) -> Result<()> {
+    pub async fn rejoin_peers(&self, peers: Vec<PeerId>) -> Result<()> {
         self.sender
-            .join_peers(peers)
+            .join_peers(peer_ids_to_endpoints(peers))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
     }
@@ -292,10 +287,23 @@ pub struct GossipRejoinHandle {
 
 impl GossipRejoinHandle {
     /// Re-join the given peers — see [`VaultGossip::rejoin_peers`].
-    pub async fn rejoin_peers(&self, peers: Vec<EndpointId>) -> Result<()> {
+    pub async fn rejoin_peers(&self, peers: Vec<PeerId>) -> Result<()> {
         self.sender
-            .join_peers(peers)
+            .join_peers(peer_ids_to_endpoints(peers))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to re-join gossip peers: {e}"))
     }
+}
+
+/// Convert `PeerId`s to iroh `EndpointId`s for a gossip re-join, dropping any
+/// legacy/non-curve-point id (it could never be a reachable bootstrap target).
+///
+/// gossip.rs still speaks iroh's gossip transport directly (the transport descent
+/// is Stage C), so the `PeerId → EndpointId` conversion is inlined here rather than
+/// going through p2p-core's crate-private adapter.
+fn peer_ids_to_endpoints(peers: Vec<PeerId>) -> Vec<EndpointId> {
+    peers
+        .into_iter()
+        .filter_map(|p| EndpointId::from_bytes(p.as_bytes()).ok())
+        .collect()
 }

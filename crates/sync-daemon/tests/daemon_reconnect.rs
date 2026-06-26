@@ -21,7 +21,9 @@ mod daemon_reconnect {
     use sync_daemon::daemon::Daemon;
     use sync_daemon::watcher::{FileEvent, FileEventKind};
 
-    use super::common::{build_node, connect_nodes, now_ms_test, shared_vault_id, spawn_daemon};
+    use super::common::{
+        build_node, connect_nodes, endpoint_id, now_ms_test, shared_vault_id, spawn_daemon,
+    };
 
     /// Poll until `predicate` returns true or 10 seconds elapse.
     ///
@@ -309,11 +311,13 @@ mod daemon_reconnect {
         // supervisor's mutations from outside the spawned event loop.
         let lookup = node_a.sync_node.peer_lookup.clone();
         assert!(
-            lookup.get_endpoint_info(throttled_id).is_some(),
+            lookup
+                .get_endpoint_info(endpoint_id(throttled_id))
+                .is_some(),
             "throttled hint should start present in the lookup"
         );
         assert!(
-            lookup.get_endpoint_info(due_id).is_some(),
+            lookup.get_endpoint_info(endpoint_id(due_id)).is_some(),
             "due hint should start present in the lookup"
         );
 
@@ -367,12 +371,16 @@ mod daemon_reconnect {
         // the eviction is driven by the due alternative, not by URL class.
         wait_until("throttled hint evicted from lookup", || {
             let lookup = lookup.clone();
-            async move { lookup.get_endpoint_info(throttled_id).is_none() }
+            async move {
+                lookup
+                    .get_endpoint_info(endpoint_id(throttled_id))
+                    .is_none()
+            }
         })
         .await;
 
         assert!(
-            lookup.get_endpoint_info(due_id).is_some(),
+            lookup.get_endpoint_info(endpoint_id(due_id)).is_some(),
             "due hint must remain in the lookup (re-seeded each due tick)"
         );
 
@@ -414,7 +422,7 @@ mod daemon_reconnect {
         // starts absent: the first due tick is what adds it.
         let lookup = node_a.sync_node.peer_lookup.clone();
         assert!(
-            lookup.get_endpoint_info(peer_id).is_none(),
+            lookup.get_endpoint_info(endpoint_id(peer_id)).is_none(),
             "hint should start absent — the first supervisor tick adds it"
         );
 
@@ -453,7 +461,7 @@ mod daemon_reconnect {
         // proves the supervisor loop is running before we assert retention.
         wait_until("sole hint re-seeded by first due tick", || {
             let lookup = lookup.clone();
-            async move { lookup.get_endpoint_info(peer_id).is_some() }
+            async move { lookup.get_endpoint_info(endpoint_id(peer_id)).is_some() }
         })
         .await;
 
@@ -463,7 +471,7 @@ mod daemon_reconnect {
         // tick the old eviction needed.
         tokio::time::sleep(Duration::from_millis(750)).await;
         assert!(
-            lookup.get_endpoint_info(peer_id).is_some(),
+            lookup.get_endpoint_info(endpoint_id(peer_id)).is_some(),
             "the sole peer-relay hint must remain in the lookup across throttled \
              ticks — evicting it would strand the only address needed to heal the \
              partition"
@@ -514,8 +522,8 @@ mod daemon_reconnect {
         node_a.sync_node.set_peer_relay(y_id, &y_relay_url);
 
         let lookup = node_a.sync_node.peer_lookup.clone();
-        assert!(lookup.get_endpoint_info(x_id).is_some());
-        assert!(lookup.get_endpoint_info(y_id).is_some());
+        assert!(lookup.get_endpoint_info(endpoint_id(x_id)).is_some());
+        assert!(lookup.get_endpoint_info(endpoint_id(y_id)).is_some());
 
         // Both hints are throttled: recent attempt + failures puts each well
         // inside its backoff window, and neither is due.
@@ -557,7 +565,8 @@ mod daemon_reconnect {
         wait_until("both throttled hints evicted from lookup", || {
             let lookup = lookup.clone();
             async move {
-                lookup.get_endpoint_info(x_id).is_none() && lookup.get_endpoint_info(y_id).is_none()
+                lookup.get_endpoint_info(endpoint_id(x_id)).is_none()
+                    && lookup.get_endpoint_info(endpoint_id(y_id)).is_none()
             }
         })
         .await;
@@ -618,11 +627,11 @@ mod daemon_reconnect {
 
         let lookup = node_a.sync_node.peer_lookup.clone();
         assert!(
-            lookup.get_endpoint_info(lifeline_id).is_some(),
+            lookup.get_endpoint_info(endpoint_id(lifeline_id)).is_some(),
             "domain lifeline hint should start present in the lookup"
         );
         assert!(
-            lookup.get_endpoint_info(lan_id).is_some(),
+            lookup.get_endpoint_info(endpoint_id(lan_id)).is_some(),
             "LAN-IP hint should start present in the lookup"
         );
 
@@ -673,7 +682,7 @@ mod daemon_reconnect {
         // The LAN-IP hint is evicted — the liveness proof the supervisor ran.
         wait_until("LAN-IP hint evicted from lookup", || {
             let lookup = lookup.clone();
-            async move { lookup.get_endpoint_info(lan_id).is_none() }
+            async move { lookup.get_endpoint_info(endpoint_id(lan_id)).is_none() }
         })
         .await;
 
@@ -681,7 +690,7 @@ mod daemon_reconnect {
         // RETAINED across throttled ticks even though a (LAN-only) alternative
         // exists. This is the off-LAN regression the fix closes.
         assert!(
-            lookup.get_endpoint_info(lifeline_id).is_some(),
+            lookup.get_endpoint_info(endpoint_id(lifeline_id)).is_some(),
             "off-LAN domain lifeline must be retained when it is the only \
              off-LAN-reachable hint, even with a LAN-only alternative present"
         );

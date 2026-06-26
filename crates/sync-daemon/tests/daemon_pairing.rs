@@ -24,7 +24,8 @@ mod daemon_pairing {
     use sync_daemon::watcher::FileEvent;
 
     use super::common::{
-        build_node, connect_nodes, inject_deleted, inject_modified, shared_vault_id, spawn_daemon,
+        build_node, connect_nodes, endpoint_id, inject_deleted, inject_modified, shared_vault_id,
+        spawn_daemon,
     };
 
     /// Poll until `predicate` returns true or 10 seconds elapse.
@@ -124,10 +125,7 @@ mod daemon_pairing {
         // Join gossip on node B so NeighborUp fires on daemon A.
         let gossip_b = node_b
             .sync_node
-            .join_vault_gossip(
-                &vault_id,
-                vec![node_a.node_id.as_bytes().try_into().unwrap()],
-            )
+            .join_vault_gossip(&vault_id, vec![node_a.node_id])
             .await?;
         let daemon_b = spawn_daemon(node_b, gossip_b);
 
@@ -226,7 +224,6 @@ mod daemon_pairing {
     /// Seed 65 reserved.
     #[tokio::test]
     async fn test_submit_code_without_request_returns_error() -> anyhow::Result<()> {
-        use iroh::EndpointId;
         use sync_daemon::daemon::Daemon;
         use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
         use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -236,7 +233,7 @@ mod daemon_pairing {
         let gossip = node.sync_node.join_vault_gossip(&vault_id, vec![]).await?;
 
         // Capture the node's endpoint_id before moving node.sync_node.
-        let endpoint_id: EndpointId = node.sync_node.node_id();
+        let endpoint_id: PeerId = node.sync_node.node_id();
 
         let (_file_event_tx, file_event_rx) =
             mpsc::unbounded_channel::<sync_daemon::watcher::FileEvent>();
@@ -315,7 +312,6 @@ mod daemon_pairing {
     /// Seeds 66/67 reserved.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_two_step_pairing_request_then_submit() -> anyhow::Result<()> {
-        use iroh::EndpointId;
         use sync_daemon::daemon::Daemon;
         use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
         use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -406,10 +402,9 @@ mod daemon_pairing {
         let (b_cmd_tx, b_cmd_rx) = mpsc::unbounded_channel::<DaemonCommand>();
         daemon_b.wire_control(b_status_tx, b_pairing_tx, b_cmd_rx, "Mesh B".to_string());
 
-        // Seed B's discovered map with A's endpoint — this replaces mDNS in tests.
-        let a_endpoint: EndpointId = a_endpoint_id;
+        // Seed B's discovered map with A's id — this replaces mDNS in tests.
         daemon_b
-            .test_seed_discovered(a_vault_id.to_string(), a_endpoint)
+            .test_seed_discovered(a_vault_id.to_string(), a_endpoint_id)
             .await;
 
         let b_loop = tokio::spawn(async move {
@@ -618,7 +613,6 @@ mod daemon_pairing {
     /// Seeds 68/69 reserved.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_pairing_persists_responder_relay() -> anyhow::Result<()> {
-        use iroh::EndpointId;
         use p2p_core::EmbeddedRelay;
         use sync_daemon::daemon::Daemon;
         use sync_daemon::pair_api::{DaemonCommand, DaemonStatus, PairingUiEvent};
@@ -648,7 +642,7 @@ mod daemon_pairing {
         let relay = EmbeddedRelay::start("127.0.0.1:0".parse().unwrap()).await?;
         let relay_url_str = "https://relay-a.test/".to_string();
 
-        let a_endpoint_id: EndpointId = node_a.sync_node.node_id();
+        let a_endpoint_id: PeerId = node_a.sync_node.node_id();
 
         // Clone B's peer_lookup handle BEFORE moving sync_node into Daemon::new.
         // MemoryLookup is Arc-backed, so the clone stays live and reflects any
@@ -782,7 +776,7 @@ mod daemon_pairing {
         // Live lookup: B's peer_lookup should carry A's (endpoint_id, relay_url).
         // This proves `add_peer_relay` was called on the current session after pairing.
         let hint = b_peer_lookup
-            .get_endpoint_info(a_endpoint_id)
+            .get_endpoint_info(endpoint_id(a_endpoint_id))
             .expect("B's peer_lookup should have A's relay hint after pairing");
         let hint_relay_urls: Vec<_> = hint.into_endpoint_addr().relay_urls().cloned().collect();
         assert!(

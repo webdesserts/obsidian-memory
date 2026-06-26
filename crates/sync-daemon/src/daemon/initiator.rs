@@ -40,11 +40,11 @@ pub(super) const INITIATOR_DISCOVERY_TIMEOUT_SECS: u64 = 10;
 pub(super) struct InitiatorPairOutcome {
     pub(super) result: sync_core::pairing::PairingResult,
     pub(super) responder_device_name: String,
-    /// The transport-verified `EndpointId` of the responder — the QUIC connection
+    /// The transport-verified `PeerId` of the responder — the QUIC connection
     /// target the initiator dialed. Used to key the persisted relay hint so we
     /// don't infer the responder's identity from `mesh_members` (which is not
     /// transport-verified).
-    pub(super) responder_endpoint_id: EndpointId,
+    pub(super) responder_endpoint_id: PeerId,
 }
 
 /// State tracked between `StartDiscovery`, `RequestPairing`, and `SubmitCode`
@@ -55,9 +55,9 @@ pub(super) struct InitiatorPairOutcome {
 /// `code_tx`. `SubmitCode` stores `submit_reply` then fires `code_tx` to
 /// unblock the parked task.
 pub(super) struct InitiatorSession {
-    /// Maps `vault_id` to the first observed peer's endpoint, used by
+    /// Maps `vault_id` to the first observed peer's id, used by
     /// `RequestPairing` to dial the mesh.
-    pub(super) discovered: Arc<Mutex<HashMap<String, EndpointId>>>,
+    pub(super) discovered: Arc<Mutex<HashMap<String, PeerId>>>,
     /// Cancels the discovery scan and any in-progress pairing attempt.
     pub(super) cancel: CancellationToken,
     /// Filled by `RequestPairing` after the parked task spawns. `SubmitCode`
@@ -78,7 +78,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///
     /// This method is `pub` solely for integration test access — use only in
     /// test code. Production callers should go through `StartDiscovery`.
-    pub async fn test_seed_discovered(&mut self, vault_id: String, endpoint_id: iroh::EndpointId) {
+    pub async fn test_seed_discovered(&mut self, vault_id: String, endpoint_id: PeerId) {
         if self.active_initiator.is_none() {
             let cancel = CancellationToken::new();
             self.active_initiator = Some(InitiatorSession {
@@ -118,7 +118,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let cancel = CancellationToken::new();
-        let discovered = Arc::new(Mutex::new(HashMap::<String, EndpointId>::new()));
+        let discovered = Arc::new(Mutex::new(HashMap::<String, PeerId>::new()));
 
         self.active_initiator = Some(InitiatorSession {
             discovered: discovered.clone(),
@@ -461,14 +461,16 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             .adopt_vault_id(vault_sync::VaultId::from(new_vault_id.as_u64()))
             .await?;
 
-        // 2. Bootstrap gossip off the mesh members (same filter-map as startup).
-        let bootstrap_ids: Vec<EndpointId> = mesh_members
+        // 2. Bootstrap gossip off the mesh members (same validate-and-keep as
+        //    startup): skip a non-curve-point id gracefully, keep the `PeerId`.
+        let bootstrap_ids: Vec<PeerId> = mesh_members
             .iter()
-            .filter_map(|p| {
+            .filter(|p| {
                 EndpointId::from_bytes(p.as_bytes())
                     .map_err(|e| warn!("Skipping invalid mesh member for gossip bootstrap: {}", e))
-                    .ok()
+                    .is_ok()
             })
+            .copied()
             .collect();
 
         // 3. Join the new topic and swap — the old VaultGossip drops here,
@@ -520,7 +522,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 /// occurs — `connect_reply` carries the `Err` in that case.
 async fn run_initiator_pairing_parked(
     endpoint: &iroh::Endpoint,
-    peer_endpoint_id: EndpointId,
+    peer_endpoint_id: PeerId,
     self_node_id_bytes: [u8; 32],
     device_name: &str,
     connect_reply: oneshot::Sender<Result<String, String>>,
@@ -531,6 +533,11 @@ async fn run_initiator_pairing_parked(
         node_id: self_peer_id,
         device_name: device_name.to_string(),
     };
+    // The pairing connect still speaks iroh's id (the `pair_with_mesh*` rework is
+    // Stage A3). The target is a discovered mesh peer whose id came from a real
+    // mDNS-advertised key, so the conversion is infallible here.
+    let peer_endpoint = EndpointId::from_bytes(peer_endpoint_id.as_bytes())
+        .expect("discovered pairing target is a valid, transport-sourced peer id");
 
     // The PairingChallenge carries the responder's device_name; capture it
     // here so we can return it to the UI's success message.
@@ -542,7 +549,7 @@ async fn run_initiator_pairing_parked(
     let connect_reply_cell = Arc::new(Mutex::new(Some(connect_reply)));
     let connect_reply_for_closure = connect_reply_cell.clone();
 
-    let result = pair_with_mesh_interactive(endpoint, peer_endpoint_id, &hello, move |challenge| {
+    let result = pair_with_mesh_interactive(endpoint, peer_endpoint, &hello, move |challenge| {
         let setter = captured_device_name_setter.clone();
         let reply_cell = connect_reply_for_closure.clone();
         let code_rx = code_rx; // move into closure — runs exactly once

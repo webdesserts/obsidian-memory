@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use iroh::EndpointId;
+use p2p_core::PeerId;
 use p2p_core::RelayAddr;
 use sync_core::network::{SyncNode, VaultGossipExt};
 use sync_core::peer_id::VaultId;
@@ -84,7 +84,7 @@ pub async fn adopt_vault_id_on_disk(vault_path: &Path, new_id: VaultId) -> anyho
 /// `None`; the live-daemon initiator flow passes its advertised URL.
 pub async fn persist_adopted_relay(
     vault_path: &Path,
-    responder_id: EndpointId,
+    responder_id: PeerId,
     relay_urls: &[String],
     self_relay_url: Option<String>,
     sync_node: &SyncNode,
@@ -149,7 +149,6 @@ mod tests {
     #[tokio::test]
     async fn persist_adopted_relay_preserves_own_relay_url() {
         use crate::persistence::DaemonConfig;
-        use iroh::SecretKey;
         use std::sync::Arc;
         use tempfile::TempDir;
 
@@ -175,10 +174,9 @@ mod tests {
                 .await
                 .expect("failed to build SyncNode for test");
 
-        // The responder is a DIFFERENT device, so its EndpointId won't trip the
-        // self-skip in the live-lookup seed (`add_peer_relay`).
-        let responder_secret = SecretKey::from_bytes(&[7u8; 32]);
-        let responder_id = responder_secret.public();
+        // The responder is a DIFFERENT device, so its id won't trip the self-skip
+        // in the live-lookup seed (`add_peer_relay`).
+        let responder_id = PeerId::from_secret_bytes([7u8; 32]);
         let responder_relay = "http://responder-relay:3340/".to_string();
 
         persist_adopted_relay(

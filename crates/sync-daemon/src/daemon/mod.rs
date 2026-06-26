@@ -294,7 +294,7 @@ pub struct DaemonRunConfig {
 /// which is what makes stale-hint eviction safe.
 struct ExchangeLearned {
     /// The peer we just synced with.
-    endpoint_id: EndpointId,
+    endpoint_id: PeerId,
     /// The active relay URL iroh reported for the peer, if it connected through
     /// a relay. `None` for a LAN-direct connection (no relay path) — we still
     /// stamp success, we just don't overwrite the stored URL with nothing.
@@ -416,7 +416,7 @@ pub struct Daemon<FS: FileSystem, AL> {
     /// inside the spawned task, which can't borrow `&mut self`. The async mutex
     /// (not `std`) is required: nothing holds the guard across an `.await` today,
     /// but it lives behind the same shared-handle pattern as `peer_registry`.
-    bootstrap_connect_inflight: Arc<Mutex<HashSet<EndpointId>>>,
+    bootstrap_connect_inflight: Arc<Mutex<HashSet<PeerId>>>,
 
     // ── allowlist convergence ───────────────────────────────────────────────
     /// Wall-clock (`now_ms()`) of the last connected-path roster reconcile, or
@@ -828,14 +828,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         }
 
         let now = now_ms();
-        let mut bootstrap_ids: Vec<EndpointId> = Vec::new();
-        // EndpointIds dialed this tick, so we can attribute the (coarse) failure
+        let mut bootstrap_ids: Vec<PeerId> = Vec::new();
+        // Peer ids dialed this tick, so we can attribute the (coarse) failure
         // after the attempt if no neighbor materializes.
-        let mut due_ids: Vec<EndpointId> = Vec::new();
+        let mut due_ids: Vec<PeerId> = Vec::new();
         // Due hints whose relay URL parses, paired with that URL. Drives the
         // supervisor-issued relay-carrying connect below — the recovery for peers
         // whose bare-id gossip dial parked and can never be re-dialed by gossip.
-        let mut due_relay_targets: Vec<(EndpointId, RelayAddr)> = Vec::new();
+        let mut due_relay_targets: Vec<(PeerId, RelayAddr)> = Vec::new();
 
         // When this is the only hint we have, it is the lookup's sole route to
         // the peer — we never evict it while partitioned (see the throttled
@@ -857,7 +857,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // Decide per hint, applying node calls (set/remove) and stamping the
         // in-memory `last_attempt_ms` for due hints as we go.
         for hint in self.peer_relays.iter_mut() {
-            let Ok(endpoint_id) = hint.endpoint_id.parse::<EndpointId>() else {
+            let Ok(peer_id) = hint.endpoint_id.parse::<PeerId>() else {
                 // Malformed snapshot entry — skip silently; startup already warned
                 // about this entry at load time.
                 continue;
@@ -873,18 +873,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                 // failure_count — the last-hint guarantee that a returning
                 // off-LAN peer is never stranded.
                 if let Ok(relay_addr) = RelayAddr::parse(&hint.relay_url) {
-                    self.sync_node.set_peer_relay(endpoint_id, &relay_addr);
+                    self.sync_node.set_peer_relay(peer_id, &relay_addr);
                     // Also drive a supervisor-issued connect for this hint (below):
                     // gossip's bare-id Dialer can park forever and is then never
                     // re-dialed, so we establish the relay-carrying connection
                     // ourselves and hand it to gossip.
-                    due_relay_targets.push((endpoint_id, relay_addr));
+                    due_relay_targets.push((peer_id, relay_addr));
                 }
-                // Even with an unparseable URL, still bootstrap by EndpointId —
+                // Even with an unparseable URL, still bootstrap by peer id —
                 // mDNS or a prior direct address may reach the peer on-LAN.
                 hint.last_attempt_ms = Some(now);
-                bootstrap_ids.push(endpoint_id);
-                due_ids.push(endpoint_id);
+                bootstrap_ids.push(peer_id);
+                due_ids.push(peer_id);
             } else {
                 // Throttled. Evict from the lookup UNLESS this hint is a lifeline
                 // we must never drop while partitioned:
@@ -902,7 +902,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     // A live alternative remains (another hint, or another off-LAN
                     // route) — safe to evict this one so nothing re-resolves the
                     // dead relay until it comes due again.
-                    self.sync_node.remove_peer_relay(endpoint_id);
+                    self.sync_node.remove_peer_relay(peer_id);
                 }
                 // Otherwise RETAINED in the lookup — the relay-reap reconnect fix,
                 // generalized to the off-LAN lifeline.
@@ -960,8 +960,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // queued Join, flips the peer Active, and the handshake yields NeighborUp.
         // This is independent of gossip's parked Dialer, so it also recovers a peer
         // that is ALREADY stuck.
-        for (endpoint_id, relay_url) in due_relay_targets {
-            self.spawn_bootstrap_connect(endpoint_id, relay_url);
+        for (peer, relay_url) in due_relay_targets {
+            self.spawn_bootstrap_connect(peer, relay_url);
         }
 
         // Step 5: every due hint failed to yield a neighbor this tick (step 1
@@ -982,7 +982,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// same peer would accumulate dozens of concurrent connects. We skip a peer
     /// whose connect is already in flight, insert before spawning, and remove when
     /// the task finishes (both success and failure).
-    fn spawn_bootstrap_connect(&self, endpoint_id: EndpointId, relay_url: RelayAddr) {
+    fn spawn_bootstrap_connect(&self, peer: PeerId, relay_url: RelayAddr) {
         let endpoint = self.sync_node.endpoint.clone();
         let gossip = self.sync_node.gossip.clone();
         let rejoin = self.vault_gossip.rejoin_handle();
@@ -994,7 +994,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             // atomic against concurrent ticks.
             {
                 let mut set = inflight.lock().await;
-                if !set.insert(endpoint_id) {
+                if !set.insert(peer) {
                     return;
                 }
             }
@@ -1003,10 +1003,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             // for `accept_conn` to drain on adoption (deterministic ordering — the
             // queued Join is what initiates the handshake from our side once the
             // connection is adopted).
-            if let Err(e) = rejoin.rejoin_peers(vec![endpoint_id]).await {
-                debug!(peer = %endpoint_id, "bootstrap re-join before connect failed: {e}");
+            if let Err(e) = rejoin.rejoin_peers(vec![peer]).await {
+                debug!(peer = %peer, "bootstrap re-join before connect failed: {e}");
             }
 
+            // The supervisor working set speaks `PeerId`; the raw `endpoint.connect`
+            // needs iroh's id. A snapshot hint with a legacy/non-curve-point id
+            // could never be dialed, so skip it (releasing the in-flight slot).
+            let Ok(endpoint_id) = iroh::EndpointId::from_bytes(peer.as_bytes()) else {
+                debug!(peer = %peer, "bootstrap connect skipped — hint id is not a valid key");
+                inflight.lock().await.remove(&peer);
+                return;
+            };
             // The relay-carrying addr is inserted as an `App` path before address
             // lookup runs, so the connect resolves immediately and cannot park.
             // The relay round-trips back to iroh's URL type for the raw connect; it
@@ -1018,18 +1026,18 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
                     // Adopt the connection into gossip: drains the queued Join →
                     // peer Active → handshake → NeighborUp.
                     if let Err(e) = gossip.handle_connection(conn).await {
-                        debug!(peer = %endpoint_id, "gossip rejected supervisor bootstrap connection: {e}");
+                        debug!(peer = %peer, "gossip rejected supervisor bootstrap connection: {e}");
                     }
                 }
                 Err(e) => {
                     // A real, fast failure now (vs the parked bare-id dial) — the
                     // relay is genuinely unreachable this attempt. The next due
                     // tick retries.
-                    debug!(peer = %endpoint_id, "supervisor bootstrap connect failed: {e}");
+                    debug!(peer = %peer, "supervisor bootstrap connect failed: {e}");
                 }
             }
 
-            inflight.lock().await.remove(&endpoint_id);
+            inflight.lock().await.remove(&peer);
         });
     }
 
@@ -1080,7 +1088,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// failure history stays intact and real backoff resumes from it the moment
     /// the window expires. (A successful dial still zeroes the count via
     /// [`on_exchange_learned`], grace or not.)
-    fn record_due_hint_failures(&mut self, due_ids: &[EndpointId]) {
+    fn record_due_hint_failures(&mut self, due_ids: &[PeerId]) {
         if due_ids.is_empty() {
             return;
         }
@@ -1288,7 +1296,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // relay}. Mirrors the startup seed in `startup.rs`: skip self (iroh rejects
         // self-directed relay paths) and invalid EndpointIds; dedup against the
         // existing snapshot so re-learning is a no-op.
-        let own_endpoint_id = self.sync_node.node_id();
+        let own_peer_id = self.sync_node.node_id();
         let peers = match self.allowlist.list_peers().await {
             Ok(peers) => peers,
             Err(e) => {
@@ -1297,14 +1305,14 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             }
         };
         for peer in &peers {
-            let endpoint_id = match EndpointId::from_bytes(peer.node_id.as_bytes()) {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("Skipping invalid allowlist peer for learned-relay seed: {e}");
-                    continue;
-                }
-            };
-            if endpoint_id == own_endpoint_id {
+            // Validate the peer key up front, skipping a legacy/non-curve-point id
+            // gracefully (never panicking) — the deliberate degrade this loop has
+            // always done. The seed itself now speaks `PeerId`.
+            if EndpointId::from_bytes(peer.node_id.as_bytes()).is_err() {
+                warn!("Skipping invalid allowlist peer for learned-relay seed");
+                continue;
+            }
+            if peer.node_id == own_peer_id {
                 continue;
             }
             let endpoint_hex = peer.node_id.to_string();
@@ -1315,7 +1323,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
             if already {
                 continue;
             }
-            self.sync_node.add_peer_relay(endpoint_id, &url);
+            self.sync_node.add_peer_relay(peer.node_id, &url);
             self.peer_relays.push(crate::persistence::PeerRelay::new(
                 endpoint_hex,
                 url_str.clone(),
@@ -1431,7 +1439,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// `#[cfg(test)]` gate would break them. Not a public production API.
     pub async fn apply_exchange_success_for_test(
         &mut self,
-        endpoint_id: EndpointId,
+        endpoint_id: PeerId,
         relay_url: Option<RelayAddr>,
     ) {
         self.on_exchange_learned(ExchangeLearned {
@@ -2043,7 +2051,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// echo how we had been reaching the peer. Called only on a true
     /// Unknown/Dead → Alive transition so duplicate liveness signals don't spam.
     async fn log_peer_connected(&self, node_id: EndpointId, peer_id: PeerId) {
-        let conn_type = self.sync_node.peer_conn_info(node_id).await.conn_type;
+        // `peer_conn_info` now takes the `PeerId` (it degrades to an Unknown path
+        // on a non-curve-point key); `node_id` stays for the byte-identical
+        // `%node_id` log field this cluster emits.
+        let conn_type = self.sync_node.peer_conn_info(peer_id).await.conn_type;
         self.log_connect_with_conn_type(node_id, peer_id, conn_type)
             .await;
     }
@@ -2118,8 +2129,12 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// event loop remains free to handle inbound sync requests from the same peer
     /// — both sides fire NeighborUp simultaneously and each tries to connect to
     /// the other, which would deadlock if the QUIC call blocked the select loop.
-    async fn on_neighbor_up(&mut self, node_id: EndpointId) {
-        let peer_id = PeerId::from_bytes(*node_id.as_bytes());
+    async fn on_neighbor_up(&mut self, peer_id: PeerId) {
+        // A NeighborUp peer is over a live gossip connection — its id is
+        // transport-sourced, so the iroh-id conversion (needed for the
+        // connection-path snapshot the connect log takes) cannot fail.
+        let node_id = EndpointId::from_bytes(peer_id.as_bytes())
+            .expect("NeighborUp peer is a live, transport-sourced peer id");
         let transition = self.peer_registry.lock().await.mark_alive(peer_id);
         if transition == ConnectTransition::NewlyAlive {
             self.log_peer_connected(node_id, peer_id).await;
@@ -2147,7 +2162,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // NeighborUp simultaneously, each needs to respond to the other's
         // inbound sync — which can only happen if the event loop isn't blocked.
         spawn_sync_exchange(
-            node_id,
+            peer_id,
             peer_id,
             request_bytes,
             self.vault.clone(),
@@ -2168,8 +2183,11 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     }
 
     /// A peer left the gossip swarm.
-    async fn on_neighbor_down(&mut self, node_id: EndpointId) {
-        let peer_id = PeerId::from_bytes(*node_id.as_bytes());
+    async fn on_neighbor_down(&mut self, peer_id: PeerId) {
+        // A NeighborDown peer was just connected, so its id is transport-sourced
+        // and the iroh-id conversion (for the disconnect log) cannot fail.
+        let node_id = EndpointId::from_bytes(peer_id.as_bytes())
+            .expect("NeighborDown peer is a live, transport-sourced peer id");
         self.log_peer_disconnected(node_id, peer_id).await;
         self.peer_registry.lock().await.on_neighbor_down(&peer_id);
         self.emit_status().await;
@@ -2180,11 +2198,10 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// The allowlist check happens synchronously. The QUIC exchange is spawned as
     /// a background task so the event loop stays free to process other events while
     /// the pull is in flight.
-    async fn on_change_received(&mut self, from: EndpointId, path: String) {
+    async fn on_change_received(&mut self, from: PeerId, path: String) {
         debug!(peer = %from, path = %path, "Change notification received — pulling update");
-        let peer_id = PeerId::from_bytes(*from.as_bytes());
 
-        if !self.is_peer_allowed(&peer_id).await {
+        if !self.is_peer_allowed(&from).await {
             warn!(peer = %from, "Change notification from non-allowlisted peer, ignoring");
             return;
         }
@@ -2201,7 +2218,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
 
         spawn_sync_exchange(
             from,
-            peer_id,
+            from,
             request_bytes,
             self.vault.clone(),
             self.allowlist.clone(),
@@ -2274,9 +2291,8 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     /// roster from a peer already in our allowlist. `merge_roster` unions the
     /// incoming entries with tombstone-precedence, so this both adds peers we were
     /// missing and honors revocations a trusted member propagated.
-    async fn on_allowlist_roster_received(&self, from: iroh::EndpointId, peers: Vec<AllowedPeer>) {
-        let sender_id = PeerId::from_bytes(*from.as_bytes());
-        if !self.is_peer_allowed(&sender_id).await {
+    async fn on_allowlist_roster_received(&self, from: PeerId, peers: Vec<AllowedPeer>) {
+        if !self.is_peer_allowed(&from).await {
             warn!(peer = %from, "Allowlist roster from non-allowlisted peer, ignoring");
             return;
         }
@@ -2284,7 +2300,7 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
         // A roster broadcast arriving from this peer proves it is connected even
         // when our HyParView never fired NeighborUp — log the connect on a true
         // transition (the reliability fix).
-        self.on_peer_liveness(sender_id).await;
+        self.on_peer_liveness(from).await;
 
         match self.allowlist.merge_roster(&peers).await {
             Ok(()) => {
@@ -2300,16 +2316,15 @@ impl<FS: FileSystem + 'static, AL: AllowlistStorage + 'static> Daemon<FS, AL> {
     ///
     /// Only processes the update if the sender is already in our allowlist —
     /// we don't trust gossip from peers we haven't explicitly paired with.
-    async fn on_allowlist_update_received(&self, from: iroh::EndpointId, peer: AllowedPeer) {
-        let sender_id = PeerId::from_bytes(*from.as_bytes());
-        if !self.is_peer_allowed(&sender_id).await {
+    async fn on_allowlist_update_received(&self, from: PeerId, peer: AllowedPeer) {
+        if !self.is_peer_allowed(&from).await {
             warn!(peer = %from, "Allowlist update from non-allowlisted peer, ignoring");
             return;
         }
 
         // The update broadcast proves the sender is connected — same reliability
         // fix as the roster path.
-        self.on_peer_liveness(sender_id).await;
+        self.on_peer_liveness(from).await;
 
         match self
             .allowlist

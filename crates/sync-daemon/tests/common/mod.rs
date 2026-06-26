@@ -31,6 +31,14 @@ pub fn seed(n: u8) -> [u8; 32] {
     [n; 32]
 }
 
+/// Convert a `PeerId` to iroh's `EndpointId` (same 32 bytes) for tests that drive
+/// raw iroh APIs — `MemoryLookup::get_endpoint_info`, `endpoint.connect`, etc. —
+/// which still speak iroh's id even though the daemon's public surface is `PeerId`.
+#[allow(dead_code)] // see RelayNode — per-binary common compilation
+pub fn endpoint_id(peer: PeerId) -> iroh::EndpointId {
+    iroh::EndpointId::from_bytes(peer.as_bytes()).expect("test PeerId is a valid key")
+}
+
 /// A relay-aware test node: an iroh `SyncNode` whose home relay is `relay_url`,
 /// plus a vault and allowlist, ready to be handed to `Daemon::new`.
 ///

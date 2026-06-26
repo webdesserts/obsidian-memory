@@ -69,7 +69,7 @@ pub(super) enum SyncExchangeKind {
 /// need to re-acquire `&mut self`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_sync_exchange<FS, AL>(
-    target: EndpointId,
+    target: PeerId,
     peer_id: PeerId,
     request_bytes: Vec<u8>,
     vault: Arc<Mutex<Vault<FS>>>,
@@ -82,6 +82,11 @@ pub(super) fn spawn_sync_exchange<FS, AL>(
     FS: FileSystem + 'static,
     AL: AllowlistStorage + 'static,
 {
+    // The raw QUIC connect + remote_info lookup need iroh's id. `target` is
+    // transport-sourced (this exchange is driven by a live gossip neighbour /
+    // received change), so the conversion is infallible for it.
+    let target_endpoint = EndpointId::from_bytes(target.as_bytes())
+        .expect("sync-exchange target is a live, transport-sourced peer id");
     tokio::spawn(async move {
         // Drive the variable-length vault-sync handshake to termination over one
         // bi-stream (digest opener → … → terminal `reply: None`), processing each
@@ -90,7 +95,7 @@ pub(super) fn spawn_sync_exchange<FS, AL>(
         // reverse-initiated sync can't deadlock against it.
         let modified = match super::sync_stream::pump_outbound(
             &endpoint,
-            target,
+            target_endpoint,
             &request_bytes,
             &vault,
         )
@@ -149,7 +154,7 @@ pub(super) fn spawn_sync_exchange<FS, AL>(
         // extends the lock-hold. A LAN-direct connection yields no active relay
         // path → `None`, which still resets freshness without inventing a URL.
         let relay_url = endpoint
-            .remote_info(target)
+            .remote_info(target_endpoint)
             .await
             .as_ref()
             .and_then(active_relay_url);

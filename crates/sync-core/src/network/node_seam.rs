@@ -17,9 +17,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::EndpointId;
 use iroh_gossip::TopicId;
-use p2p_core::{AllowlistStorage, P2pNode, RelayAddr};
+use p2p_core::{AllowlistStorage, P2pNode, PeerId, RelayAddr};
 
 use crate::network::SYNC_ALPN;
 use crate::network::gossip::VaultGossip;
@@ -187,12 +186,12 @@ pub trait VaultGossipExt {
 
     /// Subscribe to gossip for a specific vault.
     ///
-    /// `bootstrap_nodes` should be the `EndpointId`s of known peers for that vault.
+    /// `bootstrap_nodes` should be the `PeerId`s of known peers for that vault.
     /// At least one bootstrap node is needed to join the gossip swarm.
     async fn join_vault_gossip(
         &self,
         vault_id: &VaultId,
-        bootstrap_nodes: Vec<EndpointId>,
+        bootstrap_nodes: Vec<PeerId>,
     ) -> Result<VaultGossip>;
 }
 
@@ -208,7 +207,7 @@ impl VaultGossipExt for P2pNode {
     async fn join_vault_gossip(
         &self,
         vault_id: &VaultId,
-        bootstrap_nodes: Vec<EndpointId>,
+        bootstrap_nodes: Vec<PeerId>,
     ) -> Result<VaultGossip> {
         let topic = <P2pNode as VaultGossipExt>::vault_topic(vault_id);
         let handle = self.join_topic(topic, bootstrap_nodes).await?;

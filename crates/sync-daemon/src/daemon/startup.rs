@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use p2p_core::FileAllowlistStorage;
+use p2p_core::PeerId;
 use p2p_core::RelayAddr;
 use sync_core::allowlist::AllowlistStorage;
 use sync_core::network::discovery::MeshMetadata;
@@ -428,7 +429,7 @@ async fn startup_inner(
     // `allowlist` Arc moves into `Daemon::new`) so the same cross-product feeds
     // both wires, computed once. The resulting `Vec<PeerRelay>` is handed to
     // `seed_peer_relays_snapshot` after `Daemon::new`.
-    let own_endpoint_id = sync_node.node_id();
+    let own_peer_id = sync_node.node_id();
     let supervisor_seed: Vec<PeerRelay> = {
         let allowlist_peers = match allowlist.list_peers().await {
             Ok(peers) => peers,
@@ -439,24 +440,24 @@ async fn startup_inner(
         };
         let mut seed = Vec::new();
         for peer in &allowlist_peers {
-            let endpoint_id = match EndpointId::from_bytes(peer.node_id.as_bytes()) {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("Skipping invalid allowlist peer for peer-relay seed: {e}");
-                    continue;
-                }
-            };
+            // Validate the peer key, skipping a legacy/non-curve-point id
+            // gracefully (never panicking) — the deliberate degrade this seed has
+            // always done. The seed itself speaks `PeerId`.
+            if EndpointId::from_bytes(peer.node_id.as_bytes()).is_err() {
+                warn!("Skipping invalid allowlist peer for peer-relay seed");
+                continue;
+            }
             // Skip self: the first-pair bootstrap adds this node to its OWN
             // allowlist, but seeding ourselves would make the supervisor (and
             // gossip bootstrap) try to dial this node through a relay — iroh
             // rejects self-directed relay paths. Mirrors `add_peer_relay`'s
             // self-skip on the live lookup.
-            if endpoint_id == own_endpoint_id {
+            if peer.node_id == own_peer_id {
                 continue;
             }
             let endpoint_hex = peer.node_id.to_string();
             for relay in &public_relays {
-                sync_node.add_peer_relay(endpoint_id, relay);
+                sync_node.add_peer_relay(peer.node_id, relay);
                 seed.push(PeerRelay::new(endpoint_hex.clone(), relay.as_str()));
             }
         }
@@ -484,10 +485,12 @@ async fn startup_inner(
     };
     sync_node.publish_mesh_info(&mesh_metadata, relay_url.as_ref());
 
-    let bootstrap_ids: Vec<EndpointId> = match allowlist.list_peers().await {
+    let bootstrap_ids: Vec<PeerId> = match allowlist.list_peers().await {
         Ok(peers) => peers
             .iter()
-            .filter_map(|p| {
+            // Validate each key, skipping a non-curve-point id gracefully (it could
+            // never be a reachable bootstrap target); keep the `PeerId`.
+            .filter(|p| {
                 EndpointId::from_bytes(p.node_id.as_bytes())
                     .map_err(|e| {
                         warn!(
@@ -495,8 +498,9 @@ async fn startup_inner(
                             e
                         )
                     })
-                    .ok()
+                    .is_ok()
             })
+            .map(|p| p.node_id)
             .collect(),
         Err(e) => {
             warn!("Failed to read allowlist for gossip bootstrap: {}", e);

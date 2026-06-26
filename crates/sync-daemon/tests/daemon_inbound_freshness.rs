@@ -80,10 +80,14 @@ mod daemon_inbound_freshness {
         // wire format is sync-core's `[u32 LE len][bytes]` (re-derived here, as the
         // daemon's own `write_frame` does — see `sync_stream.rs`).
         let opener = initiator.vault.lock().await.prepare_request().await?;
+        // `node_id()` is now a `PeerId`; the raw iroh `connect` wants its
+        // `EndpointId` (same 32 bytes).
+        let responder_endpoint =
+            iroh::EndpointId::from_bytes(responder.node_id().as_bytes()).unwrap();
         let connection = initiator
             .sync_node
             .endpoint
-            .connect(responder.node_id(), sync_core::network::SYNC_ALPN)
+            .connect(responder_endpoint, sync_core::network::SYNC_ALPN)
             .await?;
         let (mut send, _recv) = connection.open_bi().await?;
         let len = u32::try_from(opener.len()).expect("opener fits in u32");
