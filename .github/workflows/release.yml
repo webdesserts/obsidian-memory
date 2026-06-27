@@ -367,3 +367,46 @@ jobs:
     secrets: inherit
     permissions:
       "packages": "write"
+
+  # Build + self-sign the desktop Tauri .dmg and attach it to the Release.
+  # This is intentionally NON-GATING: cargo-dist (the homebrew/CLI cut) is the
+  # must-ship, and a dmg hiccup must never block it. `continue-on-error: true`
+  # plus the fact that no cargo-dist job lists this job in `needs` keeps it
+  # decoupled; it hangs off `host` only so the Release exists before upload.
+  build-desktop-dmg:
+    name: build-desktop-dmg (aarch64-apple-darwin)
+    needs:
+      - host
+    runs-on: "macos-14"
+    continue-on-error: true
+    permissions:
+      "contents": "write"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+      # `cargo tauri build` runs tauri.conf.json's beforeBuildCommand
+      # (npm ci + build in frontend/) to produce the gitignored frontend/dist,
+      # then bundles the .app + .dmg per bundle.targets ["app","dmg"].
+      - name: Bundle .app/.dmg
+        working-directory: crates/desktop
+        run: cargo tauri build
+      # Ad-hoc self-sign (no Developer ID, no notarization). Gatekeeper will
+      # show "unidentified developer" — users right-click → Open.
+      - name: Ad-hoc self-sign the .app
+        run: |
+          APP=$(ls -d target/release/bundle/macos/*.app)
+          codesign -s - --force --deep "$APP"
+          codesign --verify -vvv "$APP" || true
+      - name: Upload dmg to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG=$(ls target/release/bundle/dmg/*.dmg | head -1)
+          gh release upload "$GITHUB_REF_NAME" "$DMG" --repo "$GITHUB_REPOSITORY" --clobber

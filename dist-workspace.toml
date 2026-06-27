@@ -29,6 +29,9 @@ default-features = false
 # `--workspace`, so the non-dist `desktop`/`sync-daemon` crates (dist = false)
 # are never compiled — `desktop`'s GTK/Tauri deps break the cross-target builds.
 precise-builds = true
+# The release workflow is hand-augmented with a `build-desktop-dmg` job that dist
+# doesn't generate; tell dist not to enforce ci-file freshness against it.
+allow-dirty = ["ci"]
 # Custom build setup to download model before building
 github-build-setup = "../build-setup.yml"
 # Post-announce jobs to run in CI

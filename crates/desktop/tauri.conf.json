@@ -3,6 +3,7 @@
   "productName": "Memory",
   "identifier": "com.webdesserts.obsidian-memory",
   "build": {
+    "beforeBuildCommand": "npm ci && npm run build",
     "frontendDist": "frontend/dist"
   },
   "app": {
