@@ -25,6 +25,10 @@ install-path = "CARGO_HOME"
 features = ["embedded-model", "sync"]
 # Whether default-features should be enabled with cargo build
 default-features = false
+# Build dist-eligible packages individually (`cargo build -p <pkg>`) instead of
+# `--workspace`, so the non-dist `desktop`/`sync-daemon` crates (dist = false)
+# are never compiled — `desktop`'s GTK/Tauri deps break the cross-target builds.
+precise-builds = true
 # Custom build setup to download model before building
 github-build-setup = "../build-setup.yml"
 # Post-announce jobs to run in CI
