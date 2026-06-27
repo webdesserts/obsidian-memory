@@ -33,7 +33,9 @@ pub struct EmbeddingManager {
     cache_path: PathBuf,
     /// Whether the model is loaded
     model_loaded: RwLock<bool>,
-    /// Path to the model directory
+    /// Path to the model directory (used by the runtime HuggingFace download path).
+    /// With `embedded-model` the model is baked into the binary, so this is unused in that build.
+    #[cfg_attr(feature = "embedded-model", allow(dead_code))]
     model_dir: PathBuf,
 }
 
