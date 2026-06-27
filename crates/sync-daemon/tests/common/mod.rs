@@ -8,8 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::address_lookup::memory::MemoryLookup;
-use p2p_core::RelayAddr;
+use p2p_core::{EndpointId, MemoryLookup, RelayAddr};
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::{SyncNode, SyncNodeSeam, gossip::VaultGossip};
 use sync_core::peer_id::{PeerId, VaultId};
@@ -35,8 +34,8 @@ pub fn seed(n: u8) -> [u8; 32] {
 /// raw iroh APIs — `MemoryLookup::get_endpoint_info`, `endpoint.connect`, etc. —
 /// which still speak iroh's id even though the daemon's public surface is `PeerId`.
 #[allow(dead_code)] // see RelayNode — per-binary common compilation
-pub fn endpoint_id(peer: PeerId) -> iroh::EndpointId {
-    iroh::EndpointId::from_bytes(peer.as_bytes()).expect("test PeerId is a valid key")
+pub fn endpoint_id(peer: PeerId) -> EndpointId {
+    EndpointId::from_bytes(peer.as_bytes()).expect("test PeerId is a valid key")
 }
 
 /// A relay-aware test node: an iroh `SyncNode` whose home relay is `relay_url`,

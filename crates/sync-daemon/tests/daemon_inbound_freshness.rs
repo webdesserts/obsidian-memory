@@ -12,7 +12,7 @@ mod daemon_inbound_freshness {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use iroh::address_lookup::memory::MemoryLookup;
+    use p2p_core::MemoryLookup;
     use tokio::sync::{Mutex, mpsc};
 
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};

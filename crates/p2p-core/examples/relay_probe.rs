@@ -11,8 +11,8 @@
 //! machinery. Point it at the embedded relay's local bind to test the server alone,
 //! or at the public URL to test the full Caddy + NAT-hairpin path:
 //!
-//!     cargo run -p sync-core --example relay_probe -- http://localhost:3340/
-//!     cargo run -p sync-core --example relay_probe -- https://umbra.computer/
+//!     cargo run -p p2p-core --example relay_probe -- http://localhost:3340/
+//!     cargo run -p p2p-core --example relay_probe -- https://umbra.computer/
 //!
 //! Set `RUST_LOG=iroh=debug,iroh_relay=debug` to watch the relay client handshake.
 

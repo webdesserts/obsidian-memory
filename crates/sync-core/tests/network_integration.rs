@@ -12,8 +12,7 @@ mod network_integration {
 
     use std::sync::Arc;
 
-    use iroh::{EndpointAddr, address_lookup::memory::MemoryLookup};
-    use p2p_core::PeerAddr;
+    use p2p_core::{EndpointAddr, MemoryLookup, PeerAddr};
     use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
     use sync_core::network::streams::InboundSyncRx;
     use sync_core::network::{

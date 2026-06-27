@@ -59,12 +59,12 @@ reqwest = "0.13.2"
 tempfile.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-# Iroh is no longer a PRODUCTION dependency — the daemon reaches the network
-# entirely through p2p-core. The integration tests still name iroh types directly
-# (MemoryLookup harness plumbing, the `_for_test` raw handles, hand-rolled gossip
-# scaffolding), so it stays a dev-dependency.
-iroh = { version = "1.0.0-rc.1", default-features = false }
-iroh-gossip = { version = "0.100", default-features = false, features = ["net"] }
+# Iroh is not a dependency of sync-daemon in any section. The integration tests
+# name iroh transport types through `p2p-core`'s `test-util` re-exports
+# (`MemoryLookup`, `EndpointId`, etc.); the `_for_test` raw handles reach iroh's
+# inherent methods via their return types. iroh / iroh-gossip arrive only
+# transitively through p2p-core. (The `"iroh_gossip::net=debug"` env-filter
+# strings in this suite are tracing target names, not crate references.)
 bincode.workspace = true
 anyhow.workspace = true
 # `test-util` exposes SyncNode::new_relay_only for the off-LAN/NAT repro tests.

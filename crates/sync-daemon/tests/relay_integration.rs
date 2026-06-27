@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::{EndpointId, RelayUrl, SecretKey, Watcher};
+use p2p_core::{EndpointId, RelayUrl, SecretKey, Watcher};
 use sync_core::allowlist::{AllowlistStorage, InMemoryAllowlist};
 use sync_core::network::gossip::GossipEvent;
 use sync_core::network::streams::connect_and_sync_raw;
