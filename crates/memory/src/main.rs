@@ -134,13 +134,22 @@ pub struct ReplaceOperation {
 pub struct ReplaceInNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
-    /// Array of edit operations. Each oldText must appear exactly once in the note.
+    /// Array of edit operations. Each oldText must appear exactly once within
+    /// the scoped content (the whole note, or just the section when `section`
+    /// is set).
     pub edits: Vec<ReplaceOperation>,
-    /// Content hash from ReadNote - required to verify note hasn't changed
+    /// Content hash from ReadNote - required to verify note hasn't changed.
+    /// When `section` is set, this is the section's hash (from a
+    /// section-scoped ReadNote), not the whole file's.
     pub content_hash: String,
     /// Preview changes without applying them (default: false)
     #[serde(default, rename = "dryRun")]
     pub dry_run: bool,
+    /// Optional section path (from the outline tool's `path` field) to
+    /// replace text within just one section instead of the whole note. When
+    /// set, `content_hash` scopes to that section only.
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 /// A single line-range edit operation for the EditNote tool
@@ -509,7 +518,7 @@ impl MemoryServer {
             .collect();
 
         let graph = self.graph().read().await;
-        tools::replace_in_note::execute(
+        tools::replace_in_note::execute_scoped(
             &self.config().vault_path,
             self.storage(),
             &graph,
@@ -517,6 +526,7 @@ impl MemoryServer {
             edits,
             &params.0.content_hash,
             params.0.dry_run,
+            params.0.section.as_deref(),
         )
         .await
     }
