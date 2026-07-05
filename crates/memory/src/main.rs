@@ -95,6 +95,13 @@ pub struct ReadNoteParams {
     pub note: String,
 }
 
+/// Parameters for the Outline tool
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OutlineParams {
+    /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
+    pub note: String,
+}
+
 /// Parameters for the WriteNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteNoteParams {
@@ -431,6 +438,17 @@ impl MemoryServer {
     ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         tools::read_note::execute(self.storage(), &graph, &params.0.note).await
+    }
+
+    #[tool(
+        description = "Discover a note's addressable sections (frontmatter, preamble, and heading-delimited sections) for section-scoped reads and writes on oversized notes. This is a fallback for oversized notes, not the primary editing path — prefer small, heavily-linked notes where possible. Returns a flat list of sections, each with a `path` — the literal string to pass as the `section` param of ReadNote, EditNote, or ReplaceInNote."
+    )]
+    async fn outline(
+        &self,
+        params: Parameters<OutlineParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let graph = self.graph().read().await;
+        tools::outline::execute(self.storage(), &graph, &params.0.note).await
     }
 
     #[tool(

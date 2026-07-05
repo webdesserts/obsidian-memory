@@ -66,12 +66,9 @@
 //! reads and writes: it returns exactly the inclusive line range joined with
 //! `"\n"`, nothing prepended or appended.
 
-// This module is pure library plumbing with no MCP tool wired to it yet -
-// the `outline` tool (next commit) and `read_note`/`edit_note`/
-// `replace_in_note` section support (following commits) are the callers.
-// Silence dead-code warnings until that wiring lands.
-#![allow(dead_code)]
-
 pub mod heading;
 pub mod outline;
+// `path::resolve_section` has no caller yet - `read_note`/`edit_note`/
+// `replace_in_note` section support (later commits) are the callers.
+#[allow(dead_code)]
 pub mod path;
