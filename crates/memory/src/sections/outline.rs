@@ -4,6 +4,7 @@
 
 use obsidian_fs::split_frontmatter;
 
+use super::heading;
 use super::heading::parse_headings;
 
 /// What kind of section this is.
@@ -68,7 +69,7 @@ pub fn build_outline(content: &str) -> Outline {
     let lines: Vec<&str> = content.split('\n').collect();
     let total_lines = lines.len();
 
-    let (frontmatter_yaml, _rest) = split_frontmatter(content);
+    let (frontmatter_yaml, body) = split_frontmatter(content);
     let mut body_start_line = 1;
 
     if let Some(yaml) = frontmatter_yaml {
@@ -92,7 +93,25 @@ pub fn build_outline(content: &str) -> Outline {
         body_start_line = closing_line + 1;
     }
 
-    let headings = parse_headings(content);
+    // Heading detection never scans the frontmatter-delimited region: an
+    // ordinary YAML full-line comment (e.g. "# a note about this field") is
+    // syntactically identical to an ATX heading and would otherwise leak a
+    // bogus heading into the outline. Parse only the post-frontmatter body,
+    // then offset each heading's line number back to be absolute within the
+    // whole file.
+    let heading_scan_target = if frontmatter_yaml.is_some() {
+        body
+    } else {
+        content
+    };
+    let line_offset = body_start_line - 1;
+    let headings: Vec<heading::HeadingLine> = parse_headings(heading_scan_target)
+        .into_iter()
+        .map(|h| heading::HeadingLine {
+            line: h.line + line_offset,
+            ..h
+        })
+        .collect();
     let first_heading_line = headings.first().map(|h| h.line);
 
     let preamble_end_line = first_heading_line.map(|l| l - 1).unwrap_or(total_lines);
@@ -279,6 +298,23 @@ more text";
             .find(|s| s.kind == SectionKind::Frontmatter)
             .expect("frontmatter section should be present even with invalid YAML");
         assert_eq!(frontmatter.end_line, 3);
+    }
+
+    #[test]
+    fn frontmatter_containing_a_bare_comment_line_produces_zero_headings_from_that_region() {
+        // A completely ordinary YAML full-line comment is syntactically
+        // identical to an ATX heading. Heading detection must never scan
+        // inside the frontmatter span, or this would inject a bogus heading.
+        let content = "---\n# a note about this field\ntitle: Test\n---\n# Real Heading\nbody";
+        let outline = build_outline(content);
+
+        let headings: Vec<&Section> = outline
+            .sections
+            .iter()
+            .filter(|s| s.kind == SectionKind::Heading)
+            .collect();
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].text, "Real Heading");
     }
 
     #[test]

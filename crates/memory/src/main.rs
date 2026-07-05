@@ -93,6 +93,11 @@ pub struct RememberParams {
 pub struct ReadNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
+    /// Optional section path (from the outline tool's `path` field) to read just
+    /// one section instead of the whole note, e.g. "Daily Log > 2026-W26-4".
+    /// content_hash then scopes to that section only.
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 /// Parameters for the Outline tool
@@ -437,7 +442,13 @@ impl MemoryServer {
         params: Parameters<ReadNoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
-        tools::read_note::execute(self.storage(), &graph, &params.0.note).await
+        tools::read_note::execute_scoped(
+            self.storage(),
+            &graph,
+            &params.0.note,
+            params.0.section.as_deref(),
+        )
+        .await
     }
 
     #[tool(

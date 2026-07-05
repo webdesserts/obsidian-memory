@@ -238,6 +238,19 @@ mod tests {
     }
 
     #[test]
+    fn fence_with_backtick_in_info_string_is_still_recognized_as_a_fence() {
+        // CommonMark disallows a backtick in a backtick-fence's info string
+        // (to avoid ambiguity with inline code spans), but that rule isn't
+        // enforced here - accepted looseness, pinned as documented behavior
+        // rather than left as an unspecified accident.
+        let content = "```rust `inline` \n# Not a heading\n```\n# Real Heading";
+        assert_eq!(
+            levels_and_texts(content),
+            vec![(1, "Real Heading".to_string())]
+        );
+    }
+
+    #[test]
     fn different_fence_character_nested_inside_does_not_close_outer_fence() {
         // A `~~~` marker appearing textually inside a ``` fence must not close it.
         let content = "```\n~~~\n# Not a heading\n```\n# Real Heading";

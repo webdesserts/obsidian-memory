@@ -68,7 +68,4 @@
 
 pub mod heading;
 pub mod outline;
-// `path::resolve_section` has no caller yet - `read_note`/`edit_note`/
-// `replace_in_note` section support (later commits) are the callers.
-#[allow(dead_code)]
 pub mod path;
