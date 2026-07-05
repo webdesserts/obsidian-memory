@@ -21,6 +21,7 @@ mod config;
 mod embeddings;
 mod graph;
 mod projects;
+mod sections;
 mod storage;
 mod tools;
 mod watcher;
