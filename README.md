@@ -159,9 +159,11 @@ The `Search` tool combines semantic embeddings with graph structure:
 |------|-------------|
 | `Remember` | Load session context (Working Memory, Log, weekly journal, project notes) at session start |
 | `Search` | Find notes by semantic similarity. Supports `query` and `debug` parameters |
-| `ReadNote` | Read full content of a note |
+| `ReadNote` | Read full content of a note, or just one section with the optional `section` param |
+| `Outline` | Discover a note's addressable sections (frontmatter, preamble, headings) for section-scoped reads and writes on oversized notes |
 | `WriteNote` | Create or overwrite a note |
-| `EditNote` | Make text replacements in a note (find/replace) |
+| `EditNote` | Replace lines in a note by line number (line-range edits). Supports the optional `section` param to scope to one section, with line numbers relative to that section |
+| `ReplaceInNote` | Make text replacements in a note (find/replace). Supports the optional `section` param to scope to one section |
 | `MoveNote` | Move/rename a note (automatically updates wiki-links in other notes) |
 | `DeleteNote` | Delete a note from the vault |
 | `GetNoteInfo` | Get metadata, frontmatter, and links for a note |

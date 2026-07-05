@@ -501,7 +501,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits."
+        description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits. Optionally pass `section` (a path from the Outline tool) to scope oldText matching to just that section instead of the whole note - content_hash then refers to the section's hash."
     )]
     async fn replace_in_note(
         &self,
@@ -532,7 +532,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Replace lines in a note by line number. Each edit specifies a startLine and endLine (1-indexed, inclusive, matching ReadNote output) and newText to replace that range. Use empty newText to delete lines. Ranges must not overlap. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits."
+        description = "Replace lines in a note by line number. Each edit specifies a startLine and endLine (1-indexed, inclusive, matching ReadNote output) and newText to replace that range. Use empty newText to delete lines. Ranges must not overlap. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits. Optionally pass `section` (a path from the Outline tool) to scope the edit to just that section instead of the whole note - when set, startLine/endLine become relative to the section (line 1 = the section's own heading line) and content_hash refers to the section's hash."
     )]
     async fn edit_note(
         &self,

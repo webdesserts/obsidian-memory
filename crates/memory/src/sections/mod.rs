@@ -64,7 +64,21 @@
 //! trailing-newline "phantom empty final line" convention).
 //! [`outline::extract_section`] is the single extraction path used by both
 //! reads and writes: it returns exactly the inclusive line range joined with
-//! `"\n"`, nothing prepended or appended.
+//! `"\n"`, nothing prepended or appended. A no-op [`write::splice_section`]
+//! (replacing a section's range with the exact content that was extracted
+//! from it) reproduces the input byte-for-byte.
+//!
+//! ## Writes
+//!
+//! [`write::resolve_section_for_write`] is the single write-side entry point,
+//! used by both `edit_note` and `replace_in_note`: it builds a fresh outline
+//! of the current file content, resolves the path, extracts the section, and
+//! hash-verifies it against the caller's expected hash before returning the
+//! section's absolute line range and content for editing. Resolving fresh
+//! (rather than against a cached outline) is what makes "the section moved"
+//! safe - a section is re-located by path at write time, so an earlier
+//! sibling section growing or shrinking doesn't invalidate the target
+//! section's hash. Only a change to the target section's own content does.
 
 pub mod heading;
 pub mod outline;
