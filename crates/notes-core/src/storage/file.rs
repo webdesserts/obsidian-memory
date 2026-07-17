@@ -11,16 +11,41 @@ use super::traits::{NoteMetadata, Storage, StorageError, WriteResult};
 
 /// Filesystem storage backend.
 ///
-/// Stores notes as markdown files in the vault directory.
+/// Stores notes as markdown files in the vault directory by default.
 /// Uses SHA-256 hashing for optimistic locking.
 pub struct FileStorage {
     vault_path: PathBuf,
+    /// Extension appended to a URI that doesn't already carry it, without the
+    /// leading dot (e.g. `Some("md".to_string())`). `None` means URIs map to
+    /// paths verbatim - no extension is appended, stripped, or filtered on.
+    extension: Option<String>,
 }
 
 impl FileStorage {
-    /// Create a new FileStorage for the given vault path.
+    /// Create a new FileStorage for the given vault path, appending `.md` to
+    /// any URI that doesn't already carry it. This is the MCP server's
+    /// original, byte-for-byte-preserved behavior.
     pub fn new(vault_path: PathBuf) -> Self {
-        Self { vault_path }
+        Self::with_extension(vault_path, Some("md"))
+    }
+
+    /// Create a new FileStorage with an explicit extension policy.
+    ///
+    /// `Some(ext)` (without the leading dot) appends `.{ext}` to a URI that
+    /// doesn't already carry it - matching `new`'s default when `ext` is
+    /// `"md"`. `None` maps URIs to paths verbatim, with no extension
+    /// appended, stripped, or filtered on - for extension-agnostic
+    /// consumers that don't store Markdown.
+    pub fn with_extension(vault_path: PathBuf, extension: Option<impl Into<String>>) -> Self {
+        Self {
+            vault_path,
+            extension: extension.map(Into::into),
+        }
+    }
+
+    /// This storage's extension suffix (`".{ext}"`), if any.
+    fn extension_suffix(&self) -> Option<String> {
+        self.extension.as_ref().map(|ext| format!(".{ext}"))
     }
 
     /// Convert a memory URI to a filesystem path.
@@ -33,11 +58,10 @@ impl FileStorage {
             reason: e.to_string(),
         })?;
 
-        // Add .md extension if not present
-        let with_ext = if clean.ends_with(".md") {
-            clean
-        } else {
-            format!("{}.md", clean)
+        // Add the extension if configured and not already present
+        let with_ext = match self.extension_suffix() {
+            Some(suffix) if !clean.ends_with(&suffix) => format!("{clean}{suffix}"),
+            _ => clean,
         };
 
         Ok(self.vault_path.join(with_ext))
@@ -51,7 +75,10 @@ impl FileStorage {
         path.strip_prefix(&self.vault_path)
             .ok()
             .and_then(|rel| rel.to_str())
-            .map(|s| s.strip_suffix(".md").unwrap_or(s).to_string())
+            .map(|s| match self.extension_suffix() {
+                Some(suffix) => s.strip_suffix(&suffix).unwrap_or(s).to_string(),
+                None => s.to_string(),
+            })
     }
 
     /// Compute SHA-256 hash of content.
@@ -239,7 +266,17 @@ impl Storage for FileStorage {
 }
 
 impl FileStorage {
-    /// Recursively list markdown files in a directory.
+    /// Whether `file_name` matches this storage's extension policy - always
+    /// true when no extension is configured (`None`).
+    fn matches_extension(&self, file_name: &str) -> bool {
+        match self.extension_suffix() {
+            Some(suffix) => file_name.ends_with(&suffix),
+            None => true,
+        }
+    }
+
+    /// Recursively list files matching this storage's extension policy in a
+    /// directory (markdown files, by default).
     // kept: backs the `list` trait method, which only the FileStorage tests exercise today.
     #[allow(dead_code)]
     async fn list_recursive(
@@ -263,7 +300,7 @@ impl FileStorage {
             if file_type.is_dir() {
                 Box::pin(self.list_recursive(&path, notes)).await?;
             } else if file_type.is_file()
-                && file_name_str.ends_with(".md")
+                && self.matches_extension(&file_name_str)
                 && let Some(uri) = self.path_to_uri(&path)
             {
                 notes.push(uri);
@@ -460,6 +497,37 @@ mod tests {
 
         // Read with extension also works (URI normalization)
         let (content, _) = storage.read("test.md").await.unwrap();
+        assert_eq!(content, "content");
+    }
+
+    #[tokio::test]
+    async fn test_with_extension_none_maps_uris_to_paths_verbatim() {
+        let temp = TempDir::new().unwrap();
+        let storage = FileStorage::with_extension(temp.path().to_path_buf(), None::<&str>);
+
+        storage.write("test", "content", None).await.unwrap();
+
+        // No extension was appended - the URI is the exact file name.
+        assert!(temp.path().join("test").exists());
+        assert!(!temp.path().join("test.md").exists());
+
+        let (content, _) = storage.read("test").await.unwrap();
+        assert_eq!(content, "content");
+
+        // list() only respects an extension filter when one is configured.
+        let listed = storage.list("").await.unwrap();
+        assert_eq!(listed, vec!["test"]);
+    }
+
+    #[tokio::test]
+    async fn test_with_extension_supports_a_non_md_extension() {
+        let temp = TempDir::new().unwrap();
+        let storage = FileStorage::with_extension(temp.path().to_path_buf(), Some("txt"));
+
+        storage.write("test", "content", None).await.unwrap();
+
+        assert!(temp.path().join("test.txt").exists());
+        let (content, _) = storage.read("test").await.unwrap();
         assert_eq!(content, "content");
     }
 }
