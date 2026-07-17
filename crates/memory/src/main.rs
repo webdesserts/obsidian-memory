@@ -21,10 +21,14 @@ mod config;
 mod embeddings;
 mod graph;
 mod projects;
-mod sections;
-mod storage;
 mod tools;
 mod watcher;
+
+// `sections`/`storage` moved to the `notes-core` crate (autonomy#69); these
+// re-exports keep every existing `crate::sections::...`/`crate::storage::...`
+// path in `tools/*.rs` resolving unchanged.
+use notes_core::sections;
+use notes_core::storage;
 
 use config::Config;
 use embeddings::EmbeddingManager;

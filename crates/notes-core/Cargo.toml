@@ -1,0 +1,23 @@
+[package]
+name = "notes-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Note-editing core: outline/section addressing and content-hash-guarded storage, shared by the MCP server and other note-editing consumers"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+obsidian-fs = { path = "../obsidian-fs" }
+
+async-trait.workspace = true
+tokio.workspace = true
+rand.workspace = true
+
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
