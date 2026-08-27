@@ -202,14 +202,24 @@ fn parse_path(path: &str) -> (Option<String>, String, Option<String>) {
 }
 
 /// Extract all unique note names from wiki links in content
+///
+/// A link's `name`/`extension` split can't distinguish a genuinely dotted note
+/// name (`[[llama.cpp]]`) from an explicit `.md`-suffixed link (`[[Note.md]]`) —
+/// both split at the last dot. Only the latter should have its extension
+/// stripped, to match how a real file's `Path::file_stem()` only ever strips a
+/// trailing `.md`; any other extension is kept as part of the note's name.
 pub fn extract_linked_notes(content: &str) -> Vec<String> {
     let links = parse_wiki_links(content);
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
 
     for link in links {
-        if seen.insert(link.name.clone()) {
-            result.push(link.name);
+        let note_name = match link.extension.as_deref() {
+            Some("md") => link.name.clone(),
+            _ => link.file_name(),
+        };
+        if seen.insert(note_name.clone()) {
+            result.push(note_name);
         }
     }
 
@@ -384,5 +394,41 @@ mod tests {
         let notes = extract_linked_notes(content);
 
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn extract_dotted_note_name() {
+        let content = "[[llama.cpp]]";
+        let notes = extract_linked_notes(content);
+
+        assert_eq!(notes, vec!["llama.cpp".to_string()]);
+    }
+
+    #[test]
+    fn extract_dotted_note_name_with_decimal_version() {
+        let content = "[[Qwen 3.8]]";
+        let notes = extract_linked_notes(content);
+
+        assert_eq!(notes, vec!["Qwen 3.8".to_string()]);
+    }
+
+    #[test]
+    fn extract_dotted_note_name_strips_parent_path() {
+        let content = "[[knowledge/llama.cpp]]";
+        let notes = extract_linked_notes(content);
+
+        assert_eq!(notes, vec!["llama.cpp".to_string()]);
+    }
+
+    #[test]
+    fn extract_explicit_md_extension_still_strips_it() {
+        // Guard: an explicit `.md`-suffixed link is indistinguishable from a
+        // dotted name at the parser level (both split at the last dot), so the
+        // extractor must special-case exactly this extension to match
+        // `Path::file_stem()`'s behavior on the corresponding file.
+        let content = "[[Note.md]]";
+        let notes = extract_linked_notes(content);
+
+        assert_eq!(notes, vec!["Note".to_string()]);
     }
 }

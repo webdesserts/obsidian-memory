@@ -241,6 +241,55 @@ mod tests {
         assert!(text.contains("Note A"));
     }
 
+    /// Builds a vault through the real content -> extractor -> graph path
+    /// (`GraphIndex::initialize`), unlike `create_test_vault()`'s hand-typed
+    /// `update_note` calls which bypass `extract_linked_notes` entirely and so
+    /// can't catch bugs in the extractor itself.
+    async fn create_dotted_link_vault() -> (TempDir, GraphIndex) {
+        let temp_dir = TempDir::new().unwrap();
+        let vault_path = temp_dir.path();
+
+        fs::write(vault_path.join("llama.cpp.md"), "Notes on llama.cpp")
+            .await
+            .unwrap();
+
+        fs::write(
+            vault_path.join("Note About Llama.md"),
+            "See [[llama.cpp]] for details",
+        )
+        .await
+        .unwrap();
+
+        let mut graph = GraphIndex::new();
+        graph.initialize(vault_path).await.unwrap();
+
+        (temp_dir, graph)
+    }
+
+    #[tokio::test]
+    async fn test_get_note_with_dotted_name_shows_real_backlinks() {
+        let (temp_dir, graph) = create_dotted_link_vault().await;
+
+        let result = execute(temp_dir.path(), "test-vault", &graph, "llama.cpp")
+            .await
+            .expect("should succeed");
+
+        let text = result.content[0]
+            .raw
+            .as_text()
+            .expect("Expected text")
+            .text
+            .clone();
+
+        // The dotted note indexes under its full name and shows the real backlink.
+        assert!(text.contains("Linked from:"));
+        assert!(text.contains("Note About Llama"));
+
+        // No phantom "llama" entry (the extension-truncated name) exists anywhere
+        // in the graph.
+        assert!(graph.get_backlinks("llama").is_none());
+    }
+
     #[tokio::test]
     async fn test_normalizes_note_reference() {
         let (temp_dir, graph) = create_test_vault().await;
