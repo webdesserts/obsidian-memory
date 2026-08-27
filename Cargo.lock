@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "auth-service"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "memory-common",
@@ -4677,7 +4677,7 @@ dependencies = [
 
 [[package]]
 name = "memory"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "memory-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "dirs 6.0.0",
  "tempfile",
@@ -5126,7 +5126,7 @@ dependencies = [
 
 [[package]]
 name = "notes-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "hex",
@@ -5570,7 +5570,7 @@ dependencies = [
 
 [[package]]
 name = "obsidian-fs"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5701,7 +5701,7 @@ dependencies = [
 
 [[package]]
 name = "p2p-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7193,7 +7193,7 @@ dependencies = [
 
 [[package]]
 name = "semantic-embeddings"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -7896,7 +7896,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7921,7 +7921,7 @@ dependencies = [
 
 [[package]]
 name = "sync-daemon"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9225,7 +9225,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vault-sync"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -9686,7 +9686,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "wiki-links"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
 ]
