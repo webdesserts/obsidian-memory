@@ -41,7 +41,7 @@ EXPOSE 3001
 
 # Health check — identical to the canonical image
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:3001/.well-known/oauth-authorization-server > /dev/null || exit 1
+    CMD curl -sf http://localhost:3001/setup > /dev/null || exit 1
 
 ENTRYPOINT ["auth-service"]
 CMD ["--port", "3001", "--bind", "0.0.0.0", "--config-path", "/config"]

@@ -1,5 +1,5 @@
 services:
-  # OAuth 2.1 + API key authentication
+  # API key authentication
   auth-service:
     image: ghcr.io/webdesserts/auth-service:${VERSION:-latest}
     volumes:
@@ -79,7 +79,7 @@ volumes:
       o: bind
       device: ${NOTES_PATH:?NOTES_PATH must be set to vault directory}
 
-  # Persistent config for auth service (tokens, clients, API keys)
+  # Persistent config for auth service (users, passkeys, sessions, API keys)
   auth-config:
 
 networks:

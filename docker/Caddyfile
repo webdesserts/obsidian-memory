@@ -1,44 +1,7 @@
 # Obsidian Memory VPS Stack
-# TLS via Let's Encrypt, OAuth routing, forward_auth for MCP
+# TLS via Let's Encrypt, forward_auth for MCP
 
 {$DOMAIN} {
-    # OAuth metadata discovery at root (MCP spec requires this)
-    handle /.well-known/oauth-authorization-server {
-        reverse_proxy auth-service:3001 {
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
-
-    # OAuth metadata discovery (legacy /auth path)
-    handle /auth/.well-known/oauth-authorization-server {
-        uri strip_prefix /auth
-        reverse_proxy auth-service:3001 {
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
-
-    # OAuth endpoints (public)
-    handle /auth/register {
-        uri strip_prefix /auth
-        reverse_proxy auth-service:3001 {
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
-
-    handle /auth/authorize* {
-        uri strip_prefix /auth
-        reverse_proxy auth-service:3001 {
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
-
-    handle /auth/token {
-        uri strip_prefix /auth
-        reverse_proxy auth-service:3001 {
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
-
     # Setup endpoint for first-time passkey registration (public but rate-limited)
     handle /auth/setup* {
         uri strip_prefix /auth
@@ -63,7 +26,7 @@
         }
     }
 
-    # Protected MCP endpoint - requires valid OAuth token or API key
+    # Protected MCP endpoint - requires a valid API key
     handle /mcp* {
         forward_auth auth-service:3001 {
             uri /validate
