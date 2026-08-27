@@ -401,6 +401,43 @@ mod tests {
     }
 
     #[test]
+    fn test_embed_links_create_backlinks_but_not_phantom_paths() {
+        // Belt-and-suspenders for c2's "no phantom note entries" guarantee: it
+        // holds structurally at this layer regardless of the wiki-links
+        // extractor fix, since `name_to_paths` is only ever populated from real
+        // vault files (via `index_file`), never from a note's link targets.
+        let mut index = GraphIndex::new();
+
+        let links: HashSet<String> = ["diagram.png".to_string()].into_iter().collect();
+        index.update_note("Note A", PathBuf::from("Note A.md"), links);
+
+        assert!(
+            index
+                .get_backlinks("diagram.png")
+                .unwrap()
+                .contains("Note A.md")
+        );
+        assert!(index.get_paths_for_name("diagram.png").is_none());
+    }
+
+    #[test]
+    fn test_backlinks_for_dotted_note_name() {
+        // Belt-and-suspenders: GraphIndex itself is agnostic to dots in note
+        // names — the whole bug lived in the extractor, not here.
+        let mut index = GraphIndex::new();
+
+        let links: HashSet<String> = ["llama.cpp".to_string()].into_iter().collect();
+        index.update_note("Note A", PathBuf::from("Note A.md"), links);
+
+        assert!(
+            index
+                .get_backlinks("llama.cpp")
+                .unwrap()
+                .contains("Note A.md")
+        );
+    }
+
+    #[test]
     fn test_same_name_different_folders() {
         let mut index = GraphIndex::new();
 
