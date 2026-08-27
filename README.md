@@ -52,7 +52,7 @@ DOMAIN=example.com NOTES_PATH=/path/to/vault docker compose up -d
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DOMAIN` | Yes | Public domain for OAuth URLs (e.g., `example.com`) |
+| `DOMAIN` | Yes | Public domain for the service (used for TLS and WebAuthn origin, e.g., `example.com`) |
 | `NOTES_PATH` | Yes | Absolute path to vault directory on the host |
 | `VERSION` | No | Image tag (defaults to `latest`) |
 | `RUST_LOG` | No | Log level (defaults to `info`) |
@@ -67,7 +67,6 @@ docker network create proxy
 
 The services don't handle TLS or authentication routing themselves — that's the reverse proxy's job. See [`docker/Caddyfile`](docker/Caddyfile) for a working Caddy example. Any reverse proxy needs to handle:
 
-- **OAuth discovery** — `/.well-known/oauth-authorization-server` → `auth-service:3001`
 - **Auth endpoints** — `/auth/*` → `auth-service:3001` (strip the `/auth` prefix)
 - **MCP endpoint** — `/mcp*` → `memory:3000` (protected via auth delegation to `auth-service:3001/validate`)
 - **Sync WebSocket** — `/sync` → `memory:8080`
