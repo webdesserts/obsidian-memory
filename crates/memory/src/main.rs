@@ -564,35 +564,17 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Replace lines in a note by line number. Each edit specifies a startLine and endLine (1-indexed, inclusive, matching ReadNote output) and newText to replace that range. Use empty newText to delete lines. Ranges must not overlap. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits. Optionally pass `section` (a path from the Outline tool) to scope the edit to just that section instead of the whole note - when set, startLine/endLine become relative to the section (line 1 = the section's own heading line) and content_hash refers to the section's hash."
+        description = "Retired - merged into WriteNote. Use write_note with an optional `section` parameter for section-scoped writes instead."
     )]
     async fn edit_note(
         &self,
-        params: Parameters<EditNoteParams>,
+        _params: Parameters<EditNoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let edits: Vec<tools::edit_note::LineEdit> = params
-            .0
-            .edits
-            .into_iter()
-            .map(|e| tools::edit_note::LineEdit {
-                start_line: e.start_line,
-                end_line: e.end_line,
-                new_text: e.new_text,
-            })
-            .collect();
-
-        let graph = self.graph().read().await;
-        tools::edit_note::execute_scoped(
-            &self.config().vault_path,
-            self.storage(),
-            &graph,
-            &params.0.note,
-            edits,
-            &params.0.content_hash,
-            params.0.dry_run,
-            params.0.section.as_deref(),
-        )
-        .await
+        Err(ErrorData::invalid_params(
+            "edit_note has been merged into write_note. Use write_note with an optional \
+             `section` parameter for section-scoped writes.",
+            None,
+        ))
     }
 
     #[tool(
