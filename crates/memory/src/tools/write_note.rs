@@ -831,6 +831,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_edit_section_not_found_maps_to_teaching_error() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        fs::write(temp_dir.path().join("test.md"), "# A\nbody")
+            .await
+            .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let result = execute_scoped(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            "# Nonexistent\nreplacement",
+            Some("irrelevant_hash"),
+            Some("Nonexistent"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Section not found: Nonexistent"));
+        assert!(err.message.contains("outline"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_section_ambiguous_path_maps_to_teaching_error() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        fs::write(
+            temp_dir.path().join("test.md"),
+            "# Notes\nfirst\n# Notes\nsecond",
+        )
+        .await
+        .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let result = execute_scoped(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            "# Notes\nreplacement",
+            Some("irrelevant_hash"),
+            Some("Notes"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("ambiguous"));
+        assert!(err.message.contains("matches: Notes, Notes"));
+        assert!(err.message.contains("disambiguate"));
+    }
+
+    #[tokio::test]
+    async fn test_create_section_ambiguous_existing_path_maps_to_teaching_error() {
+        let (temp_dir, storage, mut graph) = create_test_env().await;
+
+        fs::write(
+            temp_dir.path().join("test.md"),
+            "# Notes\nfirst\n# Notes\nsecond",
+        )
+        .await
+        .unwrap();
+        graph.update_note("test", PathBuf::from("test.md"), HashSet::new());
+
+        let result = execute_scoped(
+            temp_dir.path(),
+            &storage,
+            &graph,
+            "test",
+            "new body",
+            None,
+            Some("Notes"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("ambiguous"));
+        assert!(err.message.contains("matches: Notes, Notes"));
+        assert!(err.message.contains("disambiguate"));
+    }
+
+    #[tokio::test]
     async fn test_edit_section_note_does_not_exist_errors() {
         let (temp_dir, storage, graph) = create_test_env().await;
 
