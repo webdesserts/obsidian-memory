@@ -17,8 +17,8 @@ use crate::storage::{Storage, StorageError};
 /// themselves.
 #[derive(Serialize)]
 pub struct OutlineSectionEntry {
-    /// The literal string to pass as the `section` param of `read_note`,
-    /// `edit_note`, or `replace_in_note`.
+    /// The literal string to pass as the `section` param of `read_note` or
+    /// `write_note`.
     pub path: String,
     /// "heading" | "frontmatter" | "preamble"
     pub kind: &'static str,
@@ -56,8 +56,8 @@ fn kind_str(kind: SectionKind) -> &'static str {
 ///
 /// Returns the flat list of a note's addressable sections (frontmatter,
 /// preamble, and heading-delimited sections). `path` values in the response
-/// are the literal strings to pass as the `section` param of `read_note`,
-/// `edit_note`, or `replace_in_note`.
+/// are the literal strings to pass as the `section` param of `read_note` or
+/// `write_note`.
 pub async fn execute<S: Storage>(
     storage: &S,
     graph: &GraphIndex,

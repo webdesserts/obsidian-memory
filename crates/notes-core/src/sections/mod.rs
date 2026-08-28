@@ -70,15 +70,23 @@
 //!
 //! ## Writes
 //!
-//! [`write::resolve_section_for_write`] is the single write-side entry point,
-//! used by both `edit_note` and `replace_in_note`: it builds a fresh outline
-//! of the current file content, resolves the path, extracts the section, and
-//! hash-verifies it against the caller's expected hash before returning the
-//! section's absolute line range and content for editing. Resolving fresh
-//! (rather than against a cached outline) is what makes "the section moved"
-//! safe - a section is re-located by path at write time, so an earlier
-//! sibling section growing or shrinking doesn't invalidate the target
-//! section's hash. Only a change to the target section's own content does.
+//! [`write::resolve_section_for_write`] is the single write-side entry point
+//! for editing an *existing* section, used by `write_note`'s section-scoped
+//! edit branch: it builds a fresh outline of the current file content,
+//! resolves the path, extracts the section, and hash-verifies it against the
+//! caller's expected hash before returning the section's absolute line range
+//! and content for editing. Resolving fresh (rather than against a cached
+//! outline) is what makes "the section moved" safe - a section is
+//! re-located by path at write time, so an earlier sibling section growing
+//! or shrinking doesn't invalidate the target section's hash. Only a change
+//! to the target section's own content does.
+//!
+//! [`create::create_section`] is the counterpart for *creating* a section
+//! that doesn't exist yet, used by `write_note`'s section-scoped create
+//! branch (triggered by an absent `content_hash`): given a heading path, it
+//! finds the deepest existing ancestor, synthesizes whatever heading chain
+//! is missing (cascading one level per missing segment, capped at level 6),
+//! and splices the new leaf in as that ancestor's last child.
 
 pub mod create;
 pub mod heading;

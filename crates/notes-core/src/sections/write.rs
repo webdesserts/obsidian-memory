@@ -1,6 +1,7 @@
-//! Section write resolution: the shared helper both `edit_note` and
-//! `replace_in_note` use to locate a section fresh, verify its hash, and
-//! splice modified content back into the full file.
+//! Section write resolution: the helper `write_note` uses to locate an
+//! existing section fresh, verify its hash, and splice modified content
+//! back into the full file (the create-side counterpart, for sections that
+//! don't exist yet, is `super::create`).
 
 use super::outline::{build_outline, extract_section};
 use super::path::{SectionResolveError, resolve_section};
@@ -39,9 +40,10 @@ pub struct ResolvedSectionWrite {
 /// Build a fresh outline of `full_content`, resolve `path` against it, extract
 /// the matched section, and verify its hash against `expected_hash`.
 ///
-/// This is the single resolution entry point for section-scoped writes - both
-/// `edit_note` and `replace_in_note` call this rather than re-implementing
-/// matching. Resolving fresh (not against a caller-cached outline) is what
+/// This is the single resolution entry point for editing an existing
+/// section - `write_note`'s section-scoped edit branch calls this rather
+/// than re-implementing matching. Resolving fresh (not against a
+/// caller-cached outline) is what
 /// makes "the section moved" safe: a section is re-located by path at write
 /// time, so shifted line numbers from an earlier edit don't matter as long as
 /// the target section's own content hasn't changed.

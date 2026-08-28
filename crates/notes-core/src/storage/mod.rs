@@ -14,8 +14,8 @@ mod traits;
 pub use content_hash::ContentHash;
 pub use file::FileStorage;
 // kept: NoteMetadata/WriteResult have no production consumer outside this
-// crate's own Storage impls, but need to be `pub` here so test-only Storage
-// wrappers (e.g. edit_note.rs's ForceWriteHashMismatchStorage) can implement
-// the trait's exact read()/write() signatures.
+// crate's own Storage impls, but need to be `pub` here so any external
+// Storage trait impl (e.g. a test-only wrapper simulating a specific
+// failure) can implement the trait's exact read()/write() signatures.
 #[allow(unused_imports)]
 pub use traits::{NoteMetadata, Storage, StorageError, WriteResult};

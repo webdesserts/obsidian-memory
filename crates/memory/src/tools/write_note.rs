@@ -83,7 +83,7 @@ fn map_write_error(e: StorageError) -> ErrorData {
 // kept: the MCP tool handler in main.rs calls execute_scoped directly, so
 // this has no production caller, but every existing test (in this file and
 // cross-file callers) still calls execute() unchanged, matching the
-// edit_note::execute / replace_in_note::execute precedent.
+// read_note::execute precedent.
 #[allow(dead_code)]
 pub async fn execute<S: Storage>(
     vault_path: &Path,
@@ -124,8 +124,10 @@ pub async fn execute<S: Storage>(
 ///   heading line (unlike create, since there's no heading to synthesize -
 ///   it's already there). The section is re-resolved fresh by path against
 ///   the current file and hash-verified before splicing, reusing
-///   `resolve_section_for_write`/`splice_section` - the same machinery
-///   `edit_note` and `replace_in_note` use for section-scoped edits.
+///   `resolve_section_for_write`/`splice_section`, the same machinery that
+///   used to be shared with `edit_note`/`replace_in_note`'s own
+///   section-scoped edits before both retired that capability in favor of
+///   this tool.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_scoped<S: Storage>(
     _vault_path: &Path,

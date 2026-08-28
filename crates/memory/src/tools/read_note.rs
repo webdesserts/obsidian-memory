@@ -31,7 +31,7 @@ pub fn number_lines(content: &str) -> String {
 pub struct ReadNoteResponse {
     /// The content of the note
     pub content: String,
-    /// Content hash for optimistic locking - pass this to write_note or edit_note
+    /// Content hash for optimistic locking - pass this to write_note
     pub content_hash: String,
     /// The section's full canonical path, present only when a section was
     /// read. Re-submit this (rather than the original short input) on a
@@ -48,7 +48,7 @@ pub struct ReadNoteResponse {
 /// continues to compile and pass without modification.
 // kept: the MCP tool handler in main.rs calls execute_scoped directly, so
 // this has no production caller, but every existing test (in this file and
-// the cross-file edit_note/replace_in_note/write_note read-then-write flows)
+// the cross-file replace_in_note/write_note read-then-write flows)
 // still calls execute() unchanged, matching the Storage-trait precedent above.
 #[allow(dead_code)]
 pub async fn execute<S: Storage>(

@@ -162,21 +162,35 @@ pub struct ReplaceInNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
     /// Array of edit operations. Each oldText must appear exactly once within
-    /// the scoped content (the whole note, or just the section when `section`
-    /// is set).
+    /// the note.
     pub edits: Vec<ReplaceOperation>,
     /// Content hash from ReadNote - required to verify note hasn't changed.
-    /// When `section` is set, this is the section's hash (from a
-    /// section-scoped ReadNote), not the whole file's.
     pub content_hash: String,
     /// Preview changes without applying them (default: false)
     #[serde(default, rename = "dryRun")]
     pub dry_run: bool,
-    /// Optional section path (from the outline tool's `path` field) to
-    /// replace text within just one section instead of the whole note. When
-    /// set, `content_hash` scopes to that section only.
+    /// Not supported by replace_in_note, which always replaces within the
+    /// whole note. Present only so a section-scoped request can be rejected
+    /// with a clear, teaching error instead of a generic "unknown field"
+    /// message. Use write_note with its own `section` parameter for
+    /// section-scoped writes.
     #[serde(default)]
     pub section: Option<String>,
+}
+
+/// Reject replace_in_note calls that pass `section` — replace_in_note always
+/// matches within the whole note, so a section-scoped request is a client
+/// mistake. Returns a teaching error naming the tool that does support
+/// section-scoped writes.
+fn reject_replace_in_note_section(section: Option<&str>) -> Result<(), ErrorData> {
+    if section.is_some() {
+        return Err(ErrorData::invalid_params(
+            "replace_in_note does not support section-scoped writes. Use \
+             write_note with its `section` parameter instead.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// A single line-range edit operation for the EditNote tool
@@ -485,7 +499,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote, EditNote, or ReplaceInNote unchanged."
+        description = "Read the complete contents of a note. Returns JSON with content and content_hash. Content includes line numbers (cat -n format: right-aligned number + tab). content_hash is computed on raw content — pass it through to WriteNote or ReplaceInNote unchanged."
     )]
     async fn read_note(
         &self,
@@ -502,7 +516,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Discover a note's addressable sections (frontmatter, preamble, and heading-delimited sections) for section-scoped reads and writes on oversized notes. This is a fallback for oversized notes, not the primary editing path — prefer small, heavily-linked notes where possible. Returns a flat list of sections, each with a `path` — the literal string to pass as the `section` param of ReadNote, EditNote, or ReplaceInNote."
+        description = "Discover a note's addressable sections (frontmatter, preamble, and heading-delimited sections) for section-scoped reads and writes on oversized notes. This is a fallback for oversized notes, not the primary editing path — prefer small, heavily-linked notes where possible. Returns a flat list of sections, each with a `path` — the literal string to pass as the `section` param of ReadNote or WriteNote."
     )]
     async fn outline(
         &self,
@@ -533,12 +547,14 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits. Optionally pass `section` (a path from the Outline tool) to scope oldText matching to just that section instead of the whole note - content_hash then refers to the section's hash."
+        description = "Make surgical text replacements in a note. Each edit specifies oldText (must match exactly and appear once) and newText. Requires content_hash from ReadNote. Returns JSON with new content_hash for chained edits."
     )]
     async fn replace_in_note(
         &self,
         params: Parameters<ReplaceInNoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        reject_replace_in_note_section(params.0.section.as_deref())?;
+
         let edits: Vec<tools::replace_in_note::Edit> = params
             .0
             .edits
@@ -550,7 +566,7 @@ impl MemoryServer {
             .collect();
 
         let graph = self.graph().read().await;
-        tools::replace_in_note::execute_scoped(
+        tools::replace_in_note::execute(
             &self.config().vault_path,
             self.storage(),
             &graph,
@@ -558,7 +574,6 @@ impl MemoryServer {
             edits,
             &params.0.content_hash,
             params.0.dry_run,
-            params.0.section.as_deref(),
         )
         .await
     }
@@ -923,6 +938,126 @@ mod tests {
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// Build a real `MemoryServer` over a fresh vault path, for wiring
+    /// defeat-checks that need to prove a guard is actually called from
+    /// inside the real `#[tool]`-generated handler - not just callable in
+    /// isolation as a free function. `SharedState` is built as a raw struct
+    /// literal (this module can see its private fields, since `mod tests`
+    /// is a descendant of the module that defines them): a bare, unpopulated
+    /// `GraphIndex::new()` (note resolution falls back to `storage.exists`
+    /// for top-level note names with no subdirectory - see
+    /// `tools::common::resolve_note_uri` - so fixtures just need a file on
+    /// disk, not graph registration, for the tests that use this helper
+    /// today), `EmbeddingManager::new` (confirmed synchronous/cheap - it
+    /// only sets up paths, no model load until `.initialize()`/first
+    /// search), `FileStorage::new`, and no watcher.
+    fn test_server(vault_path: &std::path::Path) -> super::MemoryServer {
+        let shared = super::SharedState {
+            config: std::sync::Arc::new(super::Config::new(&vault_path.to_string_lossy())),
+            graph: std::sync::Arc::new(tokio::sync::RwLock::new(super::GraphIndex::new())),
+            embeddings: std::sync::Arc::new(super::EmbeddingManager::new(vault_path)),
+            storage: std::sync::Arc::new(super::FileStorage::new(vault_path.to_path_buf())),
+            watcher: None,
+        };
+        super::MemoryServer::from_shared(shared)
+    }
+
+    // D7 wiring defeat-checks (memory/o:9): each of these calls the real
+    // `#[tool]`-generated async method through `test_server`, proving the
+    // named guard/stub is wired into the actual handler's call path -
+    // exercising it in isolation (as a free function) can't prove that.
+
+    #[tokio::test]
+    async fn test_reject_replace_in_note_section_wired_into_real_handler() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let original_content = "Original content, must survive a rejected replace_in_note call.";
+        tokio::fs::write(temp_dir.path().join("test.md"), original_content)
+            .await
+            .unwrap();
+
+        let server = test_server(temp_dir.path());
+        let result = server
+            .replace_in_note(rmcp::handler::server::wrapper::Parameters(
+                super::ReplaceInNoteParams {
+                    note: "test".to_string(),
+                    edits: vec![super::ReplaceOperation {
+                        old_text: "Original".to_string(),
+                        new_text: "REPLACED - must never land on disk".to_string(),
+                    }],
+                    content_hash: "irrelevant-to-this-test".to_string(),
+                    dry_run: false,
+                    section: Some("Some Section".to_string()),
+                },
+            ))
+            .await;
+
+        let err = result.expect_err("replace_in_note must reject a section-scoped request");
+        assert!(err.message.contains("write_note"));
+
+        let on_disk = tokio::fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, original_content);
+    }
+
+    #[tokio::test]
+    async fn test_edit_note_stub_wired_into_real_handler() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let original_content = "Original content, must survive an edit_note call.";
+        tokio::fs::write(temp_dir.path().join("test.md"), original_content)
+            .await
+            .unwrap();
+
+        let server = test_server(temp_dir.path());
+        let result = server
+            .edit_note(rmcp::handler::server::wrapper::Parameters(
+                super::EditNoteParams {
+                    note: "test".to_string(),
+                    edits: vec![super::LineEditOperation {
+                        start_line: 1,
+                        end_line: 1,
+                        new_text: "REPLACED - must never land on disk".to_string(),
+                    }],
+                    content_hash: "irrelevant-to-this-test".to_string(),
+                    dry_run: false,
+                    section: None,
+                },
+            ))
+            .await;
+
+        let err = result.expect_err("edit_note must always reject - it's retired");
+        assert!(err.message.contains("write_note"));
+
+        let on_disk = tokio::fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, original_content);
+    }
+
+    #[tokio::test]
+    async fn test_write_note_section_create_through_real_handler() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        let server = test_server(temp_dir.path());
+        let result = server
+            .write_note(rmcp::handler::server::wrapper::Parameters(
+                super::WriteNoteParams {
+                    note: "test".to_string(),
+                    content: "first entry".to_string(),
+                    content_hash: None,
+                    section: Some("Daily Log".to_string()),
+                },
+            ))
+            .await
+            .expect("section create through the real handler should succeed");
+        assert!(!result.is_error.unwrap_or(false));
+
+        let on_disk = tokio::fs::read_to_string(temp_dir.path().join("test.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, "# Daily Log\nfirst entry");
+    }
 
     #[tokio::test]
     async fn test_health_endpoint() {
