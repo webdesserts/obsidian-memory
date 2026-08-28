@@ -38,6 +38,7 @@ use watcher::VaultWatcher;
 
 /// Parameters for the Log tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogParams {
     /// Timeline entry content (single bullet point). Tool adds timestamp and day headers automatically.
     /// Tag work items with associated jira tickets or github issues when relevant.
@@ -46,6 +47,7 @@ pub struct LogParams {
 
 /// Parameters for the GetNoteInfo tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetNoteInfoParams {
     /// Note reference - supports: "memory:Note Name", "memory:knowledge/Note Name", "knowledge/Note Name", "[[Note Name]]"
     pub note: String,
@@ -53,6 +55,7 @@ pub struct GetNoteInfoParams {
 
 /// Parameters for the UpdateFrontmatter tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateFrontmatterParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -64,6 +67,7 @@ pub struct UpdateFrontmatterParams {
 
 /// Parameters for the Search tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchParams {
     /// The search query - what information are you looking for? Supports wiki-links: [[Note]] searches using that note's content. Multiple notes: [[TypeScript]] [[Projects]] finds notes similar to BOTH. Mixed: 'type safety in [[TypeScript]]' combines note content with text. Wiki-links enable graph boosting (connected notes rank higher).
     pub query: String,
@@ -74,6 +78,7 @@ pub struct SearchParams {
 
 /// Parameters for the WriteLogs tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteLogsParams {
     /// ISO week date in YYYY-Www-D format (e.g., '2025-W50-1' for Monday of week 50). Week starts on Monday (1=Mon, 7=Sun).
     #[serde(rename = "isoWeekDate")]
@@ -84,6 +89,7 @@ pub struct WriteLogsParams {
 
 /// Parameters for the Remember tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RememberParams {
     /// The client's current working directory path. Used for project discovery
     /// via git remote and directory name matching. When omitted (e.g. on iOS
@@ -94,6 +100,7 @@ pub struct RememberParams {
 
 /// Parameters for the ReadNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -106,6 +113,7 @@ pub struct ReadNoteParams {
 
 /// Parameters for the Outline tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OutlineParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -113,6 +121,7 @@ pub struct OutlineParams {
 
 /// Parameters for the WriteNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -120,10 +129,33 @@ pub struct WriteNoteParams {
     pub content: String,
     /// Content hash from ReadNote - required for existing notes, omit for new notes
     pub content_hash: Option<String>,
+    /// Not supported by write_note, which always replaces the whole note.
+    /// Present only so a section-scoped write request can be rejected with a
+    /// clear, teaching error instead of a generic "unknown field" message.
+    /// Use replace_in_note or edit_note with their own `section` parameter
+    /// for section-scoped writes.
+    #[serde(default)]
+    pub section: Option<String>,
+}
+
+/// Reject write_note calls that pass `section` — write_note always replaces
+/// the whole note, so a section-scoped request is a client mistake. Returns a
+/// teaching error naming the tools that do support section-scoped edits.
+fn reject_write_note_section(section: Option<&str>) -> Result<(), ErrorData> {
+    if section.is_some() {
+        return Err(ErrorData::invalid_params(
+            "write_note does not support section-scoped writes. Use \
+             replace_in_note or edit_note with their `section` parameter \
+             instead.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// A single find-and-replace operation for the ReplaceInNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceOperation {
     /// Text to search for - must match exactly and appear only once
     #[serde(rename = "oldText")]
@@ -135,6 +167,7 @@ pub struct ReplaceOperation {
 
 /// Parameters for the ReplaceInNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceInNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -158,6 +191,7 @@ pub struct ReplaceInNoteParams {
 
 /// A single line-range edit operation for the EditNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LineEditOperation {
     /// First line to replace (1-indexed, inclusive). Matches line numbers from ReadNote output.
     #[serde(rename = "startLine")]
@@ -172,6 +206,7 @@ pub struct LineEditOperation {
 
 /// Parameters for the EditNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EditNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -196,6 +231,7 @@ pub struct EditNoteParams {
 
 /// Parameters for the DeleteNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
@@ -203,6 +239,7 @@ pub struct DeleteNoteParams {
 
 /// Parameters for the MoveNote tool
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MoveNoteParams {
     /// Source note reference
     pub from: String,
@@ -492,6 +529,8 @@ impl MemoryServer {
         &self,
         params: Parameters<WriteNoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        reject_write_note_section(params.0.section.as_deref())?;
+
         let graph = self.graph().read().await;
         tools::write_note::execute(
             &self.config().vault_path,
@@ -929,5 +968,99 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"OK");
+    }
+
+    // Regression coverage for memory/o:8: a tool params struct that silently
+    // tolerates unknown fields lets a client-side typo (or an invented
+    // parameter, like the incident's `section` on write_note) pass through
+    // deserialization unnoticed instead of surfacing as an error.
+
+    #[test]
+    fn test_deny_unknown_fields_rejects_unknown_field_on_update_frontmatter() {
+        let payload = serde_json::json!({
+            "note": "test",
+            "updates": {},
+            "content_hash": "abc123",
+            "bogus_field": "nope",
+        });
+
+        let result: Result<super::UpdateFrontmatterParams, _> = serde_json::from_value(payload);
+        let err = result.expect_err("unknown field should be rejected, not silently ignored");
+        assert!(
+            err.to_string().contains("bogus_field"),
+            "error should name the offending field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_deny_unknown_fields_rejects_unknown_field_on_write_note() {
+        let payload = serde_json::json!({
+            "note": "test",
+            "content": "hello",
+            "bogus_field": "nope",
+        });
+
+        let result: Result<super::WriteNoteParams, _> = serde_json::from_value(payload);
+        let err = result.expect_err("unknown field should be rejected, not silently ignored");
+        assert!(
+            err.to_string().contains("bogus_field"),
+            "error should name the offending field, got: {}",
+            err
+        );
+    }
+
+    // Direct pin for the memory/o:8 incident shape: a write_note call
+    // carrying a `section` param it was never meant to accept. `section` is
+    // now a *known* field (unlike the two tests above), so it deserializes
+    // fine — the rejection happens one step later, in the handler's guard.
+    #[tokio::test]
+    async fn test_write_note_section_param_rejected_and_content_unmodified() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = notes_core::storage::FileStorage::new(temp_dir.path().to_path_buf());
+        let original_content = "Original content, must survive a rejected write_note call.";
+        tokio::fs::write(temp_dir.path().join("test.md"), original_content)
+            .await
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "note": "test",
+            "content": "REPLACED - this must never land on disk",
+            "content_hash": "irrelevant-to-this-test",
+            "section": "Some Section",
+        });
+
+        let params: super::WriteNoteParams = serde_json::from_value(payload)
+            .expect("section is a known field now, deserialization succeeds");
+        assert_eq!(params.section.as_deref(), Some("Some Section"));
+
+        let err = super::reject_write_note_section(params.section.as_deref())
+            .expect_err("write_note must reject a section-scoped request");
+        assert!(err.message.contains("replace_in_note"));
+        assert!(err.message.contains("edit_note"));
+
+        // This proves the guard rejects the o:8 shape, and that the
+        // fixture note stays unmodified because this test's rejection path
+        // never calls tools::write_note::execute at all — it does not
+        // exercise the real write_note handler through Parameters<T>
+        // extraction, so it can't prove the handler actually calls this
+        // guard first. A true end-to-end proof needs MemoryServer test
+        // infrastructure that doesn't exist yet (filed as an observation).
+        use notes_core::storage::Storage as _;
+        let (on_disk, _) = storage.read("test").await.unwrap();
+        assert_eq!(on_disk, original_content);
+    }
+
+    #[test]
+    fn test_write_note_params_without_section_passes_guard() {
+        let payload = serde_json::json!({
+            "note": "test",
+            "content": "hello",
+            "content_hash": null,
+        });
+
+        let params: super::WriteNoteParams = serde_json::from_value(payload).unwrap();
+        assert_eq!(params.section, None);
+        assert!(super::reject_write_note_section(params.section.as_deref()).is_ok());
     }
 }
