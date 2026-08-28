@@ -80,6 +80,7 @@
 //! sibling section growing or shrinking doesn't invalidate the target
 //! section's hash. Only a change to the target section's own content does.
 
+pub mod create;
 pub mod heading;
 pub mod outline;
 pub mod path;

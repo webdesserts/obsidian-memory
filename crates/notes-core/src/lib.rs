@@ -13,6 +13,7 @@
 pub mod sections;
 pub mod storage;
 
+pub use sections::create::{ResolvedSectionCreate, SectionCreateError, create_section};
 pub use sections::outline::{Outline, Section, SectionKind, build_outline, extract_section};
 pub use sections::path::{SectionResolveError, resolve_section};
 pub use sections::write::{

@@ -63,14 +63,21 @@ pub fn resolve_section<'a>(
 
 /// Split a path on `" > "`, trimming and collapsing internal whitespace runs
 /// within each segment, then lowercasing for case-insensitive comparison.
-fn normalize_segments(path: &str) -> Vec<String> {
+///
+/// `pub(crate)`: also used by `sections::create` to match a create request's
+/// path against the existing outline's ancestor chain, the same
+/// normalization `resolve_section` matches against.
+pub(crate) fn normalize_segments(path: &str) -> Vec<String> {
     path.split(" > ")
         .map(|segment| collapse_whitespace(segment.trim()).to_lowercase())
         .collect()
 }
 
 /// Collapse runs of whitespace within a string down to single spaces.
-fn collapse_whitespace(s: &str) -> String {
+///
+/// `pub(crate)`: also used by `sections::create` to build a new heading's
+/// display text from a raw path segment.
+pub(crate) fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
