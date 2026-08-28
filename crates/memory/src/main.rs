@@ -125,32 +125,22 @@ pub struct OutlineParams {
 pub struct WriteNoteParams {
     /// Note reference - supports wiki-links ([[Note]]), memory URIs (memory:knowledge/Note), or plain names
     pub note: String,
-    /// The content to write to the note
+    /// The content to write. For a whole-note write, the entire note
+    /// content. When `section` is set: a create (content_hash omitted)
+    /// takes body-only content and the heading line is synthesized
+    /// automatically; an edit (content_hash set) takes the section's full
+    /// replacement text, including its own heading line.
     pub content: String,
-    /// Content hash from ReadNote - required for existing notes, omit for new notes
+    /// Content hash from ReadNote/Outline. Omit to create a new note or a
+    /// new section; required to overwrite an existing note or edit an
+    /// existing section.
     pub content_hash: Option<String>,
-    /// Not supported by write_note, which always replaces the whole note.
-    /// Present only so a section-scoped write request can be rejected with a
-    /// clear, teaching error instead of a generic "unknown field" message.
-    /// Use replace_in_note or edit_note with their own `section` parameter
-    /// for section-scoped writes.
+    /// Optional section path (from the Outline tool's `path` field) to
+    /// scope the write to one section instead of the whole note - creating
+    /// it (and any missing ancestor headings) when content_hash is omitted,
+    /// or overwriting it in place when content_hash is set.
     #[serde(default)]
     pub section: Option<String>,
-}
-
-/// Reject write_note calls that pass `section` — write_note always replaces
-/// the whole note, so a section-scoped request is a client mistake. Returns a
-/// teaching error naming the tools that do support section-scoped edits.
-fn reject_write_note_section(section: Option<&str>) -> Result<(), ErrorData> {
-    if section.is_some() {
-        return Err(ErrorData::invalid_params(
-            "write_note does not support section-scoped writes. Use \
-             replace_in_note or edit_note with their `section` parameter \
-             instead.",
-            None,
-        ));
-    }
-    Ok(())
 }
 
 /// A single find-and-replace operation for the ReplaceInNote tool
@@ -523,22 +513,21 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Create a new note or overwrite an existing note. For existing notes, include content_hash from ReadNote. Returns JSON with new content_hash for chained writes."
+        description = "Create a new note or overwrite an existing note. For existing notes, include content_hash from ReadNote. Returns JSON with new content_hash for chained writes. Optionally pass `section` (a path from the Outline tool) to scope the write to one section: omit content_hash to create it (and any missing ancestor headings, synthesized automatically) with body-only content, or set content_hash to overwrite an existing section in place with its full replacement text including the heading line."
     )]
     async fn write_note(
         &self,
         params: Parameters<WriteNoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        reject_write_note_section(params.0.section.as_deref())?;
-
         let graph = self.graph().read().await;
-        tools::write_note::execute(
+        tools::write_note::execute_scoped(
             &self.config().vault_path,
             self.storage(),
             &graph,
             &params.0.note,
             &params.0.content,
             params.0.content_hash.as_deref(),
+            params.0.section.as_deref(),
         )
         .await
     }
@@ -1008,59 +997,5 @@ mod tests {
             "error should name the offending field, got: {}",
             err
         );
-    }
-
-    // Direct pin for the memory/o:8 incident shape: a write_note call
-    // carrying a `section` param it was never meant to accept. `section` is
-    // now a *known* field (unlike the two tests above), so it deserializes
-    // fine — the rejection happens one step later, in the handler's guard.
-    #[tokio::test]
-    async fn test_write_note_section_param_rejected_and_content_unmodified() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let storage = notes_core::storage::FileStorage::new(temp_dir.path().to_path_buf());
-        let original_content = "Original content, must survive a rejected write_note call.";
-        tokio::fs::write(temp_dir.path().join("test.md"), original_content)
-            .await
-            .unwrap();
-
-        let payload = serde_json::json!({
-            "note": "test",
-            "content": "REPLACED - this must never land on disk",
-            "content_hash": "irrelevant-to-this-test",
-            "section": "Some Section",
-        });
-
-        let params: super::WriteNoteParams = serde_json::from_value(payload)
-            .expect("section is a known field now, deserialization succeeds");
-        assert_eq!(params.section.as_deref(), Some("Some Section"));
-
-        let err = super::reject_write_note_section(params.section.as_deref())
-            .expect_err("write_note must reject a section-scoped request");
-        assert!(err.message.contains("replace_in_note"));
-        assert!(err.message.contains("edit_note"));
-
-        // This proves the guard rejects the o:8 shape, and that the
-        // fixture note stays unmodified because this test's rejection path
-        // never calls tools::write_note::execute at all — it does not
-        // exercise the real write_note handler through Parameters<T>
-        // extraction, so it can't prove the handler actually calls this
-        // guard first. A true end-to-end proof needs MemoryServer test
-        // infrastructure that doesn't exist yet (filed as an observation).
-        use notes_core::storage::Storage as _;
-        let (on_disk, _) = storage.read("test").await.unwrap();
-        assert_eq!(on_disk, original_content);
-    }
-
-    #[test]
-    fn test_write_note_params_without_section_passes_guard() {
-        let payload = serde_json::json!({
-            "note": "test",
-            "content": "hello",
-            "content_hash": null,
-        });
-
-        let params: super::WriteNoteParams = serde_json::from_value(payload).unwrap();
-        assert_eq!(params.section, None);
-        assert!(super::reject_write_note_section(params.section.as_deref()).is_ok());
     }
 }
