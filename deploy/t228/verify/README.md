@@ -39,15 +39,19 @@ crate's own unit tests already do (`storage.create_user(...)`,
 probes run against a real container over real HTTP rather than in-process:
 
 - `seed-config/*.json` and `Caddyfile` are injected into their containers
-  via `docker cp` + a restart, not a bind-mount volume -- this Docker
-  host's VM (Colima) only virtiofs-mounts `/opt/docker` and
-  `/Users/nir/notes`; `$HOME` (and this worktree under it) isn't mounted,
-  so a host bind mount of a file under here fails at container-create
-  time with an OCI "not a directory" error even though the file exists
-  and is the right type. `docker cp` is a host<->daemon data copy over
-  the Docker API and doesn't depend on any VM filesystem mount, so it
-  works regardless. See `docker-compose.yml`'s header comment and
-  `verify.sh`'s injection step for the mechanics.
+  via `docker cp`, not a bind-mount volume -- this Docker host's VM
+  (Colima) only virtiofs-mounts `/opt/docker` and `/Users/nir/notes`;
+  `$HOME` (and this worktree under it) isn't mounted, so a host bind
+  mount of a file under here fails at container-create time with an OCI
+  "not a directory" error even though the file exists and is the right
+  type. `docker cp` is a host<->daemon data copy over the Docker API and
+  doesn't depend on any VM filesystem mount, so it works regardless.
+  `verify.sh` creates the stack without starting it
+  (`docker compose create`), copies the files in, then starts it
+  (`docker compose start`) -- so each container's first read of its
+  config is already the seeded one, no restart needed. See
+  `docker-compose.yml`'s header comment and `verify.sh`'s injection step
+  for the mechanics.
 - `seed-config/users.json` seeds one `StoredUser` directly.
 - `seed-config/sessions.json` seeds one `StoredSession` whose
   `session_hash` is `hash_token(<plaintext>)` for a known plaintext
@@ -114,12 +118,19 @@ WebAuthn ceremony itself remains untested anywhere in the crate (design
   on every invocation, and set as the compose file's default `name:` too)
   so `down -v` can never reach another project's resources.
 - Own bridge network (`verify`), never the live `proxy` network.
-- No fixed host port publish. The live Caddy already publishes
-  `0.0.0.0:80`/`0.0.0.0:443`; a fixed publish on 80/443/3001/3000 here
-  would collide with it the moment the scratch stack starts. `caddy`'s
-  port 80 is published on an ephemeral, loopback-only host port
-  (`127.0.0.1::80`) instead; `verify.sh` resolves the actual assigned
-  port via `docker compose port caddy 80`.
+- **No host port published at all.** `caddy` is reached only from the
+  `probe` sibling container (a `sleep infinity` `curlimages/curl`
+  container on the same `verify` network) -- `verify.sh` drives every
+  HTTP assertion via `docker compose exec probe curl ...`, never through
+  the host's TCP stack. This isn't just belt-and-suspenders against the
+  live Caddy's `0.0.0.0:80`/`0.0.0.0:443` collision risk: an ephemeral
+  loopback publish (`127.0.0.1::80` + `docker compose port`) was tried
+  first and found genuinely unreliable on this machine -- the Colima
+  VM's host<->VM port-forwarder did not reliably surface newly-created
+  containers' ephemeral ports on the macOS host side (confirmed via
+  `lsof` on the host showing no listener while `colima ssh -- ss -tlnp`
+  showed the port bound inside the VM), while container-to-container
+  traffic on the custom bridge network was reliable throughout.
 - Teardown (`docker compose -p t228-verify down -v`) runs unconditionally
   via an `EXIT` trap, and `verify.sh` then asserts no `t228-verify`-labeled
   containers or networks remain by name.
