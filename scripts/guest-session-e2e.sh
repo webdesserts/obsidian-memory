@@ -75,7 +75,7 @@
 #                         actual landed code).
 # ---------------------------------------------------------------------------
 LOGIN_KEY_FIELD="key"
-LOGIN_TOKEN_FIELD="token"
+LOGIN_TOKEN_FIELD="session_token"
 SESSION_COOKIE_NAME="auth_session"
 
 set -u
