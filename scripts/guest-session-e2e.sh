@@ -52,13 +52,13 @@
 #
 #   LOGIN_KEY_FIELD      the JSON field name the /login/key request body
 #                         expects the API key under.
-#                         Guessed: "key" (mirrors config.json's existing
+#                         Confirmed 2026-09-03: "key" (mirrors config.json's existing
 #                         {key, name, active} shape, per plan P1/A1).
 #   LOGIN_TOKEN_FIELD     the JSON field name the /login/key response body
 #                         carries the session token under -- the "agents
 #                         get the token in the JSON body" half of the
 #                         plan (Dispatch A2).
-#                         Guessed: "token".
+#                         Reconciled 2026-09-03: "session_token" (Dispatch A's KeyLoginResponse; commit 6447a28).
 #   SESSION_COOKIE_NAME   the cookie name the session is presented under
 #                         on every subsequent request (this script builds
 #                         the Cookie header by hand rather than relying on
@@ -66,7 +66,7 @@
 #                         the plan states agents get the raw token value,
 #                         not a browser Set-Cookie round-trip, from
 #                         /login/key).
-#                         Guessed: "auth_session" (already used by
+#                         Confirmed 2026-09-03: "auth_session" (already used by
 #                         StoredSession / deploy/t228/verify's seed
 #                         fixtures for the PASSKEY session cookie -- high
 #                         confidence the key->session exchange reuses the

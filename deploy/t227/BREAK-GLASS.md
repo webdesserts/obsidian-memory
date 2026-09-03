@@ -148,25 +148,31 @@ environment variable, set in `docker/docker-compose.yml`, is inherited by
   `/auth/setup` again and re-register from scratch.
 - Every active session (`sessions.json`) -- every browser currently
   logged in is signed out immediately.
+- **Every guest principal** -- `users.json` holds guests too (as of
+  Dispatch A, `create-guest`), so `rhea` is deleted along with Michael's
+  own record.
+- **Every runtime API key** (`api_keys.json`) -- `reset_auth` now clears
+  the key store as well (re-verified 2026-09-03 against Dispatch A's
+  landed `Storage::reset_auth`, obsidian-memory `dd6e86b`). That is
+  rhea's key AND the migrated `OpenCode` entry.
 
-**Exactly what this does NOT touch** (also verified at source, same
-function): `config.json` (the API-key file) is untouched -- the
-`OpenCode` bearer key (and, once Dispatch A lands, any other
-storage-backed API key/guest principal) keeps working straight through a
-`reset`. `/config/clients.json` and `/config/tokens.json` (OAuth-era
-leftovers, out of scope for this card, see the plan's Noticed section)
-are also untouched.
+**Exactly what this does NOT touch** (same function): `config.json`
+(the legacy API-key file) is untouched, so the `OpenCode` bearer key is
+re-seeded into `api_keys.json` on the next service startup
+(`migrate_config_keys`) and keeps working after one restart.
+`/config/clients.json` and `/config/tokens.json` (OAuth-era leftovers,
+out of scope for this card) are also untouched.
 
-**Re-verify this section once Dispatch A lands.** This runbook documents
-`Reset`'s scope as of the pre-t:227 code in this worktree (`fe77a54`).
-Dispatch A adds runtime, storage-backed API keys and a guest principal
-(`create-guest`) -- if `reset_auth` is ever widened to also clear the new
-key/guest storage, running `reset` during a break-glass recovery would
-silently revoke the guest floor (criterion 2) and any migrated bearer
-key, which is a materially different blast radius than the "just
-passkeys and sessions" scope documented above. Check
-`crates/auth-service/src/storage.rs::reset_auth` against Dispatch A's
-landed diff before relying on this section unchanged.
+**Blast radius, stated plainly:** a `reset` destroys the guest floor
+(criterion 2). After one, re-run `create-guest --handle rhea` and
+`issue-key --user rhea --name rhea`, hand the new key over
+out-of-band, and note that the re-created guest gets a NEW uuid: the
+prime registry's `agent:rhea` entry still points at the old one, and
+`seed_actor` refuses to adopt a different uuid onto an existing handle,
+so the registry side needs a deliberate re-link (`rename`/alias) rather
+than a re-seed. Prefer restarting the service (section 1) over
+resetting it; reset is for corrupted auth state, not for a stuck
+container.
 
 ## 3. The colima path
 
