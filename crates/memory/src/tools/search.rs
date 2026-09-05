@@ -194,8 +194,10 @@ async fn build_query_embedding(
     let mut combined: Embedding = vec![0.0; EMBEDDING_DIM];
     let mut count = 0;
 
-    for text in texts {
-        let embedding = embeddings.get_embedding("__query__", &text).await?;
+    // Query embeddings are encoded explicitly and never written to the note
+    // cache: they are ephemeral, not content-addressed by note path.
+    let embeddings = embeddings.encode_query_texts(&texts).await?;
+    for embedding in embeddings {
         for (i, val) in embedding.iter().enumerate() {
             combined[i] += val;
         }
