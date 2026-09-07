@@ -92,7 +92,7 @@ pub struct WriteLogsParams {
 #[serde(deny_unknown_fields)]
 pub struct RememberParams {
     /// Explicit agent identifier selecting this session's private context note:
-    /// the exact conventional path `agents/<agent_id>/Working Memory.md` in the
+    /// the exact path `agents/<agent_id>/Working Memory — <agent_id>.md` in the
     /// vault. Must be a lowercase ASCII identifier: starts with a letter, then
     /// letters/digits/hyphens/underscores, at most 64 characters. Absent,
     /// empty, or invalid IDs are rejected with an invalid-params error before
@@ -462,7 +462,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Load session context for an explicitly named agent in a single call. Requires agent_id: a lowercase ASCII identifier (starts with a letter, then letters/digits/hyphens/underscores, at most 64 characters). Reads the exact conventional private note agents/<agent_id>/Working Memory.md from the vault - never a basename or semantic lookup - plus discovered project notes based on the cwd's git remotes and directory names. Does not return the pooled Working Memory.md, Log.md, or the weekly journal, and never falls back to another note: a missing agent note yields a visible diagnostic instead. IDs are never inferred from cwd, usernames, or headers. Use this at the start of every session to get complete context about current focus, this agent's working memory, and project context."
+        description = "Load session context for an explicitly named agent in a single call. Requires agent_id: a lowercase ASCII identifier (starts with a letter, then letters/digits/hyphens/underscores, at most 64 characters). Reads the exact conventional private note agents/<agent_id>/Working Memory — <agent_id>.md from the vault - never a basename or semantic lookup - plus discovered project notes based on the cwd's git remotes and directory names. Does not return the pooled Working Memory.md, Log.md, or the weekly journal, and never falls back to another note: a missing agent note yields a visible diagnostic instead. IDs are never inferred from cwd, usernames, or headers. Use this at the start of every session to get complete context about current focus, this agent's working memory, and project context."
     )]
     async fn remember(
         &self,
@@ -1085,7 +1085,7 @@ mod tests {
         // needed - remember reads the exact conventional path directly)
         tokio::fs::create_dir_all(temp_dir.path().join("agents/iris")).await.unwrap();
         tokio::fs::write(
-            temp_dir.path().join("agents/iris/Working Memory.md"),
+            temp_dir.path().join("agents/iris/Working Memory — iris.md"),
             "iris-handler-wiring-marker",
         )
         .await

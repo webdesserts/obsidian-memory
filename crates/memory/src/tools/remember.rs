@@ -1,7 +1,7 @@
 //! Remember Tool - Load session context for an explicitly named agent
 //!
 //! Requires an explicit `agent_id` and reads the exact conventional private
-//! note `agents/<agent_id>/Working Memory.md` from the vault, plus discovered
+//! note `agents/<agent_id>/Working Memory — <agent_id>.md` from the vault, plus discovered
 //! project notes. It does not return the pooled `Working Memory.md`, `Log.md`,
 //! or the weekly journal, and it never falls back to another note when the
 //! agent's note is missing - it surfaces a visible diagnostic instead.
@@ -33,7 +33,7 @@ fn validate_agent_id(agent_id: Option<&str>) -> Result<&str, ErrorData> {
             "remember requires an explicit agent_id: a lowercase ASCII identifier \
              (starts with a letter, then letters/digits/hyphens/underscores, at most \
              64 characters). It selects the conventional private note \
-             agents/<agent_id>/Working Memory.md. IDs are never inferred from cwd, \
+             agents/<agent_id>/Working Memory — <agent_id>.md. IDs are never inferred from cwd, \
              usernames, or headers.",
             None,
         )
@@ -47,7 +47,7 @@ fn validate_agent_id(agent_id: Option<&str>) -> Result<&str, ErrorData> {
                 "invalid agent_id {:?}: must be a lowercase ASCII identifier that \
                  starts with a letter, followed by letters/digits/hyphens/underscores, \
                  at most {} characters. It selects the conventional private note \
-                 agents/<agent_id>/Working Memory.md; IDs are not normalized or \
+                 agents/<agent_id>/Working Memory — <agent_id>.md; IDs are not normalized or \
                  inferred from other inputs.",
                 id, AGENT_ID_MAX_LEN
             ),
@@ -75,7 +75,7 @@ fn is_valid_agent_id(id: &str) -> bool {
 ///
 /// `agent_id` must be a valid conventional identifier (see
 /// [`validate_agent_id`]); it selects the exact conventional private note
-/// `agents/<agent_id>/Working Memory.md` relative to the vault. `cwd` remains
+/// `agents/<agent_id>/Working Memory — <agent_id>.md` relative to the vault. `cwd` remains
 /// the independent project-discovery input and is used for discovery even when
 /// the agent's note is missing. Missing private notes are never created, and
 /// pooled context files are never substituted.
@@ -88,11 +88,11 @@ pub async fn execute(
     // Reject absent/empty/invalid IDs before loading any context.
     let agent_id = validate_agent_id(agent_id)?;
 
-    // Conventional agent-private note path: agents/<agent_id>/Working Memory.md
+    // Agent-specific basenames avoid collisions in the existing note tools.
     let working_memory_path = vault_path
         .join("agents")
         .join(agent_id)
-        .join("Working Memory.md");
+        .join(format!("Working Memory — {agent_id}.md"));
 
     // Discover projects if CWD was provided (independent of the agent note)
     let discovery_result = cwd.map(|cwd| discover_projects(cwd, graph_index, vault_path));
@@ -250,13 +250,13 @@ mod tests {
         // Conventional agent-private notes in separate conventional paths
         std::fs::create_dir_all(vault_path.join("agents/iris")).unwrap();
         std::fs::write(
-            vault_path.join("agents/iris/Working Memory.md"),
+            vault_path.join("agents/iris/Working Memory — iris.md"),
             format!("### Active\n\n{}\n", IRIS_MARKER),
         )
         .unwrap();
         std::fs::create_dir_all(vault_path.join("agents/rhea")).unwrap();
         std::fs::write(
-            vault_path.join("agents/rhea/Working Memory.md"),
+            vault_path.join("agents/rhea/Working Memory — rhea.md"),
             format!("### Active\n\n{}\n", RHEA_MARKER),
         )
         .unwrap();
@@ -517,7 +517,7 @@ mod tests {
 
         // Edit the note on disk (as an editor would), then reread
         std::fs::write(
-            vault_path.join("agents/iris/Working Memory.md"),
+            vault_path.join("agents/iris/Working Memory — iris.md"),
             "### Active\n\nupdated-after-edit-marker\n",
         )
         .unwrap();
