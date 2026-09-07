@@ -91,10 +91,22 @@ pub struct WriteLogsParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RememberParams {
+    /// Explicit agent identifier selecting this session's private context note:
+    /// the exact conventional path `agents/<agent_id>/Working Memory.md` in the
+    /// vault. Must be a lowercase ASCII identifier: starts with a letter, then
+    /// letters/digits/hyphens/underscores, at most 64 characters. Absent,
+    /// empty, or invalid IDs are rejected with an invalid-params error before
+    /// any context is loaded; IDs are never normalized or inferred from cwd,
+    /// usernames, headers, or aliases. When the note is missing or unreadable,
+    /// a visible diagnostic is returned and nothing else is loaded as a
+    /// fallback (the pooled Working Memory.md, Log.md, and weekly journal are
+    /// never returned).
+    pub agent_id: Option<String>,
     /// The client's current working directory path. Used for project discovery
-    /// via git remote and directory name matching. When omitted (e.g. on iOS
-    /// or other clients without a filesystem), project discovery is skipped
-    /// but Log, Working Memory, and the weekly note are still loaded.
+    /// via git remote and directory name matching. This is the independent
+    /// project-discovery input - it never influences the agent ID. When
+    /// omitted (e.g. on iOS or other clients without a filesystem), project
+    /// discovery is skipped but the agent's private note is still loaded.
     pub cwd: Option<String>,
 }
 
@@ -450,7 +462,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Load all session context files in a single call. Returns Log.md, Working Memory.md, current weekly note, and discovered project notes. Automatically discovers projects based on git remotes and directory names. Use this at the start of every session to get complete context about recent work, current focus, this week's activity, and project context."
+        description = "Load session context for an explicitly named agent in a single call. Requires agent_id: a lowercase ASCII identifier (starts with a letter, then letters/digits/hyphens/underscores, at most 64 characters). Reads the exact conventional private note agents/<agent_id>/Working Memory.md from the vault - never a basename or semantic lookup - plus discovered project notes based on the cwd's git remotes and directory names. Does not return the pooled Working Memory.md, Log.md, or the weekly journal, and never falls back to another note: a missing agent note yields a visible diagnostic instead. IDs are never inferred from cwd, usernames, or headers. Use this at the start of every session to get complete context about current focus, this agent's working memory, and project context."
     )]
     async fn remember(
         &self,
@@ -458,7 +470,13 @@ impl MemoryServer {
     ) -> Result<CallToolResult, ErrorData> {
         let graph = self.graph().read().await;
         let cwd = params.0.cwd.map(std::path::PathBuf::from);
-        tools::remember::execute(&self.config().vault_path, &graph, cwd.as_deref()).await
+        tools::remember::execute(
+            &self.config().vault_path,
+            &graph,
+            cwd.as_deref(),
+            params.0.agent_id.as_deref(),
+        )
+        .await
     }
 
     #[tool(
@@ -1057,6 +1075,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(on_disk, "# Daily Log\nfirst entry");
+    }
+
+    #[tokio::test]
+    async fn test_remember_agent_id_wired_into_real_handler() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Conventional agent-private note on disk (no graph registration
+        // needed - remember reads the exact conventional path directly)
+        tokio::fs::create_dir_all(temp_dir.path().join("agents/iris")).await.unwrap();
+        tokio::fs::write(
+            temp_dir.path().join("agents/iris/Working Memory.md"),
+            "iris-handler-wiring-marker",
+        )
+        .await
+        .unwrap();
+
+        let server = test_server(temp_dir.path());
+        let result = server
+            .remember(rmcp::handler::server::wrapper::Parameters(
+                super::RememberParams {
+                    agent_id: Some("iris".to_string()),
+                    cwd: None,
+                },
+            ))
+            .await
+            .expect("agent-mode remember through the real handler should succeed");
+
+        let texts: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(|c| {
+                if let Some(r) = c.raw.as_resource() {
+                    match &r.resource {
+                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    c.raw.as_text().map(|t| t.text.clone())
+                }
+            })
+            .collect();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("iris-handler-wiring-marker"),
+            "handler must load the agent's conventional note, got: {}",
+            joined
+        );
+
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["agentId"], "iris");
+        assert_eq!(structured["workingMemoryLoaded"], true);
+    }
+
+    #[tokio::test]
+    async fn test_remember_absent_agent_id_rejected_by_real_handler() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        let server = test_server(temp_dir.path());
+        let result = server
+            .remember(rmcp::handler::server::wrapper::Parameters(
+                super::RememberParams {
+                    agent_id: None,
+                    cwd: None,
+                },
+            ))
+            .await;
+
+        let err = result.expect_err("remember without agent_id must be rejected");
+        assert!(
+            err.message.contains("agent_id"),
+            "diagnostic should name the agent_id contract, got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

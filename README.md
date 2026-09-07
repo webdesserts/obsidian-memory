@@ -132,9 +132,9 @@ The memory system organizes notes into categories:
 
 | File | Purpose | Auto-loaded |
 |------|---------|-------------|
-| `Working Memory.md` | Scratchpad for active work | Yes |
-| `Log.md` | Chronological session activity | Yes |
-| `journal/YYYY-wNN.md` | Weekly summaries and notes | Current week only |
+| `Working Memory.md` | Scratchpad for active work (per agent: `agents/<agent_id>/Working Memory.md`) | Via the `Remember` `agent_id` param |
+| `Log.md` | Chronological session activity | No - read on demand |
+| `journal/YYYY-wNN.md` | Weekly summaries and notes | No - read on demand |
 | `projects/*.md` | Project-specific context | Matched by git remote URL or directory name |
 | `knowledge/*.md` | Stable long-term notes | On demand |
 
@@ -156,7 +156,7 @@ The `Search` tool combines semantic embeddings with graph structure:
 
 | Tool | Description |
 |------|-------------|
-| `Remember` | Load session context (Working Memory, Log, weekly journal, project notes) at session start |
+| `Remember` | Load session context at session start: the agent's private `agents/<agent_id>/Working Memory.md` (explicit required `agent_id` param - lowercase identifier, max 64 chars) plus project notes matched from cwd git remotes/directory names. Never falls back to the pooled Working Memory.md, Log.md, or weekly journal |
 | `Search` | Find notes by semantic similarity. Supports `query` and `debug` parameters |
 | `ReadNote` | Read full content of a note, or just one section with the optional `section` param |
 | `Outline` | Discover a note's addressable sections (frontmatter, preamble, headings) for section-scoped reads and writes on oversized notes |
