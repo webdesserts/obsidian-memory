@@ -123,7 +123,7 @@ The server is read-only by default - it indexes your existing notes but won't mo
 
 The memory system organizes notes into categories:
 
-- **Temporary notes** (`Working Memory.md`, `Log.md`) - Scratchpad and activity log, frequently rewritten
+- **Temporary notes** (per-agent working memory) - Active context, consolidated as work progresses
 - **Periodic notes** (`journal/`) - Weekly summaries that persist longer
 - **Project notes** (`projects/`) - Context for specific codebases
 - **Permanent notes** (`knowledge/`) - Stable reference material
@@ -133,10 +133,11 @@ The memory system organizes notes into categories:
 | File | Purpose | Auto-loaded |
 |------|---------|-------------|
 | `Working Memory.md` | Scratchpad for active work (per agent: `agents/<agent_id>/Working Memory — <agent_id>.md`) | Via the `Remember` `agent_id` param |
-| `Log.md` | Chronological session activity | No - read on demand |
 | `journal/YYYY-wNN.md` | Weekly summaries and notes | No - read on demand |
 | `projects/*.md` | Project-specific context | Matched by git remote URL or directory name |
 | `knowledge/*.md` | Stable long-term notes | On demand |
+
+Existing `Log.md` files remain ordinary notes and are not deleted by this change. The dedicated Log and WriteLogs tools are retired; historical content can still be read with the generic note tools when relevant.
 
 ### Search
 
@@ -167,8 +168,6 @@ The `Search` tool combines semantic embeddings with graph structure:
 | `DeleteNote` | Delete a note from the vault |
 | `GetNoteInfo` | Get metadata, frontmatter, and links for a note |
 | `UpdateFrontmatter` | Update YAML frontmatter fields |
-| `Log` | Append a timestamped entry to Log.md |
-| `WriteLogs` | Replace an entire day's log entries (for consolidation) |
 | `GetWeeklyNote` | Get the path for the current week's journal note |
 | `GetCurrentDatetime` | Get current datetime in ISO format |
 | `Reflect` | Get instructions for memory consolidation |

@@ -36,15 +36,6 @@ use graph::GraphIndex;
 use storage::FileStorage;
 use watcher::VaultWatcher;
 
-/// Parameters for the Log tool
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LogParams {
-    /// Timeline entry content (single bullet point). Tool adds timestamp and day headers automatically.
-    /// Tag work items with associated jira tickets or github issues when relevant.
-    pub content: String,
-}
-
 /// Parameters for the GetNoteInfo tool
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -74,17 +65,6 @@ pub struct SearchParams {
     /// Show detailed score breakdown (semantic, graph proximity, boost calculation). Useful for understanding how results are ranked.
     #[serde(default)]
     pub debug: bool,
-}
-
-/// Parameters for the WriteLogs tool
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WriteLogsParams {
-    /// ISO week date in YYYY-Www-D format (e.g., '2025-W50-1' for Monday of week 50). Week starts on Monday (1=Mon, 7=Sun).
-    #[serde(rename = "isoWeekDate")]
-    pub iso_week_date: String,
-    /// Object mapping time strings to log messages. Keys: '9:00 AM', '2:30 PM', etc. (12-hour format with AM/PM). Values: Log entry content. Example: { '9:00 AM': 'Started investigation', '2:30 PM': 'Fixed bug #123' }
-    pub entries: std::collections::HashMap<String, String>,
 }
 
 /// Parameters for the Remember tool
@@ -391,13 +371,6 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Append a timestamped entry to Log.md for active work state and debugging context tracking. Records chronological session activity - what happened when. The tool automatically adds timestamps and organizes entries by day. Use this for tracking work in progress, debugging steps, state changes, and decisions made during active work."
-    )]
-    async fn log(&self, params: Parameters<LogParams>) -> Result<CallToolResult, ErrorData> {
-        tools::log::execute(&self.config().vault_path, &params.0.content).await
-    }
-
-    #[tool(
         description = "Get metadata and graph connections for the current week's journal note. Returns path, URIs, frontmatter, and links/backlinks. Works whether or not the note exists yet. Use ReadNote tool to get content."
     )]
     async fn get_weekly_note_info(&self) -> Result<CallToolResult, ErrorData> {
@@ -479,22 +452,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Replace an entire day's log entries with consolidated/compacted entries. Use this ONLY during memory consolidation to rewrite or summarize a day's logs. For adding new entries during active work, use the Log tool instead (it's simpler and doesn't require reading the log first). This tool automatically formats entries with correct timestamps, en-dashes, and chronological sorting. Pass an empty object to delete the entire day section (header and all entries)."
-    )]
-    async fn write_logs(
-        &self,
-        params: Parameters<WriteLogsParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        tools::write_logs::execute(
-            &self.config().vault_path,
-            &params.0.iso_week_date,
-            params.0.entries,
-        )
-        .await
-    }
-
-    #[tool(
-        description = "Review active context (Log.md, Working Memory.md, current weekly journal, project notes) and consolidate content into permanent storage. Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. Returns detailed consolidation instructions."
+        description = "Review explicitly available work and activity context (the caller's working memory or other auto-loaded context notes, the current weekly journal, project notes) and consolidate content into permanent storage. Optimizes token usage by keeping active/relevant work accessible while compressing or archiving finished work. Applies information lifecycle: active work = keep lean, shipped/merged = compress and archive. Returns detailed consolidation instructions."
     )]
     async fn reflect(&self) -> Result<CallToolResult, ErrorData> {
         tools::reflect::execute()
@@ -1297,6 +1255,97 @@ mod tests {
             "diagnostic should name the agent_id contract, got: {}",
             err.message
         );
+    }
+
+    // Owning-boundary checks (t272): the Log and WriteLogs MCP tools are
+    // retired. The advertised tool list is the public API surface, so these
+    // prove the retirement through the real `#[tool_router]`-generated
+    // router - not just that the handler methods were removed from this file.
+
+    #[test]
+    fn test_log_and_write_logs_not_advertised() {
+        let server = test_server(std::path::Path::new("/tmp/t272-nonexistent-vault"));
+        let advertised: Vec<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        assert!(
+            !advertised.iter().any(|n| n == "log" || n == "write_logs"),
+            "log/write_logs must not be advertised; advertised tools: {advertised:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_advertised_log_writing_route() {
+        let server = test_server(std::path::Path::new("/tmp/t272-nonexistent-vault"));
+        let tools = server.tool_router.list_all();
+
+        // No replacement logger or compat stub: nothing may advertise an
+        // append-to-Log workflow or point agents at a Log-writing tool.
+        for tool in &tools {
+            let desc = tool.description.as_deref().unwrap_or("").to_lowercase();
+            assert!(
+                !desc.contains("writelogs") && !desc.contains("log tool"),
+                "advertised tool '{}' must not advertise a Log-writing workflow: {}",
+                tool.name,
+                desc
+            );
+        }
+    }
+
+    // Preserved Remember contract through the real handler: it loads the
+    // agent's explicit conventional note and never the pooled Log.md, even
+    // when a poisoned pooled Log.md exists in the vault.
+    #[tokio::test]
+    async fn test_remember_handler_never_returns_pooled_log() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::write(
+            temp_dir.path().join("Log.md"),
+            "POISONED-POOLED-LOG must never be returned",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(temp_dir.path().join("agents/iris"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            temp_dir.path().join("agents/iris/Working Memory — iris.md"),
+            "iris-private-note-marker",
+        )
+        .await
+        .unwrap();
+
+        let server = test_server(temp_dir.path());
+        let result = server
+            .remember(rmcp::handler::server::wrapper::Parameters(
+                super::RememberParams {
+                    agent_id: Some("iris".to_string()),
+                    cwd: None,
+                },
+            ))
+            .await
+            .expect("remember with a valid agent_id must succeed");
+
+        for block in &result.content {
+            if let Some(resource) = block.raw.as_resource()
+                && let rmcp::model::ResourceContents::TextResourceContents { uri, .. } =
+                    &resource.resource
+            {
+                assert!(
+                    !uri.contains("Log.md"),
+                    "remember must never return the pooled Log.md, got uri: {uri}"
+                );
+            }
+            if let Some(text) = block.raw.as_text() {
+                assert!(
+                    !text.text.contains("POISONED-POOLED-LOG"),
+                    "remember must never leak pooled Log.md content"
+                );
+            }
+        }
     }
 
     #[tokio::test]
