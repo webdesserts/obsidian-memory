@@ -10,13 +10,16 @@
 //! `sections`'s and `storage`'s own module docs for the addressing grammar
 //! and the read-first-write (optimistic locking) contract.
 
+pub mod replace;
 pub mod sections;
 pub mod storage;
 
+pub use replace::{RejectedEdit, ReplacementEdit, ReplacementError, apply_replacements};
 pub use sections::create::{ResolvedSectionCreate, SectionCreateError, create_section};
 pub use sections::outline::{Outline, Section, SectionKind, build_outline, extract_section};
 pub use sections::path::{SectionResolveError, resolve_section};
 pub use sections::write::{
-    ResolvedSectionWrite, SectionWriteError, resolve_section_for_write, splice_section,
+    ResolvedSectionWrite, SectionWriteError, resolve_section_for_edit, resolve_section_for_write,
+    splice_section,
 };
 pub use storage::{ContentHash, FileStorage, NoteMetadata, Storage, StorageError, WriteResult};
