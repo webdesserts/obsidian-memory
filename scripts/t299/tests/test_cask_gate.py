@@ -25,7 +25,6 @@ class CandidateTests(unittest.TestCase):
         self.calls = []
         self.command_failure = None
         self.push = 'success'
-        self.search_result = gate.QUALIFIED + '\n'
         self.queue_busy = False
         self.remote = None
         self.repo = self.root / 'brew'
@@ -33,8 +32,7 @@ class CandidateTests(unittest.TestCase):
         self.cache = self.root / 'homebrew-cache-prefixed-download.dmg'
         self.cache.write_bytes(b'fixture dmg')
         self.sha = hashlib.sha256(self.cache.read_bytes()).hexdigest()
-        self.config = self.root / 'audit.json'
-        self.config.write_text(json.dumps({'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture self-signed incompatibility']}))
+        self.search_output = (gate.QUALIFIED + '\n', '', 0)
         self.signer_config = self.root / 'signer.json'
         self.signer_config.write_text(json.dumps(signer_fixture()))
         self.validated_paths = []
@@ -90,15 +88,16 @@ class CandidateTests(unittest.TestCase):
         if argv[:2] == ['brew', '--cache']:
             return result(str(self.cache) + '\n')
         if argv[:2] == ['brew', 'search']:
-            return result('other/tap/webdesserts-memory\n' if self.command_failure == 'collision' else self.search_result)
-        if argv[:2] == ['brew', 'audit']:
-            return result(err='fixture self-signed incompatibility\n', code=1)
+            if self.command_failure == 'collision':
+                return result('other/tap/webdesserts-memory\n')
+            out, err, code = self.search_output
+            return result(out, err, code)
         if argv[0] in ('brew', 'ruby'):
             return result()
         self.fail('unexpected command: ' + repr(argv))
 
     def validate(self, **kw):
-        return gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, runner=self.runner, **kw)
+        return gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', runner=self.runner, **kw)
 
     def artifact_validator(self, dmg, version, config_path, runner):
         self.assertEqual(dmg.name, 'Memory_0.5.8_aarch64.dmg')
@@ -116,7 +115,7 @@ class CandidateTests(unittest.TestCase):
         options = dict(run_id='123', runner=self.runner, signer_config=self.signer_config,
                        validator=self.artifact_validator)
         options.update(overrides)
-        return gate.publish(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, **options)
+        return gate.publish(self.tap, 'v0.5.8', self.sha, 'sonoma', **options)
 
     def assert_no_staging(self):
         self.assertEqual(self.git('diff', '--cached', '--name-only').stdout, '')
@@ -126,7 +125,7 @@ class CandidateTests(unittest.TestCase):
         expected = ('cask "webdesserts-memory" do\n'
                     '  version "0.5.8"\n'
                     '  sha256 "' + self.sha + '"\n\n'
-                    '  url "https://github.com/webdesserts/obsidian-memory/releases/download/v0.5.8/Memory_0.5.8_aarch64.dmg"\n'
+                    '  url "https://github.com/webdesserts/obsidian-memory/releases/download/v#{version}/Memory_#{version}_aarch64.dmg"\n'
                     '  name "Memory"\n'
                     '  desc "Desktop companion for Obsidian memory"\n'
                     '  homepage "https://github.com/webdesserts/obsidian-memory"\n\n'
@@ -141,6 +140,9 @@ class CandidateTests(unittest.TestCase):
                     '  EOS\n'
                     'end\n')
         self.assertEqual(gate.generate('v0.5.8', self.sha, 'sonoma'), expected)
+        self.assertNotIn('v0.5.8/Memory_0.5.8', expected)
+        self.assertNotIn('no_check', gate.generate('v0.5.8', self.sha, 'tahoe'))
+        self.assertIn('depends_on macos: :tahoe', gate.generate('v0.5.8', self.sha, 'tahoe'))
         for tag, sha, floor in [('v0.5.8', self.sha, ''), ('v0.5.8', self.sha, 'invented'), ('v0.5.8', 'bad', 'sonoma'), ('latest', self.sha, 'sonoma')]:
             with self.subTest(tag=tag, sha=sha, floor=floor), self.assertRaises(gate.ValidationError):
                 gate.generate(tag, sha, floor)
@@ -162,16 +164,16 @@ class CandidateTests(unittest.TestCase):
             'HOMEBREW_NO_ANALYTICS': '0', 'HOMEBREW_COLOR': '1',
         }
         expected = dict(allowed, HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1',
-                        HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0')
+                        HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0', HOMEBREW_NO_COLOR='1')
         seen = []
         def inspecting(argv, **kwargs):
             if argv[0] in ('ruby', 'brew'):
                 self.assertEqual(kwargs.get('env'), expected, argv)
                 seen.append(argv)
             return self.runner(argv, **kwargs)
-        self.search_result = gate.TOKEN + '\n'
+        self.search_output = (gate.TOKEN + '\n', '', 0)
         with patch.dict(os.environ, dict(allowed, **hostile), clear=True):
-            gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, runner=inspecting)
+            gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', runner=inspecting)
             self.assertEqual(os.environ['GH_TOKEN'], hostile['GH_TOKEN'])
             self.assertEqual(os.environ['HOMEBREW_NO_INSTALL_FROM_API'], '1')
         self.assertEqual([argv[:2] for argv in seen], [
@@ -183,16 +185,18 @@ class CandidateTests(unittest.TestCase):
 
     def test_default_validate_cannot_publish_and_repeat_uses_head(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(gate, 'publish', side_effect=AssertionError('publication reached')):
-            self.assertEqual(self.validate()['status'], 'validated')
+            receipt = self.validate()
+            self.assertEqual(receipt['status'], 'validated')
+            self.assertEqual(receipt['audit'], 'passed')
             self.assertEqual(self.validate()['baseline'], self.baseline)
         self.assert_no_staging()
         self.assertFalse(any(a[0] == 'git' and a[1] in ('add', 'commit', 'push') for a in self.calls))
         self.assertFalse((self.repo / 'Library/Taps/webdesserts/homebrew-tap').exists())
-        self.assertEqual(gate.parser().parse_args(['--tap', str(self.tap), '--tag', 'v0.5.8', '--sha256', self.sha, '--macos-floor', 'sonoma', '--audit-config', str(self.config)]).operation, 'validate')
+        self.assertEqual(gate.parser().parse_args(['--tap', str(self.tap), '--tag', 'v0.5.8', '--sha256', self.sha, '--macos-floor', 'sonoma']).operation, 'validate')
 
     def test_default_cli_and_missing_floor_do_not_publish(self):
         arguments = ['cask_gate.py', '--tap', str(self.tap), '--tag', 'v0.5.8', '--sha256', self.sha,
-                     '--macos-floor', 'sonoma', '--audit-config', str(self.config)]
+                     '--macos-floor', 'sonoma']
         with patch.object(sys, 'argv', arguments), patch.object(gate, 'validate', return_value={'status': 'validated'}) as validate, patch.object(gate, 'publish', side_effect=AssertionError('publication reached')), patch('sys.stdout', new_callable=io.StringIO):
             self.assertEqual(gate.main(), 0)
             validate.assert_called_once()
@@ -227,20 +231,39 @@ class CandidateTests(unittest.TestCase):
             self.validate()
         self.assert_no_staging()
 
-    def test_missing_audit_configuration_refuses_before_rewrite(self):
-        self.config.unlink()
-        with self.assertRaises(gate.ValidationError):
-            self.validate()
-        self.assertFalse((self.tap / gate.CASK).exists())
-        self.assert_no_staging()
+    def test_stale_audit_config_flag_is_dead_as_intentional_negative(self):
+        with self.assertRaises(SystemExit) as caught:
+            gate.parser().parse_args(['--tap', str(self.tap), '--tag', 'v0.5.8',
+                                      '--audit-config', 'irrelevant.json'])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_collision_availability_and_own_token_are_bounded(self):
         for output in ['', gate.QUALIFIED + '\n', gate.TOKEN + '\n']:
-            self.search_result = output
+            self.search_output = (output, '', 0)
             self.assertEqual(self.validate()['status'], 'validated')
-        self.search_result = gate.QUALIFIED + '\nother/tap/' + gate.TOKEN
+        self.search_output = (gate.QUALIFIED + '\nother/tap/' + gate.TOKEN, '', 0)
         with self.assertRaises(gate.ValidationError):
             self.validate()
+        self.assert_no_staging()
+
+    def test_collision_search_accepts_only_exact_no_color_no_match(self):
+        no_match = 'Error: No formulae or casks found for "/^webdesserts-memory$/".\n'
+        self.search_output = ('', no_match, 1)
+        self.assertEqual(self.validate()['status'], 'validated')
+        for out, err, code in [
+            ('', no_match + 'another line\n', 1),
+            ('', '\x1b[31m' + no_match, 1),
+            ('', no_match.rstrip('\n'), 1),
+            ('', '', 1),
+            ('', 'Error: something else\n', 1),
+            ('webdesserts-memory\n', no_match, 1),
+            ('', no_match, 2),
+            (gate.QUALIFIED + '\n', 'warning on success\n', 0),
+        ]:
+            self.search_output = (out, err, code)
+            with self.subTest(out=out, err=err, code=code), self.assertRaises(gate.ValidationError):
+                self.validate()
+        self.search_output = (gate.QUALIFIED + '\n', '', 0)
         self.assert_no_staging()
 
     def test_published_head_is_baseline_for_repeat_validation(self):
@@ -282,7 +305,7 @@ class CandidateTests(unittest.TestCase):
                 raise OSError('fixture fetch failure')
             return original(argv, **kwargs)
         with self.assertRaises(OSError):
-            gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, runner=raising)
+            gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', runner=raising)
         self.assertFalse((self.repo / 'Library/Taps/webdesserts').exists())
         self.assert_no_staging()
 
@@ -364,7 +387,9 @@ class CandidateTests(unittest.TestCase):
         self.assert_no_staging()
 
     def test_publish_requires_signer_configuration_before_rewrite(self):
-        for config in (None, self.root / 'missing.json', self.config):
+        bogus_signer = self.root / 'bogus-signer.json'
+        bogus_signer.write_text(json.dumps({'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture self-signed incompatibility']}))
+        for config in (None, self.root / 'missing.json', bogus_signer):
             with self.subTest(config=config), self.assertRaises(gate.ValidationError):
                 self.publish(signer_config=config)
             self.assertFalse((self.tap / gate.CASK).exists())
@@ -374,7 +399,7 @@ class CandidateTests(unittest.TestCase):
     def test_publish_cli_requires_explicit_signer_config(self):
         args = ['cask_gate.py', '--operation', 'publish', '--tap', str(self.tap),
                 '--tag', 'v0.5.8', '--sha256', self.sha, '--macos-floor', 'sonoma',
-                '--audit-config', str(self.config), '--run-id', '123']
+                '--run-id', '123']
         with patch.object(sys, 'argv', args), patch('sys.stderr', new_callable=io.StringIO) as output:
             self.assertEqual(gate.main(), 1)
             self.assertIn('explicit signer configuration required', output.getvalue())
@@ -507,6 +532,28 @@ class CandidateTests(unittest.TestCase):
             self.publish()
         self.assert_no_staging()
 
+    def test_audit_failure_blocks_before_artifact_validation_and_git_write(self):
+        audit_codes = []
+        validated = []
+        original = self.runner
+        def auditing(argv, **kwargs):
+            outcome = original(argv, **kwargs)
+            if argv[:2] == ['brew', 'audit']:
+                audit_codes.append(outcome.returncode)
+            return outcome
+        def validator(dmg, version, config_path, runner):
+            validated.append(dmg)
+            return self.artifact_validator(dmg, version, config_path, runner)
+        self.command_failure = 'audit'
+        with self.assertRaises(gate.ValidationError):
+            self.publish(runner=auditing, validator=validator)
+        self.assertEqual(audit_codes, [1])
+        self.assertEqual(validated, [])
+        self.assertFalse(any(a[0] == 'git' and any(v in a for v in ('add', 'commit', 'push')) for a in self.calls))
+        # Candidate file creation and temporary Homebrew mapping precede the
+        # audit by design; the guarantee is no publication Git write.
+        self.assert_no_staging()
+
     def test_commit_failure_reports_local_stage(self):
         self.command_failure = 'commit'
         receipt = self.publish()
@@ -539,39 +586,6 @@ class AuditQueueTests(unittest.TestCase):
         for tag, baseline in [('v0.5.8', '0.5.8'), ('v0.5.9', '0.5.10'), ('v0.5.8', '0.5.7-rc.1')]:
             with self.subTest(tag=tag, baseline=baseline), self.assertRaises(gate.ValidationError):
                 gate.require_newer(tag, '  version "' + baseline + '"\n')
-
-    def test_audit_config_rejects_placeholders_and_missing_or_invalid_records(self):
-        with tempfile.TemporaryDirectory(prefix='memory-audit-config-test-') as directory:
-            path = Path(directory) / 'audit.json'
-            records = [{}, {'exit_code': 0, 'stdout_lines': [], 'stderr_lines': ['fixture']},
-                       {'exit_code': 1, 'stdout_lines': [], 'stderr_lines': []},
-                       {'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['{path}']},
-                       {'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture\x85']},
-                       {'exit_code': True, 'stdout_lines': [], 'stderr_lines': ['fixture']}]
-            for record in records:
-                path.write_text(json.dumps(record))
-                with self.subTest(record=record), self.assertRaises(gate.ValidationError):
-                    gate.load_audit_config(path)
-
-    def test_exact_audit_classifier_only(self):
-        record = {'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture rejection']}
-        for code, out, err in [(1, '', 'fixture rejection\n'), (1, '', 'fixture rejection\r\n')]:
-            self.assertEqual(gate.classify_audit(subprocess.CompletedProcess([], code, out, err), record), 'expected_self_signed_incompatibility')
-        for code, out, err in [(0, '', ''), (1, '', 'fixture rejection\nother'), (1, 'other', 'fixture rejection'), (1, '', 'fixture rejection\x85'), (2, '', 'fixture rejection')]:
-            with self.subTest(code=code, out=out, err=err), self.assertRaises(gate.ValidationError):
-                gate.classify_audit(subprocess.CompletedProcess([], code, out, err), record)
-
-    def test_audit_exception_does_not_absorb_floor_deprecation(self):
-        record = {'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture self-signed incompatibility']}
-        warning = 'Warning: Calling string comparison format for `depends_on macos:` is deprecated!'
-        for stream in ('stdout', 'stderr'):
-            for position in ('before', 'after', 'instead'):
-                outputs = {'stdout': '', 'stderr': 'fixture self-signed incompatibility\n'}
-                prior = outputs[stream]
-                outputs[stream] = (warning + '\n' + prior if position == 'before' else
-                                   prior + warning + '\n' if position == 'after' else warning + '\n')
-                with self.subTest(stream=stream, position=position), self.assertRaises(gate.ValidationError):
-                    gate.classify_audit(subprocess.CompletedProcess([], 1, outputs['stdout'], outputs['stderr']), record)
 
     def test_queue_auth_remains_separate_from_candidate_environment(self):
         def runner(argv, **kwargs):

@@ -47,7 +47,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(self.verify.index('load_config(config)'), self.verify.index('urllib.request.urlopen'))
         self.assertIn('digest(artifact) == expected', self.verify)
         self.assertIn("receipt['sha256'] == expected", self.verify)
-        self.assertIn("'--audit-config', 'tooling/scripts/t299/audit_config.json'", self.verify)
+        self.assertNotIn('--audit-config', self.cask)
         candidate = list(python_blocks(self.verify))[-1]
         self.assertLess(candidate.index('], check=True)'), candidate.index("output.write('verified=true"))
 

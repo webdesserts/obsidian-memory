@@ -1,8 +1,10 @@
 """Owner-operated stable cask gates; desktop prerelease casks are out of scope.
 
-Default validation has no Git write operation. Audit configuration is external,
-probe-approved JSON: exit_code plus complete stdout_lines and stderr_lines.
-No production classifier is supplied or inferred here.
+Default validation has no Git write operation. The official
+`brew audit --cask --online` gate must exit 0 (via the checked runner); its
+output is not classified. Audit output is not evidence of Gatekeeper
+preapproval: that classification belongs solely to artifact_validator's
+spctl/ticket evidence.
 """
 import argparse
 from contextlib import contextmanager
@@ -21,6 +23,8 @@ REPOSITORY = 'webdesserts/obsidian-memory'
 TOKEN = 'webdesserts-memory'
 QUALIFIED = 'webdesserts/tap/' + TOKEN
 CASK = 'Casks/' + TOKEN + '.rb'
+# Literal Homebrew interpolation, kept out of .format braces by concatenation.
+CASK_URL = 'https://github.com/' + REPOSITORY + '/releases/download/v#{version}/Memory_#{version}_aarch64.dmg'
 FLOORS = ('big_sur', 'monterey', 'ventura', 'sonoma', 'sequoia', 'tahoe')
 NONTERMINAL = ('queued', 'requested', 'waiting', 'pending', 'in_progress')
 STABLE_VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
@@ -66,32 +70,7 @@ def generate(tag, sha256, macos_floor):
     The macOS floor is a reviewed support policy, not proof on every newer macOS release.
   EOS
 end
-'''.format(version=value, sha256=sha256.lower(), url=asset_url(tag), floor=macos_floor)
-
-
-def load_audit_config(path):
-    require(path is not None and Path(path).is_file(), 'external probe-approved audit configuration missing')
-    try:
-        record = json.loads(Path(path).read_text())
-        require(set(record) == {'exit_code', 'stdout_lines', 'stderr_lines'}, 'invalid audit configuration fields')
-        require(type(record['exit_code']) is int and 1 <= record['exit_code'] <= 255, 'expected audit incompatibility exit code required')
-        for stream in ('stdout_lines', 'stderr_lines'):
-            require(isinstance(record[stream], list) and len(record[stream]) <= 64, 'invalid audit lines')
-            for line in record[stream]:
-                require(isinstance(line, str) and 0 < len(line) <= 4096 and not re.search(r'[\x00-\x1f\x7f-\x9f\u2028\u2029{}]', line), 'audit lines must be literal probe observations without placeholders')
-        require(record['stdout_lines'] or record['stderr_lines'], 'empty audit classifier')
-        return record
-    except (ValueError, TypeError, KeyError) as exc:
-        raise ValidationError('invalid audit configuration') from exc
-
-
-def classify_audit(result, record):
-    require(result.returncode == record['exit_code'], 'unexpected audit exit code')
-    for stream in ('stdout', 'stderr'):
-        text = getattr(result, stream)
-        require(len(text) <= 65536 and not re.search(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]', text), 'invalid audit output')
-        require(text.splitlines() == record[stream + '_lines'], 'unrelated or unknown audit output')
-    return 'expected_self_signed_incompatibility'
+'''.format(version=value, sha256=sha256.lower(), url=CASK_URL, floor=macos_floor)
 
 
 def read_git(tap, runner, *args):
@@ -151,13 +130,13 @@ def mapped_tap(tap, runner, env):
             owner.rmdir()
 
 
-def candidate_gates(tap, tag, sha256, audit_record, runner):
+def candidate_gates(tap, tag, sha256, runner):
     # Preserve tool lookup, user/cache/temp locations, locale and CI behavior only.
     # Queue authentication stays in the separate gh path, never Ruby/Homebrew.
     env = {key: os.environ[key] for key in (
         'PATH', 'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'CI',
     ) if key in os.environ}
-    env.update(HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1', HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0')
+    env.update(HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1', HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0', HOMEBREW_NO_COLOR='1')
     path = tap / CASK
     with mapped_tap(tap, runner, env):
         checked(runner, ['ruby', '-c', str(path)], env=env)
@@ -175,9 +154,15 @@ def candidate_gates(tap, tag, sha256, audit_record, runner):
         cache = Path(checked(runner, ['brew', '--cache', '--cask', QUALIFIED], env=env).strip())
         require(cache.is_absolute() and cache.is_file() and digest(cache) == sha256.lower(), 'candidate fetched SHA mismatch')
         checked(runner, ['brew', 'style', '--cask', str(path)], env=env)
-        collision = checked(runner, ['brew', 'search', '--casks', '/^' + TOKEN + '$/'], env=env)
-        # Only an exact own-tap result is understood; errors never mean available.
-        tokens = collision.split()
+        result = runner(['brew', 'search', '--casks', '/^' + TOKEN + '$/'], env=env)
+        # Only the exact no-color no-match diagnostic or an exact own-tap result
+        # is understood; every other exit code or diagnostic is a collision or
+        # lookup failure, never availability. No text is stripped or normalized.
+        if result.returncode == 1 and result.stdout == '' and result.stderr == 'Error: No formulae or casks found for "/^webdesserts-memory$/".\n':
+            tokens = []
+        else:
+            require(result.returncode == 0 and result.stderr == '', 'cask token collision lookup failed unexpectedly')
+            tokens = result.stdout.split()
         if tokens == [TOKEN]:
             own = checked(runner, ['brew', 'info', '--json=v2', '--cask', TOKEN], env=env)
             try:
@@ -188,28 +173,27 @@ def candidate_gates(tap, tag, sha256, audit_record, runner):
                 raise ValidationError('invalid collision resolution') from exc
         else:
             require(tokens in ([], [QUALIFIED]), 'cask token collision or ambiguous lookup')
-        result = runner(['brew', 'audit', '--cask', '--online', QUALIFIED], env=env)
-        audit = classify_audit(result, audit_record)
+        checked(runner, ['brew', 'audit', '--cask', '--online', QUALIFIED], env=env)
+        audit = 'passed'
     return audit, cache
 
 
-def _validate_candidate(tap, tag, sha256, macos_floor, audit_config, runner):
+def _validate_candidate(tap, tag, sha256, macos_floor, runner):
     candidate = generate(tag, sha256, macos_floor)
-    record = load_audit_config(audit_config)
     tap = Path(tap).resolve()
     head, baseline = capture_baseline(tap, candidate, runner)
     require_newer(tag, baseline)
     path = tap / CASK
     path.parent.mkdir(exist_ok=True)
     path.write_bytes(candidate.encode())
-    audit, cache = candidate_gates(tap, tag, sha256, record, runner)
+    audit, cache = candidate_gates(tap, tag, sha256, runner)
     require(path.read_bytes() == candidate.encode(), 'candidate changed during gates')
     require(capture_baseline(tap, candidate, runner)[0] == head, 'tap baseline changed during gates')
     return {'status': 'validated', 'baseline': head, 'tag': tag, 'sha256': sha256.lower(), 'macos_floor': macos_floor, 'audit': audit}, cache
 
 
-def validate(tap, tag, sha256, macos_floor, audit_config, runner=run):
-    receipt, _ = _validate_candidate(tap, tag, sha256, macos_floor, audit_config, runner)
+def validate(tap, tag, sha256, macos_floor, runner=run):
+    receipt, _ = _validate_candidate(tap, tag, sha256, macos_floor, runner)
     return receipt
 
 
@@ -257,20 +241,19 @@ def remote_head(tap, runner):
     return raw.split()[0]
 
 
-def publish(tap, tag, sha256, macos_floor, audit_config, *, run_id, signer_config=None, runner=run, validator=None):
+def publish(tap, tag, sha256, macos_floor, *, run_id, signer_config=None, runner=run, validator=None):
     """Explicit publication only; callers must maintain owner-enforced no overlap."""
     require(signer_config is not None, 'explicit signer configuration required for publication')
     artifact_validator.load_config(signer_config)
     if validator is None:
         validator = artifact_validator.validate
     candidate = generate(tag, sha256, macos_floor)
-    load_audit_config(audit_config)
     check_queue(run_id, runner)
     tap = Path(tap).resolve()
     head, baseline = capture_baseline(tap, candidate, runner, clean=True)
     require(remote_head(tap, runner) == head, 'stale remote baseline')
     require_newer(tag, baseline)
-    receipt, cache = _validate_candidate(tap, tag, sha256, macos_floor, audit_config, runner)
+    receipt, cache = _validate_candidate(tap, tag, sha256, macos_floor, runner)
     _validate_fetched_artifact(cache, tag, sha256, signer_config, validator, runner)
     check_queue(run_id, runner)
     require(remote_head(tap, runner) == head, 'remote changed before staging')
@@ -304,7 +287,6 @@ def parser():
     value.add_argument('--tag')
     value.add_argument('--sha256')
     value.add_argument('--macos-floor')
-    value.add_argument('--audit-config', type=Path)
     value.add_argument('--signer-config', type=Path, help='Required for publish; approved public signer configuration')
     value.add_argument('--run-id')
     return value
@@ -318,7 +300,7 @@ def main():
             receipt = {'status': 'queue_clear', 'atomic_lock': False}
         else:
             require(args.tap is not None, 'explicit tap directory required')
-            values = (args.tap, args.tag, args.sha256, args.macos_floor, args.audit_config)
+            values = (args.tap, args.tag, args.sha256, args.macos_floor)
             receipt = publish(*values, run_id=args.run_id, signer_config=args.signer_config) if args.operation == 'publish' else validate(*values)
         print(json.dumps(receipt, sort_keys=True))
         return 0 if receipt['status'] in ('validated', 'published', 'queue_clear') else 1

@@ -83,7 +83,6 @@ jobs:
               '--tag', os.environ['RELEASE_TAG'],
               '--sha256', os.environ['EXPECTED_SHA256'],
               '--macos-floor', os.environ['MACOS_FLOOR'],
-              '--audit-config', 'tooling/scripts/t299/audit_config.json',
           ], check=True)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('verified=true\n')
@@ -143,5 +142,4 @@ jobs:
               '--tag', os.environ['RELEASE_TAG'],
               '--sha256', os.environ['EXPECTED_SHA256'],
               '--macos-floor', os.environ['MACOS_FLOOR'],
-              '--audit-config', 'tooling/scripts/t299/audit_config.json',
           ], check=True)
