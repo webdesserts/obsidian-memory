@@ -15,8 +15,10 @@ This is the authoritative desktop install, approval, update and recovery guide.
 The private `webdesserts/tap/webdesserts-memory` cask is **UNPUBLISHED** until
 `t:299`'s owner-approved artifact, validation, smoke and publication gates pass.
 Release tooling is authored, and the owner-approved public signer configuration
-now validates a signed local probe package. Normal GUI startup, quarantined cask
-installation and same-signer upgrade behavior remain gated live work.
+now validates a signed local probe package. The unquarantined local 0.5.7 probe
+also passed normal LaunchServices launch, sustained health, quit and relaunch on
+Umbra. Final 0.5.8 packaging, quarantined cask installation and same-signer
+upgrade behavior remain gated live work.
 
 **What works:**
 
@@ -182,8 +184,8 @@ Production `signer_config.json` now contains the owner-approved public identity
 and exact pre-approval observations from the local compatibility probe; it
 contains no key material. Audit-classifier configuration is **not yet present**
 and must come from the real candidate audit without invented diagnostics.
-Remaining gates cover normal GUI startup, tag/CLI release, desktop upload,
-fixture-assisted quarantined install/monotonic upgrade smoke and restoration,
+Remaining gates cover the final 0.5.8 build, tag/CLI release, desktop upload,
+fixture-assisted quarantined cask launch/monotonic upgrade smoke and restoration,
 final candidate validation with the reviewed macOS floor, tap publication, and
 explicit automation enablement. The short tap README install/link entry belongs
 to owner-reviewed first publication (G6); this guide remains authoritative.

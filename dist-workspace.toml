@@ -29,8 +29,9 @@ default-features = false
 # `--workspace`, so the non-dist `desktop`/`sync-daemon` crates (dist = false)
 # are never compiled — `desktop`'s GTK/Tauri deps break the cross-target builds.
 precise-builds = true
-# The release workflow is hand-augmented with a `build-desktop-dmg` job that dist
-# doesn't generate; tell dist not to enforce ci-file freshness against it.
+# The generated release workflow intentionally differs from cargo-dist output:
+# t299 retires desktop DMG generation from tag CI and keeps signing on Umbra.
+# Preserve this exception until regeneration can retain that boundary explicitly.
 allow-dirty = ["ci"]
 # Custom build setup to download model before building
 github-build-setup = "../build-setup.yml"
