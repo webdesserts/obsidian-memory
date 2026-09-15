@@ -14,8 +14,9 @@ static files served from `public/windows/`, no React).
 This is the authoritative desktop install, approval, update and recovery guide.
 The private `webdesserts/tap/webdesserts-memory` cask is **UNPUBLISHED** until
 `t:299`'s owner-approved artifact, validation, smoke and publication gates pass.
-Release tooling is authored; a working signed package and GUI upgrade behavior
-have not yet been established by the required live probes.
+Release tooling is authored, and the owner-approved public signer configuration
+now validates a signed local probe package. Normal GUI startup, quarantined cask
+installation and same-signer upgrade behavior remain gated live work.
 
 **What works:**
 
@@ -177,14 +178,15 @@ prevent competing releases and desktop publications until publication completes;
 the queue check is defensive, not an atomic lock. Broader automatic publication
 remains disabled.
 
-Production `signer_config.json` and audit-classifier configuration are **not yet
-present**; owner-approved probe observations must supply them, without invented
-values or key material. Remaining gates cover identity provisioning, compatibility
-and public-config approval, tag/CLI release, desktop upload, fixture-assisted
-quarantined install/monotonic upgrade smoke and restoration, final candidate
-validation with the reviewed macOS floor, tap publication, and explicit automation
-enablement. The short tap README install/link entry belongs to owner-reviewed
-first publication (G6); this guide remains authoritative.
+Production `signer_config.json` now contains the owner-approved public identity
+and exact pre-approval observations from the local compatibility probe; it
+contains no key material. Audit-classifier configuration is **not yet present**
+and must come from the real candidate audit without invented diagnostics.
+Remaining gates cover normal GUI startup, tag/CLI release, desktop upload,
+fixture-assisted quarantined install/monotonic upgrade smoke and restoration,
+final candidate validation with the reviewed macOS floor, tap publication, and
+explicit automation enablement. The short tap README install/link entry belongs
+to owner-reviewed first publication (G6); this guide remains authoritative.
 
 ## Frontend / ui dependency
 
