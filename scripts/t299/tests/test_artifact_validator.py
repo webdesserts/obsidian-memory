@@ -1,0 +1,209 @@
+import hashlib
+import json
+from pathlib import Path
+import plistlib
+import subprocess
+import shutil
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import artifact_validator as av
+
+CERT = b'fixture public DER bytes, not a real certificate'
+DR = 'identifier "com.webdesserts.obsidian-memory" and certificate leaf = H"fixture"'
+
+
+def config():
+    return dict(common_name='ObsidianMemory Dev Signing', der_sha256=hashlib.sha256(CERT).hexdigest(),
+                designated_requirement=DR, observations={
+                    'spctl': dict(exit_code=3, stdout_contains=[], stderr_contains=['rejected: fixture self-signed']),
+                    'ticket': dict(exit_code=65, stdout_contains=['fixture ticket absent'], stderr_contains=[])})
+
+
+class FixtureRunner:
+    def __init__(self):
+        self.calls = []
+        self.fail = None
+        self.metadata = {}
+        self.arch = 'arm64'
+        self.certificates = 1
+        self.details = 'Authority=ObsidianMemory Dev Signing\nSignature size=123\n'
+        self.dr = 'designated => ' + DR
+        self.mounted = False
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        out, err, code = '', '', 0
+        if argv[:2] == ['hdiutil', 'attach']:
+            self.mount = Path(argv[argv.index('-mountpoint') + 1])
+            self.cleanup_mount(self.mount)
+            app = self.mount / 'Memory.app/Contents'
+            (app / 'MacOS').mkdir(parents=True)
+            (app / 'MacOS/desktop').write_bytes(b'fixture executable')
+            info = dict(CFBundleIdentifier=av.BUNDLE_ID, CFBundleShortVersionString='0.5.7', CFBundleExecutable='desktop')
+            info.update(self.metadata)
+            (app / 'Info.plist').write_bytes(plistlib.dumps(info))
+            self.mounted = True
+        elif argv[:2] == ['hdiutil', 'detach']:
+            assert argv[-1] == str(self.mount)
+            self.mounted = False
+            if self.fail != 'detach':
+                shutil.rmtree(self.mount / 'Memory.app')
+        else:
+            assert self.mounted
+            assert str(self.mount) in argv[-1]
+            if '--extract-certificates' in argv:
+                prefix = argv[argv.index('--extract-certificates') + 1]
+                for i in range(self.certificates):
+                    Path(prefix + str(i)).write_bytes(CERT)
+            elif argv[0] == 'lipo':
+                out = self.arch
+            elif '-r-' in argv:
+                err = self.dr
+            elif '-dv' in argv:
+                err = self.details
+            elif argv[0] == 'spctl':
+                code, err = 3, 'rejected: fixture self-signed'
+            elif argv[0] == 'xcrun':
+                code, out = 65, 'fixture ticket absent'
+        if self.fail and self.fail in argv:
+            code = 99
+        return subprocess.CompletedProcess(argv, code, out, err)
+
+
+class ValidatorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='validator tests ')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.dmg = self.root / 'Memory_0.5.7_aarch64.dmg'
+        self.dmg.write_bytes(b'fixture dmg')
+        self.cfg = self.root / 'fixture.json'
+        self.settings = config()
+        self.runner = FixtureRunner()
+        self.runner.cleanup_mount = lambda mount: self.addCleanup(shutil.rmtree, mount, True)
+
+    def validate(self):
+        self.cfg.write_text(json.dumps(self.settings))
+        return av.validate(self.dmg, '0.5.7', self.cfg, runner=self.runner)
+
+    def test_success_receipt_after_detach(self):
+        original = av.digest
+        def digest(path):
+            if path == self.dmg:
+                self.assertFalse(self.runner.mounted)
+                self.assertEqual(self.runner.calls[-1][1], 'detach')
+            return original(path)
+        with patch.object(av, 'digest', digest):
+            receipt = self.validate()
+        self.assertEqual(receipt['sha256'], hashlib.sha256(b'fixture dmg').hexdigest())
+        self.assertEqual(receipt['observations'], {'spctl': 'expected_preapproval', 'ticket': 'expected_preapproval'})
+        attach = self.runner.calls[0]
+        self.assertIn('-readonly', attach)
+        self.assertIn('-nobrowse', attach)
+
+    def test_identity_mismatches(self):
+        for field, value in [('common_name', 'Other'), ('der_sha256', '0'*64), ('designated_requirement', DR + ' and false')]:
+            with self.subTest(field=field):
+                self.settings = config()
+                self.settings[field] = value
+                with self.assertRaises(av.ValidationError):
+                    self.validate()
+                self.assertEqual(self.runner.calls[-1][1], 'detach')
+
+    def test_bad_metadata_and_arch(self):
+        for key, value in [('CFBundleIdentifier', 'other'), ('CFBundleShortVersionString', '1.0.0'), ('CFBundleExecutable', '../desktop'), ('CFBundleExecutable', 'other')]:
+            with self.subTest(key=key, value=value):
+                self.runner.metadata = {key: value}
+                with self.assertRaises(av.ValidationError):
+                    self.validate()
+        self.runner.metadata = {}
+        for arch in ['x86_64', 'arm64 x86_64', 'arm64e']:
+            self.runner.arch = arch
+            with self.assertRaises(av.ValidationError):
+                self.validate()
+
+    def test_missing_multiple_certificates_and_unsigned(self):
+        for count in [0, 2]:
+            self.runner.certificates = count
+            with self.assertRaises(av.ValidationError):
+                self.validate()
+        self.runner.certificates = 1
+        for details in ['Signature=adhoc', 'flags=0x20002(adhoc,linker-signed)', 'Authority=Other', '']:
+            self.runner.details = details
+            with self.assertRaises(av.ValidationError):
+                self.validate()
+
+    def test_command_failures_always_detach_and_no_digest(self):
+        for command in ['attach', '--extract-certificates', '--verify', '-r-', '-dv', 'lipo', 'spctl', 'stapler', 'detach']:
+            self.runner.fail = command
+            with self.subTest(command=command), patch.object(av, 'digest', wraps=av.digest) as digest:
+                with self.assertRaises(av.ValidationError):
+                    self.validate()
+                self.assertNotIn(unittest.mock.call(self.dmg), digest.call_args_list)
+                self.assertEqual(self.runner.calls[-1][1], 'detach')
+
+    def test_missing_config_and_invalid_config_do_not_mount(self):
+        with self.assertRaisesRegex(av.ValidationError, 'identity configuration missing'):
+            av.validate(self.dmg, '0.5.7', self.cfg, runner=self.runner)
+        for key, value in [('common_name', ''), ('der_sha256', 'A'*64), ('designated_requirement', ''), ('observations', {})]:
+            self.settings = config()
+            self.settings[key] = value
+            with self.assertRaises(av.ValidationError):
+                self.validate()
+        self.assertEqual(self.runner.calls, [])
+
+    def test_missing_or_wrong_filename_does_not_mount(self):
+        self.dmg.unlink()
+        with self.assertRaises(av.ValidationError):
+            self.validate()
+        self.dmg = self.root / 'Other.dmg'
+        self.dmg.write_bytes(b'x')
+        with self.assertRaises(av.ValidationError):
+            self.validate()
+        self.assertEqual(self.runner.calls, [])
+
+    def test_classifier_exact_exit_streams_and_unknown(self):
+        record = config()['observations']['spctl']
+        good = subprocess.CompletedProcess([], 3, '', 'rejected: fixture self-signed')
+        self.assertEqual(av.classify(good, record), 'expected_preapproval')
+        for code, out, err in [(0, '', good.stderr), (3, good.stderr, ''), (3, '', 'unknown'), (3, '', good.stderr+'\ninternal error'), (3, '', 'x'*9000)]:
+            with self.subTest(code=code, out=out, err=err[:40]), self.assertRaises(av.ValidationError):
+                av.classify(subprocess.CompletedProcess([], code, out, err), record)
+
+    def test_unique_owned_mounts_and_exception_cleanup(self):
+        self.validate()
+        first = self.runner.mount
+        self.validate()
+        self.assertNotEqual(first, self.runner.mount)
+        base = self.runner
+        def raises(argv):
+            if argv[0] == 'lipo':
+                raise OSError('fixture tool missing')
+            return base(argv)
+        self.runner = raises
+        with self.assertRaises(OSError):
+            self.validate()
+        self.assertEqual(base.calls[-1][1], 'detach')
+
+    def test_codesign_identity_on_stdout(self):
+        base = self.runner
+        def stdout_runner(argv):
+            result = base(argv)
+            if '-dv' in argv or '-r-' in argv:
+                result.stdout, result.stderr = result.stderr, result.stdout
+            return result
+        self.runner = stdout_runner
+        self.assertEqual(self.validate()['status'], 'validated')
+
+    def test_adhoc_reference_fixture(self):
+        self.runner.details = (Path(__file__).parent / 'fixtures/adhoc-codesign.txt').read_text()
+        with self.assertRaises(av.ValidationError):
+            self.validate()
+
+
+if __name__ == '__main__':
+    unittest.main()
