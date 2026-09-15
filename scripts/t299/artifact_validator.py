@@ -39,29 +39,34 @@ def load_config(path):
         require('identifier "' + BUNDLE_ID + '"' in cfg['designated_requirement'], 'requirement missing bundle identifier')
         require(set(cfg['observations']) == {'spctl', 'ticket'}, 'missing observation configuration')
         for record in cfg['observations'].values():
-            require(set(record) == {'exit_code', 'stdout_contains', 'stderr_contains'}, 'invalid observation fields')
+            require(set(record) == {'exit_code', 'stdout_lines', 'stderr_lines'}, 'invalid observation fields')
             require(type(record['exit_code']) is int and 1 <= record['exit_code'] <= 255, 'expected rejection exit code required')
-            tokens = []
-            for key in ['stdout_contains', 'stderr_contains']:
-                require(isinstance(record[key], list) and len(record[key]) <= 16, 'invalid observation patterns')
-                for token in record[key]:
-                    require(isinstance(token, str) and 3 <= len(token) <= 512 and token.strip() == token and '\n' not in token, 'invalid observation substring')
-                tokens.extend(record[key])
-            require(tokens, 'empty observation classifier')
+            lines = []
+            for key in ['stdout_lines', 'stderr_lines']:
+                require(isinstance(record[key], list) and len(record[key]) <= 16, 'invalid observation templates')
+                for line in record[key]:
+                    require(isinstance(line, str) and 1 <= len(line) <= 512 and not re.search(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]', line), 'invalid observation line')
+                    literal = line.replace('{path}', '')
+                    require(line.count('{path}') <= 1 and '{' not in literal and '}' not in literal, 'unknown observation placeholder')
+                lines.extend(record[key])
+            require(lines, 'empty observation classifier')
         return cfg
     except (ValueError, TypeError, KeyError) as exc:
         raise ValidationError('invalid identity configuration') from exc
 
 
-def classify(result, record):
+def classify(result, record, app_path):
+    path = str(app_path)
+    require(Path(path).is_absolute() and Path(path).name == 'Memory.app' and
+            '..' not in Path(path).parts and len(path) <= 4096 and
+            not re.search(r'[\x00-\x1f\x7f-\x9f\u2028\u2029]', path), 'invalid observation app path')
     require(result.returncode == record['exit_code'], 'unknown observation exit code')
     for stream in ['stdout', 'stderr']:
         text = getattr(result, stream)
-        tokens = record[stream + '_contains']
         require(len(text) <= MAX_OUTPUT, 'observation output too large')
-        require(all(token in text for token in tokens), 'unknown observation text')
-        # Unrecognized diagnostic lines must not hide behind an expected rejection.
-        require(all(any(token in line for token in tokens) for line in text.splitlines() if line.strip()), 'unexpected observation diagnostic')
+        expected = [line.replace('{path}', path) for line in record[stream + '_lines']]
+        # Only line endings and a final newline normalize; diagnostic content is exact.
+        require(text.splitlines() == expected, 'unknown observation text')
     return 'expected_preapproval'
 
 
@@ -126,8 +131,8 @@ def validate(dmg, version, config_path, runner=run):
             authorities = [line[len('Authority='):] for line in text.splitlines() if line.startswith('Authority=')]
             require(authorities == [cfg['common_name']], 'wrong signer common name')
             observations = {
-                'spctl': classify(runner(['spctl', '--assess', '--type', 'execute', '--verbose=4', str(app)]), cfg['observations']['spctl']),
-                'ticket': classify(runner(['xcrun', 'stapler', 'validate', str(app)]), cfg['observations']['ticket']),
+                'spctl': classify(runner(['spctl', '--assess', '--type', 'execute', '--verbose=4', str(app)]), cfg['observations']['spctl'], app),
+                'ticket': classify(runner(['xcrun', 'stapler', 'validate', str(app)]), cfg['observations']['ticket'], app),
             }
         finally:
             checked(runner, ['hdiutil', 'detach', str(mount)])

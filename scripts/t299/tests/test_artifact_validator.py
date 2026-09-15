@@ -19,8 +19,8 @@ DR = 'identifier "com.webdesserts.obsidian-memory" and certificate leaf = H"fixt
 def config():
     return dict(common_name='ObsidianMemory Dev Signing', der_sha256=hashlib.sha256(CERT).hexdigest(),
                 designated_requirement=DR, observations={
-                    'spctl': dict(exit_code=3, stdout_contains=[], stderr_contains=['rejected: fixture self-signed']),
-                    'ticket': dict(exit_code=65, stdout_contains=['fixture ticket absent'], stderr_contains=[])})
+                    'spctl': dict(exit_code=3, stdout_lines=[], stderr_lines=['{path}: rejected: fixture self-signed']),
+                    'ticket': dict(exit_code=65, stdout_lines=['fixture ticket absent: {path}'], stderr_lines=[])})
 
 
 class FixtureRunner:
@@ -66,9 +66,9 @@ class FixtureRunner:
             elif '-dv' in argv:
                 err = self.details
             elif argv[0] == 'spctl':
-                code, err = 3, 'rejected: fixture self-signed'
+                code, err = 3, argv[-1] + ': rejected: fixture self-signed'
             elif argv[0] == 'xcrun':
-                code, out = 65, 'fixture ticket absent'
+                code, out = 65, 'fixture ticket absent: ' + argv[-1]
         if self.fail and self.fail in argv:
             code = 99
         return subprocess.CompletedProcess(argv, code, out, err)
@@ -168,11 +168,50 @@ class ValidatorTests(unittest.TestCase):
 
     def test_classifier_exact_exit_streams_and_unknown(self):
         record = config()['observations']['spctl']
-        good = subprocess.CompletedProcess([], 3, '', 'rejected: fixture self-signed')
-        self.assertEqual(av.classify(good, record), 'expected_preapproval')
-        for code, out, err in [(0, '', good.stderr), (3, good.stderr, ''), (3, '', 'unknown'), (3, '', good.stderr+'\ninternal error'), (3, '', 'x'*9000)]:
+        app = self.root / 'mount with spaces/Memory.app'
+        good = subprocess.CompletedProcess([], 3, '', str(app) + ': rejected: fixture self-signed')
+        self.assertEqual(av.classify(good, record, app), 'expected_preapproval')
+        for code, out, err in [(0, '', good.stderr), (3, good.stderr, ''), (3, '', 'unknown'), (3, '', good.stderr+'\ninternal error'), (3, '', good.stderr+'; unknown internal error'), (3, '', 'prefix '+good.stderr), (3, '', ' '+good.stderr), (3, '', good.stderr+' '), (3, '', good.stderr+'\n\n'), (3, '', 'x'*9000), (3, '', good.stderr.replace('mount with spaces', 'other mount'))]:
             with self.subTest(code=code, out=out, err=err[:40]), self.assertRaises(av.ValidationError):
-                av.classify(subprocess.CompletedProcess([], code, out, err), record)
+                av.classify(subprocess.CompletedProcess([], code, out, err), record, app)
+
+    def test_classifier_order_and_line_endings(self):
+        app = self.root / 'mount with spaces/Memory.app'
+        record = dict(exit_code=3, stdout_lines=['first', 'second: {path}'], stderr_lines=['rejected'])
+        for separator in ['\n', '\r\n', '\r']:
+            result = subprocess.CompletedProcess([], 3, separator.join(['first', 'second: '+str(app)])+separator, 'rejected'+separator)
+            self.assertEqual(av.classify(result, record, app), 'expected_preapproval')
+        for lines in [['second: '+str(app), 'first'], ['first', 'extra', 'second: '+str(app)], ['first', '', 'second: '+str(app)]]:
+            with self.assertRaises(av.ValidationError):
+                av.classify(subprocess.CompletedProcess([], 3, '\n'.join(lines), 'rejected'), record, app)
+
+    def test_observation_templates_reject_unknown_placeholders_and_controls(self):
+        for line in ['{other}', '{path!r}', '{path.name}', '{path:20}', '{{path}}', '{path}{path}', 'bad\nline', 'bad\rline', 'bad\x00line', 'bad\u2028line']:
+            self.settings = config()
+            self.settings['observations']['spctl']['stderr_lines'] = [line]
+            with self.subTest(line=line), self.assertRaises(av.ValidationError):
+                self.validate()
+        self.assertEqual(self.runner.calls, [])
+
+    def test_invalid_classifier_path_rejected(self):
+        record = config()['observations']['spctl']
+        for app in ['relative/Memory.app', '/tmp/../Memory.app', '/tmp/Other.app', '/tmp/bad\npath/Memory.app']:
+            result = subprocess.CompletedProcess([], 3, '', app + ': rejected: fixture self-signed')
+            with self.subTest(app=app), self.assertRaises(av.ValidationError):
+                av.classify(result, record, app)
+
+    def test_same_line_unknown_error_detaches_without_receipt(self):
+        base = self.runner
+        def corrupted(argv):
+            result = base(argv)
+            if argv[0] == 'spctl':
+                result.stderr += '; unknown internal error'
+            return result
+        self.runner = corrupted
+        with self.assertRaises(av.ValidationError), patch.object(av, 'digest', wraps=av.digest) as digest:
+            self.validate()
+        self.assertNotIn(unittest.mock.call(self.dmg), digest.call_args_list)
+        self.assertEqual(base.calls[-1][1], 'detach')
 
     def test_unique_owned_mounts_and_exception_cleanup(self):
         self.validate()
