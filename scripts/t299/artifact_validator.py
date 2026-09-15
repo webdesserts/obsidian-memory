@@ -64,6 +64,7 @@ def classify(result, record, app_path):
     for stream in ['stdout', 'stderr']:
         text = getattr(result, stream)
         require(len(text) <= MAX_OUTPUT, 'observation output too large')
+        require(not re.search(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]', text), 'invalid observation output control')
         expected = [line.replace('{path}', path) for line in record[stream + '_lines']]
         # Only line endings and a final newline normalize; diagnostic content is exact.
         require(text.splitlines() == expected, 'unknown observation text')

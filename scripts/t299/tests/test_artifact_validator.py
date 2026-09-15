@@ -185,6 +185,23 @@ class ValidatorTests(unittest.TestCase):
             with self.assertRaises(av.ValidationError):
                 av.classify(subprocess.CompletedProcess([], 3, '\n'.join(lines), 'rejected'), record, app)
 
+    def test_classifier_rejects_raw_controls_before_line_normalization(self):
+        app = self.root / 'mount with spaces/Memory.app'
+        controls = [chr(code) for code in range(32) if code not in [10, 13]]
+        controls += [chr(code) for code in range(127, 160)] + ['\u2028', '\u2029']
+        for stream in ['stdout', 'stderr']:
+            for control in controls:
+                for placement in ['trailing', 'inter-line']:
+                    lines = ['first'] if placement == 'trailing' else ['first', 'second']
+                    text = 'first' + control if placement == 'trailing' else control.join(lines)
+                    record = dict(exit_code=3, stdout_lines=[], stderr_lines=[])
+                    record[stream + '_lines'] = lines
+                    output = dict(stdout='', stderr='')
+                    output[stream] = text
+                    result = subprocess.CompletedProcess([], 3, **output)
+                    with self.subTest(stream=stream, control=repr(control), placement=placement), self.assertRaises(av.ValidationError):
+                        av.classify(result, record, app)
+
     def test_observation_templates_reject_unknown_placeholders_and_controls(self):
         for line in ['{other}', '{path!r}', '{path.name}', '{path:20}', '{{path}}', '{path}{path}', 'bad\nline', 'bad\rline', 'bad\x00line', 'bad\u2028line']:
             self.settings = config()
