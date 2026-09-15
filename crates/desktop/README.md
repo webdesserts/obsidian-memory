@@ -182,13 +182,37 @@ remains disabled.
 
 Production `signer_config.json` now contains the owner-approved public identity
 and exact pre-approval observations from the local compatibility probe; it
-contains no key material. Audit-classifier configuration is **not yet present**
-and must come from the real candidate audit without invented diagnostics.
-Remaining gates cover the final 0.5.8 build, tag/CLI release, desktop upload,
-fixture-assisted quarantined cask launch/monotonic upgrade smoke and restoration,
-final candidate validation with the reviewed macOS floor, tap publication, and
-explicit automation enablement. The short tap README install/link entry belongs
-to owner-reviewed first publication (G6); this guide remains authoritative.
+contains no key material. It remains the sole source of spctl/ticket
+preapproval classification: the official Homebrew audit does not inspect
+Gatekeeper.
+
+The real v0.5.8 candidate audit produced a concrete finding: with the concrete
+(un-interpolated) release URL, the official audit failed and suggested
+`sha256 :no_check`, which is forbidden policy. The generator now emits Homebrew
+version interpolation (`v#{version}` / `Memory_#{version}`) in the cask source
+URL, and the probe receipt records the official
+`brew audit --cask --online` passing with exit 0 for that candidate. The
+candidate gate requires that audit to exit 0 before any publication; audit
+output itself is not classified. This is audit-only evidence, not a passed
+full candidate gate.
+
+The v0.5.8 build, tag, and release upload are done, and local unquarantined
+startup passed. Remaining gates are fixture-assisted quarantined launch and
+monotonic upgrade smoke, final candidate validation with the reviewed macOS
+floor, tap publication, and explicit automation enablement, plus the two
+integration gates below.
+
+The `desktop-cask` workflow is dispatchable only after it exists on the default
+branch: until `main` is fast-forwarded to the reviewed v0.5.x tip, dispatch by
+name fails. Later owner-controlled dispatch must explicitly use `main` at that
+reviewed tip. The gates run on the `macos-14` runner; whether its Homebrew
+recognizes `depends_on macos: :tahoe`, resolves fetch/collision there, and
+passes `brew style` and `brew audit --cask --online` on a cold cache is a gate
+to verify at the first verify-dispatch — runner compatibility is not evidence
+of Tahoe (or Sonoma) support, and artifact signature/spctl/ticket validation
+still runs before any publication. The short tap README install/link entry
+belongs to owner-reviewed first publication (G6); this guide remains
+authoritative.
 
 ## Frontend / ui dependency
 
