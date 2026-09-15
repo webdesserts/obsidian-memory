@@ -45,6 +45,11 @@ def asset_url(tag):
     return 'https://github.com/{}/releases/download/{}/Memory_{}_aarch64.dmg'.format(REPOSITORY, tag, version(tag))
 
 
+def resolved_cask_source_path(value, tap):
+    source = Path(value)
+    return (source if source.is_absolute() else Path(tap) / source).resolve()
+
+
 def generate(tag, sha256, macos_floor):
     value = version(tag)
     require(isinstance(sha256, str) and re.fullmatch('[0-9a-fA-F]{64}', sha256), '64hex artifact digest required')
@@ -145,7 +150,7 @@ def candidate_gates(tap, tag, sha256, runner):
             casks = json.loads(raw)['casks']
             require(len(casks) == 1, 'wrong cask resolution count')
             cask = casks[0]
-            require(Path(cask['ruby_source_path']).resolve() == path.resolve() and
+            require(resolved_cask_source_path(cask['ruby_source_path'], tap) == path.resolve() and
                     cask['token'] == TOKEN and cask['full_token'] == QUALIFIED and cask['tap'] == 'webdesserts/tap' and
                     cask['version'] == version(tag) and cask['sha256'] == sha256.lower() and cask['url'] == asset_url(tag), 'wrong candidate resolution')
         except (ValueError, KeyError, TypeError) as exc:
@@ -168,7 +173,7 @@ def candidate_gates(tap, tag, sha256, runner):
             try:
                 matches = json.loads(own)['casks']
                 require(len(matches) == 1 and matches[0]['full_token'] == QUALIFIED and
-                        Path(matches[0]['ruby_source_path']).resolve() == path.resolve(), 'unqualified token resolves elsewhere')
+                        resolved_cask_source_path(matches[0]['ruby_source_path'], tap) == path.resolve(), 'unqualified token resolves elsewhere')
             except (ValueError, KeyError, TypeError) as exc:
                 raise ValidationError('invalid collision resolution') from exc
         else:

@@ -34,6 +34,7 @@ class CandidateTests(unittest.TestCase):
         self.sha = hashlib.sha256(self.cache.read_bytes()).hexdigest()
         self.search_output = (gate.QUALIFIED + '\n', '', 0)
         self.unqualified_info_override = None
+        self.absolute_ruby_source_path = False
         self.signer_config = self.root / 'signer.json'
         self.signer_config.write_text(json.dumps(signer_fixture()))
         self.validated_paths = []
@@ -82,7 +83,7 @@ class CandidateTests(unittest.TestCase):
             source = self.tap / gate.CASK
             cask = {'token': gate.TOKEN, 'full_token': gate.QUALIFIED, 'tap': 'webdesserts/tap',
                     'version': '0.5.8', 'sha256': self.sha, 'url': gate.asset_url('v0.5.8'),
-                    'ruby_source_path': str(source)}
+                    'ruby_source_path': str(source) if self.absolute_ruby_source_path else gate.CASK}
             if self.command_failure == 'resolution':
                 cask['ruby_source_path'] = '/wrong/cask.rb'
             if argv[-1] == gate.TOKEN and self.unqualified_info_override:
@@ -152,6 +153,12 @@ class CandidateTests(unittest.TestCase):
                 gate.generate(tag, sha, floor)
         for forbidden in ['no-quarantine', 'xattr', 'postflight', 'no_check', 'spctl']:
             self.assertNotIn(forbidden, expected)
+
+    def test_candidate_resolution_accepts_relative_and_absolute_source_paths(self):
+        self.assertEqual(self.validate()['status'], 'validated')
+        self.absolute_ruby_source_path = True
+        self.assertEqual(self.validate()['status'], 'validated')
+        self.assert_no_staging()
 
     def test_all_candidate_children_receive_only_allowlisted_environment(self):
         allowed = {
