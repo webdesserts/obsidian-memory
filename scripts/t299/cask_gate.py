@@ -52,7 +52,7 @@ def generate(tag, sha256, macos_floor):
   homepage "https://github.com/webdesserts/obsidian-memory"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :{floor}"
+  depends_on macos: :{floor}
 
   app "Memory.app"
 
@@ -129,7 +129,9 @@ def mapped_tap(tap, runner, env):
     repository = Path(checked(runner, ['brew', '--repository'], env=env).strip())
     require(repository.is_absolute() and (repository / 'Library/Taps').is_dir(), 'invalid Homebrew repository')
     owner = repository / 'Library/Taps/webdesserts'
-    created_owner = not owner.exists()
+    owner_exists = owner.exists() or owner.is_symlink()
+    require(not owner_exists or (not owner.is_symlink() and owner.is_dir()), 'tap owner must be a real directory, not a file or symlink')
+    created_owner = not owner_exists
     owner.mkdir(exist_ok=True)
     mapping = owner / 'homebrew-tap'
     created_mapping = False
@@ -147,7 +149,12 @@ def mapped_tap(tap, runner, env):
 
 
 def candidate_gates(tap, tag, sha256, audit_record, runner):
-    env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1', HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0')
+    # Preserve tool lookup, user/cache/temp locations, locale and CI behavior only.
+    # Queue authentication stays in the separate gh path, never Ruby/Homebrew.
+    env = {key: os.environ[key] for key in (
+        'PATH', 'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'CI',
+    ) if key in os.environ}
+    env.update(HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1', HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0')
     path = tap / CASK
     with mapped_tap(tap, runner, env):
         checked(runner, ['ruby', '-c', str(path)], env=env)

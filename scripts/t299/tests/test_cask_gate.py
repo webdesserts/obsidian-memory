@@ -22,7 +22,7 @@ class CandidateTests(unittest.TestCase):
         self.tap = self.root / 'tap'
         self.tap.mkdir()
         self.calls = []
-        self.fail = None
+        self.command_failure = None
         self.push = 'success'
         self.search_result = gate.QUALIFIED + '\n'
         self.queue_busy = False
@@ -68,10 +68,10 @@ class CandidateTests(unittest.TestCase):
                 if self.push in ('accepted', 'unknown', 'unchanged-exception'):
                     raise OSError('fixture transport error')
                 return result(code=0 if self.push == 'success' else 1)
-            if self.fail == 'commit' and 'commit' in argv:
+            if self.command_failure == 'commit' and 'commit' in argv:
                 return result(code=1)
             return subprocess.run(argv, **kwargs, capture_output=True, text=True)
-        if self.fail and self.fail in argv:
+        if self.command_failure and self.command_failure in argv:
             return result(err='unrelated failure', code=1)
         if argv == ['brew', '--repository']:
             return result(str(self.repo) + '\n')
@@ -80,18 +80,18 @@ class CandidateTests(unittest.TestCase):
             cask = {'token': gate.TOKEN, 'full_token': gate.QUALIFIED, 'tap': 'webdesserts/tap',
                     'version': '0.5.8', 'sha256': self.sha, 'url': gate.asset_url('v0.5.8'),
                     'ruby_source_path': str(source)}
-            if self.fail == 'resolution':
+            if self.command_failure == 'resolution':
                 cask['ruby_source_path'] = '/wrong/cask.rb'
             return result(json.dumps({'casks': [cask]}))
         if argv[:2] == ['brew', '--cache']:
             return result(str(self.cache) + '\n')
         if argv[:2] == ['brew', 'search']:
-            return result('other/tap/webdesserts-memory\n' if self.fail == 'collision' else self.search_result)
+            return result('other/tap/webdesserts-memory\n' if self.command_failure == 'collision' else self.search_result)
         if argv[:2] == ['brew', 'audit']:
             return result(err='fixture self-signed incompatibility\n', code=1)
         if argv[0] in ('brew', 'ruby'):
             return result()
-        self.failTest('unexpected command: ' + repr(argv))
+        self.fail('unexpected command: ' + repr(argv))
 
     def validate(self, **kw):
         return gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, runner=self.runner, **kw)
@@ -112,7 +112,7 @@ class CandidateTests(unittest.TestCase):
                     '  desc "Desktop companion for Obsidian memory"\n'
                     '  homepage "https://github.com/webdesserts/obsidian-memory"\n\n'
                     '  depends_on arch: :arm64\n'
-                    '  depends_on macos: ">= :sonoma"\n\n'
+                    '  depends_on macos: :sonoma\n\n'
                     '  app "Memory.app"\n\n'
                     '  caveats <<~EOS\n'
                     '    Memory is self-signed, not Apple-notarized. On first launch, macOS may block it.\n'
@@ -127,6 +127,40 @@ class CandidateTests(unittest.TestCase):
                 gate.generate(tag, sha, floor)
         for forbidden in ['no-quarantine', 'xattr', 'postflight', 'no_check', 'spctl']:
             self.assertNotIn(forbidden, expected)
+
+    def test_all_candidate_children_receive_only_allowlisted_environment(self):
+        allowed = {
+            'PATH': os.defpath, 'HOME': str(self.root), 'TMPDIR': str(self.root),
+            'USER': 'fixture', 'LOGNAME': 'fixture', 'LANG': 'C',
+            'LC_ALL': 'C', 'LC_CTYPE': 'C', 'CI': 'true',
+        }
+        hostile = {
+            'GH_TOKEN': 'fixture-gh-secret', 'GITHUB_TOKEN': 'fixture-github-secret',
+            'AWS_SECRET_ACCESS_KEY': 'fixture-unrelated-secret', 'RUBYOPT': '-rhostile',
+            'HOMEBREW_NO_INSTALL_FROM_API': '1', 'HOMEBREW_DEVELOPER': '1',
+            'HOMEBREW_DEVCMD_RUN': '1', 'HOMEBREW_CASK_OPTS': 'hostile',
+            'HOMEBREW_NO_AUTO_UPDATE': '0', 'HOMEBREW_NO_ENV_HINTS': '0',
+            'HOMEBREW_NO_ANALYTICS': '0', 'HOMEBREW_COLOR': '1',
+        }
+        expected = dict(allowed, HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1',
+                        HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0')
+        seen = []
+        def inspecting(argv, **kwargs):
+            if argv[0] in ('ruby', 'brew'):
+                self.assertEqual(kwargs.get('env'), expected, argv)
+                seen.append(argv)
+            return self.runner(argv, **kwargs)
+        self.search_result = gate.TOKEN + '\n'
+        with patch.dict(os.environ, dict(allowed, **hostile), clear=True):
+            gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, runner=inspecting)
+            self.assertEqual(os.environ['GH_TOKEN'], hostile['GH_TOKEN'])
+            self.assertEqual(os.environ['HOMEBREW_NO_INSTALL_FROM_API'], '1')
+        self.assertEqual([argv[:2] for argv in seen], [
+            ['brew', '--repository'], ['ruby', '-c'], ['brew', 'info'],
+            ['brew', 'fetch'], ['brew', '--cache'], ['brew', 'style'],
+            ['brew', 'search'], ['brew', 'info'], ['brew', 'audit'],
+        ])
+        self.assert_no_staging()
 
     def test_default_validate_cannot_publish_and_repeat_uses_head(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(gate, 'publish', side_effect=AssertionError('publication reached')):
@@ -153,12 +187,12 @@ class CandidateTests(unittest.TestCase):
     def test_gate_failures_never_stage_and_cleanup_mapping(self):
         for failure in ['resolution', 'fetch', 'style', 'audit', 'collision', 'search', 'ruby']:
             with self.subTest(failure=failure):
-                self.fail = failure
+                self.command_failure = failure
                 with self.assertRaises(gate.ValidationError):
                     self.validate()
                 self.assert_no_staging()
                 self.assertFalse((self.repo / 'Library/Taps/webdesserts/homebrew-tap').exists())
-        self.fail = None
+        self.command_failure = None
         self.cache.write_bytes(b'wrong digest')
         with self.assertRaises(gate.ValidationError):
             self.validate()
@@ -259,6 +293,49 @@ class CandidateTests(unittest.TestCase):
             with self.subTest(verb=verb), self.assertRaises(gate.ValidationError):
                 gate.read_git(self.tap, self.runner, verb)
 
+    def test_owner_symlink_cannot_create_mapping_in_external_directory(self):
+        owner = self.repo / 'Library/Taps/webdesserts'
+        external = self.root / 'external-owner'
+        external.mkdir()
+        sentinel = external / 'sentinel'
+        sentinel.write_bytes(b'external state must remain untouched\x00')
+        owner.symlink_to(external, target_is_directory=True)
+        link_before = owner.lstat()
+        target_before = external.stat()
+        with self.assertRaises(gate.ValidationError):
+            self.validate()
+        self.assertTrue(owner.is_symlink())
+        self.assertEqual(os.readlink(owner), str(external))
+        for key in ('st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+            self.assertEqual(getattr(owner.lstat(), key), getattr(link_before, key))
+            self.assertEqual(getattr(external.stat(), key), getattr(target_before, key))
+        self.assertEqual(sentinel.read_bytes(), b'external state must remain untouched\x00')
+        self.assertEqual(list(external.iterdir()), [sentinel])
+        self.assertFalse((external / 'homebrew-tap').is_symlink())
+        self.assertEqual([a for a in self.calls if a[0] in ('brew', 'ruby')], [['brew', '--repository']])
+        self.assert_no_staging()
+
+    def test_owner_file_and_dangling_symlink_are_rejected_unchanged(self):
+        owner = self.repo / 'Library/Taps/webdesserts'
+        missing = self.root / 'missing-owner'
+        for kind in ('file', 'dangling-symlink'):
+            with self.subTest(kind=kind):
+                if kind == 'file':
+                    owner.write_bytes(b'owner file')
+                else:
+                    owner.symlink_to(missing, target_is_directory=True)
+                before = owner.lstat()
+                with self.assertRaises(gate.ValidationError):
+                    self.validate()
+                self.assertEqual(owner.lstat(), before)
+                if kind == 'file':
+                    self.assertEqual(owner.read_bytes(), b'owner file')
+                else:
+                    self.assertEqual(os.readlink(owner), str(missing))
+                    self.assertFalse(missing.exists())
+                owner.unlink()
+        self.assert_no_staging()
+
     def test_existing_mapping_is_not_replaced(self):
         mapping = self.repo / 'Library/Taps/webdesserts/homebrew-tap'
         mapping.mkdir(parents=True)
@@ -302,13 +379,13 @@ class CandidateTests(unittest.TestCase):
         self.assert_no_staging()
 
     def test_publish_gate_failure_does_not_stage(self):
-        self.fail = 'style'
+        self.command_failure = 'style'
         with self.assertRaises(gate.ValidationError):
             self.publish()
         self.assert_no_staging()
 
     def test_commit_failure_reports_local_stage(self):
-        self.fail = 'commit'
+        self.command_failure = 'commit'
         receipt = self.publish()
         self.assertEqual(receipt['status'], 'publication_failed')
         self.assertEqual(receipt['local'], 'staging_or_commit_may_exist')
@@ -360,6 +437,27 @@ class AuditQueueTests(unittest.TestCase):
         for code, out, err in [(0, '', ''), (1, '', 'fixture rejection\nother'), (1, 'other', 'fixture rejection'), (1, '', 'fixture rejection\x85'), (2, '', 'fixture rejection')]:
             with self.subTest(code=code, out=out, err=err), self.assertRaises(gate.ValidationError):
                 gate.classify_audit(subprocess.CompletedProcess([], code, out, err), record)
+
+    def test_audit_exception_does_not_absorb_floor_deprecation(self):
+        record = {'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture self-signed incompatibility']}
+        warning = 'Warning: Calling string comparison format for `depends_on macos:` is deprecated!'
+        for stream in ('stdout', 'stderr'):
+            for position in ('before', 'after', 'instead'):
+                outputs = {'stdout': '', 'stderr': 'fixture self-signed incompatibility\n'}
+                prior = outputs[stream]
+                outputs[stream] = (warning + '\n' + prior if position == 'before' else
+                                   prior + warning + '\n' if position == 'after' else warning + '\n')
+                with self.subTest(stream=stream, position=position), self.assertRaises(gate.ValidationError):
+                    gate.classify_audit(subprocess.CompletedProcess([], 1, outputs['stdout'], outputs['stderr']), record)
+
+    def test_queue_auth_remains_separate_from_candidate_environment(self):
+        def runner(argv, **kwargs):
+            self.assertEqual(argv[0], 'gh')
+            self.assertNotIn('env', kwargs)
+            self.assertEqual(os.environ['GH_TOKEN'], 'fixture-queue-auth')
+            return subprocess.CompletedProcess(argv, 0, '[{"total_count": 0, "workflow_runs": []}]', '')
+        with patch.dict(os.environ, {'GH_TOKEN': 'fixture-queue-auth'}, clear=True):
+            gate.check_queue('123', runner=runner)
 
     def test_queue_self_exclusion_all_nonterminal_and_incomplete_errors(self):
         calls = []
