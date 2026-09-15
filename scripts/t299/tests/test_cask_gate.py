@@ -192,6 +192,8 @@ class CandidateTests(unittest.TestCase):
             ['brew', 'fetch'], ['brew', '--cache'], ['brew', 'style'],
             ['brew', 'search'], ['brew', 'info'], ['brew', 'audit'],
         ])
+        self.assertIn(['brew', 'style', '--cask', gate.QUALIFIED], seen)
+        self.assertNotIn(['brew', 'style', '--cask', str(self.tap / gate.CASK)], seen)
         self.assert_no_staging()
 
     def test_default_validate_cannot_publish_and_repeat_uses_head(self):

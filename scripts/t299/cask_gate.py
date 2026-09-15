@@ -158,7 +158,7 @@ def candidate_gates(tap, tag, sha256, runner):
         checked(runner, ['brew', 'fetch', '--cask', QUALIFIED], env=env)
         cache = Path(checked(runner, ['brew', '--cache', '--cask', QUALIFIED], env=env).strip())
         require(cache.is_absolute() and cache.is_file() and digest(cache) == sha256.lower(), 'candidate fetched SHA mismatch')
-        checked(runner, ['brew', 'style', '--cask', str(path)], env=env)
+        checked(runner, ['brew', 'style', '--cask', QUALIFIED], env=env)
         result = runner(['brew', 'search', '--casks', '/^' + TOKEN + '$/'], env=env)
         # Only the exact no-color no-match diagnostic or an exact own-tap result
         # is understood; every other exit code or diagnostic is a collision or
