@@ -33,6 +33,7 @@ class CandidateTests(unittest.TestCase):
         self.cache.write_bytes(b'fixture dmg')
         self.sha = hashlib.sha256(self.cache.read_bytes()).hexdigest()
         self.search_output = (gate.QUALIFIED + '\n', '', 0)
+        self.unqualified_info_override = None
         self.signer_config = self.root / 'signer.json'
         self.signer_config.write_text(json.dumps(signer_fixture()))
         self.validated_paths = []
@@ -84,6 +85,9 @@ class CandidateTests(unittest.TestCase):
                     'ruby_source_path': str(source)}
             if self.command_failure == 'resolution':
                 cask['ruby_source_path'] = '/wrong/cask.rb'
+            if argv[-1] == gate.TOKEN and self.unqualified_info_override:
+                field, value = self.unqualified_info_override
+                cask[field] = value
             return result(json.dumps({'casks': [cask]}))
         if argv[:2] == ['brew', '--cache']:
             return result(str(self.cache) + '\n')
@@ -245,6 +249,26 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaises(gate.ValidationError):
             self.validate()
         self.assert_no_staging()
+
+    def test_own_token_collision_requires_own_full_token_and_source_path(self):
+        self.search_output = (gate.TOKEN + '\n', '', 0)
+        for field, value in [
+            ('full_token', 'other/tap/' + gate.TOKEN),
+            ('ruby_source_path', str(self.root / 'foreign-cask.rb')),
+        ]:
+            start = len(self.calls)
+            self.unqualified_info_override = (field, value)
+            with self.subTest(field=field), self.assertRaises(gate.ValidationError):
+                self.validate()
+            calls = self.calls[start:]
+            self.assertTrue(any(argv[:4] == ['brew', 'info', '--json=v2', '--cask']
+                                and argv[-1] == gate.TOKEN for argv in calls))
+            self.assertFalse(any(argv[:2] == ['brew', 'audit'] for argv in calls))
+            self.assertFalse(any(argv[0] == 'git'
+                                 and any(verb in argv for verb in ('add', 'commit', 'push'))
+                                 for argv in calls))
+            self.assert_no_staging()
+        self.unqualified_info_override = None
 
     def test_collision_search_accepts_only_exact_no_color_no_match(self):
         no_match = 'Error: No formulae or casks found for "/^webdesserts-memory$/".\n'
