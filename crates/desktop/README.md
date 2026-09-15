@@ -11,9 +11,11 @@ static files served from `public/windows/`, no React).
 
 ## Status
 
-Phase 1.5 of the [Memory Desktop App](../../) effort. Ships in v0.5.x as the
-release-blocker for restoring internet-traversing sync after the plugin's
-embedded relay was removed in commit `4eec6c1`.
+This is the authoritative desktop install, approval, update and recovery guide.
+The private `webdesserts/tap/webdesserts-memory` cask is **UNPUBLISHED** until
+`t:299`'s owner-approved artifact, validation, smoke and publication gates pass.
+Release tooling is authored; a working signed package and GUI upgrade behavior
+have not yet been established by the required live probes.
 
 **What works:**
 
@@ -28,20 +30,24 @@ embedded relay was removed in commit `4eec6c1`.
   `daemon.toml`.
 
 **Out of scope for v0.5.x:** cross-network pairing (invite codes / URLs are
-Phase 6), auto-port-forwarding, the React popup UI on left-click, code
-signing, auto-update.
+Phase 6), auto-port-forwarding, the React popup UI on left-click and in-app
+auto-update. Self-signed private distribution is gated work, not a shipped cask;
+Developer ID signing and notarization are out of scope.
 
 ## Running
 
-The vault path is read from `OBSIDIAN_MEMORY_VAULT` (no `--vault` flag).
+Terminal development runs can use `OBSIDIAN_MEMORY_VAULT` (no `--vault` flag).
+Normal GUI launch requires a persisted vault path in `app-settings.json`;
+Finder/Spotlight do not inherit a terminal's environment. There is no first-run
+vault onboarding UI. The mandatory smoke preseeds settings for a scratch vault
+as **test preparation**, not as proof of clean-install onboarding.
 
-> **Note:** `npm run tauri dev` / `npm run tauri build` do **not** work with
-> this crate's layout — the frontend is a subfolder of the tauri crate, so
-> tauri-cli resolves the wrong cwd, and there's no `tsconfig.json` for the
-> `tsc` build step. Run the binary directly instead. **Important:** the
-> frontend is embedded at **compile time** and `dist/windows/` (the pairing
-> UIs) is **not committed**, so build the frontend **before** `cargo` compiles
-> — otherwise the pairing windows open blank:
+> **Local development:** the frontend is embedded at **compile time**, and
+> `dist/windows/` (the pairing UIs) is **not committed**. Build the frontend
+> before compiling Rust or the pairing windows open blank. The binary-only
+> helper below is not the packaged-release path; use the gated publisher tooling
+> described under [Releasing the desktop app](#releasing-the-desktop-app), not
+> ad-hoc npm Tauri commands.
 
 ```bash
 # 1. Build the frontend once (emits frontend/dist incl. the pairing windows)
@@ -55,17 +61,15 @@ cd crates/desktop/frontend && npm install && npm run build
 OBSIDIAN_MEMORY_VAULT=~/notes ./target/debug/desktop
 ```
 
-On first run the tray icon appears in the menu bar. The app is dock-less by
+With a configured vault, the tray icon appears in the menu bar. The app is dockless by
 design — the `Accessory` activation policy is set in `main.rs`. The health
 endpoint binds `127.0.0.1:8082` (the `HEALTH_PORT` const in `main.rs`; 8081 is
 avoided because it's commonly taken, e.g. by llama-swap). Change the const if needed.
 
 **Blank pairing window?** The `windows/*.html` weren't embedded — you compiled
 before building the frontend (or changed `dist/` afterward). Run `npm run build`
-in `frontend/`, then `cargo clean -p desktop` to force a re-embed, then `cargo run`.
-
-A packaged release `.app` (`tauri build`) isn't wired up for this layout yet —
-tracked as a follow-up.
+in `frontend/`, then `cargo clean -p desktop` to force a re-embed, rebuild with
+`build-desktop.sh`, and launch the signed binary.
 
 ### Code signing (firewall persistence)
 
@@ -74,12 +78,113 @@ self-signed certificate. This matters on machines running the macOS Application
 Firewall (especially MDM/stealth setups): ad-hoc signing (`codesign -s -`)
 re-anchors the firewall's allow-rule on the binary's cdhash, which changes every
 build — so you get a fresh "allow incoming connections" prompt on every rebuild.
-Signing with a named cert anchors the rule on the cert instead, so a single Allow
-persists across all future rebuilds (proven on the MDM machine 2026-06-13).
+A stable certificate supported firewall-rule persistence in the recorded local
+MDM test (2026-06-13); that is not evidence of Gatekeeper approval persistence
+for packaged-app upgrades.
 
-The cert lives in the team's 1Password **Develop** vault for fleet distribution;
-import it into your login keychain and set it to *Always Trust* for code signing,
-then `build-desktop.sh` signs with it automatically (see the team signing runbook).
+Policy: the stable identity is owner-managed in **Apple Keychain on one
+designated publisher Mac**. Local development signing requires owner-approved
+Keychain provisioning and a runbook. This guide does not establish provisioning
+on any host or authorize key distribution or trust-policy changes.
+
+## Private cask installation and updates
+
+**Not available yet.** Once the publication gates pass, install with:
+
+```text
+brew install --cask webdesserts/tap/webdesserts-memory
+```
+
+The candidate targets **arm64**. Architecture support and the final cask macOS
+floor become authoritative only after smoke and a full gate rerun on the final
+candidate. The reviewed floor is a conservative support policy evidenced on the
+tested OS, not proof of compatibility with every newer macOS release.
+
+### Expected first-launch approval
+
+With the vault path already persisted, launch Memory from Applications in
+Finder or through Spotlight. One visible self-signed Gatekeeper approval is
+expected on first install, subject to smoke confirmation:
+
+1. Compare any warning with the probe-reviewed expected self-signed pattern.
+2. **Only if it matches**, use **System Settings > Privacy & Security > Open
+   Anyway** and the ordinary confirmation dialog.
+3. Relaunch normally from Applications/Finder/Spotlight; use the menu-bar icon.
+
+An unexpected warning means **stop and escalate to the owner**; do not approve
+it. Preserve quarantine. Do not use `--no-quarantine`, remove quarantine with
+`xattr`, install custom trust policies, globally disable Gatekeeper/SIP, or use
+right-click as a bypass. The explicit System Settings flow is the sole trust
+exception, not a reason to weaken system security.
+
+Updates are user-triggered:
+
+```text
+brew update
+brew upgrade --cask webdesserts/tap/webdesserts-memory
+```
+
+Same-signer approval behavior remains **unverified** until the mandatory
+monotonic smoke: approve and relaunch a same-signed local-only v0.5.7 baseline,
+then upgrade the same isolated cask token to the strictly newer candidate with
+no intervening candidate install, downgrade or uninstall. Record launch,
+relaunch and any renewed approval; do not assume an earlier approval persists.
+The app remains dockless/menu-bar based and does not automatically restart after
+an upgrade. Quit before upgrading and relaunch normally afterward.
+
+### Recovery
+
+A failed or absent desktop artifact fails the publication gate and preserves
+the prior cask. If a bad candidate was already published:
+
+1. Disable cask publication automation so it cannot undo recovery.
+2. Have the owner revert the **exact tap cask commit**, then verify the retained
+   release asset and its digest against the restored cask.
+3. Quit Memory, then use the restored definition:
+
+```text
+brew update
+brew uninstall --cask webdesserts/tap/webdesserts-memory
+brew install --cask webdesserts/tap/webdesserts-memory
+```
+
+This is an owner-coordinated tap rollback, not an `@version` install. Relaunch
+normally; stop on unexpected warnings. Replacing the certificate is an identity
+change requiring a new probe and validation, not a routine upgrade with promised
+approval persistence.
+
+## Releasing the desktop app
+
+[`scripts/t299/publish_desktop.py`](../../scripts/t299/publish_desktop.py) defaults
+to **build-and-validate only**, with no release upload. Signing is restricted to
+the designated publisher Mac using the owner-managed Keychain identity. The
+single Tauri packaging path uses pinned **tauri-cli 2.11.4**; its compatibility
+probe must pass before real use. Probe failure means stop and replan: there is
+no fallback signing/build path. The embedded `Memory.app` in the DMG must pass
+validation; authored tooling alone is not proof of a valid package.
+
+Explicit `--publish` additionally requires an **existing owner-authorized tag
+and release** and upload approval. It does not create tags or replace assets.
+There is no Developer ID/notarization route and no Apple credentials are needed
+or handled. CI never holds the signing key or builds/signs desktop release bytes.
+
+The separate [`desktop-cask` workflow](../../.github/workflows/desktop-cask.yml)
+defaults to **verify**, using the exact tag and expected digest. Cask publication
+requires explicit publish intent, successful verification and owner enablement/
+environment gates. [`cask_gate.py`](../../scripts/t299/cask_gate.py) defaults to
+validate-only; pre-publication validation cannot commit or push. The owner must
+prevent competing releases and desktop publications until publication completes;
+the queue check is defensive, not an atomic lock. Broader automatic publication
+remains disabled.
+
+Production `signer_config.json` and audit-classifier configuration are **not yet
+present**; owner-approved probe observations must supply them, without invented
+values or key material. Remaining gates cover identity provisioning, compatibility
+and public-config approval, tag/CLI release, desktop upload, fixture-assisted
+quarantined install/monotonic upgrade smoke and restoration, final candidate
+validation with the reviewed macOS floor, tap publication, and explicit automation
+enablement. The short tap README install/link entry belongs to owner-reviewed
+first publication (G6); this guide remains authoritative.
 
 ## Frontend / ui dependency
 

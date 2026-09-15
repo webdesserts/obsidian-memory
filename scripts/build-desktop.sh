@@ -10,9 +10,10 @@
 # on the cert instead (stable), so one "Allow" sticks across all future rebuilds.
 # Proven on rhea (MDM/stealth firewall) 2026-06-13.
 #
-# Prereq: the "ObsidianMemory Dev Signing" code-signing cert must be in the login
-# keychain and trusted for code signing. Setup runbook: Plans/Stable Code-Signing
-# (the cert is also stored in 1Password "Develop" for fleet distribution).
+# Policy: the stable "ObsidianMemory Dev Signing" identity is owner-managed in
+# Apple Keychain on the designated publisher Mac. Local development signing
+# requires owner-approved Keychain provisioning and a runbook; this script
+# neither provisions the identity nor packages a release app.
 #
 # Usage:
 #   ./scripts/build-desktop.sh            # debug build + sign
@@ -36,7 +37,7 @@ cargo build -p desktop "$@"
 
 if ! security find-identity -v -p codesigning | grep -q "$CERT_NAME"; then
   echo "error: code-signing identity '$CERT_NAME' not found in your keychain." >&2
-  echo "  Set it up per Plans/Stable Code-Signing (cert is in 1Password 'Develop')." >&2
+  echo "  Local dev signing requires owner-approved Apple Keychain provisioning/runbook; the stable identity is owner-managed on the designated publisher Mac." >&2
   echo "  Without it, the firewall re-prompts on every rebuild." >&2
   exit 1
 fi
