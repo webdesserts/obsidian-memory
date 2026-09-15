@@ -578,13 +578,34 @@ class CandidateTests(unittest.TestCase):
             validated.append(dmg)
             return self.artifact_validator(dmg, version, config_path, runner)
         self.command_failure = 'audit'
-        with self.assertRaises(gate.ValidationError):
+        with self.assertRaises(gate.ValidationError) as caught:
             self.publish(runner=auditing, validator=validator)
+        self.assertEqual(
+            str(caught.exception),
+            "command failed: brew audit; stdout=''; stderr='unrelated failure'",
+        )
         self.assertEqual(audit_codes, [1])
         self.assertEqual(validated, [])
         self.assertFalse(any(a[0] == 'git' and any(v in a for v in ('add', 'commit', 'push')) for a in self.calls))
         # Candidate file creation and temporary Homebrew mapping precede the
         # audit by design; the guarantee is no publication Git write.
+        self.assert_no_staging()
+
+    def test_audit_failure_diagnostic_is_bounded(self):
+        original = self.runner
+        def noisy_audit(argv, **kwargs):
+            if argv[:2] == ['brew', 'audit']:
+                return subprocess.CompletedProcess(
+                    argv, 1, '', 'x' * (gate.MAX_AUDIT_OUTPUT + 1)
+                )
+            return original(argv, **kwargs)
+        with self.assertRaisesRegex(
+            gate.ValidationError, 'invalid or excessive brew audit output'
+        ):
+            self.publish(runner=noisy_audit)
+        self.assertFalse(any(a[0] == 'git'
+                             and any(verb in a for verb in ('add', 'commit', 'push'))
+                             for a in self.calls))
         self.assert_no_staging()
 
     def test_commit_failure_reports_local_stage(self):

@@ -1,8 +1,7 @@
 """Owner-operated stable cask gates; desktop prerelease casks are out of scope.
 
 Default validation has no Git write operation. The official
-`brew audit --cask --online` gate must exit 0 (via the checked runner); its
-output is not classified. Audit output is not evidence of Gatekeeper
+`brew audit --cask --online` gate must exit 0; its output is not classified. Audit output is not evidence of Gatekeeper
 preapproval: that classification belongs solely to artifact_validator's
 spctl/ticket evidence.
 """
@@ -28,6 +27,7 @@ CASK_URL = 'https://github.com/' + REPOSITORY + '/releases/download/v#{version}/
 FLOORS = ('big_sur', 'monterey', 'ventura', 'sonoma', 'sequoia', 'tahoe')
 NONTERMINAL = ('queued', 'requested', 'waiting', 'pending', 'in_progress')
 STABLE_VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)'
+MAX_AUDIT_OUTPUT = 65536
 
 
 def checked(runner, argv, **kwargs):
@@ -178,7 +178,16 @@ def candidate_gates(tap, tag, sha256, runner):
                 raise ValidationError('invalid collision resolution') from exc
         else:
             require(tokens in ([], [QUALIFIED]), 'cask token collision or ambiguous lookup')
-        checked(runner, ['brew', 'audit', '--cask', '--online', QUALIFIED], env=env)
+        result = runner(['brew', 'audit', '--cask', '--online', QUALIFIED], env=env)
+        require(isinstance(result.stdout, str) and isinstance(result.stderr, str) and
+                len(result.stdout) + len(result.stderr) <= MAX_AUDIT_OUTPUT,
+                'invalid or excessive brew audit output')
+        if result.returncode != 0:
+            raise ValidationError(
+                'command failed: brew audit; stdout={!r}; stderr={!r}'.format(
+                    result.stdout, result.stderr
+                )
+            )
         audit = 'passed'
     return audit, cache
 
