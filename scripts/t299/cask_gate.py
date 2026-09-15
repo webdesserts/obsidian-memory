@@ -10,8 +10,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
+import tempfile
 
+import artifact_validator
 from artifact_validator import ValidationError, digest, require, run
 
 REPOSITORY = 'webdesserts/obsidian-memory'
@@ -187,10 +190,10 @@ def candidate_gates(tap, tag, sha256, audit_record, runner):
             require(tokens in ([], [QUALIFIED]), 'cask token collision or ambiguous lookup')
         result = runner(['brew', 'audit', '--cask', '--online', QUALIFIED], env=env)
         audit = classify_audit(result, audit_record)
-    return audit
+    return audit, cache
 
 
-def validate(tap, tag, sha256, macos_floor, audit_config, runner=run):
+def _validate_candidate(tap, tag, sha256, macos_floor, audit_config, runner):
     candidate = generate(tag, sha256, macos_floor)
     record = load_audit_config(audit_config)
     tap = Path(tap).resolve()
@@ -199,10 +202,30 @@ def validate(tap, tag, sha256, macos_floor, audit_config, runner=run):
     path = tap / CASK
     path.parent.mkdir(exist_ok=True)
     path.write_bytes(candidate.encode())
-    audit = candidate_gates(tap, tag, sha256, record, runner)
+    audit, cache = candidate_gates(tap, tag, sha256, record, runner)
     require(path.read_bytes() == candidate.encode(), 'candidate changed during gates')
     require(capture_baseline(tap, candidate, runner)[0] == head, 'tap baseline changed during gates')
-    return {'status': 'validated', 'baseline': head, 'tag': tag, 'sha256': sha256.lower(), 'macos_floor': macos_floor, 'audit': audit}
+    return {'status': 'validated', 'baseline': head, 'tag': tag, 'sha256': sha256.lower(), 'macos_floor': macos_floor, 'audit': audit}, cache
+
+
+def validate(tap, tag, sha256, macos_floor, audit_config, runner=run):
+    receipt, _ = _validate_candidate(tap, tag, sha256, macos_floor, audit_config, runner)
+    return receipt
+
+
+def _validate_fetched_artifact(cache, tag, sha256, signer_config, validator, runner):
+    expected = sha256.lower()
+    require(cache.is_file() and digest(cache) == expected, 'fetched artifact changed before signer validation')
+    # Homebrew cache names need not satisfy the validator's exact asset contract.
+    with tempfile.TemporaryDirectory(prefix='memory-cask-artifact-') as directory:
+        dmg = Path(directory) / ('Memory_{}_aarch64.dmg'.format(version(tag)))
+        shutil.copyfile(cache, dmg)
+        require(digest(dmg) == expected and digest(cache) == expected, 'fetched artifact copy SHA mismatch')
+        result = validator(dmg, version(tag), signer_config, runner=runner)
+        require(isinstance(result, dict) and result.get('status') == 'validated' and
+                result.get('sha256') == expected and result.get('version') == version(tag) and
+                result.get('asset') == dmg.name and result.get('size') == dmg.stat().st_size and
+                digest(dmg) == expected, 'artifact validator receipt or copied bytes mismatch')
 
 
 def check_queue(run_id, runner=run):
@@ -234,8 +257,12 @@ def remote_head(tap, runner):
     return raw.split()[0]
 
 
-def publish(tap, tag, sha256, macos_floor, audit_config, *, run_id, runner=run):
+def publish(tap, tag, sha256, macos_floor, audit_config, *, run_id, signer_config=None, runner=run, validator=None):
     """Explicit publication only; callers must maintain owner-enforced no overlap."""
+    require(signer_config is not None, 'explicit signer configuration required for publication')
+    artifact_validator.load_config(signer_config)
+    if validator is None:
+        validator = artifact_validator.validate
     candidate = generate(tag, sha256, macos_floor)
     load_audit_config(audit_config)
     check_queue(run_id, runner)
@@ -243,7 +270,8 @@ def publish(tap, tag, sha256, macos_floor, audit_config, *, run_id, runner=run):
     head, baseline = capture_baseline(tap, candidate, runner, clean=True)
     require(remote_head(tap, runner) == head, 'stale remote baseline')
     require_newer(tag, baseline)
-    receipt = validate(tap, tag, sha256, macos_floor, audit_config, runner)
+    receipt, cache = _validate_candidate(tap, tag, sha256, macos_floor, audit_config, runner)
+    _validate_fetched_artifact(cache, tag, sha256, signer_config, validator, runner)
     check_queue(run_id, runner)
     require(remote_head(tap, runner) == head, 'remote changed before staging')
     require(capture_baseline(tap, candidate, runner)[0] == head and (tap / CASK).read_bytes() == candidate.encode(), 'local baseline or candidate changed before staging')
@@ -277,6 +305,7 @@ def parser():
     value.add_argument('--sha256')
     value.add_argument('--macos-floor')
     value.add_argument('--audit-config', type=Path)
+    value.add_argument('--signer-config', type=Path, help='Required for publish; approved public signer configuration')
     value.add_argument('--run-id')
     return value
 
@@ -290,7 +319,7 @@ def main():
         else:
             require(args.tap is not None, 'explicit tap directory required')
             values = (args.tap, args.tag, args.sha256, args.macos_floor, args.audit_config)
-            receipt = publish(*values, run_id=args.run_id) if args.operation == 'publish' else validate(*values)
+            receipt = publish(*values, run_id=args.run_id, signer_config=args.signer_config) if args.operation == 'publish' else validate(*values)
         print(json.dumps(receipt, sort_keys=True))
         return 0 if receipt['status'] in ('validated', 'published', 'queue_clear') else 1
     except (ValidationError, OSError) as exc:

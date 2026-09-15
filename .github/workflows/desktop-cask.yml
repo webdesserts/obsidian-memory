@@ -138,6 +138,7 @@ jobs:
           subprocess.run([
               '/usr/bin/python3', '-B', 'tooling/scripts/t299/cask_gate.py',
               '--operation', 'publish', '--run-id', os.environ['GITHUB_RUN_ID'],
+              '--signer-config', 'tooling/scripts/t299/signer_config.json',
               '--tap', str(Path('tap').resolve()),
               '--tag', os.environ['RELEASE_TAG'],
               '--sha256', os.environ['EXPECTED_SHA256'],

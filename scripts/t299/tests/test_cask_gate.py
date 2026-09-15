@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cask_gate as gate
+from test_artifact_validator import config as signer_fixture, FixtureRunner
 
 
 class CandidateTests(unittest.TestCase):
@@ -29,11 +30,14 @@ class CandidateTests(unittest.TestCase):
         self.remote = None
         self.repo = self.root / 'brew'
         (self.repo / 'Library/Taps').mkdir(parents=True)
-        self.cache = self.root / 'Memory_0.5.8_aarch64.dmg'
+        self.cache = self.root / 'homebrew-cache-prefixed-download.dmg'
         self.cache.write_bytes(b'fixture dmg')
         self.sha = hashlib.sha256(self.cache.read_bytes()).hexdigest()
         self.config = self.root / 'audit.json'
         self.config.write_text(json.dumps({'exit_code': 1, 'stdout_lines': [], 'stderr_lines': ['fixture self-signed incompatibility']}))
+        self.signer_config = self.root / 'signer.json'
+        self.signer_config.write_text(json.dumps(signer_fixture()))
+        self.validated_paths = []
         self.git('init', '-b', 'main')
         self.git('config', 'user.name', 'Fixture')
         self.git('config', 'user.email', 'fixture@example.invalid')
@@ -96,8 +100,23 @@ class CandidateTests(unittest.TestCase):
     def validate(self, **kw):
         return gate.validate(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, runner=self.runner, **kw)
 
-    def publish(self):
-        return gate.publish(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, run_id='123', runner=self.runner)
+    def artifact_validator(self, dmg, version, config_path, runner):
+        self.assertEqual(dmg.name, 'Memory_0.5.8_aarch64.dmg')
+        self.assertNotEqual(dmg.parent, self.cache.parent)
+        self.assertTrue(dmg.parent.name.startswith('memory-cask-artifact-'))
+        self.assertFalse(dmg.is_symlink())
+        self.assertEqual(dmg.read_bytes(), self.cache.read_bytes())
+        self.assertEqual(version, '0.5.8')
+        self.assertEqual(config_path, self.signer_config)
+        self.validated_paths.append(dmg)
+        return dict(status='validated', version=version, asset=dmg.name,
+                    sha256=gate.digest(dmg), size=dmg.stat().st_size)
+
+    def publish(self, **overrides):
+        options = dict(run_id='123', runner=self.runner, signer_config=self.signer_config,
+                       validator=self.artifact_validator)
+        options.update(overrides)
+        return gate.publish(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, **options)
 
     def assert_no_staging(self):
         self.assertEqual(self.git('diff', '--cached', '--name-only').stdout, '')
@@ -253,7 +272,7 @@ class CandidateTests(unittest.TestCase):
                 self.remote = 'a' * 40
             return result
         with self.assertRaises(gate.ValidationError):
-            gate.publish(self.tap, 'v0.5.8', self.sha, 'sonoma', self.config, run_id='123', runner=changing)
+            self.publish(runner=changing)
         self.assert_no_staging()
 
     def test_runner_exception_always_removes_owned_mapping(self):
@@ -344,8 +363,112 @@ class CandidateTests(unittest.TestCase):
         self.assertTrue(mapping.is_dir())
         self.assert_no_staging()
 
+    def test_publish_requires_signer_configuration_before_rewrite(self):
+        for config in (None, self.root / 'missing.json', self.config):
+            with self.subTest(config=config), self.assertRaises(gate.ValidationError):
+                self.publish(signer_config=config)
+            self.assertFalse((self.tap / gate.CASK).exists())
+            self.assertEqual(self.calls, [])
+            self.assert_no_staging()
+
+    def test_publish_cli_requires_explicit_signer_config(self):
+        args = ['cask_gate.py', '--operation', 'publish', '--tap', str(self.tap),
+                '--tag', 'v0.5.8', '--sha256', self.sha, '--macos-floor', 'sonoma',
+                '--audit-config', str(self.config), '--run-id', '123']
+        with patch.object(sys, 'argv', args), patch('sys.stderr', new_callable=io.StringIO) as output:
+            self.assertEqual(gate.main(), 1)
+            self.assertIn('explicit signer configuration required', output.getvalue())
+        self.assertFalse((self.tap / gate.CASK).exists())
+        self.assert_no_staging()
+
+    def test_validate_only_never_loads_signer_or_validates_artifact(self):
+        self.signer_config.unlink()
+        with patch.object(gate.artifact_validator, 'validate', side_effect=AssertionError('artifact validation reached')), patch.object(gate.artifact_validator, 'load_config', side_effect=AssertionError('signer config reached')):
+            receipt = self.validate()
+        self.assertNotIn('cache', receipt)
+        self.assertNotIn(str(self.cache), json.dumps(receipt))
+        self.assert_no_staging()
+
+    def test_artifact_rejections_and_bad_receipts_never_write_git(self):
+        for failure in ('wrong signer', 'ad-hoc signature', 'validation failure', 'bad-status', 'bad-digest', 'bad-version', 'bad-asset', 'bad-size', 'copy-mutation'):
+            path = self.tap / gate.CASK
+            if path.exists():
+                path.unlink()
+            self.validated_paths.clear()
+            def reject(dmg, version, config_path, runner):
+                receipt = self.artifact_validator(dmg, version, config_path, runner)
+                if failure in ('wrong signer', 'ad-hoc signature', 'validation failure'):
+                    raise gate.ValidationError(failure)
+                if failure == 'copy-mutation':
+                    dmg.write_bytes(b'changed during validation')
+                else:
+                    receipt[{'bad-status': 'status', 'bad-digest': 'sha256', 'bad-version': 'version', 'bad-asset': 'asset', 'bad-size': 'size'}[failure]] = 'wrong'
+                return receipt
+            with self.subTest(failure=failure), self.assertRaises(gate.ValidationError):
+                self.publish(validator=reject)
+            self.assert_no_staging()
+            self.assertTrue(self.validated_paths)
+            self.assertTrue(all(not p.parent.exists() for p in self.validated_paths))
+            self.assertFalse(any(a[0] == 'git' and any(v in a for v in ('add', 'commit', 'push')) for a in self.calls))
+
+    def test_cache_and_copy_failures_block_and_clean_temporary_directory(self):
+        original_copy = gate.shutil.copyfile
+        for failure in ('cache-before-copy', 'copy-corruption', 'copy-error'):
+            path = self.tap / gate.CASK
+            if path.exists():
+                path.unlink()
+            self.cache.write_bytes(b'fixture dmg')
+            copies = []
+            def copying(source, destination):
+                self.assertEqual(source, self.cache)
+                copies.append(destination)
+                if failure == 'copy-error':
+                    raise OSError('fixture copy failure')
+                original_copy(source, destination)
+                destination.write_bytes(b'corrupted copy')
+            def changing(argv, **kwargs):
+                result = self.runner(argv, **kwargs)
+                if failure == 'cache-before-copy' and argv[:2] == ['brew', 'audit']:
+                    self.cache.write_bytes(b'cache mutated after digest gate')
+                return result
+            with self.subTest(failure=failure), patch.object(gate.shutil, 'copyfile', side_effect=copying), self.assertRaises((gate.ValidationError, OSError)):
+                self.publish(runner=changing)
+            self.assertEqual(self.validated_paths, [])
+            self.assertTrue(all(not p.parent.exists() for p in copies))
+            self.assert_no_staging()
+
+    def test_actual_artifact_validator_is_used_by_default_before_git_writes(self):
+        for details, accepted in [('Authority=Wrong signer\n', False), ('Signature=adhoc\n', False),
+                                  ('Authority=ObsidianMemory Dev Signing\nSignature size=123\n', True)]:
+            path = self.tap / gate.CASK
+            if path.exists():
+                path.unlink()
+            fixture = FixtureRunner()
+            fixture.metadata['CFBundleShortVersionString'] = '0.5.8'
+            fixture.details = details
+            fixture.cleanup_mount = lambda mount: None
+            def combined(argv, **kwargs):
+                if argv[0] in ('hdiutil', 'lipo', 'codesign', 'spctl', 'xcrun'):
+                    return fixture(argv, **kwargs)
+                return self.runner(argv, **kwargs)
+            with self.subTest(details=details):
+                if accepted:
+                    self.assertEqual(self.publish(validator=None, runner=combined)['remote'], 'accepted')
+                else:
+                    with self.assertRaises(gate.ValidationError):
+                        self.publish(validator=None, runner=combined)
+                    self.assert_no_staging()
+            self.assertTrue(fixture.calls)
+            self.assertFalse(fixture.mount.exists())
+            attach = next(argv for argv in fixture.calls if argv[:2] == ['hdiutil', 'attach'])
+            copied = Path(attach[-1])
+            self.assertEqual(copied.name, 'Memory_0.5.8_aarch64.dmg')
+            self.assertFalse(copied.parent.exists())
+
     def test_publish_newer_success_cask_only(self):
         receipt = self.publish()
+        self.assertEqual(len(self.validated_paths), 1)
+        self.assertFalse(self.validated_paths[0].parent.exists())
         self.assertEqual(receipt['remote'], 'accepted')
         self.assertEqual(self.git('show', '--format=', '--name-only', 'HEAD').stdout.strip(), gate.CASK)
         self.assertEqual(self.git('status', '--porcelain').stdout, '')
