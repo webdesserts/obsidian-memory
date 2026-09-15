@@ -55,8 +55,11 @@ class FixtureRunner:
         else:
             assert self.mounted
             assert str(self.mount) in argv[-1]
-            if '--extract-certificates' in argv:
-                prefix = argv[argv.index('--extract-certificates') + 1]
+            extract = [arg for arg in argv if arg.startswith('--extract-certificates=')]
+            if extract:
+                assert len(extract) == 1
+                prefix = extract[0].partition('=')[2]
+                assert prefix
                 for i in range(self.certificates):
                     Path(prefix + str(i)).write_bytes(CERT)
             elif argv[0] == 'lipo':
@@ -69,7 +72,7 @@ class FixtureRunner:
                 code, err = 3, argv[-1] + ': rejected: fixture self-signed'
             elif argv[0] == 'xcrun':
                 code, out = 65, 'fixture ticket absent: ' + argv[-1]
-        if self.fail and self.fail in argv:
+        if self.fail and any(arg == self.fail or arg.startswith(self.fail) for arg in argv):
             code = 99
         return subprocess.CompletedProcess(argv, code, out, err)
 
@@ -105,6 +108,16 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn('-readonly', attach)
         self.assertIn('-nobrowse', attach)
 
+    def test_certificate_prefix_is_attached_to_codesign_option(self):
+        self.validate()
+        call = next(argv for argv in self.runner.calls
+                    if any(arg.startswith('--extract-certificates=') for arg in argv))
+        options = [arg for arg in call if arg.startswith('--extract-certificates=')]
+        self.assertEqual(len(options), 1)
+        self.assertNotEqual(options[0], '--extract-certificates=')
+        self.assertNotIn('--extract-certificates', call)
+        self.assertEqual(call[-1], str(self.runner.mount / 'Memory.app'))
+
     def test_identity_mismatches(self):
         for field, value in [('common_name', 'Other'), ('der_sha256', '0'*64), ('designated_requirement', DR + ' and false')]:
             with self.subTest(field=field):
@@ -138,7 +151,7 @@ class ValidatorTests(unittest.TestCase):
                 self.validate()
 
     def test_command_failures_always_detach_and_no_digest(self):
-        for command in ['attach', '--extract-certificates', '--verify', '-r-', '-dv', 'lipo', 'spctl', 'stapler', 'detach']:
+        for command in ['attach', '--extract-certificates=', '--verify', '-r-', '-dv', 'lipo', 'spctl', 'stapler', 'detach']:
             self.runner.fail = command
             with self.subTest(command=command), patch.object(av, 'digest', wraps=av.digest) as digest:
                 with self.assertRaises(av.ValidationError):

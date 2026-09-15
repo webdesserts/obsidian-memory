@@ -118,7 +118,7 @@ def validate(dmg, version, config_path, runner=run):
             require(arch.stdout.strip() == 'arm64' and not arch.stderr.strip(), 'wrong architecture')
             with tempfile.TemporaryDirectory(prefix='memory-public-cert-') as cert_dir:
                 prefix = Path(cert_dir) / 'signer'
-                checked(runner, ['codesign', '-d', '--extract-certificates', str(prefix), str(app)])
+                checked(runner, ['codesign', '-d', '--extract-certificates=' + str(prefix), str(app)])
                 certs = list(Path(cert_dir).iterdir())
                 require(certs == [Path(str(prefix) + '0')] and certs[0].is_file() and not certs[0].is_symlink(), 'expected one self-signed public certificate')
                 require(digest(certs[0]) == cfg['der_sha256'], 'wrong certificate fingerprint')
