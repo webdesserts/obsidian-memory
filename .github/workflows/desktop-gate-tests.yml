@@ -6,11 +6,13 @@ on:
       - 'scripts/t299/**'
       - '.github/workflows/desktop-gate-tests.yml'
       - '.github/workflows/release.yml'
+      - '.github/workflows/desktop-cask.yml'
   push:
     paths:
       - 'scripts/t299/**'
       - '.github/workflows/desktop-gate-tests.yml'
       - '.github/workflows/release.yml'
+      - '.github/workflows/desktop-cask.yml'
 
 permissions:
   contents: read
@@ -22,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Run stdlib fixture suite
+      - name: Run artifact, publisher, cask and workflow stdlib fixture suite
         shell: python {0}
         run: |
           import subprocess
@@ -51,4 +53,5 @@ jobs:
               str(Path.home() / 'go/bin/actionlint'),
               '.github/workflows/desktop-gate-tests.yml',
               '.github/workflows/release.yml',
+              '.github/workflows/desktop-cask.yml',
           ], check=True)
