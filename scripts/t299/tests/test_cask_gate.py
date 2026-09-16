@@ -173,13 +173,16 @@ class CandidateTests(unittest.TestCase):
             'HOMEBREW_DEVCMD_RUN': '1', 'HOMEBREW_CASK_OPTS': 'hostile',
             'HOMEBREW_NO_AUTO_UPDATE': '0', 'HOMEBREW_NO_ENV_HINTS': '0',
             'HOMEBREW_NO_ANALYTICS': '0', 'HOMEBREW_COLOR': '1',
+            'HOMEBREW_GITHUB_API_TOKEN': 'fixture-homebrew-read-token',
         }
         expected = dict(allowed, HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1',
                         HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0', HOMEBREW_NO_COLOR='1')
+        audit_expected = dict(expected, HOMEBREW_GITHUB_API_TOKEN=hostile['HOMEBREW_GITHUB_API_TOKEN'])
         seen = []
         def inspecting(argv, **kwargs):
             if argv[0] in ('ruby', 'brew'):
-                self.assertEqual(kwargs.get('env'), expected, argv)
+                command_env = audit_expected if argv[:2] == ['brew', 'audit'] else expected
+                self.assertEqual(kwargs.get('env'), command_env, argv)
                 seen.append(argv)
             return self.runner(argv, **kwargs)
         self.search_output = (gate.TOKEN + '\n', '', 0)

@@ -137,11 +137,15 @@ def mapped_tap(tap, runner, env):
 
 def candidate_gates(tap, tag, sha256, runner):
     # Preserve tool lookup, user/cache/temp locations, locale and CI behavior only.
-    # Queue authentication stays in the separate gh path, never Ruby/Homebrew.
+    # Queue authentication stays in the separate gh path. The dedicated read-only
+    # Homebrew token is exposed only to online audit, not Ruby or other brew steps.
     env = {key: os.environ[key] for key in (
         'PATH', 'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'CI',
     ) if key in os.environ}
     env.update(HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_ENV_HINTS='1', HOMEBREW_NO_ANALYTICS='1', HOMEBREW_COLOR='0', HOMEBREW_NO_COLOR='1')
+    audit_env = dict(env)
+    if 'HOMEBREW_GITHUB_API_TOKEN' in os.environ:
+        audit_env['HOMEBREW_GITHUB_API_TOKEN'] = os.environ['HOMEBREW_GITHUB_API_TOKEN']
     path = tap / CASK
     with mapped_tap(tap, runner, env):
         checked(runner, ['ruby', '-c', str(path)], env=env)
@@ -178,7 +182,7 @@ def candidate_gates(tap, tag, sha256, runner):
                 raise ValidationError('invalid collision resolution') from exc
         else:
             require(tokens in ([], [QUALIFIED]), 'cask token collision or ambiguous lookup')
-        result = runner(['brew', 'audit', '--cask', '--online', QUALIFIED], env=env)
+        result = runner(['brew', 'audit', '--cask', '--online', QUALIFIED], env=audit_env)
         require(isinstance(result.stdout, str) and isinstance(result.stderr, str) and
                 len(result.stdout) + len(result.stderr) <= MAX_AUDIT_OUTPUT,
                 'invalid or excessive brew audit output')

@@ -42,6 +42,7 @@ class WorkflowTests(unittest.TestCase):
         for forbidden in ['secrets.', 'contents: write', 'actions: write', "'--operation', 'publish'", 'concurrency:', '\n  push:', '\n  release:']:
             self.assertNotIn(forbidden, self.verify)
         self.assertIn('persist-credentials: false', self.verify)
+        self.assertIn('HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}', self.verify)
         self.assertIn('signer_config.json', self.verify)
         self.assertIn('load_config(config)', self.verify)
         self.assertLess(self.verify.index('load_config(config)'), self.verify.index('urllib.request.urlopen'))
@@ -56,6 +57,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('environment: desktop-cask-publication', self.publish)
         self.assertIn('actions: read', self.publish)
         self.assertIn('contents: read', self.publish)
+        self.assertIn('HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}', self.publish)
+        self.assertEqual(self.cask.count('HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}'), 2)
         self.assertEqual(self.cask.count('secrets.HOMEBREW_TAP_TOKEN'), 1)
         self.assertLess(self.publish.index("'--operation', 'check-queue'"), self.publish.index('repository: webdesserts/homebrew-tap'))
         self.assertIn("'--operation', 'publish', '--run-id', os.environ['GITHUB_RUN_ID']", self.publish)

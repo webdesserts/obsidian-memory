@@ -36,6 +36,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag }}
       EXPECTED_SHA256: ${{ inputs.sha256 }}
       MACOS_FLOOR: ${{ inputs.macos_floor }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,6 +100,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag }}
       EXPECTED_SHA256: ${{ inputs.sha256 }}
       MACOS_FLOOR: ${{ inputs.macos_floor }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
