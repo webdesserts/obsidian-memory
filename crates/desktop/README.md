@@ -12,13 +12,14 @@ static files served from `public/windows/`, no React).
 ## Status
 
 This is the authoritative desktop install, approval, update and recovery guide.
-The private `webdesserts/tap/webdesserts-memory` cask is **UNPUBLISHED** until
-`t:299`'s owner-approved artifact, validation, smoke and publication gates pass.
-Release tooling is authored, and the owner-approved public signer configuration
-now validates a signed local probe package. The unquarantined local 0.5.7 probe
-also passed normal LaunchServices launch, sustained health, quit and relaunch on
-Umbra. Final 0.5.8 packaging, quarantined cask installation and same-signer
-upgrade behavior remain gated live work.
+The private `webdesserts/tap/webdesserts-memory` cask targets v0.5.8. The exact
+public DMG, pinned self-signed identity and final cask passed the full verify-only
+gate. A quarantined, same-token 0.5.7 → 0.5.8 smoke on arm64 macOS 26.6.2
+confirmed healthy target launch, quit and relaunch through LaunchServices without
+a second blocking approval. The owner separately attested the baseline approval
+and Spotlight relaunch. Exact-0.5.8 owner launches from Applications/Finder and
+Spotlight remain a publication blocker; use the install command below only once
+the cask is visible in the tap.
 
 **What works:**
 
@@ -34,7 +35,7 @@ upgrade behavior remain gated live work.
 
 **Out of scope for v0.5.x:** cross-network pairing (invite codes / URLs are
 Phase 6), auto-port-forwarding, the React popup UI on left-click and in-app
-auto-update. Self-signed private distribution is gated work, not a shipped cask;
+auto-update. Private distribution uses a checksum-pinned, self-signed cask;
 Developer ID signing and notarization are out of scope.
 
 ## Running
@@ -92,26 +93,31 @@ on any host or authorize key distribution or trust-policy changes.
 
 ## Private cask installation and updates
 
-**Not available yet.** Once the publication gates pass, install with:
+Once the cask is visible in the tap, install it with:
 
 ```text
 brew install --cask webdesserts/tap/webdesserts-memory
 ```
 
-The candidate targets **arm64**. Architecture support and the final cask macOS
-floor become authoritative only after smoke and a full gate rerun on the final
-candidate. The reviewed floor is a conservative support policy evidenced on the
-tested OS, not proof of compatibility with every newer macOS release.
+The cask targets **arm64** and declares macOS **Tahoe** as its conservative
+support floor. The recorded smoke ran on macOS 26.6.2; that single-host result is
+not proof of compatibility with every newer release. Normal GUI launch also
+requires a persisted vault path in `app-settings.json`; the app does not yet
+provide first-run vault selection.
 
 ### Expected first-launch approval
 
 With the vault path already persisted, launch Memory from Applications in
-Finder or through Spotlight. One visible self-signed Gatekeeper approval is
-expected on first install, subject to smoke confirmation:
+Finder or through Spotlight. A visible unverified-developer Gatekeeper approval
+is expected on first install. The recorded smoke used **Open Anyway** after the
+artifact digest and signer were independently verified; the owner recognized a
+standard non-malware warning, but its exact wording was not captured and must not
+be reconstructed as a quotation:
 
-1. Compare any warning with the probe-reviewed expected self-signed pattern.
-2. **Only if it matches**, use **System Settings > Privacy & Security > Open
-   Anyway** and the ordinary confirmation dialog.
+1. Verify that the cask resolves to the intended release and checksum.
+2. **Only for the expected standard unverified-developer warning for Memory**,
+   use **System Settings > Privacy & Security > Open Anyway** and the ordinary
+   confirmation dialog.
 3. Relaunch normally from Applications/Finder/Spotlight; use the menu-bar icon.
 
 An unexpected warning means **stop and escalate to the owner**; do not approve
@@ -127,13 +133,12 @@ brew update
 brew upgrade --cask webdesserts/tap/webdesserts-memory
 ```
 
-Same-signer approval behavior remains **unverified** until the mandatory
-monotonic smoke: approve and relaunch a same-signed local-only v0.5.7 baseline,
-then upgrade the same isolated cask token to the strictly newer candidate with
-no intervening candidate install, downgrade or uninstall. Record launch,
-relaunch and any renewed approval; do not assume an earlier approval persists.
-The app remains dockless/menu-bar based and does not automatically restart after
-an upgrade. Quit before upgrading and relaunch normally afterward.
+On the recorded macOS 26.6.2 smoke host, an ordinary same-token upgrade from the
+approved, same-signed 0.5.7 baseline to exact 0.5.8 retained quarantine and
+launched/relaunched without another blocking approval. This is one observation,
+not a promise that approval persists on every host or future release. The app
+remains dockless/menu-bar based and does not automatically restart after an
+upgrade. Quit before upgrading and relaunch normally afterward.
 
 ### Recovery
 
@@ -186,33 +191,24 @@ contains no key material. It remains the sole source of spctl/ticket
 preapproval classification: the official Homebrew audit does not inspect
 Gatekeeper.
 
-The real v0.5.8 candidate audit produced a concrete finding: with the concrete
-(un-interpolated) release URL, the official audit failed and suggested
-`sha256 :no_check`, which is forbidden policy. The generator now emits Homebrew
-version interpolation (`v#{version}` / `Memory_#{version}`) in the cask source
-URL, and the probe receipt records the official
-`brew audit --cask --online` passing with exit 0 for that candidate. The
-candidate gate requires that audit to exit 0 before any publication; audit
-output itself is not classified. This is audit-only evidence, not a passed
-full candidate gate.
+The real v0.5.8 candidate audit first failed when the source used a concrete
+release URL and suggested `sha256 :no_check`, which is forbidden policy. The
+generator now emits Homebrew version interpolation (`v#{version}` /
+`Memory_#{version}`) while retaining the exact checksum. Full verify-only runs
+on the `macos-14` runner subsequently passed signer validation, isolated source
+resolution, collision handling, exact fetch, Ruby syntax, `brew style` and
+`brew audit --cask --online` with the Tahoe floor. Audit output is never treated
+as a Gatekeeper classifier.
 
-The v0.5.8 build, tag, and release upload are done, and local unquarantined
-startup passed. Remaining gates are fixture-assisted quarantined launch and
-monotonic upgrade smoke, final candidate validation with the reviewed macOS
-floor, tap publication, and explicit automation enablement, plus the two
-integration gates below.
-
-The `desktop-cask` workflow is dispatchable only after it exists on the default
-branch: until `main` is fast-forwarded to the reviewed v0.5.x tip, dispatch by
-name fails. Later owner-controlled dispatch must explicitly use `main` at that
-reviewed tip. The gates run on the `macos-14` runner; whether its Homebrew
-recognizes `depends_on macos: :tahoe`, resolves fetch/collision there, and
-passes `brew style` and `brew audit --cask --online` on a cold cache is a gate
-to verify at the first verify-dispatch — runner compatibility is not evidence
-of Tahoe (or Sonoma) support, and artifact signature/spctl/ticket validation
-still runs before any publication. The short tap README install/link entry
-belongs to owner-reviewed first publication (G6); this guide remains
-authoritative.
+The v0.5.8 build, immutable tag, release upload, quarantined same-token upgrade
+and post-smoke full candidate verification are complete. The target's healthy
+launch/relaunch evidence is agent-driven through LaunchServices; the owner has
+not yet performed the required exact-0.5.8 Applications/Finder and Spotlight
+follow-up, so first tap publication remains blocked. Broader automatic
+publication is separately owner-gated and stays disabled. Runner recognition of
+the Tahoe symbol is a packaging gate, not evidence that every Tahoe or newer
+host is compatible. This guide remains the authoritative approval and recovery
+guide; the tap README provides the short install/update entry.
 
 ## Frontend / ui dependency
 
